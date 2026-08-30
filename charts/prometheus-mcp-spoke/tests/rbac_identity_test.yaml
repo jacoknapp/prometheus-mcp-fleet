@@ -1,0 +1,138 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# identity.backend=secret buys restart survival for exactly one namespaced Role
+# over exactly one Secret. identity.backend=memory buys zero RBAC and pays for it
+# with a multi-use enrollment token. Both halves of that trade are asserted here.
+suite: spoke identity backend drives RBAC
+set:
+  cluster:
+    id: prod-us-east-1
+  hub:
+    endpoints:
+      - hub.example.com:8443
+    apiUrl: https://hub.example.com
+
+tests:
+  - it: renders a Role scoped by resourceNames to exactly the identity Secret
+    template: templates/rbac.yaml
+    documentIndex: 0
+    asserts:
+      - isKind:
+          of: Role
+      - equal:
+          path: rules[1].resourceNames
+          value: [RELEASE-NAME-prometheus-mcp-spoke-identity]
+      - equal:
+          path: rules[1].verbs
+          value: [get, update]
+      - equal:
+          path: rules[1].resources
+          value: [secrets]
+
+  - it: never grants list or watch on Secrets
+    template: templates/rbac.yaml
+    documentIndex: 0
+    asserts:
+      - notContains:
+          path: rules[1].verbs
+          content: list
+      - notContains:
+          path: rules[1].verbs
+          content: watch
+      - notContains:
+          path: rules[0].verbs
+          content: get
+
+  - it: renders nothing cluster-scoped
+    template: templates/rbac.yaml
+    asserts:
+      - notEqual:
+          path: kind
+          value: ClusterRole
+      - notEqual:
+          path: kind
+          value: ClusterRoleBinding
+
+  - it: binds the Role to the spoke ServiceAccount in this namespace only
+    template: templates/rbac.yaml
+    documentIndex: 1
+    asserts:
+      - isKind:
+          of: RoleBinding
+      - equal:
+          path: roleRef.kind
+          value: Role
+      - equal:
+          path: subjects[0].name
+          value: RELEASE-NAME-prometheus-mcp-spoke
+
+  - it: renders NO RBAC AT ALL in memory identity mode
+    template: templates/rbac.yaml
+    set:
+      identity:
+        backend: memory
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: does not project a service account token in memory identity mode either
+    template: templates/serviceaccount.yaml
+    set:
+      identity:
+        backend: memory
+    asserts:
+      - equal:
+          path: automountServiceAccountToken
+          value: false
+
+  - it: projects the token in secret identity mode, because it calls the API
+    template: templates/serviceaccount.yaml
+    asserts:
+      - equal:
+          path: automountServiceAccountToken
+          value: true
+
+  - it: omits PMF_IDENTITY_SECRET_NAME when there is no Secret to write
+    template: templates/configmap.yaml
+    documentIndex: 0
+    set:
+      identity:
+        backend: memory
+    asserts:
+      - equal:
+          path: "data.PMF_IDENTITY_BACKEND"
+          value: "memory"
+      - notExists:
+          path: "data.PMF_IDENTITY_SECRET_NAME"
+
+  - it: renders no RBAC in file identity mode either
+    template: templates/rbac.yaml
+    set:
+      identity:
+        backend: file
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: honours a custom identity Secret name in both the Role and the config
+    template: templates/rbac.yaml
+    documentIndex: 0
+    set:
+      identity:
+        secretName: fleet-spoke-identity
+    asserts:
+      - equal:
+          path: rules[1].resourceNames
+          value: [fleet-spoke-identity]
+
+  - it: keeps the config and the grant in step
+    template: templates/configmap.yaml
+    documentIndex: 0
+    set:
+      identity:
+        secretName: fleet-spoke-identity
+    asserts:
+      - equal:
+          path: "data.PMF_IDENTITY_SECRET_NAME"
+          value: "fleet-spoke-identity"

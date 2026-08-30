@@ -1,0 +1,10 @@
+{
+  "status": "success",
+  "data": {
+    "activeAlertmanagers": [
+      { "url": "http://10.42.0.31:9093/api/v2/alerts" },
+      { "url": "http://10.42.0.32:9093/api/v2/alerts" }
+    ],
+    "droppedAlertmanagers": []
+  }
+}

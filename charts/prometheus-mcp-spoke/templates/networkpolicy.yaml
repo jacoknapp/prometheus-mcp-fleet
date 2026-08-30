@@ -1,0 +1,136 @@
+{{/*
+Copyright The prometheus-mcp-fleet Authors.
+SPDX-License-Identifier: Apache-2.0
+
+Egress-first. The spoke's whole job is to dial OUT, so this policy is mostly a
+statement of the four places it is allowed to reach: DNS, the hub (in another
+cluster, over ordinary egress), the local Prometheus, and the Kubernetes API.
+
+The hub rule is an ipBlock, never a namespaceSelector: the hub is not in this
+cluster, so there is no namespace to select. Any hub.endpoints entry that is
+already an IP literal is pinned to an exact /32 or /128; a DNS name cannot be
+resolved by a NetworkPolicy at all, so those fall back to
+networkPolicy.egress.hub.cidrs -- narrow that to your hub's real addresses.
+*/}}
+{{- if .Values.networkPolicy.enabled -}}
+{{- include "prometheus-mcp-spoke.validate" . -}}
+{{- $ports := list -}}
+{{- $literalCIDRs := list -}}
+{{- range .Values.hub.endpoints -}}
+{{- $ports = append $ports (include "prometheus-mcp-spoke.endpointPort" .) -}}
+{{- $c := include "prometheus-mcp-spoke.endpointCIDR" . -}}
+{{- if $c }}{{- $literalCIDRs = append $literalCIDRs $c -}}{{- end -}}
+{{- end -}}
+{{- $ports = $ports | uniq -}}
+{{- $literalCIDRs = $literalCIDRs | uniq -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "prometheus-mcp-spoke.fullname" . }}
+  namespace: {{ include "prometheus-mcp-spoke.namespace" . }}
+  labels:
+    {{- include "prometheus-mcp-spoke.labels" . | nindent 4 }}
+    {{- with .Values.networkPolicy.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with (include "prometheus-mcp-spoke.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "prometheus-mcp-spoke.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    {{- if .Values.networkPolicy.ingress.enabled }}
+    - Ingress
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.enabled }}
+    - Egress
+    {{- end }}
+  {{- if .Values.networkPolicy.ingress.enabled }}
+  ingress:
+    # Scrapers only. This is the only thing that ever connects IN to a spoke.
+    - ports:
+        - port: admin
+          protocol: TCP
+      from:
+        {{- with .Values.networkPolicy.ingress.namespaceSelector }}
+        - namespaceSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- with $.Values.networkPolicy.ingress.podSelector }}
+          podSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        {{- end }}
+        {{- with .Values.networkPolicy.ingress.extraFrom }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+  {{- end }}
+  {{- if .Values.networkPolicy.egress.enabled }}
+  egress:
+    {{- if .Values.networkPolicy.egress.allowDNS }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.hub.enabled }}
+    {{- range $literalCIDRs }}
+    # Exact address of a hub endpoint given as an IP literal.
+    - to:
+        - ipBlock:
+            cidr: {{ . | quote }}
+      ports:
+        {{- range $ports }}
+        - port: {{ int . }}
+          protocol: TCP
+        {{- end }}
+    {{- end }}
+    {{- with .Values.networkPolicy.egress.hub.cidrs }}
+    # The hub, reached over ordinary egress. It is in another cluster, so this
+    # is an ipBlock and never a namespaceSelector. Ports come from hub.endpoints.
+    - to:
+        {{- range . }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        {{- range $ports }}
+        - port: {{ int . }}
+          protocol: TCP
+        {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.prometheus.enabled }}
+    # The local Prometheus, on the port parsed from prometheus.url.
+    - to:
+        {{- with .Values.networkPolicy.egress.prometheus.namespaceSelector }}
+        - namespaceSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- with $.Values.networkPolicy.egress.prometheus.podSelector }}
+          podSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        {{- end }}
+      ports:
+        - port: {{ int (include "prometheus-mcp-spoke.prometheusPort" .) }}
+          protocol: TCP
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.kubeAPI.enabled }}
+    # The Kubernetes API server, for the identity Secret. Pointless unless
+    # identity.backend is "secret", but harmless and one less thing to forget.
+    - ports:
+        - port: {{ .Values.networkPolicy.egress.kubeAPI.port }}
+          protocol: TCP
+    {{- end }}
+    {{- with .Values.networkPolicy.egress.extraRules }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
+{{- end }}

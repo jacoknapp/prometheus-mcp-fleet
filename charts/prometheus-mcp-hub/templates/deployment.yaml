@@ -1,0 +1,218 @@
+{{/*
+Copyright The prometheus-mcp-fleet Authors.
+SPDX-License-Identifier: Apache-2.0
+
+A plain Deployment. There is no StatefulSet and no volumeClaimTemplate because
+there is no durable on-disk state: everything that must survive a restart lives
+in the state Secret (see templates/rbac.yaml). The only writable path in the
+container is an emptyDir at /tmp.
+*/}}
+{{- include "prometheus-mcp-hub.validate" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "prometheus-mcp-hub.fullname" . }}
+  namespace: {{ include "prometheus-mcp-hub.namespace" . }}
+  labels:
+    {{- include "prometheus-mcp-hub.labels" . | nindent 4 }}
+  {{- with (include "prometheus-mcp-hub.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  strategy:
+    type: {{ .Values.updateStrategy.type }}
+    {{- if and (eq .Values.updateStrategy.type "RollingUpdate") .Values.updateStrategy.rollingUpdate }}
+    rollingUpdate:
+      {{- toYaml .Values.updateStrategy.rollingUpdate | nindent 6 }}
+    {{- end }}
+  selector:
+    matchLabels:
+      {{- include "prometheus-mcp-hub.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "prometheus-mcp-hub.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- if .Values.restartOnConfigChange }}
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.commonAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "prometheus-mcp-hub.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- if .Values.hostNetwork }}
+      hostNetwork: true
+      {{- end }}
+      {{- with .Values.dnsPolicy }}
+      dnsPolicy: {{ . }}
+      {{- end }}
+      {{- with .Values.dnsConfig }}
+      dnsConfig:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.initContainers }}
+      initContainers:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: hub
+          image: {{ include "prometheus-mcp-hub.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.extraArgs }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: mcp
+              containerPort: {{ .Values.ports.mcp }}
+              protocol: TCP
+            - name: tunnel
+              containerPort: {{ .Values.ports.tunnel }}
+              protocol: TCP
+            - name: admin
+              containerPort: {{ .Values.ports.admin }}
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: {{ include "prometheus-mcp-hub.configMapName" . }}
+            {{- with .Values.extraEnvFrom }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            # The hub addresses its own state Secret in its own namespace. The
+            # downward API is the only source of truth for that name.
+            - name: PMF_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            {{- if and .Values.goRuntime.memLimit (dig "limits" "memory" "" .Values.resources) }}
+            # GOMEMLIMIT from the cgroup limit, not from node allocatable.
+            - name: GOMEMLIMIT
+              valueFrom:
+                resourceFieldRef:
+                  containerName: hub
+                  resource: limits.memory
+                  divisor: {{ divf 1.0 .Values.goRuntime.memLimitRatio | printf "%.4f" | quote }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if .Values.startupProbe.enabled }}
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+              scheme: HTTP
+            initialDelaySeconds: {{ .Values.startupProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.startupProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.startupProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.startupProbe.failureThreshold }}
+            successThreshold: {{ .Values.startupProbe.successThreshold }}
+          {{- end }}
+          {{- if .Values.livenessProbe.enabled }}
+          # /healthz never checks a dependency. A liveness probe that does is a
+          # restart loop waiting for an upstream to blink.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+              scheme: HTTP
+            initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.livenessProbe.failureThreshold }}
+            successThreshold: {{ .Values.livenessProbe.successThreshold }}
+          {{- end }}
+          {{- if .Values.readinessProbe.enabled }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+              scheme: HTTP
+            initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.readinessProbe.failureThreshold }}
+            successThreshold: {{ .Values.readinessProbe.successThreshold }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.bootstrap.existingSecret }}
+            - name: bootstrap
+              mountPath: {{ .Values.bootstrap.mountPath }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.tunnel.tls.existingSecret }}
+            - name: tunnel-tls
+              mountPath: {{ .Values.tunnel.tls.mountPath }}
+              readOnly: true
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      {{- with .Values.extraContainers }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        # readOnlyRootFilesystem: true needs exactly one writable path. With the
+        # state Secret holding everything durable, /tmp is all there is.
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ .Values.tmpDirSizeLimit }}
+        {{- if .Values.bootstrap.existingSecret }}
+        - name: bootstrap
+          secret:
+            secretName: {{ .Values.bootstrap.existingSecret }}
+            defaultMode: 0400
+        {{- end }}
+        {{- if .Values.tunnel.tls.existingSecret }}
+        - name: tunnel-tls
+          secret:
+            secretName: {{ .Values.tunnel.tls.existingSecret }}
+            defaultMode: 0400
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

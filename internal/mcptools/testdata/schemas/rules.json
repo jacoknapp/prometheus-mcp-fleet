@@ -1,0 +1,51 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "cluster": {
+      "description": "Cluster name, exactly as returned by list_clusters.",
+      "type": "string"
+    },
+    "format": {
+      "default": "compact",
+      "description": "Output encoding. table is the cheapest for this tool.",
+      "enum": [
+        "compact",
+        "table"
+      ],
+      "type": "string"
+    },
+    "group": {
+      "description": "Restrict to one rule group, matched exactly by name.",
+      "type": "string"
+    },
+    "includeExpr": {
+      "description": "Include each rule's PromQL expression. Off by default because expressions are long; turn it on when you want to run an alert's own query with query_range.",
+      "type": "boolean"
+    },
+    "limit": {
+      "default": 50,
+      "description": "Maximum rules to return, counted across all groups.",
+      "maximum": 500,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "ruleName": {
+      "description": "Restrict to one rule, matched exactly by name.",
+      "type": "string"
+    },
+    "type": {
+      "default": "all",
+      "description": "Filter by rule kind.",
+      "enum": [
+        "all",
+        "alert",
+        "record"
+      ],
+      "type": "string"
+    }
+  },
+  "required": [
+    "cluster"
+  ],
+  "type": "object"
+}

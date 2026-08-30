@@ -1,0 +1,102 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+name: Feature request
+description: Propose a capability, a config key, a chart value or an MCP tool.
+title: "[feat]: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Two things worth knowing before you write this up, because they are the
+        two most common reasons a request is declined:
+
+        1. **The dependency budget is a closed set.** Anything that needs a new
+           direct Go dependency needs an ADR arguing for it. `k8s.io/client-go`,
+           `github.com/prometheus/prometheus` and the usual logging/CLI/ORM
+           frameworks are specifically excluded.
+        2. **The spoke is installed into ~100 clusters run by other people.**
+           Every KB of template and every RBAC rule added to the spoke is
+           reviewed by 100 platform teams. Hub-side is much cheaper than
+           spoke-side; say which side you need.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: >
+        What are you unable to do today? Describe the situation, not the solution
+        you have already designed — the fix may be somewhere you did not expect.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behaviour
+      description: >
+        What should happen instead? If it is a config key, name it (`PMF_...`).
+        If it is a chart value, give the YAML. If it is an MCP tool, sketch the
+        arguments and the shape of the result.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which surface does this touch?
+      multiple: true
+      options:
+        - hub runtime
+        - spoke runtime
+        - MCP tool surface (agent-visible)
+        - wire protocol (hub <-> spoke gRPC)
+        - Helm chart: hub
+        - Helm chart: spoke
+        - observability (metrics, traces, alerts)
+        - documentation
+        - CI / release / supply chain
+    validations:
+      required: true
+
+  - type: dropdown
+    id: compatibility
+    attributes:
+      label: Does this change the hub/spoke wire protocol?
+      description: >
+        The hub must keep serving the previous spoke minor. 100 clusters never
+        upgrade in lockstep, and that skew tolerance is the 1.0 gate.
+      options:
+        - "No"
+        - "Yes — additive only (new optional field or new RPC)"
+        - "Yes — and I do not see how to make it additive"
+        - "Unknown"
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: >
+        Including "do nothing". If there is a way to get this done today with
+        existing config, say why it is not good enough.
+
+  - type: textarea
+    id: token-cost
+    attributes:
+      label: Token cost, if this adds or changes agent-visible output
+      description: >
+        Prometheus' native JSON destroys an agent's context; output shape is a
+        hard requirement here, not a nicety. Roughly how much does this add to a
+        typical result, and can it be columnar or truncatable?
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and discussions.
+          required: true
+        - label: I have said which side (hub or spoke) this needs to live on, and why.
+          required: true

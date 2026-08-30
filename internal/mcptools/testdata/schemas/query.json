@@ -1,0 +1,57 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "cluster": {
+      "description": "Cluster name, exactly as returned by list_clusters.",
+      "type": "string"
+    },
+    "format": {
+      "default": "compact",
+      "description": "Output encoding. compact is columnar and is what you want; json is the raw Prometheus shape and costs ten to fifty times more tokens; table is fixed-width text.",
+      "enum": [
+        "compact",
+        "json",
+        "table"
+      ],
+      "type": "string"
+    },
+    "limit": {
+      "default": 100,
+      "description": "Maximum rows to return. Rows are ranked by descending value, so a truncated result keeps the largest.",
+      "maximum": 1000,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "query": {
+      "description": "PromQL expression to evaluate at a single instant, e.g. sum by(job) (up == 0).",
+      "examples": [
+        "sum by(job) (up == 0)",
+        "rate(http_requests_total[5m])"
+      ],
+      "type": "string"
+    },
+    "time": {
+      "description": "Evaluation instant. Relative (\"now\", \"now-15m\", \"-1h\") or RFC 3339 (\"2026-08-29T12:00:00Z\") or a Unix timestamp. Defaults to now.",
+      "examples": [
+        "now",
+        "now-15m",
+        "2026-08-29T12:00:00Z"
+      ],
+      "type": "string"
+    },
+    "timeout": {
+      "default": "30s",
+      "description": "Upstream evaluation timeout, e.g. \"30s\". Maximum 120s.",
+      "examples": [
+        "30s",
+        "2m"
+      ],
+      "type": "string"
+    }
+  },
+  "required": [
+    "cluster",
+    "query"
+  ],
+  "type": "object"
+}

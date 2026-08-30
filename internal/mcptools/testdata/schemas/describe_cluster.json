@@ -1,0 +1,49 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "cluster": {
+      "description": "Cluster name, exactly as returned by list_clusters.",
+      "examples": [
+        "eu-west-prod-1"
+      ],
+      "type": "string"
+    },
+    "include": {
+      "default": [
+        "jobs",
+        "metricPrefixes",
+        "alertmanager",
+        "rulesSummary"
+      ],
+      "description": "Optional sections to include. Defaults to jobs, metricPrefixes, alertmanager and rulesSummary.",
+      "items": {
+        "enum": [
+          "jobs",
+          "metricPrefixes",
+          "namespaces",
+          "alertmanager",
+          "rulesSummary",
+          "kubernetes",
+          "externalLabels"
+        ],
+        "type": "string"
+      },
+      "maxItems": 7,
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "topN": {
+      "default": 25,
+      "description": "Maximum entries in each list section.",
+      "maximum": 100,
+      "minimum": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "cluster"
+  ],
+  "type": "object"
+}

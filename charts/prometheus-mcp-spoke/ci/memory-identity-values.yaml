@@ -1,0 +1,25 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# identity.backend=memory: NO RBAC at all, no Role, no RoleBinding and no
+# projected service account token. The cost is real and is stated in the README
+# and in NOTES.txt -- the key is lost on every restart, so the spoke re-enrols
+# each time and needs a MULTI-USE enrollment token, which is a standing
+# credential that mints cluster identities.
+cluster:
+  id: airgap-dc1
+hub:
+  endpoints:
+    - 198.51.100.10:8443
+  apiUrl: https://198.51.100.10
+  existingCASecret: hub-ca
+identity:
+  backend: memory
+rbac:
+  create: false
+enrollment:
+  existingSecret: spoke-enrollment-multiuse
+networkPolicy:
+  egress:
+    kubeAPI:
+      enabled: false

@@ -1,0 +1,128 @@
+{{/*
+Copyright The prometheus-mcp-fleet Authors.
+SPDX-License-Identifier: Apache-2.0
+
+Every PMF_ key the spoke reads lives here and nowhere else, so the whole
+configuration surface is one auditable object. `PMF_NAMESPACE` and `GOMEMLIMIT`
+are the only exceptions: both come from the downward API in the Deployment,
+because neither is knowable at render time.
+
+Every key below exists in internal/config/spoke.go. The mapping is mechanical --
+flag `--foo-bar` is environment variable `PMF_FOO_BAR` -- so a key that is not
+a real flag is silently ignored by the binary and the operator gets the default
+they did not ask for. Do not add one without checking the loader.
+*/}}
+{{- include "prometheus-mcp-spoke.validate" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "prometheus-mcp-spoke.configMapName" . }}
+  namespace: {{ include "prometheus-mcp-spoke.namespace" . }}
+  labels:
+    {{- include "prometheus-mcp-spoke.labels" . | nindent 4 }}
+  {{- with (include "prometheus-mcp-spoke.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+data:
+  {{/* The hub is in another cluster. These two values are the only way to reach it. */}}
+  PMF_HUB_ENDPOINTS: {{ join "," .Values.hub.endpoints | quote }}
+  PMF_HUB_API_URL: {{ .Values.hub.apiUrl | quote }}
+  {{- if .Values.hub.caBundle }}
+  PMF_HUB_CA_FILE: {{ printf "%s/ca.crt" (trimSuffix "/" .Values.hub.caMountPath) | quote }}
+  {{- else if .Values.hub.existingCASecret }}
+  PMF_HUB_CA_FILE: {{ printf "%s/%s" (trimSuffix "/" .Values.hub.caMountPath) .Values.hub.caSecretKey | quote }}
+  {{- end }}
+  {{- if .Values.hub.tlsInsecure }}
+  PMF_HUB_TLS_INSECURE: "true"
+  {{- end }}
+  {{- if .Values.hub.allowInsecure }}
+  PMF_ALLOW_INSECURE: "true"
+  {{- end }}
+  {{- if include "prometheus-mcp-spoke.hasEnrollment" . }}
+  PMF_ENROLLMENT_TOKEN_FILE: {{ printf "%s/%s" (trimSuffix "/" .Values.enrollment.mountPath) .Values.enrollment.secretKey | quote }}
+  {{- end }}
+
+  PMF_CLUSTER_ID: {{ .Values.cluster.id | quote }}
+  {{- with .Values.cluster.displayName }}
+  PMF_CLUSTER_DISPLAY_NAME: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.cluster.description }}
+  PMF_CLUSTER_DESCRIPTION: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.cluster.labels }}
+  {{- $pairs := list }}
+  {{- range $k, $v := . }}{{ $pairs = append $pairs (printf "%s=%s" $k $v) }}{{ end }}
+  PMF_CLUSTER_LABELS: {{ join "," $pairs | quote }}
+  {{- end }}
+
+  PMF_IDENTITY_BACKEND: {{ .Values.identity.backend | quote }}
+  {{- if eq .Values.identity.backend "secret" }}
+  PMF_IDENTITY_SECRET_NAME: {{ include "prometheus-mcp-spoke.identitySecretName" . | quote }}
+  {{- end }}
+  {{/*
+    Scratch only: the /tmp emptyDir. It holds the cached hub trust bundle, and
+    the client key when identity.backend=file -- which in a pod means the key is
+    lost on restart. Nothing here is durable.
+  */}}
+  PMF_DATA_DIR: {{ .Values.config.dataDir | quote }}
+
+  PMF_PROMETHEUS_URL: {{ .Values.prometheus.url | quote }}
+  PMF_PROMETHEUS_TIMEOUT: {{ .Values.prometheus.timeout | quote }}
+  {{/*
+    int64 before quote, not just quote. Helm parses a large YAML integer as a
+    float64, so a bare `quote` renders 33554432 as "3.3554432e+07" -- which the
+    binary's strconv.ParseInt rejects, and the process refuses to start.
+  */}}
+  PMF_PROMETHEUS_MAX_RESPONSE_BYTES: {{ .Values.prometheus.maxResponseBytes | int64 | quote }}
+  {{- if .Values.prometheus.bearerToken.existingSecret }}
+  PMF_PROMETHEUS_BEARER_TOKEN_FILE: {{ printf "%s/%s" (trimSuffix "/" .Values.prometheus.bearerToken.mountPath) .Values.prometheus.bearerToken.secretKey | quote }}
+  {{- end }}
+  {{- if .Values.prometheus.tls.existingSecret }}
+  PMF_PROMETHEUS_TLS_CA_FILE: {{ printf "%s/%s" (trimSuffix "/" .Values.prometheus.tls.mountPath) .Values.prometheus.tls.secretKey | quote }}
+  {{- end }}
+  {{- if .Values.prometheus.tls.skipVerify }}
+  PMF_PROMETHEUS_TLS_SKIP_VERIFY: "true"
+  {{- end }}
+
+  PMF_FACTS_REFRESH_INTERVAL: {{ .Values.config.factsRefreshInterval | quote }}
+  PMF_RECONNECT_MIN_BACKOFF: {{ .Values.config.reconnectMinBackoff | quote }}
+  PMF_RECONNECT_MAX_BACKOFF: {{ .Values.config.reconnectMaxBackoff | quote }}
+
+  {{/*
+    Unlike the hub's, the spoke's admin listener defaults to :9090 in the binary
+    already, because it must be reachable by the kubelet's probes and by a
+    scraper. It is confined by the Service type guard and the NetworkPolicy.
+  */}}
+  PMF_ADMIN_ADDR: {{ printf ":%d" (int .Values.ports.admin) | quote }}
+  PMF_LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  PMF_LOG_FORMAT: {{ .Values.config.logFormat | quote }}
+  PMF_PPROF_ENABLED: {{ .Values.config.pprofEnabled | quote }}
+  PMF_SHUTDOWN_DRAIN_DELAY: {{ .Values.config.shutdownDrainDelay | quote }}
+  PMF_SHUTDOWN_GRACE: {{ .Values.config.shutdownGrace | quote }}
+  {{- if .Values.tracing.enabled }}
+  PMF_OTEL_EXPORTER_OTLP_ENDPOINT: {{ .Values.tracing.endpoint | quote }}
+  PMF_TRACE_SAMPLE_RATIO: {{ .Values.tracing.sampleRatio | quote }}
+  {{- end }}
+{{- if .Values.hub.caBundle }}
+---
+{{/*
+The hub's trust bundle, supplied out of band. A CA certificate is public, so a
+ConfigMap is the right object: putting it in a Secret would imply a
+confidentiality it does not have.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "prometheus-mcp-spoke.hubCAConfigMapName" . }}
+  namespace: {{ include "prometheus-mcp-spoke.namespace" . }}
+  labels:
+    {{- include "prometheus-mcp-spoke.labels" . | nindent 4 }}
+  {{- with (include "prometheus-mcp-spoke.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+data:
+  ca.crt: |
+    {{- .Values.hub.caBundle | nindent 4 }}
+{{- end }}

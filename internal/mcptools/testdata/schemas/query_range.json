@@ -1,0 +1,75 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "cluster": {
+      "description": "Cluster name, exactly as returned by list_clusters.",
+      "type": "string"
+    },
+    "end": {
+      "default": "now",
+      "description": "Range end, same forms as start. Defaults to now.",
+      "examples": [
+        "now"
+      ],
+      "type": "string"
+    },
+    "format": {
+      "default": "compact",
+      "description": "Output encoding. compact is columnar and is what you want; json is the raw Prometheus shape and costs ten to fifty times more tokens.",
+      "enum": [
+        "compact",
+        "json",
+        "table"
+      ],
+      "type": "string"
+    },
+    "maxPoints": {
+      "default": 120,
+      "description": "Maximum samples per series. Drives automatic step selection.",
+      "maximum": 500,
+      "minimum": 10,
+      "type": "integer"
+    },
+    "maxSeries": {
+      "default": 20,
+      "description": "Maximum series to return. Series are ranked by their maximum value; the selection strategy is named in truncated.selection.",
+      "maximum": 200,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "query": {
+      "description": "PromQL expression to evaluate over the range, e.g. rate(http_requests_total[5m]).",
+      "examples": [
+        "rate(container_cpu_usage_seconds_total{namespace=\"prod\"}[5m])"
+      ],
+      "type": "string"
+    },
+    "start": {
+      "default": "now-1h",
+      "description": "Range start. Relative (\"now-6h\", \"-15m\") or RFC 3339 or a Unix timestamp. Defaults to now-1h.",
+      "examples": [
+        "now-6h",
+        "-15m"
+      ],
+      "type": "string"
+    },
+    "step": {
+      "description": "Resolution, e.g. \"1m\". Omit to let the hub choose: it snaps to {15s,30s,1m,5m,15m,1h,6h,1d}, never goes below the cluster's scrape interval, and always reports what it applied in downsampled.",
+      "examples": [
+        "1m",
+        "5m"
+      ],
+      "type": "string"
+    },
+    "timeout": {
+      "default": "60s",
+      "description": "Upstream evaluation timeout, e.g. \"60s\". Maximum 120s.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "cluster",
+    "query"
+  ],
+  "type": "object"
+}

@@ -1,0 +1,62 @@
+{{/*
+Copyright The prometheus-mcp-fleet Authors.
+SPDX-License-Identifier: Apache-2.0
+
+The entire Kubernetes authorisation surface of the spoke, and it exists only in
+identity.backend=secret mode. It is namespaced, it is restricted by
+`resourceNames` to the single identity Secret this release owns, and there is
+deliberately no `list` and no `watch`: a token that can list Secrets can read
+every Secret in the namespace, which is exactly what we are avoiding.
+
+In identity.backend=memory this file renders NOTHING. That is the zero-RBAC
+mode, and the README states its cost plainly: the key lives only in memory, so
+the spoke re-enrols on every restart and needs a multi-use enrollment token.
+*/}}
+{{- if and .Values.rbac.create (eq .Values.identity.backend "secret") -}}
+{{- include "prometheus-mcp-spoke.validate" . -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "prometheus-mcp-spoke.fullname" . }}
+  namespace: {{ include "prometheus-mcp-spoke.namespace" . }}
+  labels:
+    {{- include "prometheus-mcp-spoke.labels" . | nindent 4 }}
+  {{- with (include "prometheus-mcp-spoke.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+rules:
+  # Kubernetes cannot restrict `create` by resourceNames: at authorization time
+  # the object has no name yet, and a rule that pairs them silently authorizes
+  # nothing. This verb grants "may create a Secret in this one namespace" -- NOT
+  # "may read Secrets", which is the privilege that actually matters.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  # The read/write path IS name-restricted, to exactly one Secret.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - {{ include "prometheus-mcp-spoke.identitySecretName" . | quote }}
+    verbs: ["get", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "prometheus-mcp-spoke.fullname" . }}
+  namespace: {{ include "prometheus-mcp-spoke.namespace" . }}
+  labels:
+    {{- include "prometheus-mcp-spoke.labels" . | nindent 4 }}
+  {{- with (include "prometheus-mcp-spoke.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "prometheus-mcp-spoke.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "prometheus-mcp-spoke.serviceAccountName" . }}
+    namespace: {{ include "prometheus-mcp-spoke.namespace" . }}
+{{- end }}

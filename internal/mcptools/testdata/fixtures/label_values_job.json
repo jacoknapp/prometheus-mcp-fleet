@@ -1,0 +1,4 @@
+{
+  "status": "success",
+  "data": ["apiserver", "cadvisor", "coredns", "kube-state-metrics", "kubelet", "node-exporter", "prometheus"]
+}

@@ -1,0 +1,27 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "cluster": {
+      "description": "Cluster name, exactly as returned by list_clusters.",
+      "type": "string"
+    },
+    "limit": {
+      "default": 100,
+      "description": "Maximum entries to return.",
+      "maximum": 1000,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "metric": {
+      "description": "Single metric name. Omit to list metadata for every metric the cluster publishes.",
+      "examples": [
+        "node_cpu_seconds_total"
+      ],
+      "type": "string"
+    }
+  },
+  "required": [
+    "cluster"
+  ],
+  "type": "object"
+}

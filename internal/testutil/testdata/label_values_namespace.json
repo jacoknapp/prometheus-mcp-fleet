@@ -1,0 +1,4 @@
+{
+  "status": "success",
+  "data": ["default", "istio-system", "kube-node-lease", "kube-public", "kube-system", "monitoring"]
+}

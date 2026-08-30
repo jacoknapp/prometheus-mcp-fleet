@@ -1,0 +1,77 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Conservative stale policy.
+#
+# Deliberately slow: 90 days of silence before an issue is marked stale, another
+# 30 before it closes. An operator running the spoke in 100 clusters who files a
+# subtle bug and then goes on holiday should not come back to a closed issue.
+# Anything labelled `security`, `bug`, `pinned` or `roadmap` is never touched.
+#
+# Pull requests get a shorter window because an unrebased PR rots against a
+# moving `main`, but they are only ever marked, never auto-closed.
+name: stale
+
+on:
+  schedule:
+    # Daily at 01:07 UTC.
+    - cron: "7 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stale
+  cancel-in-progress: false
+
+jobs:
+  stale:
+    name: mark and close stale items
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Run stale
+        uses: actions/stale@4391f3da665fdf50b6810c1a66712fb9ba21aa93 # v11.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+          days-before-issue-stale: 90
+          days-before-issue-close: 30
+          days-before-pr-stale: 45
+          # -1 means "never auto-close a pull request". A PR someone wrote is
+          # worth a human declining it.
+          days-before-pr-close: -1
+
+          stale-issue-label: stale
+          stale-pr-label: stale
+          exempt-issue-labels: "security,bug,pinned,roadmap,help wanted,good first issue"
+          exempt-pr-labels: "security,pinned,dependencies"
+          exempt-all-milestones: true
+          exempt-all-assignees: true
+
+          stale-issue-message: >
+            This issue has had no activity for 90 days. It will be closed in 30
+            days unless something happens here. If it is still relevant, a
+            comment saying so is enough — no need to justify it.
+          close-issue-message: >
+            Closing after 120 days of silence. This is bookkeeping, not a
+            judgement: comment and it reopens.
+          stale-pr-message: >
+            This pull request has had no activity for 45 days. It will not be
+            closed automatically, but it is probably drifting from `main` — a
+            rebase or a note about its status would help.
+
+          # Rate limiting: stay well inside the API budget and process oldest
+          # first so the backlog drains deterministically.
+          operations-per-run: 60
+          ascending: true
+          enable-statistics: true

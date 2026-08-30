@@ -1,0 +1,69 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# ---------------------------------------------------------------------------
+# CHART VALUE CONTRACT (charts/prometheus-mcp-spoke)
+# ---------------------------------------------------------------------------
+# Kept deliberately small. Every key here is a coupling between this workflow
+# and the chart's values.schema.json, and `.github/workflows/e2e.yml`
+# preflights the whole file with `helm template` before it builds anything, so
+# drift fails in seconds with a named cause. Anything the chart already
+# defaults correctly is NOT restated here.
+#
+# Set on the command line by .github/workflows/e2e.yml (never committed):
+#   enrollment.token   a pmf_enr_... token minted through the hub's admin API
+#   hub.caBundle       PEM trust bundle fetched from the hub's GET /pki/bundle
+# ---------------------------------------------------------------------------
+image:
+  # `make images REGISTRY=localhost/prometheus-mcp-fleet` produces this name.
+  registry: localhost
+  repository: prometheus-mcp-fleet/spoke
+  tag: e2e
+  digest: ""
+  # Never: kind's side-loaded copy is authoritative, and a typo in the image
+  # name then fails immediately instead of hanging on ImagePullBackOff.
+  pullPolicy: Never
+
+cluster:
+  id: e2e-kind
+  displayName: "kind e2e cluster"
+  labels:
+    env: ci
+
+hub:
+  # Cross-namespace: the hub runs in pmf-hub, the spoke in pmf-spoke, which is
+  # the same shape as the real deployment (different clusters entirely).
+  endpoints:
+    - "prometheus-mcp-hub-tunnel.pmf-hub.svc.cluster.local:8443"
+  apiUrl: "https://prometheus-mcp-hub.pmf-hub.svc.cluster.local:8080"
+
+prometheus:
+  # Created by the Prometheus operator from .github/e2e/prometheus-values.yaml.
+  url: "http://prometheus-operated.monitoring.svc:9090"
+  timeout: 25s
+
+# kind's default CNI does not enforce NetworkPolicy, so an enabled policy would
+# be silently inert and give false confidence. Rendering is covered by
+# helm-unittest and kubeconform instead.
+networkPolicy:
+  enabled: false
+
+metrics:
+  serviceMonitor:
+    enabled: false
+  prometheusRule:
+    enabled: false
+
+autoUpdate:
+  enabled: false
+
+config:
+  logLevel: debug
+  logFormat: json
+
+resources:
+  requests:
+    cpu: 25m
+    memory: 64Mi
+  limits:
+    memory: 256Mi

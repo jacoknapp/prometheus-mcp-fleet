@@ -1,0 +1,157 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# The hub is in another cluster, so its egress rule is an ipBlock and a port
+# taken from hub.endpoints. A namespaceSelector could never match it.
+suite: spoke NetworkPolicy egress reaches the configured hub
+templates:
+  - templates/networkpolicy.yaml
+set:
+  cluster:
+    id: prod-us-east-1
+  hub:
+    endpoints:
+      - hub.example.com:8443
+    apiUrl: https://hub.example.com
+
+tests:
+  - it: opens egress on the port configured in hub.endpoints
+    asserts:
+      - isKind:
+          of: NetworkPolicy
+      - contains:
+          path: spec.egress
+          content:
+            to:
+              - ipBlock:
+                  cidr: "0.0.0.0/0"
+            ports:
+              - port: 8443
+                protocol: TCP
+
+  - it: follows a non-default hub port
+    set:
+      hub:
+        endpoints:
+          - hub.example.com:9443
+    asserts:
+      - contains:
+          path: spec.egress
+          content:
+            to:
+              - ipBlock:
+                  cidr: "0.0.0.0/0"
+            ports:
+              - port: 9443
+                protocol: TCP
+
+  - it: pins an IP-literal hub endpoint to an exact /32
+    set:
+      hub:
+        endpoints:
+          - 198.51.100.10:8443
+    asserts:
+      - contains:
+          path: spec.egress
+          content:
+            to:
+              - ipBlock:
+                  cidr: "198.51.100.10/32"
+            ports:
+              - port: 8443
+                protocol: TCP
+
+  - it: opens every port when several hub replicas are listed
+    set:
+      hub:
+        endpoints:
+          - hub-0.example.com:8443
+          - hub-1.example.com:9443
+      networkPolicy:
+        egress:
+          hub:
+            cidrs:
+              - 203.0.113.0/24
+    asserts:
+      - contains:
+          path: spec.egress
+          content:
+            to:
+              - ipBlock:
+                  cidr: "203.0.113.0/24"
+            ports:
+              - port: 8443
+                protocol: TCP
+              - port: 9443
+                protocol: TCP
+
+  - it: allows DNS, the local Prometheus and the Kubernetes API
+    asserts:
+      - contains:
+          path: spec.egress
+          content:
+            to:
+              - namespaceSelector:
+                  matchLabels:
+                    kubernetes.io/metadata.name: kube-system
+            ports:
+              - port: 53
+                protocol: UDP
+              - port: 53
+                protocol: TCP
+      - contains:
+          path: spec.egress
+          content:
+            to:
+              - namespaceSelector:
+                  matchLabels:
+                    kubernetes.io/metadata.name: monitoring
+            ports:
+              - port: 9090
+                protocol: TCP
+      - contains:
+          path: spec.egress
+          content:
+            ports:
+              - port: 443
+                protocol: TCP
+
+  - it: parses the Prometheus port out of the URL, including the https default
+    set:
+      prometheus:
+        url: https://thanos-query.observability.svc
+      networkPolicy:
+        egress:
+          prometheus:
+            namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: observability
+    asserts:
+      - contains:
+          path: spec.egress
+          content:
+            to:
+              - namespaceSelector:
+                  matchLabels:
+                    kubernetes.io/metadata.name: observability
+            ports:
+              - port: 443
+                protocol: TCP
+
+  - it: never selects the hub by namespace, because the hub is not in this cluster
+    asserts:
+      - exists:
+          path: spec.egress[1].to[0].ipBlock.cidr
+      - notExists:
+          path: spec.egress[1].to[0].namespaceSelector
+      - notExists:
+          path: spec.egress[1].to[0].podSelector
+
+  - it: accepts only the metrics port inbound
+    asserts:
+      - lengthEqual:
+          path: spec.ingress
+          count: 1
+      - equal:
+          path: spec.ingress[0].ports[0].port
+          value: admin

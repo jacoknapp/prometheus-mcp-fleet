@@ -1,0 +1,57 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "cluster": {
+      "description": "Cluster name, exactly as returned by list_clusters.",
+      "type": "string"
+    },
+    "format": {
+      "default": "compact",
+      "description": "Output encoding. table is the cheapest for this tool. format \"json\" is refused here because the raw payload carries scrape URLs, which routinely embed credentials.",
+      "enum": [
+        "compact",
+        "table"
+      ],
+      "type": "string"
+    },
+    "health": {
+      "default": "any",
+      "description": "Filter by scrape health. Use \"down\" to go straight to what is broken.",
+      "enum": [
+        "any",
+        "up",
+        "down",
+        "unknown"
+      ],
+      "type": "string"
+    },
+    "job": {
+      "description": "Restrict to one scrape job, matched exactly against the job label.",
+      "examples": [
+        "kubelet"
+      ],
+      "type": "string"
+    },
+    "limit": {
+      "default": 50,
+      "description": "Maximum targets to return. The summary counts every target regardless of this limit.",
+      "maximum": 500,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "state": {
+      "default": "active",
+      "description": "Which targets to report.",
+      "enum": [
+        "active",
+        "dropped",
+        "any"
+      ],
+      "type": "string"
+    }
+  },
+  "required": [
+    "cluster"
+  ],
+  "type": "object"
+}

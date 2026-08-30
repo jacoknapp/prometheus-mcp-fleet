@@ -1,0 +1,141 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# The hub runs in a different cluster and each of ~100 installs supplies its own
+# values, so every one of these would otherwise be a silently wrong install in a
+# cluster nobody is watching.
+#
+# cluster.id, hub.endpoints, hub.apiUrl and prometheus.url are ALSO required in
+# values.schema.json, which rejects an empty one before a template runs. The
+# `fail` guards below stay as defence for --skip-schema-validation and because
+# they explain WHY, which a schema rejection cannot.
+suite: spoke misconfiguration fails at render time
+tests:
+  - it: refuses skipping hub certificate verification without the second key
+    set:
+      cluster:
+        id: prod-us-east-1
+      hub:
+        endpoints:
+          - hub.example.com:8443
+        apiUrl: https://hub.example.com
+        tlsInsecure: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "lets anything on the network impersonate the hub"
+
+  - it: refuses the secret identity backend without a projected token
+    set:
+      cluster:
+        id: prod-us-east-1
+      hub:
+        endpoints:
+          - hub.example.com:8443
+        apiUrl: https://hub.example.com
+      serviceAccount:
+        automountServiceAccountToken: false
+    asserts:
+      - failedTemplate:
+          errorPattern: "needs the projected token"
+
+  - it: refuses the secret identity backend with no RBAC and no named ServiceAccount
+    set:
+      cluster:
+        id: prod-us-east-1
+      hub:
+        endpoints:
+          - hub.example.com:8443
+        apiUrl: https://hub.example.com
+      rbac:
+        create: false
+    asserts:
+      - failedTemplate:
+          errorPattern: "Grant get,create,update on the identity Secret yourself"
+
+  - it: refuses both an inline enrollment token and an existing Secret
+    set:
+      cluster:
+        id: prod-us-east-1
+      hub:
+        endpoints:
+          - hub.example.com:8443
+        apiUrl: https://hub.example.com
+      enrollment:
+        token: pmf_enr_x
+        existingSecret: s
+    asserts:
+      - failedTemplate:
+          errorPattern: "mutually exclusive"
+
+  - it: refuses both an inline hub CA bundle and an existing CA Secret
+    set:
+      cluster:
+        id: prod-us-east-1
+      hub:
+        endpoints:
+          - hub.example.com:8443
+        apiUrl: https://hub.example.com
+        caBundle: "-----BEGIN CERTIFICATE-----"
+        existingCASecret: hub-ca
+    asserts:
+      - failedTemplate:
+          errorPattern: "reads exactly one PMF_HUB_CA_FILE"
+
+  - it: refuses to publish the admin port outside the cluster
+    set:
+      cluster:
+        id: prod-us-east-1
+      hub:
+        endpoints:
+          - hub.example.com:8443
+        apiUrl: https://hub.example.com
+      service:
+        type: LoadBalancer
+    asserts:
+      - failedTemplate:
+          errorPattern: "must never be reachable from outside the cluster"
+
+  - it: refuses an Ingress smuggled in through extraManifests
+    set:
+      cluster:
+        id: prod-us-east-1
+      hub:
+        endpoints:
+          - hub.example.com:8443
+        apiUrl: https://hub.example.com
+      extraManifests:
+        - apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: sneaky
+    asserts:
+      - failedTemplate:
+          errorPattern: "could only publish metrics and pprof"
+
+  - it: refuses a dataDir outside the one writable path
+    set:
+      cluster:
+        id: prod-us-east-1
+      hub:
+        endpoints:
+          - hub.example.com:8443
+        apiUrl: https://hub.example.com
+      config:
+        dataDir: /var/lib/prometheus-mcp-fleet
+    asserts:
+      - failedTemplate:
+          errorPattern: "readOnlyRootFilesystem is true and no extraVolumeMounts make that path writable"
+
+  - it: refuses tracing with no endpoint
+    set:
+      cluster:
+        id: prod-us-east-1
+      hub:
+        endpoints:
+          - hub.example.com:8443
+        apiUrl: https://hub.example.com
+      tracing:
+        enabled: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "tracing.enabled is true but tracing.endpoint is empty"

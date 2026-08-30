@@ -1,0 +1,16 @@
+# Everything not needed by the image build. Keeping this tight speeds the
+# build context transfer and keeps local state out of the layer cache.
+.git
+.github
+bin/
+dist/
+docs/
+charts/
+test/
+*.md
+!go.mod
+!go.sum
+coverage.out
+coverage.html
+.golangci.yml
+.editorconfig

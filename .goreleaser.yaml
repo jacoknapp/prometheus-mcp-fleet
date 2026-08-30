@@ -1,0 +1,221 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# GoReleaser v2 configuration for `prometheus-mcp-fleet`.
+#
+# Scope: binaries, archives, checksums, SBOMs, the source archive, the
+# changelog and the GitHub Release. Container images are deliberately NOT built
+# here — they are built by `.github/workflows/release.yml` with buildx from the
+# single root `Dockerfile` (`--build-arg COMPONENT=hub|spoke`), because that is
+# the same path `make images` and the weekly rebuild take. Two build recipes for
+# one artifact is how reproducibility quietly dies.
+#
+# No Homebrew tap, no Snapcraft, no nfpm: the supported install paths are the
+# Helm charts and `go install`.
+#
+# Local dry run:
+#   goreleaser release --snapshot --clean
+#   goreleaser build   --snapshot --clean --single-target
+version: 2
+
+project_name: prometheus-mcp-fleet
+
+before:
+  hooks:
+    - go mod download
+    - go mod verify
+
+# `.Version` is the tag with the leading `v` stripped, e.g. tag `v1.2.3` gives
+# `1.2.3`. That is the same string the charts use for `appVersion` and the same
+# string the image tags use, so every artifact of a release agrees on one
+# version literal.
+builds:
+  - id: hub
+    main: ./cmd/hub
+    binary: hub
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    # Mirrors the Makefile's LDFLAGS. Keep the two in step: the Makefile is the
+    # local-developer path and this is the release path, and a stamp that only
+    # appears in one of them is a debugging trap.
+    ldflags:
+      - -s -w
+      - -X github.com/jacoknapp/prometheus-mcp-fleet/internal/version.Version={{ .Version }}
+      - -X github.com/jacoknapp/prometheus-mcp-fleet/internal/version.Commit={{ .FullCommit }}
+      - -X github.com/jacoknapp/prometheus-mcp-fleet/internal/version.Date={{ .CommitDate }}
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    # Pin every output file's mtime to the tagged commit's time so a rebuild of
+    # the same tag is byte-identical. This is the archive-side equivalent of
+    # SOURCE_DATE_EPOCH in the Dockerfile.
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+  - id: spoke
+    main: ./cmd/spoke
+    binary: spoke
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/jacoknapp/prometheus-mcp-fleet/internal/version.Version={{ .Version }}
+      - -X github.com/jacoknapp/prometheus-mcp-fleet/internal/version.Commit={{ .FullCommit }}
+      - -X github.com/jacoknapp/prometheus-mcp-fleet/internal/version.Date={{ .CommitDate }}
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  # One archive per component, so an operator downloading the spoke does not
+  # also download a hub they will never run.
+  - id: hub
+    ids:
+      - hub
+    name_template: "{{ .ProjectName }}_hub_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats:
+      - tar.gz
+    files:
+      - LICENSE
+      - NOTICE
+      - README.md
+      - SECURITY.md
+
+  - id: spoke
+    ids:
+      - spoke
+    name_template: "{{ .ProjectName }}_spoke_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats:
+      - tar.gz
+    files:
+      - LICENSE
+      - NOTICE
+      - README.md
+      - SECURITY.md
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+# SPDX SBOM per archive. Needs `syft` on PATH; the release workflow installs it
+# with anchore/sbom-action/download-syft before invoking GoReleaser.
+sboms:
+  - id: archive
+    artifacts: archive
+    documents:
+      - "{{ .ArtifactName }}.spdx.sbom.json"
+
+source:
+  enabled: true
+  name_template: "{{ .ProjectName }}_{{ .Version }}_source"
+  format: tar.gz
+
+# Keyless cosign signature over checksums.txt. Signing the checksum file rather
+# than every archive keeps the Release page readable while still covering every
+# artifact transitively. Requires `id-token: write` and cosign on PATH.
+signs:
+  - id: cosign-checksums
+    cmd: cosign
+    artifacts: checksum
+    output: true
+    certificate: "${artifact}.pem"
+    args:
+      - sign-blob
+      - "--yes"
+      - "--output-certificate=${certificate}"
+      - "--output-signature=${signature}"
+      - "${artifact}"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot-{{ .ShortCommit }}"
+
+changelog:
+  use: github
+  sort: asc
+  abbrev: -1
+  groups:
+    - title: Breaking changes
+      regexp: '^.*?[a-zA-Z]+(\([\w\-\.]+\))?!:.*$'
+      order: 0
+    - title: Features
+      regexp: '^.*?feat(\([\w\-\.]+\))?!?:.+$'
+      order: 1
+    - title: Bug fixes
+      regexp: '^.*?fix(\([\w\-\.]+\))?!?:.+$'
+      order: 2
+    - title: Performance
+      regexp: '^.*?perf(\([\w\-\.]+\))?!?:.+$'
+      order: 3
+    - title: Security
+      regexp: '^.*?(sec|security)(\([\w\-\.]+\))?!?:.+$'
+      order: 4
+    - title: Refactoring
+      regexp: '^.*?refactor(\([\w\-\.]+\))?!?:.+$'
+      order: 5
+    - title: Documentation
+      regexp: '^.*?docs(\([\w\-\.]+\))?!?:.+$'
+      order: 6
+    - title: Build and dependencies
+      regexp: '^.*?(build|deps|chore\(deps\))(\([\w\-\.]+\))?!?:.+$'
+      order: 7
+    - title: Other
+      order: 999
+  filters:
+    exclude:
+      - '^test(\([\w\-\.]+\))?!?:'
+      - '^ci(\([\w\-\.]+\))?!?:'
+      - '^style(\([\w\-\.]+\))?!?:'
+      - '^chore(\([\w\-\.]+\))?!?:'
+      - "^Merge pull request"
+      - "^Merge branch"
+
+release:
+  github:
+    owner: jacoknapp
+    name: prometheus-mcp-fleet
+  draft: false
+  # `v1.2.3-rc.1` is published as a pre-release automatically; `v1.2.3` is not.
+  prerelease: auto
+  mode: replace
+  name_template: "v{{ .Version }}"
+  footer: |
+    ## Container images
+
+    ```
+    ghcr.io/jacoknapp/prometheus-mcp-fleet/hub:{{ .Version }}
+    ghcr.io/jacoknapp/prometheus-mcp-fleet/spoke:{{ .Version }}
+    ```
+
+    ## Helm charts
+
+    ```
+    helm install prometheus-mcp-hub   oci://ghcr.io/jacoknapp/charts/prometheus-mcp-hub
+    helm install prometheus-mcp-spoke oci://ghcr.io/jacoknapp/charts/prometheus-mcp-spoke
+    ```
+
+    Images and charts are signed keyless with cosign. Verify before you deploy:
+
+    ```
+    cosign verify ghcr.io/jacoknapp/prometheus-mcp-fleet/hub:{{ .Version }} \
+      --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      --certificate-identity-regexp '^https://github.com/jacoknapp/prometheus-mcp-fleet/\.github/workflows/.+@refs/tags/v.+$'
+    ```
+
+    **This release does not move the `stable` tag.** `stable` moves only through
+    the environment-protected `promote` workflow, which is the fleet-wide kill
+    switch.
+
+# The `stable` OCI tag is never touched by a release. Announcing that here as
+# well as in the workflow is deliberate belt-and-braces documentation.
+metadata:
+  mod_timestamp: "{{ .CommitTimestamp }}"

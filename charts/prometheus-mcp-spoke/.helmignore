@@ -1,0 +1,26 @@
+# Patterns to ignore when building packages.
+.DS_Store
+.git/
+.gitignore
+.bzr/
+.bzrignore
+.hg/
+.hgignore
+.svn/
+*.swp
+*.bak
+*.tmp
+*.orig
+*~
+.project
+.idea/
+*.tmproj
+.vscode/
+# Chart development scaffolding that must not ship in the package.
+#
+# The leading slash anchors these at the chart root, and it is load-bearing:
+# an unanchored `tests/` also matches `templates/tests/`, which would silently
+# drop the `helm test` hook from every package.
+/ci/
+/tests/
+/README.md.gotmpl

@@ -1,0 +1,13 @@
+version: v2
+modules:
+  - path: api/proto
+lint:
+  use:
+    - STANDARD
+  except:
+    # Proxy is a server-streaming RPC whose messages are body chunks, not a
+    # single logical "ProxyResponse"; the chunk name is the accurate one.
+    - RPC_RESPONSE_STANDARD_NAME
+breaking:
+  use:
+    - FILE

@@ -1,0 +1,79 @@
+{{/*
+Copyright The prometheus-mcp-fleet Authors.
+SPDX-License-Identifier: Apache-2.0
+
+The entire Kubernetes authorisation surface of the hub. It is namespaced, it is
+restricted by `resourceNames` to the Secrets this release owns, and there is
+deliberately no `list` or `watch`: a token that can list Secrets can read every
+Secret in the namespace, which is exactly what we are avoiding.
+*/}}
+{{- if and .Values.rbac.create (eq .Values.state.backend "secret") -}}
+{{- include "prometheus-mcp-hub.validate" . -}}
+{{/*
+Exactly two names: the state Secret and the CA Secret. PMF_STATE_SECRET_NAME
+and PMF_CA_SECRET_NAME in the ConfigMap are rendered from the same two helpers,
+so the grant and the configuration cannot drift apart.
+*/}}
+{{- $names := list (include "prometheus-mcp-hub.stateSecretName" .) (include "prometheus-mcp-hub.caSecretName" .) -}}
+{{- with .Values.rbac.extraSecretNames }}{{- $names = concat $names . -}}{{- end -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "prometheus-mcp-hub.fullname" . }}
+  namespace: {{ include "prometheus-mcp-hub.namespace" . }}
+  labels:
+    {{- include "prometheus-mcp-hub.labels" . | nindent 4 }}
+  {{- with (include "prometheus-mcp-hub.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+rules:
+  {{- if .Values.rbac.allowCreate }}
+  # Kubernetes cannot restrict `create` by resourceNames: the object does not
+  # exist yet, so the authorizer has no name to match against, and a rule that
+  # pairs them silently authorizes nothing. The verb is therefore split out.
+  # It grants "may create a Secret in this one namespace" -- NOT "may read
+  # Secrets", which is the privilege that actually matters. Pre-create the
+  # state Secret yourself and set rbac.allowCreate=false to remove even this.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  {{- end }}
+  # The read/write path IS name-restricted. There is deliberately no list and
+  # no watch: a token that can list Secrets can read every Secret in the
+  # namespace, which is the whole thing we are avoiding.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      {{- range $names | uniq | sortAlpha }}
+      - {{ . | quote }}
+      {{- end }}
+    verbs: ["get", "update"]
+  {{- if .Values.bootstrap.existingSecret }}
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - {{ .Values.bootstrap.existingSecret | quote }}
+    verbs: ["get"]
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "prometheus-mcp-hub.fullname" . }}
+  namespace: {{ include "prometheus-mcp-hub.namespace" . }}
+  labels:
+    {{- include "prometheus-mcp-hub.labels" . | nindent 4 }}
+  {{- with (include "prometheus-mcp-hub.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "prometheus-mcp-hub.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "prometheus-mcp-hub.serviceAccountName" . }}
+    namespace: {{ include "prometheus-mcp-hub.namespace" . }}
+{{- end }}

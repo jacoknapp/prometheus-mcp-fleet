@@ -1,0 +1,101 @@
+{{/*
+Copyright The prometheus-mcp-fleet Authors.
+SPDX-License-Identifier: Apache-2.0
+*/}}
+{{- if .Values.networkPolicy.enabled -}}
+{{- include "prometheus-mcp-hub.validate" . -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "prometheus-mcp-hub.fullname" . }}
+  namespace: {{ include "prometheus-mcp-hub.namespace" . }}
+  labels:
+    {{- include "prometheus-mcp-hub.labels" . | nindent 4 }}
+    {{- with .Values.networkPolicy.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with (include "prometheus-mcp-hub.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "prometheus-mcp-hub.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    {{- if .Values.networkPolicy.egress.enabled }}
+    - Egress
+    {{- end }}
+  ingress:
+    # MCP: agents reach this through the Ingress controller.
+    - ports:
+        - port: mcp
+          protocol: TCP
+      {{- if not .Values.networkPolicy.mcp.allowAll }}
+      from:
+        {{- with .Values.networkPolicy.mcp.namespaceSelector }}
+        - namespaceSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- with $.Values.networkPolicy.mcp.podSelector }}
+          podSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        {{- end }}
+        {{- with .Values.networkPolicy.mcp.extraFrom }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+    # Tunnel: spokes live in other clusters, so by default this is open. Narrow
+    # it with networkPolicy.tunnel.cidrs once you know your fleet's egress ranges.
+    - ports:
+        - port: tunnel
+          protocol: TCP
+      {{- if not .Values.networkPolicy.tunnel.allowAll }}
+      from:
+        {{- range .Values.networkPolicy.tunnel.cidrs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      {{- end }}
+    # Admin/metrics: scrapers only. This port is never published outside.
+    - ports:
+        - port: admin
+          protocol: TCP
+      from:
+        {{- with .Values.networkPolicy.admin.namespaceSelector }}
+        - namespaceSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- with $.Values.networkPolicy.admin.podSelector }}
+          podSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        {{- end }}
+        {{- with .Values.networkPolicy.admin.extraFrom }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+  {{- if .Values.networkPolicy.egress.enabled }}
+  egress:
+    {{- if .Values.networkPolicy.egress.allowDNS }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.allowKubeAPI }}
+    # The hub reads and writes its state Secret through the API server. Without
+    # this rule it cannot start with state.backend=secret.
+    - ports:
+        - port: {{ .Values.networkPolicy.egress.kubeAPIPort }}
+          protocol: TCP
+    {{- end }}
+    {{- with .Values.networkPolicy.egress.extraRules }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
+{{- end }}

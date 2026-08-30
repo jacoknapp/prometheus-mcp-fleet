@@ -1,0 +1,136 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+name: Bug report
+description: Something in the hub, the spoke or a chart does not behave as documented.
+title: "[bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing this.
+
+        **If this is a security vulnerability, stop and read
+        [SECURITY.md](https://github.com/jacoknapp/prometheus-mcp-fleet/blob/main/SECURITY.md)
+        instead.** A public issue is a public disclosure.
+
+        Please scrub secrets from anything you paste: `pmf_adm_`, `pmf_agt_` and
+        `pmf_enr_` tokens, `Authorization` headers, private keys and the HMAC
+        pepper. The hub redacts these in its own logs; copy-paste does not.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Which part is misbehaving?
+      options:
+        - hub
+        - spoke
+        - chart: prometheus-mcp-hub
+        - chart: prometheus-mcp-spoke
+        - MCP tool behaviour / output
+        - documentation
+        - CI / release tooling
+        - not sure
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: >
+        Output of `hub --version` / `spoke --version`, or the image tag or digest
+        you are running. If it is a chart problem, give the chart version too.
+      placeholder: "app 0.3.1 (commit abc1234), chart prometheus-mcp-spoke 0.4.0"
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: >
+        What did you observe? Describe the impact, not only the symptom — "agents
+        cannot query cluster `eu-prod-3`" is more useful than "there is an error".
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+      description: If the documentation says otherwise, link to the line.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: >
+        Numbered steps. A `helm install` command with the values that matter is
+        usually the fastest possible reproduction.
+      placeholder: |
+        1. helm install prometheus-mcp-spoke oci://ghcr.io/jacoknapp/charts/prometheus-mcp-spoke --set ...
+        2. Wait for the pod to become Ready
+        3. Call the `query` tool through the hub for this cluster
+        4. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: >
+        `kubectl logs` from the affected pod, at `PMF_LOG_LEVEL=debug` if you can
+        reproduce it. Secrets scrubbed. This is rendered as a code block, so no
+        backticks are needed.
+      render: text
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: >
+        Kubernetes version and distribution, CNI, whether the spoke reaches the
+        hub through a proxy or NAT, and which Prometheus-compatible backend the
+        spoke is pointed at (Prometheus, Thanos, Mimir, Cortex).
+      placeholder: |
+        Kubernetes: v1.31.4 (EKS)
+        CNI: Cilium 1.16
+        Prometheus: Thanos Query 0.37 behind the prometheus-operated Service
+        Spoke egress: through an HTTP CONNECT proxy
+    validations:
+      required: true
+
+  - type: dropdown
+    id: regression
+    attributes:
+      label: Is this a regression?
+      options:
+        - "No — it never worked for me"
+        - "Yes — it worked on an earlier version"
+        - "Unknown"
+    validations:
+      required: true
+
+  - type: input
+    id: last-good
+    attributes:
+      label: Last known good version
+      description: Only if you answered "Yes" above.
+      placeholder: "0.3.0"
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: This is not a security vulnerability (those go through SECURITY.md).
+          required: true
+        - label: I removed tokens, keys and `Authorization` headers from everything I pasted.
+          required: true

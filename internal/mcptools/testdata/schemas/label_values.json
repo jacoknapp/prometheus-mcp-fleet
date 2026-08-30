@@ -1,0 +1,54 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "cluster": {
+      "description": "Cluster name, exactly as returned by list_clusters.",
+      "type": "string"
+    },
+    "end": {
+      "default": "now",
+      "description": "Range end, same forms as start. Defaults to now.",
+      "type": "string"
+    },
+    "label": {
+      "description": "Label name whose values to list, e.g. \"job\" or \"namespace\". Use \"__name__\" for metric names.",
+      "examples": [
+        "job",
+        "namespace",
+        "__name__"
+      ],
+      "type": "string"
+    },
+    "limit": {
+      "default": 100,
+      "description": "Maximum values to return.",
+      "maximum": 2000,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "matchers": {
+      "description": "Optional series selectors scoping the lookup.",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "pattern": {
+      "description": "Optional case-insensitive substring filter applied to the values at the hub.",
+      "type": "string"
+    },
+    "start": {
+      "default": "now-1h",
+      "description": "Range start. Relative (\"now-1h\") or RFC 3339. Defaults to now-1h.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "cluster",
+    "label"
+  ],
+  "type": "object"
+}

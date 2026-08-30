@@ -1,0 +1,91 @@
+{
+  "status": "success",
+  "data": {
+    "groups": [
+      {
+        "name": "kubernetes-apps",
+        "file": "/etc/prometheus/rules/kubernetes-apps.yaml",
+        "interval": 30,
+        "limit": 0,
+        "evaluationTime": 0.004112,
+        "lastEvaluation": "2026-08-26T11:02:00.001Z",
+        "rules": [
+          {
+            "state": "firing",
+            "name": "KubePodCrashLooping",
+            "query": "max_over_time(kube_pod_container_status_waiting_reason{reason=\"CrashLoopBackOff\"}[5m]) >= 1",
+            "duration": 900,
+            "labels": { "severity": "warning" },
+            "annotations": { "summary": "Pod is crash looping." },
+            "alerts": [
+              {
+                "labels": { "alertname": "KubePodCrashLooping", "namespace": "default", "pod": "api-7d9f", "severity": "warning" },
+                "annotations": { "summary": "Pod is crash looping." },
+                "state": "firing",
+                "activeAt": "2026-08-26T10:31:00.001Z",
+                "value": "1e+00"
+              }
+            ],
+            "health": "ok",
+            "evaluationTime": 0.002101,
+            "lastEvaluation": "2026-08-26T11:02:00.001Z",
+            "type": "alerting"
+          },
+          {
+            "state": "inactive",
+            "name": "KubeDeploymentReplicasMismatch",
+            "query": "kube_deployment_spec_replicas != kube_deployment_status_replicas_available",
+            "duration": 900,
+            "labels": { "severity": "warning" },
+            "annotations": { "summary": "Deployment has not matched the expected number of replicas." },
+            "alerts": [],
+            "health": "ok",
+            "evaluationTime": 0.000901,
+            "lastEvaluation": "2026-08-26T11:02:00.003Z",
+            "type": "alerting"
+          }
+        ]
+      },
+      {
+        "name": "node-exporter.rules",
+        "file": "/etc/prometheus/rules/node-exporter.yaml",
+        "interval": 30,
+        "limit": 0,
+        "evaluationTime": 0.008901,
+        "lastEvaluation": "2026-08-26T11:02:00.010Z",
+        "rules": [
+          {
+            "name": "instance:node_cpu_utilisation:rate5m",
+            "query": "1 - avg without (cpu) (sum without (mode) (rate(node_cpu_seconds_total{mode=~\"idle|iowait|steal\"}[5m])))",
+            "labels": {},
+            "health": "ok",
+            "evaluationTime": 0.004401,
+            "lastEvaluation": "2026-08-26T11:02:00.010Z",
+            "type": "recording"
+          },
+          {
+            "state": "pending",
+            "name": "NodeFilesystemAlmostOutOfSpace",
+            "query": "node_filesystem_avail_bytes / node_filesystem_size_bytes * 100 < 5",
+            "duration": 1800,
+            "labels": { "severity": "warning" },
+            "annotations": { "summary": "Filesystem has less than 5% space left." },
+            "alerts": [
+              {
+                "labels": { "alertname": "NodeFilesystemAlmostOutOfSpace", "instance": "10.42.0.11:9100", "severity": "warning" },
+                "annotations": { "summary": "Filesystem has less than 5% space left." },
+                "state": "pending",
+                "activeAt": "2026-08-26T10:58:00.001Z",
+                "value": "4.1e+00"
+              }
+            ],
+            "health": "ok",
+            "evaluationTime": 0.004500,
+            "lastEvaluation": "2026-08-26T11:02:00.015Z",
+            "type": "alerting"
+          }
+        ]
+      }
+    ]
+  }
+}

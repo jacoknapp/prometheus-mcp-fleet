@@ -1,0 +1,31 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Prometheus Operator objects. Needs the monitoring.coreos.com/v1 CRDs to
+# install, but renders and lints without them.
+metrics:
+  serviceMonitor:
+    enabled: true
+    labels:
+      release: kube-prometheus-stack
+    interval: 15s
+    metricRelabelings:
+      - action: drop
+        sourceLabels: [__name__]
+        regex: go_memstats_.*
+  prometheusRule:
+    enabled: true
+    labels:
+      release: kube-prometheus-stack
+    additionalRuleLabels:
+      team: platform
+    thresholds:
+      spokesDisconnectedRatio: 0.05
+      caCertExpirySeconds: 2592000
+tracing:
+  enabled: true
+  endpoint: otel-collector.observability.svc:4317
+  sampleRatio: "0.10"
+tunnel:
+  serverNames:
+    - hub.example.com

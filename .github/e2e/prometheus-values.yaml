@@ -1,0 +1,57 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# kube-prometheus-stack, trimmed to the smallest thing that is still a *real*
+# Prometheus: the operator plus one Prometheus instance that scrapes itself.
+# The self-scrape is what makes `up == 1` a genuine assertion rather than a
+# fixture, and the operator is what creates the `prometheus-operated` Service
+# that the spoke chart points at by default.
+grafana:
+  enabled: false
+alertmanager:
+  enabled: false
+nodeExporter:
+  enabled: false
+kubeStateMetrics:
+  enabled: false
+kubeApiServer:
+  enabled: false
+kubelet:
+  enabled: false
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeProxy:
+  enabled: false
+kubeEtcd:
+  enabled: false
+coreDns:
+  enabled: false
+defaultRules:
+  create: false
+prometheusOperator:
+  admissionWebhooks:
+    enabled: false
+    patch:
+      enabled: false
+  tls:
+    enabled: false
+prometheus:
+  prometheusSpec:
+    # Keep the operator scraping itself and the Prometheus Service, and nothing
+    # that needs cluster RBAC we do not want to grant in CI.
+    serviceMonitorSelectorNilUsesHelmValues: true
+    podMonitorSelectorNilUsesHelmValues: true
+    ruleSelectorNilUsesHelmValues: true
+    probeSelectorNilUsesHelmValues: true
+    scrapeConfigSelectorNilUsesHelmValues: true
+    retention: 1h
+    scrapeInterval: 10s
+    evaluationInterval: 10s
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+    storageSpec: {}

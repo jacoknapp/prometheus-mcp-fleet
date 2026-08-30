@@ -1,0 +1,197 @@
+{{/*
+Copyright The prometheus-mcp-fleet Authors.
+SPDX-License-Identifier: Apache-2.0
+
+Every metric name below is copied from internal/obs/metrics.go, which is the
+only definition of the promfleet_spoke_* series.
+promfleet_spoke_client_cert_expiry_seconds holds SECONDS REMAINING (obs sets it
+from time.Until), not a unix timestamp, so the comparison is a bare
+`< threshold` and never `- time()`.
+*/}}
+{{- if .Values.metrics.prometheusRule.enabled -}}
+{{- include "prometheus-mcp-spoke.validate" . -}}
+{{- $sel := include "prometheus-mcp-spoke.ruleSelector" . -}}
+{{- $fullname := include "prometheus-mcp-spoke.fullname" . -}}
+{{- $ns := include "prometheus-mcp-spoke.namespace" . -}}
+{{/* int64 on every integer threshold: Helm parses a large YAML integer as a
+     float64, so a bare render turns 259200 into 2.592e+05. PromQL accepts that,
+     but nobody reading the alert at 03:00 should have to. */}}
+{{- $t := .Values.metrics.prometheusRule.thresholds -}}
+{{- $runbook := .Values.metrics.prometheusRule.runbookUrlPrefix -}}
+{{- $cluster := .Values.cluster.id -}}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Values.metrics.prometheusRule.namespace | default $ns }}
+  labels:
+    {{- include "prometheus-mcp-spoke.labels" . | nindent 4 }}
+    {{- with .Values.metrics.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- $ann := merge (dict) .Values.metrics.prometheusRule.annotations .Values.commonAnnotations }}
+  {{- with $ann }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  groups:
+    - name: {{ $fullname }}.rules
+      rules:
+        {{- if .Values.metrics.prometheusRule.rules.spokeDown }}
+        - alert: PrometheusMCPSpokeDown
+          expr: absent(up{ {{ $sel }} } == 1)
+          for: 10m
+          labels:
+            severity: critical
+            {{- with .Values.metrics.prometheusRule.additionalRuleLabels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: prometheus-mcp-fleet spoke in cluster {{ $cluster }} is not being scraped
+            description: >-
+              No spoke instance matching {{ $sel }} has reported up==1 for 10 minutes.
+              Cluster {{ $cluster }} is almost certainly invisible to every AI agent:
+              the hub reports it disconnected and every query against it returns a
+              spoke-unreachable tool error.
+            runbook_url: {{ $runbook }}PrometheusMCPSpokeDown.md
+        {{- end }}
+        {{- if .Values.metrics.prometheusRule.rules.tunnelDown }}
+        - alert: PrometheusMCPSpokeTunnelDown
+          {{/* max over the endpoint label: the spoke holds one tunnel per hub
+               endpoint, so this fires only when EVERY hub endpoint is down. */}}
+          expr: max(promfleet_spoke_tunnel_up{ {{ $sel }} }) == 0
+          for: 5m
+          labels:
+            severity: critical
+            {{- with .Values.metrics.prometheusRule.additionalRuleLabels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: Cluster {{ $cluster }} has no tunnel to any hub endpoint
+            description: >-
+              promfleet_spoke_tunnel_up is 0 for every configured hub endpoint. The
+              spoke dials out, so this is an egress, DNS or hub-availability problem
+              in this cluster's direction, not an inbound firewall one. Check the
+              spoke logs for the dial error and confirm the NetworkPolicy egress
+              rules still cover the hub's address.
+            runbook_url: {{ $runbook }}PrometheusMCPSpokeTunnelDown.md
+        {{- end }}
+        {{- if .Values.metrics.prometheusRule.rules.tunnelFlapping }}
+        - alert: PrometheusMCPSpokeTunnelFlapping
+          expr: >-
+            sum(increase(promfleet_spoke_tunnel_reconnects_total{ {{ $sel }} }[1h]))
+            > {{ $t.reconnectsPerHour | int64 }}
+          for: 15m
+          labels:
+            severity: warning
+            {{- with .Values.metrics.prometheusRule.additionalRuleLabels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: The tunnel from cluster {{ $cluster }} is flapping
+            description: >-
+              {{ printf "{{ $value }}" }} tunnel reconnects in the last hour. Every
+              reconnect drops the in-flight queries the hub had routed here. Check
+              for MTU, idle-timeout or LoadBalancer connection-reaping problems on
+              the path to the hub.
+            runbook_url: {{ $runbook }}PrometheusMCPSpokeTunnelFlapping.md
+        {{- end }}
+        {{- if .Values.metrics.prometheusRule.rules.prometheusDown }}
+        - alert: PrometheusMCPSpokePrometheusDown
+          expr: promfleet_spoke_prom_up{ {{ $sel }} } == 0
+          for: 10m
+          labels:
+            severity: warning
+            {{- with .Values.metrics.prometheusRule.additionalRuleLabels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: The local Prometheus is unreachable from the spoke in {{ $cluster }}
+            description: >-
+              The spoke's probe of its configured prometheus.url has been failing for
+              10 minutes. The spoke stays RUNNING on purpose -- /healthz never checks a
+              dependency -- but it reports NotReady and every query the hub routes here
+              fails.
+            runbook_url: {{ $runbook }}PrometheusMCPSpokePrometheusDown.md
+        {{- end }}
+        {{- if .Values.metrics.prometheusRule.rules.certExpiringSoon }}
+        - alert: PrometheusMCPSpokeCertExpiringSoon
+          expr: promfleet_spoke_client_cert_expiry_seconds{ {{ $sel }} } < {{ $t.certExpirySeconds | int64 }}
+          for: 1h
+          labels:
+            severity: critical
+            {{- with .Values.metrics.prometheusRule.additionalRuleLabels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: The client certificate for cluster {{ $cluster }} expires soon
+            description: >-
+              This spoke's certificate expires in
+              {{ printf "{{ $value | humanizeDuration }}" }}. Renewal happens
+              automatically at half the certificate's life, so this firing means
+              RENEWAL IS FAILING. When it expires the tunnel stops re-establishing and
+              the cluster needs a fresh enrollment token by hand.
+            runbook_url: {{ $runbook }}PrometheusMCPSpokeCertExpiringSoon.md
+        {{- end }}
+        {{- if .Values.metrics.prometheusRule.rules.promErrorRatioHigh }}
+        - alert: PrometheusMCPSpokePromErrorRatioHigh
+          expr: >-
+            (sum(rate(promfleet_spoke_prom_requests_total{ {{ $sel }}, code=~"5.." }[5m]))
+            / sum(rate(promfleet_spoke_prom_requests_total{ {{ $sel }} }[5m]))) > {{ $t.promErrorRatio }}
+          for: 10m
+          labels:
+            severity: warning
+            {{- with .Values.metrics.prometheusRule.additionalRuleLabels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: The local Prometheus is returning 5xx to the spoke in {{ $cluster }}
+            description: >-
+              {{ printf "{{ $value | humanizePercentage }}" }} of the spoke's requests
+              to its local Prometheus returned 5xx over the last 5 minutes. Agents see
+              these as tool errors against cluster {{ $cluster }}.
+            runbook_url: {{ $runbook }}PrometheusMCPSpokePromErrorRatioHigh.md
+        {{- end }}
+        {{- if .Values.metrics.prometheusRule.rules.factsRefreshFailing }}
+        - alert: PrometheusMCPSpokeFactsRefreshFailing
+          expr: >-
+            sum(increase(promfleet_spoke_facts_refresh_total{ {{ $sel }}, result="error" }[1h])) > 0
+          for: 30m
+          labels:
+            severity: info
+            {{- with .Values.metrics.prometheusRule.additionalRuleLabels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: Cluster facts for {{ $cluster }} are going stale
+            description: >-
+              Fact collection has been failing for 30 minutes. Queries still work; what
+              degrades is the hub's description of this cluster, so an agent choosing
+              between clusters sees an out-of-date picture of {{ $cluster }}.
+            runbook_url: {{ $runbook }}PrometheusMCPSpokeFactsRefreshFailing.md
+        {{- end }}
+        {{- if and .Values.autoUpdate.enabled .Values.metrics.prometheusRule.rules.autoUpdateFailed }}
+        - alert: PrometheusMCPSpokeAutoUpdateFailed
+          expr: >-
+            kube_job_status_failed{namespace="{{ $ns }}",
+            job_name=~"{{ include "prometheus-mcp-spoke.autoUpdateName" . }}-.*"} > 0
+          for: 15m
+          labels:
+            severity: warning
+            {{- with .Values.metrics.prometheusRule.additionalRuleLabels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: The spoke auto-update job failed in cluster {{ $cluster }}
+            description: >-
+              {{ printf "{{ $labels.job_name }}" }} failed. Either the cosign signature
+              or the SLSA provenance verification refused the new digest, or the rollout
+              was rolled back. The workload is still on its previous digest; nothing was
+              applied unverified.
+            runbook_url: {{ $runbook }}PrometheusMCPSpokeAutoUpdateFailed.md
+        {{- end }}
+    {{- with .Values.metrics.prometheusRule.additionalGroups }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

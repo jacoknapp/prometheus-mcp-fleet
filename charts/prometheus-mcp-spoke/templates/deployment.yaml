@@ -1,0 +1,250 @@
+{{/*
+Copyright The prometheus-mcp-fleet Authors.
+SPDX-License-Identifier: Apache-2.0
+
+A plain Deployment. There is no StatefulSet and no volumeClaimTemplate because
+there is no durable on-disk state: the issued client key and certificate live in
+the identity Secret (see templates/rbac.yaml). The only writable path in the
+container is an emptyDir at /tmp.
+*/}}
+{{- include "prometheus-mcp-spoke.validate" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "prometheus-mcp-spoke.fullname" . }}
+  namespace: {{ include "prometheus-mcp-spoke.namespace" . }}
+  labels:
+    {{- include "prometheus-mcp-spoke.labels" . | nindent 4 }}
+  {{- with (include "prometheus-mcp-spoke.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  strategy:
+    # Recreate, NOT RollingUpdate. A spoke's identity is one X.509 certificate
+    # bound to one cluster ID, held in one Secret. During a rolling update the
+    # old and the new pod would both hold that identity: they would renew over
+    # each other in the Secret, and the hub -- which keys a tunnel by the cluster
+    # ID in the certificate URI SAN -- would see each new tunnel deregister the
+    # other's. Two spokes sharing one cluster ID fight. The brief gap Recreate
+    # costs is the correct trade; the hub simply reports this cluster
+    # disconnected for a few seconds and agents get an explicit tool error.
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "prometheus-mcp-spoke.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "prometheus-mcp-spoke.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- if .Values.restartOnConfigChange }}
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.commonAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "prometheus-mcp-spoke.serviceAccountName" . }}
+      # Projected only for identity.backend=secret. In memory and file mode the
+      # spoke never calls the Kubernetes API and gets no token at all.
+      automountServiceAccountToken: {{ include "prometheus-mcp-spoke.automountToken" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- if .Values.hostNetwork }}
+      hostNetwork: true
+      {{- end }}
+      {{- with .Values.dnsPolicy }}
+      dnsPolicy: {{ . }}
+      {{- end }}
+      {{- with .Values.dnsConfig }}
+      dnsConfig:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.initContainers }}
+      initContainers:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: spoke
+          image: {{ include "prometheus-mcp-spoke.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.extraArgs }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            # The admin listener is the ONLY port. The tunnel is outbound: the
+            # spoke dials the hub, so nothing ever connects in.
+            - name: admin
+              containerPort: {{ .Values.ports.admin }}
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: {{ include "prometheus-mcp-spoke.configMapName" . }}
+            {{- with .Values.extraEnvFrom }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            # The spoke addresses its own identity Secret in its own namespace.
+            # The downward API is the only source of truth for that name.
+            - name: PMF_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            {{- if and .Values.goRuntime.memLimit (dig "limits" "memory" "" .Values.resources) }}
+            # GOMEMLIMIT from the cgroup limit, not from node allocatable.
+            - name: GOMEMLIMIT
+              valueFrom:
+                resourceFieldRef:
+                  containerName: spoke
+                  resource: limits.memory
+                  divisor: {{ divf 1.0 .Values.goRuntime.memLimitRatio | printf "%.4f" | quote }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if .Values.startupProbe.enabled }}
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+              scheme: HTTP
+            initialDelaySeconds: {{ .Values.startupProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.startupProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.startupProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.startupProbe.failureThreshold }}
+            successThreshold: {{ .Values.startupProbe.successThreshold }}
+          {{- end }}
+          {{- if .Values.livenessProbe.enabled }}
+          # /healthz never checks a dependency. A liveness probe that checked the
+          # hub or Prometheus would restart this pod every time an upstream
+          # blinked -- and in identity.backend=memory each restart burns another
+          # enrollment.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+              scheme: HTTP
+            initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.livenessProbe.failureThreshold }}
+            successThreshold: {{ .Values.livenessProbe.successThreshold }}
+          {{- end }}
+          {{- if .Values.readinessProbe.enabled }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+              scheme: HTTP
+            initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.readinessProbe.failureThreshold }}
+            successThreshold: {{ .Values.readinessProbe.successThreshold }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if include "prometheus-mcp-spoke.hasEnrollment" . }}
+            - name: enrollment
+              mountPath: {{ .Values.enrollment.mountPath }}
+              readOnly: true
+            {{- end }}
+            {{- if or .Values.hub.caBundle .Values.hub.existingCASecret }}
+            - name: hub-ca
+              mountPath: {{ .Values.hub.caMountPath }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.prometheus.bearerToken.existingSecret }}
+            - name: prometheus-auth
+              mountPath: {{ .Values.prometheus.bearerToken.mountPath }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.prometheus.tls.existingSecret }}
+            - name: prometheus-ca
+              mountPath: {{ .Values.prometheus.tls.mountPath }}
+              readOnly: true
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      {{- with .Values.extraContainers }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        # readOnlyRootFilesystem: true needs exactly one writable path. With the
+        # identity Secret holding the only thing worth keeping, /tmp is all
+        # there is.
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ .Values.tmpDirSizeLimit }}
+        {{- if include "prometheus-mcp-spoke.hasEnrollment" . }}
+        - name: enrollment
+          secret:
+            secretName: {{ include "prometheus-mcp-spoke.enrollmentSecretName" . }}
+            defaultMode: 0400
+        {{- end }}
+        {{- if .Values.hub.caBundle }}
+        - name: hub-ca
+          configMap:
+            name: {{ include "prometheus-mcp-spoke.hubCAConfigMapName" . }}
+            defaultMode: 0444
+        {{- else if .Values.hub.existingCASecret }}
+        - name: hub-ca
+          secret:
+            secretName: {{ .Values.hub.existingCASecret }}
+            defaultMode: 0400
+        {{- end }}
+        {{- if .Values.prometheus.bearerToken.existingSecret }}
+        - name: prometheus-auth
+          secret:
+            secretName: {{ .Values.prometheus.bearerToken.existingSecret }}
+            defaultMode: 0400
+        {{- end }}
+        {{- if .Values.prometheus.tls.existingSecret }}
+        - name: prometheus-ca
+          secret:
+            secretName: {{ .Values.prometheus.tls.existingSecret }}
+            defaultMode: 0400
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

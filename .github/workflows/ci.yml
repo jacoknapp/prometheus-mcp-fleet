@@ -1,0 +1,422 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Go continuous integration. Runs on every pull request (including forks) and
+# on every push to main. Nothing in this file is privileged: the workflow-level
+# permission is `contents: read` and no job requests more, so a fork PR gets an
+# identical, secretless run. Every third-party action is pinned by full commit
+# SHA; Renovate keeps the pins current.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Least privilege: read the checkout, nothing else.
+permissions:
+  contents: read
+
+# Supersede in-flight PR runs, but never cancel a main-branch run: main is what
+# the release tag is cut from and its results are the historical record.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # The toolchain the project targets. go.mod's `go` directive is the minimum
+  # supported language version, not the build toolchain, so it is deliberately
+  # not used here.
+  GO_VERSION: "1.27.x"
+  # renovate: datasource=github-releases depName=golangci/golangci-lint
+  GOLANGCI_LINT_VERSION: "v2.13.2"
+  # Repo-wide statement coverage floor, in percent. Enforced by the `test` job.
+  # TODO(coverage): raise to 80 once internal/{registry,promproxy,mcptools} land,
+  # then to the per-package 90% gate the build spec calls for.
+  COVERAGE_MIN: "70"
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+
+      - name: gofmt
+        run: make fmt-check
+
+      - name: go vet
+        run: make vet
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+          args: --timeout=5m
+
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+
+      # `make test` is `go test -race -covermode=atomic -coverprofile=coverage.out ./...`.
+      - name: Test
+        run: make test
+
+      - name: Coverage summary and floor
+        env:
+          COVERAGE_MIN: ${{ env.COVERAGE_MIN }}
+        run: |
+          set -euo pipefail
+          if [ ! -s coverage.out ]; then
+            echo "::error::coverage.out is missing or empty; check the make test target"
+            exit 1
+          fi
+
+          go tool cover -func=coverage.out > cover.txt
+          total="$(awk '/^total:/ {gsub(/%/, "", $NF); print $NF}' cover.txt)"
+          if [ -z "${total}" ]; then
+            echo "::error::could not parse a total from go tool cover"
+            exit 1
+          fi
+
+          {
+            echo "## Coverage"
+            echo
+            echo "**Total: ${total}%** (floor: ${COVERAGE_MIN}%)"
+            echo
+            echo "<details><summary>Per-package coverage</summary>"
+            echo
+            echo "| Package | Coverage |"
+            echo "| --- | ---: |"
+            awk '
+              $1 !~ /^total:/ {
+                path = $1
+                sub(/\/[^\/]*\.go:[0-9]+:$/, "", path)
+                pct = $NF
+                gsub(/%/, "", pct)
+                sum[path] += pct
+                n[path]++
+              }
+              END {
+                for (p in sum) printf "| `%s` | %.1f%% |\n", p, sum[p] / n[p]
+              }
+            ' cover.txt | sort
+            echo
+            echo "</details>"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          # awk rather than bash test: the total is a decimal.
+          awk -v got="${total}" -v min="${COVERAGE_MIN}" 'BEGIN {
+            if (got + 0 < min + 0) {
+              printf "::error::total coverage %.1f%% is below the %s%% floor\n", got, min
+              exit 1
+            }
+            printf "total coverage %.1f%% meets the %s%% floor\n", got, min
+          }'
+
+      - name: Upload coverage profile
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-profile
+          path: coverage.out
+          if-no-files-found: warn
+          retention-days: 7
+
+  build:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # `make build` stamps VERSION from `git describe`; without the tag
+          # history that silently degrades to "dev".
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+
+      # `make build` == `make build-hub build-spoke`, honouring GOOS/GOARCH.
+      - name: Cross-compile hub and spoke
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: make build
+
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+
+      # `make vuln` runs golang.org/x/vuln/cmd/govulncheck against ./...
+      - name: govulncheck
+        run: make vuln
+
+  buf:
+    name: buf
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # `buf breaking --against '.git#branch=origin/main'` needs the main ref.
+          fetch-depth: 0
+          persist-credentials: false
+
+      # lint + format + breaking-vs-main in one action. `pr_comment` is off so
+      # this job never needs `pull-requests: write`, which keeps fork PRs
+      # unprivileged.
+      - name: buf lint, format and breaking-change check
+        uses: bufbuild/buf-action@8c6a16e16f12ba20b6470afa9c2ba9b5ba8c97c3 # v1.5.0
+        with:
+          lint: true
+          format: true
+          breaking: true
+          breaking_against: "https://github.com/${{ github.repository }}.git#branch=main"
+          push: false
+          archive: false
+          pr_comment: false
+
+  tidy-check:
+    name: tidy-check
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+
+      # `make tidy` is `go mod tidy && go mod verify`.
+      - name: go mod tidy
+        run: make tidy
+
+      - name: Fail if go.mod or go.sum changed
+        run: |
+          set -euo pipefail
+          if ! git diff --exit-code -- go.mod go.sum; then
+            echo "::error file=go.mod::go mod tidy produced a diff. Run 'make tidy' and commit the result."
+            exit 1
+          fi
+
+  generate-check:
+    name: generate-check
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      # Must track the protobuf runtime pinned in go.mod.
+      PROTOC_GEN_GO_VERSION: "v1.36.12"
+      # renovate: datasource=go depName=google.golang.org/grpc/cmd/protoc-gen-go-grpc
+      PROTOC_GEN_GO_GRPC_VERSION: "v1.6.2"
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+
+      # buf.gen.yaml declares `local:` plugins, so both must be on PATH.
+      - name: Install protoc plugins
+        run: |
+          set -euo pipefail
+          go install "google.golang.org/protobuf/cmd/protoc-gen-go@${PROTOC_GEN_GO_VERSION}"
+          go install "google.golang.org/grpc/cmd/protoc-gen-go-grpc@${PROTOC_GEN_GO_GRPC_VERSION}"
+
+      - name: Install buf
+        uses: bufbuild/buf-action@8c6a16e16f12ba20b6470afa9c2ba9b5ba8c97c3 # v1.5.0
+        with:
+          setup_only: true
+
+      # `make proto` == buf lint && buf generate && gofmt -w internal/gen
+      - name: Regenerate protobuf code
+        run: make proto
+
+      - name: Fail if generated code is stale
+        run: |
+          set -euo pipefail
+          if ! git diff --exit-code -- internal/gen; then
+            echo "::error::make proto produced a diff. Regenerate and commit internal/gen."
+            exit 1
+          fi
+          if [ -n "$(git status --porcelain --untracked-files=all -- internal/gen)" ]; then
+            git status --porcelain --untracked-files=all -- internal/gen
+            echo "::error::make proto produced untracked files under internal/gen."
+            exit 1
+          fi
+
+  # The layering and dependency-budget test. It is also swept up by `./...` in
+  # the `test` job, but it gets its own check on purpose: "you imported a
+  # higher layer" and "you added a dependency outside the closed set" are
+  # review decisions, not test failures, and they deserve a status check whose
+  # name says so rather than being buried in a 40-package test log.
+  arch:
+    name: arch
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+
+      # Deleting the suite must not read as "architecture is fine".
+      - name: Require the architecture test to exist
+        run: |
+          set -euo pipefail
+          if ! ls test/arch/*_test.go >/dev/null 2>&1; then
+            echo "::error::test/arch contains no _test.go files; the layering and dependency-budget rules are unenforced and this job must not report success"
+            exit 1
+          fi
+
+      # The test shells out to `go list` to build the import graph, so the
+      # module must resolve before it runs.
+      - name: Enforce layering and the dependency budget
+        run: |
+          set -euo pipefail
+          go mod download
+          go test -v -count=1 ./test/arch/...
+
+  # A single required status check to point branch protection at, so adding a
+  # job later does not mean re-editing the protection rule.
+  ci-required:
+    name: ci-required
+    if: always()
+    needs: [lint, test, build, govulncheck, buf, tidy-check, generate-check, arch]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Fail if any required job did not succeed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          set -euo pipefail
+          echo "upstream results: ${RESULTS}"
+          for r in ${RESULTS}; do
+            if [ "${r}" != "success" ]; then
+              echo "::error::a required CI job reported '${r}'"
+              exit 1
+            fi
+          done

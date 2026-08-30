@@ -1,0 +1,15 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Single-node kind cluster for the end-to-end suite. One node is enough: the
+# hub and the spoke are exercised for protocol behaviour, not scheduling.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      # Let workloads schedule on the control plane; there is no other node.
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          taints: []

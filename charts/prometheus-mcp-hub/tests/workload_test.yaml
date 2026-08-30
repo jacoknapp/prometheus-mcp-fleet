@@ -1,0 +1,194 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+suite: hub workload shape, probes, resources and PMF_ environment
+templates:
+  - templates/deployment.yaml
+  - templates/configmap.yaml
+  - templates/service.yaml
+  - templates/service-tunnel.yaml
+  - templates/serviceaccount.yaml
+  - templates/rbac.yaml
+  - templates/networkpolicy.yaml
+tests:
+  - it: renders no StatefulSet and no PersistentVolumeClaim anywhere
+    asserts:
+      - notEqual:
+          path: kind
+          value: StatefulSet
+      - notEqual:
+          path: kind
+          value: PersistentVolumeClaim
+
+  - it: is a Deployment with no volumeClaimTemplates
+    template: templates/deployment.yaml
+    asserts:
+      - isKind:
+          of: Deployment
+      - notExists:
+          path: spec.volumeClaimTemplates
+      - notExists:
+          path: spec.serviceName
+
+  - it: has no volume backed by a PersistentVolumeClaim
+    template: templates/deployment.yaml
+    set:
+      extraVolumes:
+        - name: extra
+          emptyDir: {}
+    asserts:
+      - notContains:
+          path: spec.template.spec.volumes
+          content:
+            persistentVolumeClaim:
+              claimName: anything
+            name: data
+
+  - it: probes /healthz for startup and liveness and /readyz for readiness, all on admin
+    template: templates/deployment.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe.httpGet.path
+          value: /healthz
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe.httpGet.port
+          value: admin
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.httpGet.path
+          value: /healthz
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.httpGet.port
+          value: admin
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet.path
+          value: /readyz
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet.port
+          value: admin
+
+  - it: requests 250m/256Mi, limits memory to 1Gi and sets NO cpu limit
+    template: templates/deployment.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.requests.cpu
+          value: 250m
+      - equal:
+          path: spec.template.spec.containers[0].resources.requests.memory
+          value: 256Mi
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits.memory
+          value: 1Gi
+      - notExists:
+          path: spec.template.spec.containers[0].resources.limits.cpu
+
+  - it: takes GOMEMLIMIT from the memory limit through the downward API
+    template: templates/deployment.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GOMEMLIMIT
+            valueFrom:
+              resourceFieldRef:
+                containerName: hub
+                resource: limits.memory
+                divisor: "1.1111"
+
+  - it: takes PMF_NAMESPACE from the downward API, never from a rendered guess
+    template: templates/deployment.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PMF_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+
+  - it: drops GOMEMLIMIT when no memory limit is set, because the downward API would report node allocatable
+    template: templates/deployment.yaml
+    set:
+      # null, not an object without `limits`: helm-unittest deep-merges `set`
+      # over the chart defaults, so a partial resources block would leave the
+      # default memory limit in place and prove nothing.
+      resources:
+        limits: null
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          any: true
+          content:
+            name: GOMEMLIMIT
+
+  - it: emits every PMF_ key from internal/config/hub.go and no invented one
+    template: templates/configmap.yaml
+    asserts:
+      - equal:
+          path: "data.PMF_MCP_ADDR"
+          value: ":8080"
+      - equal:
+          path: "data.PMF_TUNNEL_ADDR"
+          value: ":8443"
+      - equal:
+          path: "data.PMF_ADMIN_ADDR"
+          value: ":9090"
+      - equal:
+          path: "data.PMF_STATE_BACKEND"
+          value: "secret"
+      - equal:
+          path: "data.PMF_STATE_SECRET_NAME"
+          value: "RELEASE-NAME-prometheus-mcp-hub-state"
+      - equal:
+          path: "data.PMF_CA_SECRET_NAME"
+          value: "RELEASE-NAME-prometheus-mcp-hub-ca"
+      - equal:
+          path: "data.PMF_DATA_DIR"
+          value: "/tmp/prometheus-mcp-fleet"
+      - equal:
+          path: "data.PMF_TRUST_DOMAIN"
+          value: "fleet.local"
+      - notExists:
+          path: "data.PMF_STATE_FILE"
+
+  - it: renders byte counts as integers, not as Go float notation the loader would reject
+    template: templates/configmap.yaml
+    asserts:
+      - equal:
+          path: "data.PMF_MAX_RESPONSE_BYTES"
+          value: "33554432"
+      - equal:
+          path: "data.PMF_MAX_RESPONSE_BUDGET_BYTES"
+          value: "268435456"
+
+  - it: swaps to the file backend cleanly
+    template: templates/configmap.yaml
+    set:
+      state:
+        backend: file
+        file: /tmp/prometheus-mcp-fleet/state.json
+    asserts:
+      - equal:
+          path: "data.PMF_STATE_BACKEND"
+          value: "file"
+      - equal:
+          path: "data.PMF_STATE_FILE"
+          value: "/tmp/prometheus-mcp-fleet/state.json"
+      - notExists:
+          path: "data.PMF_STATE_SECRET_NAME"
+
+  - it: pins the image by digest when one is given, ignoring the tag
+    template: templates/deployment.yaml
+    set:
+      image:
+        tag: v9.9.9
+        digest: sha256:1111111111111111111111111111111111111111111111111111111111111111
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/jacoknapp/prometheus-mcp-fleet/hub@sha256:1111111111111111111111111111111111111111111111111111111111111111
+
+  - it: falls back to the chart appVersion when no tag and no digest are given
+    template: templates/deployment.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/jacoknapp/prometheus-mcp-fleet/hub:0.1.0

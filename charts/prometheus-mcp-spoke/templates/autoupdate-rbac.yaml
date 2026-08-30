@@ -1,0 +1,75 @@
+{{/*
+Copyright The prometheus-mcp-fleet Authors.
+SPDX-License-Identifier: Apache-2.0
+
+The updater's entire authorisation surface. Namespaced Role, never a
+ClusterRole, and every mutating verb is restricted by `resourceNames` to the
+single Deployment this release owns. This ServiceAccount cannot touch any other
+workload in the namespace, let alone the cluster.
+*/}}
+{{- if .Values.autoUpdate.enabled -}}
+{{- include "prometheus-mcp-spoke.validate" . -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "prometheus-mcp-spoke.autoUpdate.serviceAccountName" . }}
+  namespace: {{ include "prometheus-mcp-spoke.namespace" . }}
+  labels:
+    {{- include "prometheus-mcp-spoke.componentLabels" (list . "spoke-autoupdate") | nindent 4 }}
+  {{- with (include "prometheus-mcp-spoke.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "prometheus-mcp-spoke.autoUpdate.serviceAccountName" . }}
+  namespace: {{ include "prometheus-mcp-spoke.namespace" . }}
+  labels:
+    {{- include "prometheus-mcp-spoke.componentLabels" (list . "spoke-autoupdate") | nindent 4 }}
+  {{- with (include "prometheus-mcp-spoke.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+rules:
+  # Mutation, restricted by name to exactly the one Deployment this release
+  # owns. `patch` applies the verified digest; `update` is what `kubectl rollout
+  # undo` issues on the rollback path.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: [{{ include "prometheus-mcp-spoke.fullname" . | quote }}]
+    verbs: ["get", "patch", "update"]
+  # `kubectl rollout status` and `kubectl rollout undo` issue collection
+  # requests with a field selector. A collection request carries no resource
+  # name, so RBAC resourceNames cannot apply to it: these read-only verbs are
+  # necessarily namespace-scoped. They grant no mutation.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["list", "watch"]
+  # `rollout undo` reads the ReplicaSet history to find the previous revision.
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "prometheus-mcp-spoke.autoUpdate.serviceAccountName" . }}
+  namespace: {{ include "prometheus-mcp-spoke.namespace" . }}
+  labels:
+    {{- include "prometheus-mcp-spoke.componentLabels" (list . "spoke-autoupdate") | nindent 4 }}
+  {{- with (include "prometheus-mcp-spoke.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "prometheus-mcp-spoke.autoUpdate.serviceAccountName" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "prometheus-mcp-spoke.autoUpdate.serviceAccountName" . }}
+    namespace: {{ include "prometheus-mcp-spoke.namespace" . }}
+{{- end }}

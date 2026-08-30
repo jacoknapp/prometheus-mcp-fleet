@@ -1,0 +1,150 @@
+// Copyright The prometheus-mcp-fleet Authors.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+// Package fleet.v1 defines the hub<->spoke control plane.
+//
+// Role reversal: the spoke dials the hub and, once the mTLS handshake
+// completes, serves this gRPC service over the connection it opened. The hub
+// is therefore the gRPC *client*. That inversion is what gives us native
+// HTTP/2 stream multiplexing, per-request cancellation (RST_STREAM), deadline
+// propagation (grpc-timeout) and flow control without writing any of it.
+package fleet.v1;
+
+// SpokeService is served by the spoke over the tunnel it dialed to the hub.
+service SpokeService {
+  // Describe returns the spoke's cluster facts. The hub polls this on a timer
+  // and passes the fingerprint it already holds; an unchanged spoke replies
+  // with `unchanged: true` and no payload (~40 bytes on the wire).
+  rpc Describe(DescribeRequest) returns (DescribeResponse);
+
+  // Proxy performs one allow-listed HTTP request against the spoke's local
+  // Prometheus and streams the response body back in bounded chunks. The body
+  // is opaque to the spoke: it never parses Prometheus JSON, which keeps the
+  // spoke tiny and forward-compatible with Thanos/Mimir/Cortex query APIs.
+  rpc Proxy(ProxyRequest) returns (stream ProxyChunk);
+}
+
+message DescribeRequest {
+  // Fingerprint of the facts the hub already has. Empty forces a full reply.
+  string known_fingerprint = 1;
+}
+
+message DescribeResponse {
+  // SHA-256 (hex) over the canonical encoding of facts.
+  string fingerprint = 1;
+  // True when known_fingerprint matched; facts is then unset.
+  bool unchanged = 2;
+  ClusterFacts facts = 3;
+}
+
+// ClusterFacts is the routing and discovery payload the hub publishes to AI
+// agents. It must stay small enough to render for 100 clusters at once.
+message ClusterFacts {
+  // Authoritative cluster identity. The hub ignores this field and uses the
+  // identity bound to the spoke's client certificate; it is carried here only
+  // for spoke-side logging and mismatch detection.
+  string cluster_id = 1;
+  // Human-facing name, e.g. "prod-us-east-1".
+  string display_name = 2;
+  // Operator-supplied selector labels, e.g. {env: prod, region: us-east-1}.
+  map<string, string> labels = 3;
+  // Free-form description an operator sets to orient an agent.
+  string description = 4;
+  // Spoke build version, e.g. "0.1.0".
+  string agent_version = 5;
+  // Hub<->spoke wire protocol version, e.g. "v1".
+  string protocol_version = 6;
+  // Spoke process start time. Used as the session generation so a stale
+  // reconnect can never displace a newer one.
+  int64 started_at_unix_nano = 7;
+  // Unix seconds at which the expensive facts below were last recomputed.
+  int64 collected_at_unix = 8;
+
+  KubernetesFacts kubernetes = 9;
+  PrometheusFacts prometheus = 10;
+}
+
+message KubernetesFacts {
+  // False when the spoke has no Kubernetes API access (the default: the spoke
+  // ships with zero RBAC). Everything else is then empty.
+  bool available = 1;
+  string unavailable_reason = 2;
+  // Server version, e.g. "v1.31.4".
+  string version = 3;
+  // UID of the kube-system namespace, the conventional stable cluster identity.
+  string cluster_uid = 4;
+  int32 node_count = 5;
+}
+
+message PrometheusFacts {
+  bool reachable = 1;
+  string unreachable_reason = 2;
+  // prometheus | thanos | mimir | cortex | victoriametrics | unknown
+  string flavor = 3;
+  string version = 4;
+  // Server-reported flags, e.g. "15d".
+  string retention = 5;
+  string scrape_interval = 6;
+  string lookback_delta = 7;
+  map<string, string> external_labels = 8;
+  // -1 means "not collected".
+  int64 active_series = 9;
+  int64 metric_name_count = 10;
+  // Sampled, capped lists that let an agent pick the right cluster without
+  // fanning a query out to all 100.
+  repeated string jobs = 11;
+  repeated string namespaces = 12;
+  repeated string metric_prefixes = 13;
+  int32 rule_group_count = 14;
+  int32 alerting_rule_count = 15;
+  int32 firing_alert_count = 16;
+  bool alertmanager_configured = 17;
+}
+
+message ProxyRequest {
+  // GET or POST. The spoke rejects anything else.
+  string method = 1;
+  // Absolute path against the spoke's configured Prometheus base URL. The
+  // spoke re-validates it against its own allow-list; the hub's check is not
+  // trusted as the only one.
+  string path = 2;
+  // application/x-www-form-urlencoded parameters. Always sent in the body,
+  // never the URL, so long PromQL never hits a proxy's URI length limit.
+  bytes body = 3;
+  // Hard ceiling on the response body. The spoke aborts mid-transfer once
+  // exceeded and sets ResponseTrail.truncated.
+  uint64 max_response_bytes = 4;
+  // Ask Prometheus for gzip and forward the compressed bytes verbatim.
+  bool accept_gzip = 5;
+  // Correlates hub and spoke logs for one agent tool call.
+  string request_id = 6;
+}
+
+message ProxyChunk {
+  oneof kind {
+    // Always the first message.
+    ResponseHead head = 1;
+    // Body slice, capped at 64 KiB.
+    bytes data = 2;
+    // Always the last message on a non-error stream.
+    ResponseTrail trail = 3;
+  }
+}
+
+message ResponseHead {
+  int32 status_code = 1;
+  string content_type = 2;
+  // "gzip" when the bytes are still compressed; the hub inflates.
+  string content_encoding = 3;
+}
+
+message ResponseTrail {
+  uint64 bytes_total = 1;
+  int64 upstream_duration_ms = 2;
+  bool truncated = 3;
+  repeated string warnings = 4;
+  // Set when the spoke could not complete the upstream call.
+  string error = 5;
+}

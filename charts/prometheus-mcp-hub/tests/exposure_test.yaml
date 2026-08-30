@@ -1,0 +1,133 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# The admin listener carries the credential-issuing REST API, /metrics and
+# pprof. It must never leave the cluster. These are the assertions that keep it
+# that way.
+suite: the admin port never leaves the cluster
+tests:
+  - it: routes only the mcp Service port through the Ingress
+    template: templates/ingress.yaml
+    set:
+      ingress:
+        enabled: true
+        host: mcp.example.com
+    asserts:
+      - isKind:
+          of: Ingress
+      - equal:
+          path: spec.rules[0].http.paths[0].backend.service.port.number
+          value: 8080
+      - notEqual:
+          path: spec.rules[0].http.paths[0].backend.service.port.number
+          value: 9090
+
+  - it: keeps the admin port out of the Ingress on every host including extraHosts
+    template: templates/ingress.yaml
+    set:
+      ingress:
+        enabled: true
+        host: mcp.example.com
+        extraHosts:
+          - host: alt.example.com
+    asserts:
+      - equal:
+          path: spec.rules[0].http.paths[0].backend.service.port.number
+          value: 8080
+      - equal:
+          path: spec.rules[1].http.paths[0].backend.service.port.number
+          value: 8080
+
+  - it: still routes the mcp port when the admin port is moved onto the mcp default
+    template: templates/ingress.yaml
+    set:
+      ingress:
+        enabled: true
+        host: mcp.example.com
+      service:
+        mcpPort: 8080
+      ports:
+        admin: 19090
+    asserts:
+      - equal:
+          path: spec.rules[0].http.paths[0].backend.service.port.number
+          value: 8080
+
+  - it: refuses to route anything but the mcp port through an Ingress
+    set:
+      ingress:
+        enabled: true
+        host: mcp.example.com
+        servicePortName: admin
+    asserts:
+      - failedTemplate:
+          errorPattern: "Only the \"mcp\" port may be published through an Ingress"
+
+  - it: refuses a LoadBalancer Service while the admin port is on it
+    set:
+      service:
+        type: LoadBalancer
+    asserts:
+      - failedTemplate:
+          errorPattern: "must never be reachable from outside the cluster"
+
+  - it: refuses a NodePort Service while the admin port is on it
+    set:
+      service:
+        type: NodePort
+    asserts:
+      - failedTemplate:
+          errorPattern: "must never be reachable from outside the cluster"
+
+  - it: allows a LoadBalancer only once the admin port is off the Service
+    template: templates/service.yaml
+    set:
+      service:
+        type: LoadBalancer
+        admin:
+          enabled: false
+    asserts:
+      - equal:
+          path: spec.type
+          value: LoadBalancer
+      - lengthEqual:
+          path: spec.ports
+          count: 1
+      - equal:
+          path: spec.ports[0].name
+          value: mcp
+
+  - it: refuses a tunnel LoadBalancer that would publish the admin port
+    set:
+      tunnel:
+        service:
+          port: 9090
+    asserts:
+      - failedTemplate:
+          errorPattern: "a LoadBalancer would publish the admin listener"
+
+  - it: publishes only the tunnel port on the tunnel LoadBalancer
+    template: templates/service-tunnel.yaml
+    asserts:
+      - equal:
+          path: spec.type
+          value: LoadBalancer
+      - lengthEqual:
+          path: spec.ports
+          count: 1
+      - equal:
+          path: spec.ports[0].name
+          value: tunnel
+      - equal:
+          path: spec.ports[0].targetPort
+          value: tunnel
+
+  - it: keeps the admin port on a ClusterIP Service so a ServiceMonitor can reach it
+    template: templates/service.yaml
+    asserts:
+      - equal:
+          path: spec.type
+          value: ClusterIP
+      - equal:
+          path: spec.ports[1].name
+          value: admin

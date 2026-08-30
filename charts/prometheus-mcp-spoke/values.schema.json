@@ -1,0 +1,1335 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "prometheus-mcp-spoke values",
+  "description": "Values for the prometheus-mcp-spoke chart. additionalProperties is false at the top level on purpose: a mistyped top-level key in a chart deployed to ~100 clusters is a silent default, not an error. cluster.id, hub.endpoints, hub.apiUrl and prometheus.url are REQUIRED and have no defaults, because the hub runs in a DIFFERENT cluster and every one of those installs supplies its own values. There is no persistence section and no PVC.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "cluster",
+    "hub",
+    "prometheus"
+  ],
+  "properties": {
+    "global": {
+      "description": "Reserved for Helm global values. This chart reads nothing from it.",
+      "type": "object"
+    },
+    "nameOverride": {
+      "description": "Override the chart name used in resource names.",
+      "type": "string"
+    },
+    "fullnameOverride": {
+      "description": "Override the fully qualified name of every rendered object.",
+      "type": "string"
+    },
+    "namespaceOverride": {
+      "description": "Render every object into this namespace instead of .Release.Namespace.",
+      "type": "string"
+    },
+    "commonLabels": {
+      "description": "Extra labels added to every rendered object.",
+      "type": "object"
+    },
+    "commonAnnotations": {
+      "description": "Extra annotations added to every rendered object.",
+      "type": "object"
+    },
+    "image": {
+      "description": "Spoke image.",
+      "type": "object",
+      "properties": {
+        "registry": {
+          "description": "Image registry. Empty means the repository is fully qualified already.",
+          "type": "string"
+        },
+        "repository": {
+          "description": "Spoke image repository, without the registry.",
+          "type": "string"
+        },
+        "tag": {
+          "description": "Image tag. Empty means .Chart.AppVersion. Ignored when digest is set.",
+          "type": "string"
+        },
+        "digest": {
+          "description": "Image digest. When set the image is pinned by digest and the tag is ignored.",
+          "type": "string",
+          "pattern": "^(sha256:[a-f0-9]{64})?$"
+        },
+        "pullPolicy": {
+          "description": "Image pull policy.",
+          "type": "string",
+          "enum": [
+            "Always",
+            "IfNotPresent",
+            "Never"
+          ]
+        }
+      }
+    },
+    "imagePullSecrets": {
+      "description": "Image pull secrets for a private registry.",
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "replicaCount": {
+      "description": "Number of spoke replicas. This must be exactly 1 and the chart refuses to render anything else: a spoke's identity is one X.509 certificate bound to one cluster ID, and two pods would renew over each other in the same Secret and each deregister the other's tunnel at the hub.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1
+    },
+    "revisionHistoryLimit": {
+      "description": "Number of old ReplicaSets retained.",
+      "type": "integer"
+    },
+    "serviceAccount": {
+      "description": "ServiceAccount for the spoke.",
+      "type": "object",
+      "properties": {
+        "create": {
+          "description": "Create a ServiceAccount.",
+          "type": "boolean"
+        },
+        "name": {
+          "description": "Name of the ServiceAccount. Empty means the chart fullname.",
+          "type": "string"
+        },
+        "annotations": {
+          "description": "Annotations for the ServiceAccount.",
+          "type": "object"
+        },
+        "automountServiceAccountToken": {
+          "description": "Mount the projected token. Empty means \"whatever identity.backend needs\": true for secret, false for memory and file.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "enum": [
+            true,
+            false,
+            ""
+          ]
+        }
+      }
+    },
+    "rbac": {
+      "description": "Namespaced RBAC. Rendered ONLY for identity.backend=secret; memory mode gets none.",
+      "type": "object",
+      "properties": {
+        "create": {
+          "description": "Render the Role and RoleBinding over the spoke's own identity Secret.",
+          "type": "boolean"
+        }
+      }
+    },
+    "identity": {
+      "description": "Where the issued client key and certificate live.",
+      "type": "object",
+      "properties": {
+        "backend": {
+          "description": "PMF_IDENTITY_BACKEND. `secret` writes them to a Secret in this namespace and costs one Role with get,create,update on that one Secret by name. `memory` needs NO RBAC at all, but the key is lost on every restart, so the spoke re-enrols each time and therefore needs a MULTI-USE enrollment token -- a standing credential that mints cluster identities, which is strictly weaker. `file` writes to the /tmp emptyDir, so in a pod it behaves like memory while looking durable.",
+          "type": "string",
+          "enum": [
+            "secret",
+            "memory",
+            "file"
+          ]
+        },
+        "secretName": {
+          "description": "PMF_IDENTITY_SECRET_NAME. Empty means <fullname>-identity. This exact name is what the Role restricts by resourceNames.",
+          "type": "string"
+        }
+      }
+    },
+    "cluster": {
+      "description": "This cluster's identity, as an agent sees it.",
+      "type": "object",
+      "required": [
+        "id"
+      ],
+      "properties": {
+        "id": {
+          "description": "PMF_CLUSTER_ID. REQUIRED, no default. Immutable. It is the identity the hub binds into this spoke's certificate URI SAN, and two clusters sharing one would fight over a single certificate identity.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 63,
+          "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"
+        },
+        "displayName": {
+          "description": "PMF_CLUSTER_DISPLAY_NAME.",
+          "type": "string"
+        },
+        "description": {
+          "description": "PMF_CLUSTER_DESCRIPTION.",
+          "type": "string"
+        },
+        "labels": {
+          "description": "PMF_CLUSTER_LABELS, rendered as k=v,k=v.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "hub": {
+      "description": "The hub, which runs in a DIFFERENT cluster and is reached over ordinary egress. There is deliberately no .svc default and no reference to a hub Service, hub RBAC or a hub release name anywhere in this chart.",
+      "type": "object",
+      "required": [
+        "endpoints",
+        "apiUrl"
+      ],
+      "properties": {
+        "endpoints": {
+          "description": "PMF_HUB_ENDPOINTS. REQUIRED, no default. External host:port entries, one per hub replica: the spoke holds one tunnel per endpoint, which is how hub HA works.",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 3,
+            "pattern": "^.+:[0-9]{1,5}$"
+          }
+        },
+        "apiUrl": {
+          "description": "PMF_HUB_API_URL. REQUIRED, no default. External https base URL of the hub's enrollment listener.",
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^https?://.+"
+        },
+        "caBundle": {
+          "description": "Inline PEM trust bundle for the hub, needed OUT OF BAND on first enrollment because the hub is in a different trust domain. A CA certificate is public, so it is rendered into a ConfigMap, not a Secret. Empty means trust-on-first-use.",
+          "type": "string"
+        },
+        "existingCASecret": {
+          "description": "Existing Secret holding the hub trust bundle, instead of hub.caBundle.",
+          "type": "string"
+        },
+        "caSecretKey": {
+          "description": "Key inside hub.existingCASecret holding the PEM bundle.",
+          "type": "string"
+        },
+        "caMountPath": {
+          "description": "Where the hub trust bundle is mounted.",
+          "type": "string"
+        },
+        "tlsInsecure": {
+          "description": "PMF_HUB_TLS_INSECURE. Lets anything on the network impersonate the hub. Inert without hub.allowInsecure, and the chart refuses the combination.",
+          "type": "boolean"
+        },
+        "allowInsecure": {
+          "description": "PMF_ALLOW_INSECURE. The second key that must be turned for any insecure option to take effect.",
+          "type": "boolean"
+        }
+      }
+    },
+    "enrollment": {
+      "description": "The single-use pmf_enr_ token that buys exactly one spoke certificate.",
+      "type": "object",
+      "properties": {
+        "token": {
+          "description": "Inline token, rendered into a Secret by this chart. Convenient, and worse than enrollment.existingSecret: a Helm value ends up in the release Secret and in `helm get values`.",
+          "type": "string"
+        },
+        "existingSecret": {
+          "description": "Existing Secret holding the token. Preferred. Mutually exclusive with enrollment.token.",
+          "type": "string"
+        },
+        "secretKey": {
+          "description": "Key inside the enrollment Secret.",
+          "type": "string",
+          "minLength": 1
+        },
+        "mountPath": {
+          "description": "Where the enrollment Secret is mounted; PMF_ENROLLMENT_TOKEN_FILE is derived.",
+          "type": "string"
+        }
+      }
+    },
+    "prometheus": {
+      "description": "The local, in-cluster Prometheus-compatible server this spoke proxies.",
+      "type": "object",
+      "required": [
+        "url"
+      ],
+      "properties": {
+        "url": {
+          "description": "PMF_PROMETHEUS_URL. REQUIRED. Thanos Query, Mimir and Cortex all work: the spoke never parses the response body.",
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^https?://.+"
+        },
+        "timeout": {
+          "description": "PMF_PROMETHEUS_TIMEOUT. Deliberately below the hub's query timeout so the spoke fails first with a useful error.",
+          "type": "string"
+        },
+        "maxResponseBytes": {
+          "description": "PMF_PROMETHEUS_MAX_RESPONSE_BYTES.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "bearerToken": {
+          "description": "Bearer token for an authenticating Prometheus.",
+          "type": "object",
+          "properties": {
+            "existingSecret": {
+              "description": "Existing Secret holding the token. Empty leaves the PMF_ key unset.",
+              "type": "string"
+            },
+            "secretKey": {
+              "description": "Key inside the Secret.",
+              "type": "string"
+            },
+            "mountPath": {
+              "description": "Where the Secret is mounted.",
+              "type": "string"
+            }
+          }
+        },
+        "tls": {
+          "description": "TLS for an https Prometheus.",
+          "type": "object",
+          "properties": {
+            "existingSecret": {
+              "description": "Existing Secret holding the PEM trust bundle.",
+              "type": "string"
+            },
+            "secretKey": {
+              "description": "Key inside the Secret.",
+              "type": "string"
+            },
+            "mountPath": {
+              "description": "Where the Secret is mounted.",
+              "type": "string"
+            },
+            "skipVerify": {
+              "description": "PMF_PROMETHEUS_TLS_SKIP_VERIFY. Requires hub.allowInsecure as well.",
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    "podAnnotations": {
+      "description": "Annotations for the spoke pods.",
+      "type": "object"
+    },
+    "podLabels": {
+      "description": "Extra labels for the spoke pods.",
+      "type": "object"
+    },
+    "podSecurityContext": {
+      "description": "Pod-level securityContext. runAsUser/runAsGroup/fsGroup accept null so an OpenShift SCC can assign IDs from the namespace range; runAsNonRoot and the seccomp profile are not negotiable.",
+      "type": "object",
+      "properties": {
+        "runAsNonRoot": {
+          "description": "Refuse to start any container in the pod as UID 0.",
+          "type": "boolean"
+        },
+        "runAsUser": {
+          "description": "Pod UID. null lets an OpenShift SCC assign one.",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "runAsGroup": {
+          "description": "Pod GID. null lets an OpenShift SCC assign one.",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "fsGroup": {
+          "description": "Supplemental filesystem group. null on OpenShift.",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "seccompProfile": {
+          "description": "Seccomp profile.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "description": "Seccomp profile type.",
+              "type": "string",
+              "enum": [
+                "RuntimeDefault",
+                "Localhost",
+                "Unconfined"
+              ]
+            },
+            "localhostProfile": {
+              "description": "Profile path when type is Localhost.",
+              "type": "string"
+            }
+          }
+        },
+        "supplementalGroups": {
+          "description": "Supplemental GIDs.",
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "sysctls": {
+          "description": "Pod sysctls.",
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "containerSecurityContext": {
+      "description": "Container-level securityContext.",
+      "type": "object",
+      "properties": {
+        "allowPrivilegeEscalation": {
+          "description": "Disallow gaining more privileges than the parent.",
+          "type": "boolean"
+        },
+        "readOnlyRootFilesystem": {
+          "description": "Read-only root filesystem; /tmp is the one writable path.",
+          "type": "boolean"
+        },
+        "privileged": {
+          "description": "Privileged container. Never set this true.",
+          "type": "boolean"
+        },
+        "runAsNonRoot": {
+          "description": "Refuse to run as UID 0.",
+          "type": "boolean"
+        },
+        "runAsUser": {
+          "description": "Container UID override.",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "runAsGroup": {
+          "description": "Container GID override.",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "capabilities": {
+          "description": "Linux capabilities.",
+          "type": "object",
+          "properties": {
+            "drop": {
+              "description": "Capabilities to drop; keep ALL.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "add": {
+              "description": "Capabilities to add; keep this empty.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "seccompProfile": {
+          "description": "Container seccomp profile.",
+          "type": "object"
+        }
+      }
+    },
+    "resources": {
+      "description": "Compute resources. There is deliberately no default CPU limit: CFS-throttling the process that holds this cluster's only tunnel to the hub turns a CPU spike into a cluster that drops off the fleet.",
+      "type": "object",
+      "properties": {
+        "requests": {
+          "description": "Resource requests.",
+          "type": "object",
+          "properties": {
+            "cpu": {
+              "description": "CPU request.",
+              "type": "string"
+            },
+            "memory": {
+              "description": "Memory request.",
+              "type": "string"
+            }
+          }
+        },
+        "limits": {
+          "description": "Resource limits.",
+          "type": "object",
+          "properties": {
+            "cpu": {
+              "description": "CPU limit. Deliberately unset by default.",
+              "type": "string"
+            },
+            "memory": {
+              "description": "Memory limit; also the source of GOMEMLIMIT.",
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "goRuntime": {
+      "description": "Go runtime tuning.",
+      "type": "object",
+      "properties": {
+        "memLimit": {
+          "description": "Set GOMEMLIMIT from resources.limits.memory via the downward API.",
+          "type": "boolean"
+        },
+        "memLimitRatio": {
+          "description": "Fraction of the memory limit used for GOMEMLIMIT.",
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    "tmpDirSizeLimit": {
+      "description": "sizeLimit of the /tmp emptyDir that makes readOnlyRootFilesystem workable.",
+      "type": "string"
+    },
+    "ports": {
+      "description": "Container ports.",
+      "type": "object",
+      "properties": {
+        "admin": {
+          "description": "Metrics, health and pprof listener (PMF_ADMIN_ADDR). The spoke has no other listener: it DIALS the hub, so nothing ever connects in except a scraper and the kubelet. It must never be published outside the cluster.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        }
+      }
+    },
+    "config": {
+      "description": "PMF_ configuration. Every key maps to one flag in internal/config/spoke.go.",
+      "type": "object",
+      "properties": {
+        "dataDir": {
+          "description": "PMF_DATA_DIR. Scratch only; it is the /tmp emptyDir and must stay under /tmp.",
+          "type": "string"
+        },
+        "logLevel": {
+          "description": "PMF_LOG_LEVEL.",
+          "type": "string",
+          "enum": [
+            "debug",
+            "info",
+            "warn",
+            "error"
+          ]
+        },
+        "logFormat": {
+          "description": "PMF_LOG_FORMAT.",
+          "type": "string",
+          "enum": [
+            "json",
+            "text"
+          ]
+        },
+        "factsRefreshInterval": {
+          "description": "PMF_FACTS_REFRESH_INTERVAL.",
+          "type": "string"
+        },
+        "reconnectMinBackoff": {
+          "description": "PMF_RECONNECT_MIN_BACKOFF.",
+          "type": "string"
+        },
+        "reconnectMaxBackoff": {
+          "description": "PMF_RECONNECT_MAX_BACKOFF.",
+          "type": "string"
+        },
+        "shutdownDrainDelay": {
+          "description": "PMF_SHUTDOWN_DRAIN_DELAY.",
+          "type": "string"
+        },
+        "shutdownGrace": {
+          "description": "PMF_SHUTDOWN_GRACE.",
+          "type": "string"
+        },
+        "pprofEnabled": {
+          "description": "PMF_PPROF_ENABLED.",
+          "type": "boolean"
+        }
+      }
+    },
+    "tracing": {
+      "description": "OTLP trace export.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Enable OTLP trace export.",
+          "type": "boolean"
+        },
+        "endpoint": {
+          "description": "PMF_OTEL_EXPORTER_OTLP_ENDPOINT. Required when tracing.enabled is true.",
+          "type": "string"
+        },
+        "sampleRatio": {
+          "description": "PMF_TRACE_SAMPLE_RATIO, as a string so YAML never reformats it.",
+          "type": "string",
+          "pattern": "^(0(\\.[0-9]+)?|1(\\.0+)?)$"
+        }
+      }
+    },
+    "service": {
+      "description": "Metrics Service. The only Service this chart renders, and ClusterIP only: the sole port is the admin listener, which carries metrics and pprof.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Render the Service. Required for a ServiceMonitor.",
+          "type": "boolean"
+        },
+        "type": {
+          "description": "Service type. The chart refuses anything but ClusterIP.",
+          "type": "string",
+          "enum": [
+            "ClusterIP",
+            "NodePort",
+            "LoadBalancer",
+            "ExternalName"
+          ]
+        },
+        "port": {
+          "description": "Service port for metrics.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "annotations": {
+          "description": "Annotations for the Service.",
+          "type": "object"
+        },
+        "labels": {
+          "description": "Extra labels for the Service.",
+          "type": "object"
+        }
+      }
+    },
+    "networkPolicy": {
+      "description": "NetworkPolicy. Egress-first: the spoke's whole job is to dial OUT, to exactly four places -- DNS, the hub, the local Prometheus and the Kubernetes API.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Render the NetworkPolicy.",
+          "type": "boolean"
+        },
+        "labels": {
+          "description": "Extra labels for the NetworkPolicy.",
+          "type": "object"
+        },
+        "ingress": {
+          "description": "Ingress to the metrics port. The spoke accepts nothing else.",
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "description": "Allow ingress to the metrics port.",
+              "type": "boolean"
+            },
+            "namespaceSelector": {
+              "description": "namespaceSelector for the only namespace allowed to scrape.",
+              "type": "object"
+            },
+            "podSelector": {
+              "description": "podSelector for scrapers.",
+              "type": "object"
+            },
+            "extraFrom": {
+              "description": "Additional raw ingress.from entries.",
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "egress": {
+          "description": "Spoke egress.",
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "description": "Restrict spoke egress.",
+              "type": "boolean"
+            },
+            "allowDNS": {
+              "description": "Allow DNS egress to kube-system.",
+              "type": "boolean"
+            },
+            "hub": {
+              "description": "The hub, in another cluster. An ipBlock, never a namespaceSelector: there is no namespace to select. Ports come from hub.endpoints, and any endpoint that is already an IP literal is pinned to an exact /32 or /128 automatically.",
+              "type": "object",
+              "properties": {
+                "enabled": {
+                  "description": "Allow egress to every port named in hub.endpoints.",
+                  "type": "boolean"
+                },
+                "cidrs": {
+                  "description": "CIDRs the hub may be reached at. 0.0.0.0/0 is the honest default because a NetworkPolicy cannot resolve a DNS name. Narrow it.",
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "prometheus": {
+              "description": "The local Prometheus, on the port parsed from prometheus.url.",
+              "type": "object",
+              "properties": {
+                "enabled": {
+                  "description": "Allow egress to the local Prometheus.",
+                  "type": "boolean"
+                },
+                "namespaceSelector": {
+                  "description": "namespaceSelector for the namespace Prometheus runs in.",
+                  "type": "object"
+                },
+                "podSelector": {
+                  "description": "podSelector for the Prometheus pods.",
+                  "type": "object"
+                }
+              }
+            },
+            "kubeAPI": {
+              "description": "The Kubernetes API server, for the identity Secret.",
+              "type": "object",
+              "properties": {
+                "enabled": {
+                  "description": "Allow egress to the API server. Required with identity.backend=secret.",
+                  "type": "boolean"
+                },
+                "port": {
+                  "description": "Port of the Kubernetes API server.",
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 65535
+                }
+              }
+            },
+            "extraRules": {
+              "description": "Raw additional egress rules, appended verbatim.",
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            }
+          }
+        }
+      }
+    },
+    "metrics": {
+      "description": "Prometheus Operator integration.",
+      "type": "object",
+      "properties": {
+        "serviceMonitor": {
+          "description": "Prometheus Operator ServiceMonitor. Requires the monitoring.coreos.com/v1 CRDs.",
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "description": "Render the ServiceMonitor. Requires service.enabled.",
+              "type": "boolean"
+            },
+            "namespace": {
+              "description": "Namespace for the ServiceMonitor. Empty means the release namespace.",
+              "type": "string"
+            },
+            "labels": {
+              "description": "Extra labels; must match your Prometheus' serviceMonitorSelector.",
+              "type": "object"
+            },
+            "annotations": {
+              "description": "Annotations for the ServiceMonitor.",
+              "type": "object"
+            },
+            "interval": {
+              "description": "Scrape interval.",
+              "type": "string"
+            },
+            "scrapeTimeout": {
+              "description": "Scrape timeout.",
+              "type": "string"
+            },
+            "honorLabels": {
+              "description": "honorLabels.",
+              "type": "boolean"
+            },
+            "path": {
+              "description": "Metrics path on the admin listener.",
+              "type": "string"
+            },
+            "relabelings": {
+              "description": "relabelings applied before scraping.",
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            },
+            "metricRelabelings": {
+              "description": "metricRelabelings applied after scraping.",
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            },
+            "targetLabels": {
+              "description": "Service labels copied onto scraped metrics.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "prometheusRule": {
+          "description": "Prometheus Operator PrometheusRule. Every metric name in the shipped expressions comes from internal/obs/metrics.go; promfleet_spoke_client_cert_expiry_seconds holds SECONDS REMAINING, not a unix timestamp.",
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "description": "Render the PrometheusRule.",
+              "type": "boolean"
+            },
+            "namespace": {
+              "description": "Namespace for the PrometheusRule. Empty means the release namespace.",
+              "type": "string"
+            },
+            "labels": {
+              "description": "Extra labels; must match your Prometheus' ruleSelector.",
+              "type": "object"
+            },
+            "annotations": {
+              "description": "Annotations for the PrometheusRule.",
+              "type": "object"
+            },
+            "selector": {
+              "description": "Label matcher appended to every shipped expression. Empty means job=\"<name>\".",
+              "type": "string"
+            },
+            "additionalRuleLabels": {
+              "description": "Extra labels added to every shipped alert.",
+              "type": "object"
+            },
+            "runbookUrlPrefix": {
+              "description": "Runbook URL prefix; the alert name is appended.",
+              "type": "string"
+            },
+            "rules": {
+              "description": "Individual alert toggles.",
+              "type": "object",
+              "properties": {
+                "spokeDown": {
+                  "description": "PrometheusMCPSpokeDown.",
+                  "type": "boolean"
+                },
+                "tunnelDown": {
+                  "description": "PrometheusMCPSpokeTunnelDown.",
+                  "type": "boolean"
+                },
+                "tunnelFlapping": {
+                  "description": "PrometheusMCPSpokeTunnelFlapping.",
+                  "type": "boolean"
+                },
+                "prometheusDown": {
+                  "description": "PrometheusMCPSpokePrometheusDown.",
+                  "type": "boolean"
+                },
+                "certExpiringSoon": {
+                  "description": "PrometheusMCPSpokeCertExpiringSoon.",
+                  "type": "boolean"
+                },
+                "promErrorRatioHigh": {
+                  "description": "PrometheusMCPSpokePromErrorRatioHigh.",
+                  "type": "boolean"
+                },
+                "factsRefreshFailing": {
+                  "description": "PrometheusMCPSpokeFactsRefreshFailing.",
+                  "type": "boolean"
+                },
+                "autoUpdateFailed": {
+                  "description": "PrometheusMCPSpokeAutoUpdateFailed. Requires kube-state-metrics.",
+                  "type": "boolean"
+                }
+              }
+            },
+            "thresholds": {
+              "description": "Alert thresholds.",
+              "type": "object",
+              "properties": {
+                "reconnectsPerHour": {
+                  "description": "Tunnel reconnects in one hour.",
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "certExpirySeconds": {
+                  "description": "Seconds of remaining client certificate validity.",
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "promErrorRatio": {
+                  "description": "5xx ratio from the local Prometheus.",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                }
+              }
+            },
+            "additionalGroups": {
+              "description": "Extra rule groups appended verbatim to spec.groups.",
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            }
+          }
+        }
+      }
+    },
+    "autoUpdate": {
+      "description": "Auto-update CronJob. OFF BY DEFAULT: an automatic weekly rollout to 100 production clusters is a fleet-wide outage delivery mechanism. When enabled it is digest-pinned, cosign signature- and provenance-verified, staggered by a hash of the release identity and split into cohorts.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Render the auto-update CronJob and its Role, RoleBinding and ServiceAccount.",
+          "type": "boolean"
+        },
+        "schedule": {
+          "description": "Explicit cron schedule. Empty derives one from a hash of the release identity.",
+          "type": "string"
+        },
+        "timeZone": {
+          "description": "IANA time zone for the schedule (Kubernetes >= 1.27).",
+          "type": "string"
+        },
+        "cohort": {
+          "description": "Release cohort: canary accepts a promotion immediately, early after 72h, stable after 7 days. It also shifts the derived weekday.",
+          "type": "string",
+          "enum": [
+            "canary",
+            "early",
+            "stable"
+          ]
+        },
+        "channelTag": {
+          "description": "Moving OCI tag the updater resolves to a digest. Never written into the pod spec.",
+          "type": "string",
+          "minLength": 1
+        },
+        "pinned": {
+          "description": "Refuse to patch anything, while still running verification.",
+          "type": "boolean"
+        },
+        "identity": {
+          "description": "Extra string mixed into the stagger hash. Empty means release name plus namespace.",
+          "type": "string"
+        },
+        "concurrencyPolicy": {
+          "description": "CronJob concurrencyPolicy.",
+          "type": "string",
+          "enum": [
+            "Allow",
+            "Forbid",
+            "Replace"
+          ]
+        },
+        "startingDeadlineSeconds": {
+          "description": "CronJob startingDeadlineSeconds.",
+          "type": "integer"
+        },
+        "successfulJobsHistoryLimit": {
+          "description": "CronJob successfulJobsHistoryLimit.",
+          "type": "integer"
+        },
+        "failedJobsHistoryLimit": {
+          "description": "CronJob failedJobsHistoryLimit.",
+          "type": "integer"
+        },
+        "backoffLimit": {
+          "description": "Job backoffLimit. 0: a failed verified rollout must not be retried blindly.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "activeDeadlineSeconds": {
+          "description": "Job activeDeadlineSeconds.",
+          "type": "integer"
+        },
+        "ttlSecondsAfterFinished": {
+          "description": "Job ttlSecondsAfterFinished. Empty string means unset.",
+          "type": [
+            "integer",
+            "string"
+          ]
+        },
+        "image": {
+          "description": "Updater image. It must provide a POSIX shell plus kubectl, cosign, crane and jq; the spoke image is distroless and has none of them.",
+          "type": "object",
+          "properties": {
+            "registry": {
+              "description": "Image registry. Empty means the repository is fully qualified already.",
+              "type": "string"
+            },
+            "repository": {
+              "description": "Updater image repository.",
+              "type": "string"
+            },
+            "tag": {
+              "description": "Image tag. Empty means .Chart.AppVersion. Ignored when digest is set.",
+              "type": "string"
+            },
+            "digest": {
+              "description": "Image digest. When set the image is pinned by digest and the tag is ignored.",
+              "type": "string",
+              "pattern": "^(sha256:[a-f0-9]{64})?$"
+            },
+            "pullPolicy": {
+              "description": "Image pull policy.",
+              "type": "string",
+              "enum": [
+                "Always",
+                "IfNotPresent",
+                "Never"
+              ]
+            }
+          }
+        },
+        "certificateOidcIssuer": {
+          "description": "OIDC issuer that must have signed the image.",
+          "type": "string",
+          "minLength": 1
+        },
+        "certificateIdentityRegexp": {
+          "description": "Regex the signing certificate's SAN identity must match. Narrow, never \".*\".",
+          "type": "string",
+          "minLength": 1
+        },
+        "rekorURL": {
+          "description": "Rekor transparency log URL. Empty uses cosign's default public instance.",
+          "type": "string"
+        },
+        "rolloutTimeout": {
+          "description": "kubectl rollout status timeout; on expiry the job runs rollout undo.",
+          "type": "string"
+        },
+        "resources": {
+          "description": "Compute resources. The updater is short-lived.",
+          "type": "object",
+          "properties": {
+            "requests": {
+              "description": "Resource requests.",
+              "type": "object",
+              "properties": {
+                "cpu": {
+                  "description": "CPU request.",
+                  "type": "string"
+                },
+                "memory": {
+                  "description": "Memory request.",
+                  "type": "string"
+                }
+              }
+            },
+            "limits": {
+              "description": "Resource limits.",
+              "type": "object",
+              "properties": {
+                "cpu": {
+                  "description": "CPU limit. Deliberately unset by default.",
+                  "type": "string"
+                },
+                "memory": {
+                  "description": "Memory limit; also the source of GOMEMLIMIT.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "podSecurityContext": {
+          "description": "Pod securityContext for the update job.",
+          "type": "object"
+        },
+        "containerSecurityContext": {
+          "description": "Container securityContext for the update job.",
+          "type": "object"
+        },
+        "scratchSizeLimit": {
+          "description": "sizeLimit of the writable scratch emptyDir cosign and crane need.",
+          "type": "string"
+        },
+        "nodeSelector": {
+          "description": "Node selector for the update job.",
+          "type": "object"
+        },
+        "tolerations": {
+          "description": "Tolerations for the update job.",
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "extraEnv": {
+          "description": "Extra environment variables for the update job, in raw EnvVar form.",
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "tests": {
+      "description": "helm test settings.",
+      "type": "object",
+      "properties": {
+        "image": {
+          "description": "Image for the `helm test` pod. It needs wget.",
+          "type": "object",
+          "properties": {
+            "registry": {
+              "description": "Image registry. Empty means the repository is fully qualified already.",
+              "type": "string"
+            },
+            "repository": {
+              "description": "Test image repository.",
+              "type": "string"
+            },
+            "tag": {
+              "description": "Image tag. Empty means .Chart.AppVersion. Ignored when digest is set.",
+              "type": "string"
+            },
+            "digest": {
+              "description": "Image digest. When set the image is pinned by digest and the tag is ignored.",
+              "type": "string",
+              "pattern": "^(sha256:[a-f0-9]{64})?$"
+            },
+            "pullPolicy": {
+              "description": "Image pull policy.",
+              "type": "string",
+              "enum": [
+                "Always",
+                "IfNotPresent",
+                "Never"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "extraEnv": {
+      "description": "Extra environment variables for the spoke container, in raw EnvVar form. The only supported way to set a PMF_ key this chart does not model.",
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "extraEnvFrom": {
+      "description": "Extra envFrom sources for the spoke container.",
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "extraVolumes": {
+      "description": "Extra volumes for the pod.",
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "extraVolumeMounts": {
+      "description": "Extra volume mounts for the spoke container.",
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "initContainers": {
+      "description": "Init containers.",
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "extraContainers": {
+      "description": "Extra containers (sidecars).",
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "extraArgs": {
+      "description": "Extra arguments appended to the command line. Flags beat environment.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "nodeSelector": {
+      "description": "spec.template.spec.nodeSelector.",
+      "type": "object"
+    },
+    "tolerations": {
+      "description": "spec.template.spec.tolerations.",
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "affinity": {
+      "description": "spec.template.spec.affinity.",
+      "type": "object"
+    },
+    "topologySpreadConstraints": {
+      "description": "spec.template.spec.topologySpreadConstraints.",
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "priorityClassName": {
+      "description": "spec.template.spec.priorityClassName.",
+      "type": "string"
+    },
+    "terminationGracePeriodSeconds": {
+      "description": "Must exceed config.shutdownDrainDelay plus config.shutdownGrace.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "dnsPolicy": {
+      "description": "spec.template.spec.dnsPolicy. Empty means the cluster default.",
+      "type": "string",
+      "enum": [
+        "",
+        "ClusterFirst",
+        "ClusterFirstWithHostNet",
+        "Default",
+        "None"
+      ]
+    },
+    "dnsConfig": {
+      "description": "spec.template.spec.dnsConfig.",
+      "type": "object"
+    },
+    "hostNetwork": {
+      "description": "spec.template.spec.hostNetwork.",
+      "type": "boolean"
+    },
+    "restartOnConfigChange": {
+      "description": "Roll the pods when the rendered ConfigMap changes.",
+      "type": "boolean"
+    },
+    "startupProbe": {
+      "description": "Startup probe on /healthz, served by the admin listener.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Enable the probe.",
+          "type": "boolean"
+        },
+        "initialDelaySeconds": {
+          "description": "Initial delay.",
+          "type": "integer"
+        },
+        "periodSeconds": {
+          "description": "Probe period.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "timeoutSeconds": {
+          "description": "Probe timeout.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "failureThreshold": {
+          "description": "Failure threshold.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "successThreshold": {
+          "description": "Success threshold.",
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "livenessProbe": {
+      "description": "Liveness probe on /healthz, which never checks a dependency, served by the admin listener.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Enable the probe.",
+          "type": "boolean"
+        },
+        "initialDelaySeconds": {
+          "description": "Initial delay.",
+          "type": "integer"
+        },
+        "periodSeconds": {
+          "description": "Probe period.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "timeoutSeconds": {
+          "description": "Probe timeout.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "failureThreshold": {
+          "description": "Failure threshold.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "successThreshold": {
+          "description": "Success threshold.",
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "readinessProbe": {
+      "description": "Readiness probe on /readyz, served by the admin listener.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Enable the probe.",
+          "type": "boolean"
+        },
+        "initialDelaySeconds": {
+          "description": "Initial delay.",
+          "type": "integer"
+        },
+        "periodSeconds": {
+          "description": "Probe period.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "timeoutSeconds": {
+          "description": "Probe timeout.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "failureThreshold": {
+          "description": "Failure threshold.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "successThreshold": {
+          "description": "Success threshold.",
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "extraManifests": {
+      "description": "Extra manifests rendered verbatim, each passed through tpl.",
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    }
+  }
+}

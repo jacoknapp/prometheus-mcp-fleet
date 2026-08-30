@@ -1,0 +1,36 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# The hub trust bundle supplied inline and out of band, which is what makes the
+# FIRST enrollment authenticated rather than trust-on-first-use, plus an
+# authenticating https Prometheus behind a bearer token.
+cluster:
+  id: prod-tls
+hub:
+  endpoints:
+    - hub.example.com:8443
+  apiUrl: https://hub.example.com
+  caBundle: |
+    -----BEGIN CERTIFICATE-----
+    MIIBkTCB+wIJAJ3nS3wJqZ3nMAoGCCqGSM49BAMCMBExDzANBgNVBAMMBmZha2Vj
+    YTAeFw0yNDAxMDEwMDAwMDBaFw0zNDAxMDEwMDAwMDBaMBExDzANBgNVBAMMBmZh
+    a2VjYTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABHRlc3Rvbmx5ZmFrZWtleWZv
+    cmNoYXJ0Y2l0ZXN0aW5nb25seW5vdGFyZWFsY2VydGlmaWNhdGVhdGFsbDAKBggq
+    hkjOPQQDAgNIADBFAiEA3RlY2hub3RhcmVhbHNpZ25hdHVyZWZha2VkYXRhAiAx
+    ZmFrZXNpZ25hdHVyZWZvcmNoYXJ0Y2l0ZXN0aW5nb25seQ==
+    -----END CERTIFICATE-----
+enrollment:
+  existingSecret: spoke-enrollment
+prometheus:
+  url: https://prometheus.monitoring.svc:9091
+  bearerToken:
+    existingSecret: prometheus-sa-token
+    secretKey: token
+  tls:
+    existingSecret: prometheus-ca
+    secretKey: ca.crt
+networkPolicy:
+  egress:
+    hub:
+      cidrs:
+        - 203.0.113.0/24

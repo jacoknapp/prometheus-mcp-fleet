@@ -1,0 +1,4 @@
+{
+  "status": "success",
+  "data": ["__name__", "container", "endpoint", "instance", "job", "namespace", "node", "pod", "service"]
+}

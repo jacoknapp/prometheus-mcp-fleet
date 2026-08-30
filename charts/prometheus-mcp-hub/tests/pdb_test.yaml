@@ -1,0 +1,63 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# A minAvailable:1 PodDisruptionBudget in front of a single replica can never be
+# satisfied, so it blocks every node drain in the cluster forever. The chart
+# force-disables the PDB below two replicas; this suite is what keeps it that way.
+suite: hub PodDisruptionBudget only exists where it can be satisfied
+templates:
+  - templates/pdb.yaml
+tests:
+  - it: renders no PDB at one replica even though podDisruptionBudget.enabled is true
+    set:
+      replicaCount: 1
+      podDisruptionBudget:
+        enabled: true
+        minAvailable: 1
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders no PDB at zero replicas
+    set:
+      replicaCount: 0
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders the PDB at two replicas
+    set:
+      replicaCount: 2
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: PodDisruptionBudget
+      - equal:
+          path: spec.minAvailable
+          value: 1
+      - equal:
+          path: spec.selector.matchLabels["app.kubernetes.io/name"]
+          value: prometheus-mcp-hub
+
+  - it: stays absent at two replicas when explicitly disabled
+    set:
+      replicaCount: 2
+      podDisruptionBudget:
+        enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: uses maxUnavailable instead of minAvailable when asked
+    set:
+      replicaCount: 3
+      podDisruptionBudget:
+        minAvailable: null
+        maxUnavailable: 1
+    asserts:
+      - equal:
+          path: spec.maxUnavailable
+          value: 1
+      - notExists:
+          path: spec.minAvailable

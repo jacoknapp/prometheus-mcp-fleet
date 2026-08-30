@@ -1,0 +1,29 @@
+apiVersion: v2
+name: prometheus-mcp-hub
+description: MCP server that gives AI agents Prometheus capability across a fleet of Kubernetes clusters, terminating mTLS tunnels dialled by prometheus-mcp-spoke.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.28.0-0"
+keywords:
+  - mcp
+  - model-context-protocol
+  - prometheus
+  - observability
+  - ai
+  - fleet
+  - multi-cluster
+home: https://github.com/jacoknapp/prometheus-mcp-fleet
+sources:
+  - https://github.com/jacoknapp/prometheus-mcp-fleet
+maintainers:
+  - name: jacoknapp
+    email: jacoknapp@gmail.com
+    url: https://github.com/jacoknapp
+annotations:
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/operator: "false"
+  artifacthub.io/prerelease: "true"
+  artifacthub.io/signKey: |
+    fingerprint: keyless (sigstore)
+    url: https://github.com/jacoknapp/prometheus-mcp-fleet

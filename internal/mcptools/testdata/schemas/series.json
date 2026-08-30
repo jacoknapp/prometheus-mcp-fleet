@@ -1,0 +1,57 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "cluster": {
+      "description": "Cluster name, exactly as returned by list_clusters.",
+      "type": "string"
+    },
+    "end": {
+      "default": "now",
+      "description": "Range end, same forms as start. Defaults to now.",
+      "type": "string"
+    },
+    "format": {
+      "default": "compact",
+      "description": "Output encoding. compact is columnar; table is fixed-width text; json is the raw Prometheus shape.",
+      "enum": [
+        "compact",
+        "json",
+        "table"
+      ],
+      "type": "string"
+    },
+    "limit": {
+      "default": 100,
+      "description": "Maximum label sets to return.",
+      "maximum": 1000,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "matchers": {
+      "description": "One or more PromQL series selectors, e.g. [\"up{job=\\\"api\\\"}\"]. A bare label name is not a selector.",
+      "examples": [
+        [
+          "up{job=\"api\"}"
+        ]
+      ],
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1,
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "start": {
+      "default": "now-1h",
+      "description": "Range start. Relative (\"now-1h\") or RFC 3339. Defaults to now-1h.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "cluster",
+    "matchers"
+  ],
+  "type": "object"
+}

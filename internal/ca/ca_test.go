@@ -1,0 +1,845 @@
+// Copyright The prometheus-mcp-fleet Authors.
+// SPDX-License-Identifier: Apache-2.0
+
+package ca
+
+import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"errors"
+	"math/big"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/google/go-cmp/cmp"
+)
+
+func TestOptionsDefaults(t *testing.T) {
+	t.Parallel()
+
+	got := Options{}.withDefaults()
+	if got.TrustDomain != DefaultTrustDomain {
+		t.Errorf("TrustDomain = %q, want %q", got.TrustDomain, DefaultTrustDomain)
+	}
+	if got.SpokeCertTTL != DefaultSpokeCertTTL {
+		t.Errorf("SpokeCertTTL = %s, want %s", got.SpokeCertTTL, DefaultSpokeCertTTL)
+	}
+	if got.CATTL != DefaultCATTL {
+		t.Errorf("CATTL = %s, want %s", got.CATTL, DefaultCATTL)
+	}
+	if got.ServerCertTTL != DefaultServerCertTTL {
+		t.Errorf("ServerCertTTL = %s, want %s", got.ServerCertTTL, DefaultServerCertTTL)
+	}
+	if got.Clock == nil {
+		t.Fatal("Clock is nil after defaulting")
+	}
+	if d := time.Since(got.Clock()); d > time.Minute || d < -time.Minute {
+		t.Errorf("default clock is not time.Now: off by %s", d)
+	}
+
+	explicit := Options{
+		TrustDomain:   "other.test",
+		SpokeCertTTL:  time.Hour,
+		CATTL:         2 * time.Hour,
+		ServerCertTTL: 3 * time.Hour,
+		Clock:         func() time.Time { return testTime },
+	}.withDefaults()
+	if diff := cmp.Diff("other.test", explicit.TrustDomain); diff != "" {
+		t.Errorf("TrustDomain (-want +got):\n%s", diff)
+	}
+	if explicit.SpokeCertTTL != time.Hour || explicit.CATTL != 2*time.Hour || explicit.ServerCertTTL != 3*time.Hour {
+		t.Errorf("explicit TTLs were overwritten: %+v", explicit)
+	}
+	if !explicit.Clock().Equal(testTime) {
+		t.Errorf("explicit clock was overwritten")
+	}
+}
+
+func TestOptionsValidate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		opts Options
+		ok   bool
+	}{
+		{name: "defaults", opts: Options{}, ok: true},
+		{name: "dotted trust domain", opts: Options{TrustDomain: "fleet.example.internal"}, ok: true},
+		{name: "single label trust domain", opts: Options{TrustDomain: "f"}, ok: true},
+		{name: "uppercase trust domain", opts: Options{TrustDomain: "Fleet.local"}},
+		{name: "trust domain with port", opts: Options{TrustDomain: "fleet.local:8443"}},
+		{name: "trust domain with path", opts: Options{TrustDomain: "fleet.local/x"}},
+		{name: "trust domain with userinfo", opts: Options{TrustDomain: "a@fleet.local"}},
+		{name: "trust domain leading dash", opts: Options{TrustDomain: "-fleet.local"}},
+		{name: "negative spoke ttl", opts: Options{SpokeCertTTL: -time.Hour}},
+		{name: "negative ca ttl", opts: Options{CATTL: -time.Hour}},
+		{name: "negative server ttl", opts: Options{ServerCertTTL: -time.Hour}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := tc.opts.withDefaults().validate()
+			if tc.ok {
+				if err != nil {
+					t.Fatalf("validate: unexpected error %v", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrInvalidOptions) {
+				t.Fatalf("validate: got %v, want ErrInvalidOptions", err)
+			}
+		})
+	}
+}
+
+func TestCreateProducesConservativeRoot(t *testing.T) {
+	t.Parallel()
+
+	clock := newFakeClock(testTime)
+	certPath, keyPath := paths(t)
+	c, err := Create(certPath, keyPath, Options{TrustDomain: "unit.test", CATTL: 24 * time.Hour, Clock: clock.Now})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	cert := c.Certificate()
+	if !cert.IsCA {
+		t.Error("root is not a CA")
+	}
+	if !cert.BasicConstraintsValid {
+		t.Error("root has no basic constraints")
+	}
+	if !cert.MaxPathLenZero || cert.MaxPathLen != 0 {
+		t.Errorf("root path length = %d (zero=%v), want 0/true", cert.MaxPathLen, cert.MaxPathLenZero)
+	}
+	if want := x509.KeyUsageCertSign | x509.KeyUsageCRLSign; cert.KeyUsage != want {
+		t.Errorf("KeyUsage = %b, want %b", cert.KeyUsage, want)
+	}
+	if len(cert.ExtKeyUsage) != 0 || len(cert.UnknownExtKeyUsage) != 0 {
+		t.Errorf("root carries extended key usage %v/%v, want none", cert.ExtKeyUsage, cert.UnknownExtKeyUsage)
+	}
+	if _, ok := cert.PublicKey.(*ecdsa.PublicKey); !ok {
+		t.Fatalf("root key is %T, want *ecdsa.PublicKey", cert.PublicKey)
+	}
+	if got := cert.PublicKey.(*ecdsa.PublicKey).Curve; got != elliptic.P256() {
+		t.Errorf("root curve = %s, want P-256", got.Params().Name)
+	}
+	if got, want := cert.NotBefore.UTC(), testTime.Add(-clockSkew); !got.Equal(want) {
+		t.Errorf("NotBefore = %s, want %s", got, want)
+	}
+	if got, want := c.NotAfter().UTC(), testTime.Add(24*time.Hour); !got.Equal(want) {
+		t.Errorf("NotAfter = %s, want %s", got, want)
+	}
+	if got := c.TrustDomain(); got != "unit.test" {
+		t.Errorf("TrustDomain = %q, want %q", got, "unit.test")
+	}
+	if n := cert.SerialNumber; n.Sign() <= 0 || n.BitLen() > serialBits {
+		t.Errorf("serial %s has bitlen %d, want 1..%d and positive", n, n.BitLen(), serialBits)
+	}
+	if len(cert.URIs)+len(cert.DNSNames)+len(cert.IPAddresses) != 0 {
+		t.Error("root carries SANs, want none")
+	}
+}
+
+func TestCreateFilePermissions(t *testing.T) {
+	t.Parallel()
+
+	certPath, keyPath := paths(t)
+	if _, err := Create(certPath, keyPath, Options{}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	keyInfo, err := os.Stat(keyPath)
+	if err != nil {
+		t.Fatalf("stat key: %v", err)
+	}
+	if got := keyInfo.Mode().Perm(); got != 0o600 {
+		t.Errorf("key mode = %04o, want 0600", got)
+	}
+	certInfo, err := os.Stat(certPath)
+	if err != nil {
+		t.Fatalf("stat cert: %v", err)
+	}
+	if got := certInfo.Mode().Perm(); got&0o077 != 0o044 {
+		t.Errorf("cert mode = %04o, want world readable", got)
+	}
+	// No temp files may survive a successful create.
+	entries, err := os.ReadDir(filepath.Dir(certPath))
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".tmp") {
+			t.Errorf("temp file %s survived", e.Name())
+		}
+	}
+}
+
+func TestCreateThenLoadRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	certPath, keyPath := paths(t)
+	opts := Options{TrustDomain: "round.trip", Clock: newFakeClock(testTime).Now}
+	created, err := Create(certPath, keyPath, opts)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	loaded, err := Load(certPath, keyPath, opts)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if diff := cmp.Diff(created.Certificate().Raw, loaded.Certificate().Raw); diff != "" {
+		t.Errorf("certificate DER differs after reload (-created +loaded):\n%s", diff)
+	}
+	if diff := cmp.Diff(created.BundlePEM(), loaded.BundlePEM()); diff != "" {
+		t.Errorf("bundle differs after reload (-created +loaded):\n%s", diff)
+	}
+	if !created.key.PublicKey.Equal(&loaded.key.PublicKey) {
+		t.Error("loaded key does not match created key")
+	}
+	// LoadOrCreate on an existing pair must load, not recreate.
+	again, err := LoadOrCreate(certPath, keyPath, opts)
+	if err != nil {
+		t.Fatalf("LoadOrCreate: %v", err)
+	}
+	if diff := cmp.Diff(created.Certificate().Raw, again.Certificate().Raw); diff != "" {
+		t.Errorf("LoadOrCreate regenerated the root (-created +again):\n%s", diff)
+	}
+}
+
+func TestBundleAndPoolAreDefensiveCopies(t *testing.T) {
+	t.Parallel()
+
+	c := mustCA(t, Options{})
+	b1 := c.BundlePEM()
+	b1[0] ^= 0xff
+	if diff := cmp.Diff(c.BundlePEM(), c.certPEM); diff != "" {
+		t.Errorf("mutating BundlePEM changed the CA (-got +want):\n%s", diff)
+	}
+	p1, p2 := c.Pool(), c.Pool()
+	if p1 == p2 {
+		t.Error("Pool returned the same pool twice; a caller could widen shared trust")
+	}
+	if got := len(p1.Subjects()); got != 1 { //nolint:staticcheck // system pool is never used here
+		t.Errorf("pool has %d subjects, want 1", got)
+	}
+}
+
+func TestCreateRefusesToOverwrite(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		preCert    bool
+		preKey     bool
+		wantExists bool
+	}{
+		{name: "both present", preCert: true, preKey: true, wantExists: true},
+		{name: "only cert present", preCert: true, wantExists: true},
+		{name: "only key present", preKey: true, wantExists: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			certPath, keyPath := paths(t)
+			if tc.preCert {
+				if err := os.WriteFile(certPath, []byte("existing"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.preKey {
+				if err := os.WriteFile(keyPath, []byte("existing"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, err := Create(certPath, keyPath, Options{})
+			if !errors.Is(err, ErrCAExists) {
+				t.Fatalf("Create: got %v, want ErrCAExists", err)
+			}
+			if tc.preCert {
+				b, readErr := os.ReadFile(certPath)
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				if string(b) != "existing" {
+					t.Error("existing certificate was overwritten")
+				}
+			}
+			if tc.preKey {
+				b, readErr := os.ReadFile(keyPath)
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				if string(b) != "existing" {
+					t.Error("existing key was overwritten")
+				}
+			}
+			if !tc.preCert {
+				if _, statErr := os.Stat(certPath); !errors.Is(statErr, os.ErrNotExist) {
+					t.Error("failed Create left a reservation behind at the certificate path")
+				}
+			}
+			if !tc.preKey {
+				if _, statErr := os.Stat(keyPath); !errors.Is(statErr, os.ErrNotExist) {
+					t.Error("failed Create left a reservation behind at the key path")
+				}
+			}
+		})
+	}
+}
+
+func TestLoadOrCreateHalfPresent(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		preCert bool
+		preKey  bool
+	}{
+		{name: "cert without key", preCert: true},
+		{name: "key without cert", preKey: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			certPath, keyPath := paths(t)
+			if tc.preCert {
+				if err := os.WriteFile(certPath, []byte("half"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.preKey {
+				if err := os.WriteFile(keyPath, []byte("half"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, err := LoadOrCreate(certPath, keyPath, Options{})
+			if !errors.Is(err, ErrCAIncomplete) {
+				t.Fatalf("LoadOrCreate: got %v, want ErrCAIncomplete", err)
+			}
+		})
+	}
+}
+
+func TestLoadOrCreateCreatesWhenAbsent(t *testing.T) {
+	t.Parallel()
+
+	certPath, keyPath := paths(t)
+	c, err := LoadOrCreate(certPath, keyPath, Options{TrustDomain: "made.up"})
+	if err != nil {
+		t.Fatalf("LoadOrCreate: %v", err)
+	}
+	if c.TrustDomain() != "made.up" {
+		t.Errorf("TrustDomain = %q", c.TrustDomain())
+	}
+	for _, p := range []string{certPath, keyPath} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("stat %s: %v", p, err)
+		}
+	}
+}
+
+func TestLoadOrCreateConcurrent(t *testing.T) {
+	t.Parallel()
+
+	certPath, keyPath := paths(t)
+	const n = 8
+	var (
+		wg    sync.WaitGroup
+		mu    sync.Mutex
+		serls []string
+	)
+	wg.Add(n)
+	for range n {
+		go func() {
+			defer wg.Done()
+			c, err := LoadOrCreate(certPath, keyPath, Options{})
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				t.Errorf("LoadOrCreate: %v", err)
+				return
+			}
+			serls = append(serls, SerialHex(c.Certificate().SerialNumber))
+		}()
+	}
+	wg.Wait()
+	if len(serls) != n {
+		t.Fatalf("got %d results, want %d", len(serls), n)
+	}
+	for _, s := range serls {
+		if s != serls[0] {
+			t.Fatalf("racing callers saw different roots: %v", serls)
+		}
+	}
+}
+
+func TestLoadOrCreateRejectsNonRegularPaths(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "adir")
+	if err := os.Mkdir(sub, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadOrCreate(sub, filepath.Join(dir, "k"), Options{}); !errors.Is(err, ErrInvalidCA) {
+		t.Errorf("directory as cert path: got %v, want ErrInvalidCA", err)
+	}
+	if _, err := LoadOrCreate(filepath.Join(dir, "c"), sub, Options{}); !errors.Is(err, ErrInvalidCA) {
+		t.Errorf("directory as key path: got %v, want ErrInvalidCA", err)
+	}
+
+	file := filepath.Join(dir, "afile")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	notADir := filepath.Join(file, "nested")
+	if _, err := LoadOrCreate(notADir, filepath.Join(dir, "k2"), Options{}); err == nil {
+		t.Error("stat through a non-directory: got nil error")
+	} else if errors.Is(err, ErrCANotFound) || errors.Is(err, ErrCAExists) {
+		t.Errorf("stat through a non-directory: got %v, want a raw stat error", err)
+	}
+	if _, err := LoadOrCreate(filepath.Join(dir, "c2"), notADir, Options{}); err == nil {
+		t.Error("stat through a non-directory (key): got nil error")
+	}
+}
+
+func TestLoadOrCreateInvalidOptions(t *testing.T) {
+	t.Parallel()
+
+	certPath, keyPath := paths(t)
+	if _, err := LoadOrCreate(certPath, keyPath, Options{TrustDomain: "NOPE"}); !errors.Is(err, ErrInvalidOptions) {
+		t.Fatalf("got %v, want ErrInvalidOptions", err)
+	}
+}
+
+func TestCreateUnwritableDirectory(t *testing.T) {
+	t.Parallel()
+
+	dir := filepath.Join(t.TempDir(), "missing")
+	_, err := Create(filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key"), Options{})
+	if err == nil {
+		t.Fatal("Create into a missing directory: got nil error")
+	}
+	if errors.Is(err, ErrCAExists) {
+		t.Fatalf("got %v, want a raw create error", err)
+	}
+}
+
+func TestLoadMissing(t *testing.T) {
+	t.Parallel()
+
+	certPath, keyPath := paths(t)
+	if _, err := Load(certPath, keyPath, Options{}); !errors.Is(err, ErrCANotFound) {
+		t.Errorf("missing cert: got %v, want ErrCANotFound", err)
+	}
+	if _, err := Create(certPath, keyPath, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(keyPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(certPath, keyPath, Options{}); !errors.Is(err, ErrCANotFound) {
+		t.Errorf("missing key: got %v, want ErrCANotFound", err)
+	}
+}
+
+func TestLoadInvalidOptions(t *testing.T) {
+	t.Parallel()
+
+	certPath, keyPath := paths(t)
+	if _, err := Load(certPath, keyPath, Options{CATTL: -1}); !errors.Is(err, ErrInvalidOptions) {
+		t.Fatalf("got %v, want ErrInvalidOptions", err)
+	}
+}
+
+func TestLoadRefusesLooseKeyPermissions(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		mode os.FileMode
+		ok   bool
+	}{
+		{name: "0600", mode: 0o600, ok: true},
+		{name: "0400", mode: 0o400, ok: true},
+		{name: "0640 group readable", mode: 0o640},
+		{name: "0604 world readable", mode: 0o604},
+		{name: "0660 group writable", mode: 0o660},
+		{name: "0666", mode: 0o666},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			certPath, keyPath := paths(t)
+			if _, err := Create(certPath, keyPath, Options{}); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(keyPath, tc.mode); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(certPath, keyPath, Options{})
+			switch {
+			case tc.ok && err != nil:
+				t.Fatalf("Load: unexpected error %v", err)
+			case !tc.ok && !errors.Is(err, ErrInsecureKeyMode):
+				t.Fatalf("Load: got %v, want ErrInsecureKeyMode", err)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsBadMaterial(t *testing.T) {
+	t.Parallel()
+
+	// A well-formed but wrong keypair to reuse across cases.
+	otherKey := newKey(t)
+	otherKeyDER, err := x509.MarshalPKCS8PrivateKey(otherKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rsaDER, err := x509.MarshalPKCS8PrivateKey(rsaKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p384, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p384DER, err := x509.MarshalECPrivateKey(p384)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	selfSigned := func(t *testing.T, tmpl *x509.Certificate, key *ecdsa.PrivateKey) []byte {
+		t.Helper()
+		tmpl.SerialNumber = big.NewInt(7)
+		tmpl.NotBefore = testTime
+		tmpl.NotAfter = testTime.Add(time.Hour)
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return pemBlock(pemTypeCertificate, der)
+	}
+
+	tests := []struct {
+		name    string
+		cert    func(t *testing.T) []byte
+		key     func(t *testing.T) []byte
+		wantErr error
+	}{
+		{
+			name:    "cert not pem",
+			cert:    func(*testing.T) []byte { return []byte("not pem at all") },
+			wantErr: ErrInvalidCA,
+		},
+		{
+			name:    "cert wrong pem type",
+			cert:    func(*testing.T) []byte { return pemBlock("PRIVATE KEY", otherKeyDER) },
+			wantErr: ErrInvalidCA,
+		},
+		{
+			name:    "cert pem holds garbage",
+			cert:    func(*testing.T) []byte { return pemBlock(pemTypeCertificate, []byte{1, 2, 3}) },
+			wantErr: ErrInvalidCA,
+		},
+		{
+			name:    "key not pem",
+			key:     func(*testing.T) []byte { return []byte("nope") },
+			wantErr: ErrInvalidCA,
+		},
+		{
+			name:    "key wrong pem type",
+			key:     func(*testing.T) []byte { return pemBlock("CERTIFICATE", otherKeyDER) },
+			wantErr: ErrInvalidCA,
+		},
+		{
+			name:    "key pkcs8 garbage",
+			key:     func(*testing.T) []byte { return pemBlock(pemTypePrivateKey, []byte{9, 9}) },
+			wantErr: ErrInvalidCA,
+		},
+		{
+			name:    "key sec1 garbage",
+			key:     func(*testing.T) []byte { return pemBlock(pemTypeECKeyLegacy, []byte{9, 9}) },
+			wantErr: ErrInvalidCA,
+		},
+		{
+			name:    "key is rsa",
+			key:     func(*testing.T) []byte { return pemBlock(pemTypePrivateKey, rsaDER) },
+			wantErr: ErrInvalidCA,
+		},
+		{
+			name:    "key is p384",
+			key:     func(*testing.T) []byte { return pemBlock(pemTypeECKeyLegacy, p384DER) },
+			wantErr: ErrInvalidCA,
+		},
+		{
+			name:    "key does not match cert",
+			key:     func(*testing.T) []byte { return pemBlock(pemTypePrivateKey, otherKeyDER) },
+			wantErr: ErrInvalidCA,
+		},
+		{
+			name: "cert is not a ca",
+			cert: func(t *testing.T) []byte {
+				return selfSigned(t, &x509.Certificate{
+					Subject:               pkix.Name{CommonName: "leaf"},
+					BasicConstraintsValid: true,
+					KeyUsage:              x509.KeyUsageDigitalSignature,
+				}, otherKey)
+			},
+			key:     func(*testing.T) []byte { return pemBlock(pemTypePrivateKey, otherKeyDER) },
+			wantErr: ErrInvalidCA,
+		},
+		{
+			name: "ca without certsign",
+			cert: func(t *testing.T) []byte {
+				return selfSigned(t, &x509.Certificate{
+					Subject:               pkix.Name{CommonName: "ca"},
+					BasicConstraintsValid: true,
+					IsCA:                  true,
+					KeyUsage:              x509.KeyUsageCRLSign,
+				}, otherKey)
+			},
+			key:     func(*testing.T) []byte { return pemBlock(pemTypePrivateKey, otherKeyDER) },
+			wantErr: ErrInvalidCA,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			certPath, keyPath := paths(t)
+			if _, err := Create(certPath, keyPath, Options{}); err != nil {
+				t.Fatal(err)
+			}
+			if tc.cert != nil {
+				if err := os.WriteFile(certPath, tc.cert(t), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.key != nil {
+				if err := os.WriteFile(keyPath, tc.key(t), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, err := Load(certPath, keyPath, Options{})
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("Load: got %v, want %v", err, tc.wantErr)
+			}
+			if strings.Contains(err.Error(), "MII") || strings.Contains(err.Error(), "BEGIN") {
+				t.Errorf("error message may contain key material: %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadAcceptsRSACACertificate(t *testing.T) {
+	t.Parallel()
+
+	// An RSA-keyed CA certificate paired with an EC key must be rejected at
+	// the public-key type check rather than panicking.
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(11),
+		Subject:               pkix.Name{CommonName: "rsa ca"},
+		NotBefore:             testTime,
+		NotAfter:              testTime.Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &rsaKey.PublicKey, rsaKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPath, keyPath := paths(t)
+	if _, err := Create(certPath, keyPath, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(certPath, pemBlock(pemTypeCertificate, der), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(certPath, keyPath, Options{}); !errors.Is(err, ErrInvalidCA) {
+		t.Fatalf("got %v, want ErrInvalidCA", err)
+	}
+}
+
+func TestLoadAcceptsSEC1Key(t *testing.T) {
+	t.Parallel()
+
+	certPath, keyPath := paths(t)
+	c, err := Create(certPath, keyPath, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sec1, err := x509.MarshalECPrivateKey(c.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, pemBlock(pemTypeECKeyLegacy, sec1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(certPath, keyPath, Options{})
+	if err != nil {
+		t.Fatalf("Load with SEC1 key: %v", err)
+	}
+	if !loaded.key.PublicKey.Equal(&c.key.PublicKey) {
+		t.Error("SEC1 key round trip produced a different key")
+	}
+}
+
+func TestLoadCertificatePathIsDirectory(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	if _, err := Load(dir, filepath.Join(dir, "k"), Options{}); err == nil {
+		t.Fatal("Load with a directory as the certificate path: got nil error")
+	}
+}
+
+func TestSerialHex(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   *big.Int
+		want string
+	}{
+		{name: "nil", in: nil, want: ""},
+		{name: "zero", in: big.NewInt(0), want: "0"},
+		{name: "small", in: big.NewInt(255), want: "ff"},
+		{name: "lowercase", in: big.NewInt(0xdeadbeef), want: "deadbeef"},
+		{name: "negative loses sign", in: big.NewInt(-255), want: "ff"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if diff := cmp.Diff(tc.want, SerialHex(tc.in)); diff != "" {
+				t.Errorf("SerialHex (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestNewSerialIsRandomAndBounded(t *testing.T) {
+	t.Parallel()
+
+	seen := make(map[string]bool, 64)
+	limit := new(big.Int).Lsh(big.NewInt(1), serialBits)
+	for range 64 {
+		n, err := newSerial()
+		if err != nil {
+			t.Fatalf("newSerial: %v", err)
+		}
+		if n.Sign() <= 0 {
+			t.Fatalf("serial %s is not positive", n)
+		}
+		if n.Cmp(limit) >= 0 {
+			t.Fatalf("serial %s exceeds %d bits", n, serialBits)
+		}
+		if n.BitLen() < 96 {
+			t.Errorf("serial %s has only %d bits; entropy source looks wrong", n, n.BitLen())
+		}
+		s := SerialHex(n)
+		if seen[s] {
+			t.Fatalf("duplicate serial %s", s)
+		}
+		seen[s] = true
+	}
+}
+
+func TestValidClusterID(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		id   string
+		want bool
+	}{
+		{name: "simple", id: "prod", want: true},
+		{name: "with dashes", id: "prod-us-east-1", want: true},
+		{name: "single char", id: "a", want: true},
+		{name: "digits", id: "0", want: true},
+		{name: "max length", id: "a" + strings.Repeat("b", 61) + "c", want: true},
+		{name: "empty", id: ""},
+		{name: "too long", id: strings.Repeat("a", 64)},
+		{name: "uppercase", id: "Prod"},
+		{name: "leading dash", id: "-prod"},
+		{name: "trailing dash", id: "prod-"},
+		{name: "dot", id: "prod.us"},
+		{name: "underscore", id: "prod_us"},
+		{name: "slash", id: "prod/us"},
+		{name: "newline", id: "prod\n"},
+		{name: "space", id: "prod us"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := ValidClusterID(tc.id); got != tc.want {
+				t.Errorf("ValidClusterID(%q) = %v, want %v", tc.id, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestLinkFileExclusive(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	target := filepath.Join(dir, "f")
+	if err := linkFileExclusive(target, []byte("hello"), 0o600); err != nil {
+		t.Fatalf("linkFileExclusive: %v", err)
+	}
+	b, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff("hello", string(b)); diff != "" {
+		t.Errorf("content (-want +got):\n%s", diff)
+	}
+	// A second link to the same name must not replace it.
+	if err := linkFileExclusive(target, []byte("clobbered"), 0o600); !errors.Is(err, ErrCAExists) {
+		t.Fatalf("second link: got %v, want ErrCAExists", err)
+	}
+	b, err = os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "hello" {
+		t.Errorf("content was replaced: %q", b)
+	}
+	// No temp files may survive either outcome.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".tmp") {
+			t.Errorf("temp file %s survived", e.Name())
+		}
+	}
+	if err := linkFileExclusive(filepath.Join(dir, "missing", "f"), []byte("x"), 0o600); err == nil {
+		t.Error("linkFileExclusive into a missing directory: got nil error")
+	}
+	sub := filepath.Join(dir, "adir")
+	if err := os.Mkdir(sub, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := linkFileExclusive(sub, []byte("x"), 0o600); !errors.Is(err, ErrCAExists) {
+		t.Errorf("linkFileExclusive over a directory: got %v, want ErrCAExists", err)
+	}
+}

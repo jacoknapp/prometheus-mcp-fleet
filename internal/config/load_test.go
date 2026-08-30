@@ -1,0 +1,471 @@
+// Copyright The prometheus-mcp-fleet Authors.
+// SPDX-License-Identifier: Apache-2.0
+
+package config
+
+import (
+	"errors"
+	"flag"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/google/go-cmp/cmp"
+)
+
+// env builds a getenv function over a map, so tests never touch the process
+// environment and can therefore run in parallel.
+func env(kv map[string]string) func(string) string {
+	return func(k string) string { return kv[k] }
+}
+
+func TestEnvKey(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct{ name, flagName, want string }{
+		{"simple", "mcp-addr", "PMF_MCP_ADDR"},
+		{"multi dash", "max-inflight-per-cluster", "PMF_MAX_INFLIGHT_PER_CLUSTER"},
+		{"no dash", "pprof", "PMF_PPROF"},
+		{"already upper", "Cluster-ID", "PMF_CLUSTER_ID"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := EnvKey(tc.flagName); got != tc.want {
+				t.Errorf("EnvKey(%q) = %q, want %q", tc.flagName, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadHubDefaults(t *testing.T) {
+	t.Parallel()
+
+	c, err := LoadHub(nil, env(nil))
+	if err != nil {
+		t.Fatalf("LoadHub() error = %v", err)
+	}
+	want := &Hub{
+		MCPAddr:                DefaultMCPAddr,
+		TunnelAddr:             DefaultTunnelAddr,
+		AdminAddr:              DefaultHubAdminAddr,
+		LogLevel:               DefaultLogLevel,
+		LogFormat:              DefaultLogFormat,
+		DataDir:                DefaultDataDir,
+		PepperFile:             filepath.Join(DefaultDataDir, PepperFileName),
+		StateBackend:           StateBackendAuto,
+		StateSecretName:        DefaultStateSecretName,
+		CASecretName:           DefaultCASecretName,
+		StateFile:              filepath.Join(DefaultDataDir, StateFileName),
+		CACertFile:             filepath.Join(DefaultDataDir, CACertFileName),
+		CAKeyFile:              filepath.Join(DefaultDataDir, CAKeyFileName),
+		TrustDomain:            DefaultTrustDomain,
+		SpokeCertTTL:           336 * time.Hour,
+		EnrollmentTokenTTL:     15 * time.Minute,
+		AgentKeyTTL:            720 * time.Hour,
+		MaxSpokes:              256,
+		QueryTimeout:           30 * time.Second,
+		RangeQueryTimeout:      120 * time.Second,
+		MaxResponseBytes:       33554432,
+		MaxInflightPerCluster:  8,
+		MaxResponseBudgetBytes: 268435456,
+		FactsPollInterval:      60 * time.Second,
+		ShutdownDrainDelay:     5 * time.Second,
+		ShutdownGrace:          30 * time.Second,
+		TraceSampleRatio:       DefaultTraceSampleRatio,
+	}
+	if diff := cmp.Diff(want, c); diff != "" {
+		t.Errorf("LoadHub() defaults mismatch (-want +got):\n%s", diff)
+	}
+	// The defaults alone are deliberately not valid: --public-url has no
+	// sensible default (it is the operator's external hostname) and is
+	// required, so assert that it is the *only* thing missing.
+	err = c.Validate()
+	if err == nil {
+		t.Fatal("default hub configuration validated, but --public-url is required")
+	}
+	if !strings.Contains(err.Error(), "--public-url") {
+		t.Errorf("default hub configuration failed for an unexpected reason: %v", err)
+	}
+	c.PublicURL = "https://pmf.example.com/mcp"
+	if err := c.Validate(); err != nil {
+		t.Errorf("defaults plus --public-url must be valid, got %v", err)
+	}
+}
+
+func TestLoadSpokeDefaults(t *testing.T) {
+	t.Parallel()
+
+	c, err := LoadSpoke(nil, env(nil))
+	if err != nil {
+		t.Fatalf("LoadSpoke() error = %v", err)
+	}
+	want := &Spoke{
+		DataDir:                    DefaultDataDir,
+		IdentityBackend:            IdentityBackendAuto,
+		IdentitySecretName:         DefaultIdentitySecretName,
+		PrometheusURL:              DefaultPrometheusURL,
+		PrometheusTimeout:          25 * time.Second,
+		PrometheusMaxResponseBytes: 33554432,
+		FactsRefreshInterval:       10 * time.Minute,
+		ReconnectMinBackoff:        500 * time.Millisecond,
+		ReconnectMaxBackoff:        30 * time.Second,
+		AdminAddr:                  DefaultSpokeAdminAddr,
+		LogLevel:                   DefaultLogLevel,
+		LogFormat:                  DefaultLogFormat,
+		TraceSampleRatio:           DefaultTraceSampleRatio,
+		ShutdownDrainDelay:         5 * time.Second,
+		ShutdownGrace:              30 * time.Second,
+	}
+	if diff := cmp.Diff(want, c); diff != "" {
+		t.Errorf("LoadSpoke() defaults mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestLoadHubPrecedence(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		args []string
+		kv   map[string]string
+		want func(*Hub) any
+		got  any
+	}{
+		{
+			name: "default when neither is set",
+			want: func(c *Hub) any { return c.MCPAddr },
+			got:  DefaultMCPAddr,
+		},
+		{
+			name: "env beats default",
+			kv:   map[string]string{"PMF_MCP_ADDR": ":1111"},
+			want: func(c *Hub) any { return c.MCPAddr },
+			got:  ":1111",
+		},
+		{
+			name: "flag beats env",
+			args: []string{"--mcp-addr=:2222"},
+			kv:   map[string]string{"PMF_MCP_ADDR": ":1111"},
+			want: func(c *Hub) any { return c.MCPAddr },
+			got:  ":2222",
+		},
+		{
+			name: "single dash flag form",
+			args: []string{"-mcp-addr", ":3333"},
+			want: func(c *Hub) any { return c.MCPAddr },
+			got:  ":3333",
+		},
+		{
+			name: "empty env is treated as unset",
+			kv:   map[string]string{"PMF_MCP_ADDR": ""},
+			want: func(c *Hub) any { return c.MCPAddr },
+			got:  DefaultMCPAddr,
+		},
+		{
+			name: "duration from env",
+			kv:   map[string]string{"PMF_QUERY_TIMEOUT": "45s"},
+			want: func(c *Hub) any { return c.QueryTimeout },
+			got:  45 * time.Second,
+		},
+		{
+			name: "duration flag beats env",
+			args: []string{"--query-timeout=90s"},
+			kv:   map[string]string{"PMF_QUERY_TIMEOUT": "45s"},
+			want: func(c *Hub) any { return c.QueryTimeout },
+			got:  90 * time.Second,
+		},
+		{
+			name: "int from env",
+			kv:   map[string]string{"PMF_MAX_SPOKES": "12"},
+			want: func(c *Hub) any { return c.MaxSpokes },
+			got:  12,
+		},
+		{
+			name: "int64 from env",
+			kv:   map[string]string{"PMF_MAX_RESPONSE_BYTES": "1024"},
+			want: func(c *Hub) any { return c.MaxResponseBytes },
+			got:  int64(1024),
+		},
+		{
+			name: "bool from env accepts 1",
+			kv:   map[string]string{"PMF_PPROF_ENABLED": "1"},
+			want: func(c *Hub) any { return c.PprofEnabled },
+			got:  true,
+		},
+		{
+			name: "bool flag false beats env true",
+			args: []string{"--pprof-enabled=false"},
+			kv:   map[string]string{"PMF_PPROF_ENABLED": "true"},
+			want: func(c *Hub) any { return c.PprofEnabled },
+			got:  false,
+		},
+		{
+			name: "float from env",
+			kv:   map[string]string{"PMF_TRACE_SAMPLE_RATIO": "0.5"},
+			want: func(c *Hub) any { return c.TraceSampleRatio },
+			got:  0.5,
+		},
+		{
+			name: "gate flag",
+			args: []string{"--enable-status-config"},
+			want: func(c *Hub) any { return c.EnableStatusConfig },
+			got:  true,
+		},
+		{
+			name: "list from env",
+			kv:   map[string]string{"PMF_TUNNEL_SERVER_NAMES": "hub.example.com, 10.0.0.1 ,"},
+			want: func(c *Hub) any { return c.TunnelServerNames },
+			got:  []string{"hub.example.com", "10.0.0.1"},
+		},
+		{
+			name: "list flag beats env",
+			args: []string{"--tunnel-server-names=a.example.com"},
+			kv:   map[string]string{"PMF_TUNNEL_SERVER_NAMES": "b.example.com"},
+			want: func(c *Hub) any { return c.TunnelServerNames },
+			got:  []string{"a.example.com"},
+		},
+		{
+			name: "explicit pepper file is kept",
+			args: []string{"--pepper-file=/secrets/pepper"},
+			want: func(c *Hub) any { return c.PepperFile },
+			got:  "/secrets/pepper",
+		},
+		{
+			name: "pepper file follows data dir",
+			args: []string{"--data-dir=/srv/pmf"},
+			want: func(c *Hub) any { return c.PepperFile },
+			got:  "/srv/pmf/pepper.key",
+		},
+		{
+			name: "vendor neutral otel endpoint is honoured",
+			kv:   map[string]string{"OTEL_EXPORTER_OTLP_ENDPOINT": "otel:4317"},
+			want: func(c *Hub) any { return c.OTLPEndpoint },
+			got:  "otel:4317",
+		},
+		{
+			name: "prefixed otel endpoint wins over vendor neutral",
+			kv: map[string]string{
+				"OTEL_EXPORTER_OTLP_ENDPOINT":     "otel:4317",
+				"PMF_OTEL_EXPORTER_OTLP_ENDPOINT": "pmf-otel:4317",
+			},
+			want: func(c *Hub) any { return c.OTLPEndpoint },
+			got:  "pmf-otel:4317",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c, err := LoadHub(tc.args, env(tc.kv))
+			if err != nil {
+				t.Fatalf("LoadHub(%q) error = %v", tc.args, err)
+			}
+			if diff := cmp.Diff(tc.got, tc.want(c)); diff != "" {
+				t.Errorf("value mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestLoadSpokePrecedence(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		args []string
+		kv   map[string]string
+		want func(*Spoke) any
+		got  any
+	}{
+		{
+			name: "endpoints from env",
+			kv:   map[string]string{"PMF_HUB_ENDPOINTS": "a:8443,b:8443"},
+			want: func(c *Spoke) any { return c.HubEndpoints },
+			got:  []string{"a:8443", "b:8443"},
+		},
+		{
+			name: "endpoints flag beats env",
+			args: []string{"--hub-endpoints=c:8443"},
+			kv:   map[string]string{"PMF_HUB_ENDPOINTS": "a:8443,b:8443"},
+			want: func(c *Spoke) any { return c.HubEndpoints },
+			got:  []string{"c:8443"},
+		},
+		{
+			name: "labels from env",
+			kv:   map[string]string{"PMF_CLUSTER_LABELS": "env=prod, region = us-east-1"},
+			want: func(c *Spoke) any { return c.ClusterLabels },
+			got:  map[string]string{"env": "prod", "region": "us-east-1"},
+		},
+		{
+			name: "labels flag beats env",
+			args: []string{"--cluster-labels=env=dev"},
+			kv:   map[string]string{"PMF_CLUSTER_LABELS": "env=prod"},
+			want: func(c *Spoke) any { return c.ClusterLabels },
+			got:  map[string]string{"env": "dev"},
+		},
+		{
+			name: "cluster id from env",
+			kv:   map[string]string{"PMF_CLUSTER_ID": "prod-us-east-1"},
+			want: func(c *Spoke) any { return c.ClusterID },
+			got:  "prod-us-east-1",
+		},
+		{
+			name: "insecure acknowledgement",
+			kv:   map[string]string{"PMF_ALLOW_INSECURE": "1", "PMF_HUB_TLS_INSECURE": "true"},
+			want: func(c *Spoke) any { return c.AllowInsecure && c.HubTLSInsecure },
+			got:  true,
+		},
+		{
+			name: "prometheus url from env",
+			kv:   map[string]string{"PMF_PROMETHEUS_URL": "https://prom.svc:9090"},
+			want: func(c *Spoke) any { return c.PrometheusURL },
+			got:  "https://prom.svc:9090",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c, err := LoadSpoke(tc.args, env(tc.kv))
+			if err != nil {
+				t.Fatalf("LoadSpoke(%q) error = %v", tc.args, err)
+			}
+			if diff := cmp.Diff(tc.got, tc.want(c)); diff != "" {
+				t.Errorf("value mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestLoadErrors(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		spoke    bool
+		args     []string
+		kv       map[string]string
+		wantErr  error
+		contains string
+	}{
+		{name: "unknown flag", args: []string{"--nope"}, wantErr: ErrUsage, contains: "nope"},
+		{name: "stray argument", args: []string{"serve"}, wantErr: ErrUsage, contains: "serve"},
+		{name: "bad flag value", args: []string{"--query-timeout=banana"}, wantErr: ErrUsage, contains: "query-timeout"},
+		{name: "bad duration env", kv: map[string]string{"PMF_QUERY_TIMEOUT": "banana"}, wantErr: ErrEnv, contains: "PMF_QUERY_TIMEOUT"},
+		{name: "bad int env", kv: map[string]string{"PMF_MAX_SPOKES": "many"}, wantErr: ErrEnv, contains: "PMF_MAX_SPOKES"},
+		{name: "bad int64 env", kv: map[string]string{"PMF_MAX_RESPONSE_BYTES": "8MiB"}, wantErr: ErrEnv, contains: "PMF_MAX_RESPONSE_BYTES"},
+		{name: "bad bool env", kv: map[string]string{"PMF_PPROF_ENABLED": "yes please"}, wantErr: ErrEnv, contains: "PMF_PPROF_ENABLED"},
+		{name: "bad float env", kv: map[string]string{"PMF_TRACE_SAMPLE_RATIO": "half"}, wantErr: ErrEnv, contains: "PMF_TRACE_SAMPLE_RATIO"},
+		{
+			name:    "several bad env vars are reported together",
+			kv:      map[string]string{"PMF_MAX_SPOKES": "many", "PMF_PPROF_ENABLED": "sure"},
+			wantErr: ErrEnv, contains: "PMF_PPROF_ENABLED",
+		},
+		{
+			name: "bad labels env", spoke: true,
+			kv:      map[string]string{"PMF_CLUSTER_LABELS": "=oops"},
+			wantErr: ErrEnv, contains: "PMF_CLUSTER_LABELS",
+		},
+		{
+			name: "bad labels flag", spoke: true,
+			args:    []string{"--cluster-labels=1bad=x"},
+			wantErr: ErrUsage, contains: "cluster-labels",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var err error
+			if tc.spoke {
+				_, err = LoadSpoke(tc.args, env(tc.kv))
+			} else {
+				_, err = LoadHub(tc.args, env(tc.kv))
+			}
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("error = %v, want one wrapping %v", err, tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.contains) {
+				t.Errorf("error %q does not mention %q", err, tc.contains)
+			}
+		})
+	}
+}
+
+func TestLoadMultipleEnvErrorsAreJoined(t *testing.T) {
+	t.Parallel()
+
+	_, err := LoadHub(nil, env(map[string]string{
+		"PMF_MAX_SPOKES":    "many",
+		"PMF_PPROF_ENABLED": "sure",
+		"PMF_QUERY_TIMEOUT": "soon",
+	}))
+	if err == nil {
+		t.Fatal("LoadHub() error = nil, want three joined errors")
+	}
+	for _, want := range []string{"PMF_MAX_SPOKES", "PMF_PPROF_ENABLED", "PMF_QUERY_TIMEOUT"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("joined error does not mention %s:\n%s", want, err)
+		}
+	}
+}
+
+func TestLoadHelp(t *testing.T) {
+	t.Parallel()
+
+	for _, arg := range []string{"-h", "--help"} {
+		t.Run(arg, func(t *testing.T) {
+			t.Parallel()
+			for _, load := range []struct {
+				name string
+				fn   func([]string, func(string) string) error
+			}{
+				{"hub", func(a []string, g func(string) string) error { _, err := LoadHub(a, g); return err }},
+				{"spoke", func(a []string, g func(string) string) error { _, err := LoadSpoke(a, g); return err }},
+			} {
+				err := load.fn([]string{arg}, env(nil))
+				if !errors.Is(err, ErrHelp) {
+					t.Errorf("%s: error = %v, want ErrHelp", load.name, err)
+				}
+				if !errors.Is(err, flag.ErrHelp) {
+					t.Errorf("%s: error = %v, want it to wrap flag.ErrHelp", load.name, err)
+				}
+				var he *HelpError
+				if !errors.As(err, &he) {
+					t.Fatalf("%s: error = %v, want a *HelpError", load.name, err)
+				}
+				for _, want := range []string{"Usage:", "-log-level", "PMF_LOG_LEVEL"} {
+					if !strings.Contains(he.Usage, want) {
+						t.Errorf("%s: usage text does not mention %q:\n%s", load.name, want, he.Usage)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestLoadNilGetenvUsesProcessEnvironment(t *testing.T) {
+	// Not parallel: it mutates the process environment.
+	t.Setenv("PMF_TRUST_DOMAIN", "from-process.example")
+	c, err := LoadHub(nil, nil)
+	if err != nil {
+		t.Fatalf("LoadHub() error = %v", err)
+	}
+	if c.TrustDomain != "from-process.example" {
+		t.Errorf("TrustDomain = %q, want it read from the process environment", c.TrustDomain)
+	}
+	if os.Getenv("PMF_TRUST_DOMAIN") != "from-process.example" {
+		t.Fatal("t.Setenv did not take effect")
+	}
+
+	s, err := LoadSpoke(nil, nil)
+	if err != nil {
+		t.Fatalf("LoadSpoke() error = %v", err)
+	}
+	if s.DataDir != DefaultDataDir {
+		t.Errorf("DataDir = %q, want the default", s.DataDir)
+	}
+}

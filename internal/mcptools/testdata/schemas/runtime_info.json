@@ -1,0 +1,33 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "cluster": {
+      "description": "Cluster name, exactly as returned by list_clusters.",
+      "type": "string"
+    },
+    "include": {
+      "default": [
+        "build",
+        "runtime"
+      ],
+      "description": "Sections to include; each costs one upstream call. Defaults to build and runtime.",
+      "items": {
+        "enum": [
+          "build",
+          "runtime",
+          "flags"
+        ],
+        "type": "string"
+      },
+      "maxItems": 3,
+      "type": [
+        "null",
+        "array"
+      ]
+    }
+  },
+  "required": [
+    "cluster"
+  ],
+  "type": "object"
+}

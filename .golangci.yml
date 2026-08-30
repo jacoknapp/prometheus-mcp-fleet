@@ -1,0 +1,121 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# golangci-lint v2 configuration.
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - bodyclose # an unclosed response body leaks a connection; we proxy a lot of them
+    - contextcheck # every I/O path must carry the caller's context
+    - copyloopvar
+    - durationcheck
+    - errorlint # forces errors.Is/As over == and type assertion
+    - exhaustive # a missing case in a closed enum (promapi.Endpoint) is a real bug
+    - forbidigo
+    - gocritic
+    - gosec
+    - misspell
+    - nilerr
+    - noctx
+    - perfsprint
+    - prealloc
+    - revive
+    - rowserrcheck
+    - sloglint
+    - unconvert
+    - unparam
+    - usestdlibvars
+    - wastedassign
+    - whitespace
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+    exhaustive:
+      default-signifies-exhaustive: true
+    forbidigo:
+      forbid:
+        - pattern: ^fmt\.Print.*$
+          msg: use the injected *slog.Logger, not stdout
+        - pattern: ^log\.(Print|Fatal|Panic).*$
+          msg: use log/slog, not the log package
+        - pattern: ^math/rand\.
+          msg: use crypto/rand for anything security relevant, math/rand/v2 otherwise
+        - pattern: ^http\.DefaultClient$
+          msg: construct an explicit http.Client with timeouts
+        - pattern: ^panic$
+          msg: return an error; panic must not cross a package boundary
+    gosec:
+      excludes:
+        # G404 is handled by the forbidigo rule above with a clearer message.
+        - G404
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment # readability of domain structs wins over a few bytes
+    revive:
+      rules:
+        - name: exported # every exported symbol must be documented
+          arguments: [checkPrivateReceivers, sayRepetitiveInsteadOfStutters]
+        - name: package-comments
+        - name: error-strings
+        - name: error-naming
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: indent-error-flow
+        - name: var-naming
+        - name: unexported-return
+        - name: errorf
+        - name: increment-decrement
+        - name: range
+        - name: receiver-naming
+        - name: time-naming
+        - name: unreachable-code
+    sloglint:
+      no-mixed-args: true
+      kv-only: false
+      attr-only: true
+      context: scope
+      static-msg: false
+      key-naming-case: snake
+    staticcheck:
+      checks: ["all"]
+
+  exclusions:
+    generated: lax
+    warn-unused: true
+    rules:
+      # Generated protobuf code is not ours to lint.
+      - path: ^internal/gen/
+        linters: [revive, gocritic, staticcheck, gosec, unparam, perfsprint]
+      # Tests may use long functions, sleep, and unchecked cleanup errors.
+      - path: _test\.go$
+        linters: [gosec, unparam, contextcheck, noctx, prealloc]
+      # Composition roots legitimately wire many dependencies in one function.
+      - path: ^internal/(hub|spoke)/
+        text: "cognitive complexity|cyclomatic"
+      # The MCP tool handlers echo caller-supplied text back in errors on purpose.
+      - path: ^internal/mcptools/
+        linters: [perfsprint]
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/jacoknapp/prometheus-mcp-fleet
+  exclusions:
+    generated: lax
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

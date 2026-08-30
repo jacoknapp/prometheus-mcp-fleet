@@ -1,0 +1,49 @@
+{{/*
+Copyright The prometheus-mcp-fleet Authors.
+SPDX-License-Identifier: Apache-2.0
+*/}}
+{{- if .Values.metrics.serviceMonitor.enabled -}}
+{{- include "prometheus-mcp-spoke.validate" . -}}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "prometheus-mcp-spoke.fullname" . }}
+  namespace: {{ .Values.metrics.serviceMonitor.namespace | default (include "prometheus-mcp-spoke.namespace" .) }}
+  labels:
+    {{- include "prometheus-mcp-spoke.labels" . | nindent 4 }}
+    {{- with .Values.metrics.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- $ann := merge (dict) .Values.metrics.serviceMonitor.annotations .Values.commonAnnotations }}
+  {{- with $ann }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  jobLabel: app.kubernetes.io/name
+  namespaceSelector:
+    matchNames:
+      - {{ include "prometheus-mcp-spoke.namespace" . }}
+  selector:
+    matchLabels:
+      {{- include "prometheus-mcp-spoke.selectorLabels" . | nindent 6 }}
+  {{- with .Values.metrics.serviceMonitor.targetLabels }}
+  targetLabels:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  endpoints:
+    - port: metrics
+      path: {{ .Values.metrics.serviceMonitor.path }}
+      scheme: http
+      interval: {{ .Values.metrics.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.metrics.serviceMonitor.scrapeTimeout }}
+      honorLabels: {{ .Values.metrics.serviceMonitor.honorLabels }}
+      {{- with .Values.metrics.serviceMonitor.relabelings }}
+      relabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.metrics.serviceMonitor.metricRelabelings }}
+      metricRelabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

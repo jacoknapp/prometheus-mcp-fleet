@@ -1,0 +1,90 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# cluster.id, hub.endpoints, hub.apiUrl and replicaCount are constrained in
+# values.schema.json as well as by a `fail` in _helpers.tpl. The schema wins the
+# race, so these cases can only reach the template guard when schema validation
+# is skipped. That is not a hypothetical: `helm install --skip-schema-validation`
+# is a real flag, and the guards are what stand behind it.
+#
+# This suite therefore lives outside the default tests/*_test.yaml glob and is
+# run explicitly:
+#
+#   helm unittest --skip-schema-validation \
+#     -f 'tests/skip-schema-validation/*_test.yaml' charts/prometheus-mcp-spoke
+#
+# The schema half of the same contract is proven by `helm lint` on the chart with
+# no values file, which fails on all three required keys at once.
+suite: spoke template guards behind the schema
+tests:
+  - it: refuses an empty cluster.id
+    set:
+      cluster:
+        id: ""
+      hub:
+        endpoints:
+          - hub.example.com:8443
+        apiUrl: https://hub.example.com
+    asserts:
+      - failedTemplate:
+          errorPattern: "cluster.id is required and has no default"
+
+  - it: refuses a cluster.id the hub would reject at enrollment
+    set:
+      cluster:
+        id: Prod_US_East
+      hub:
+        endpoints:
+          - hub.example.com:8443
+        apiUrl: https://hub.example.com
+    asserts:
+      - failedTemplate:
+          errorPattern: "must match"
+
+  - it: refuses an empty hub.endpoints, because there is no in-cluster hub to default to
+    set:
+      cluster:
+        id: prod-us-east-1
+      hub:
+        endpoints: []
+        apiUrl: https://hub.example.com
+    asserts:
+      - failedTemplate:
+          errorPattern: "hub.endpoints is required and has no default"
+
+  - it: refuses a hub endpoint without a port
+    set:
+      cluster:
+        id: prod-us-east-1
+      hub:
+        endpoints:
+          - hub.example.com
+        apiUrl: https://hub.example.com
+    asserts:
+      - failedTemplate:
+          errorPattern: "is not host:port"
+
+  - it: refuses an empty hub.apiUrl
+    set:
+      cluster:
+        id: prod-us-east-1
+      hub:
+        endpoints:
+          - hub.example.com:8443
+        apiUrl: ""
+    asserts:
+      - failedTemplate:
+          errorPattern: "hub.apiUrl is required and has no default"
+
+  - it: refuses more than one replica
+    set:
+      replicaCount: 2
+      cluster:
+        id: prod-us-east-1
+      hub:
+        endpoints:
+          - hub.example.com:8443
+        apiUrl: https://hub.example.com
+    asserts:
+      - failedTemplate:
+          errorPattern: "Scale the hub, never the spoke"

@@ -1,0 +1,95 @@
+{{/*
+Copyright The prometheus-mcp-fleet Authors.
+SPDX-License-Identifier: Apache-2.0
+
+Every PMF_ key the hub reads lives here and nowhere else, so the whole
+configuration surface is one auditable object. `PMF_NAMESPACE` and `GOMEMLIMIT`
+are the only exceptions: both come from the downward API in the Deployment,
+because neither is knowable at render time.
+
+Every key below exists in internal/config/hub.go. The mapping is mechanical --
+flag `--foo-bar` is environment variable `PMF_FOO_BAR` -- so a key that is not
+a real flag is silently ignored by the binary and the operator gets the default
+they did not ask for. Do not add one without checking the loader.
+*/}}
+{{- include "prometheus-mcp-hub.validate" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "prometheus-mcp-hub.configMapName" . }}
+  namespace: {{ include "prometheus-mcp-hub.namespace" . }}
+  labels:
+    {{- include "prometheus-mcp-hub.labels" . | nindent 4 }}
+  {{- with (include "prometheus-mcp-hub.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+data:
+  PMF_MCP_ADDR: {{ printf ":%d" (int .Values.ports.mcp) | quote }}
+  PMF_TUNNEL_ADDR: {{ printf ":%d" (int .Values.ports.tunnel) | quote }}
+  {{/*
+    The binary defaults PMF_ADMIN_ADDR to 127.0.0.1:9090. In a pod that would
+    make the port unreachable by the kubelet's probes and by any scraper, so
+    the chart binds it on all interfaces and confines it with the Service, the
+    NetworkPolicy and the render-time guard in `prometheus-mcp-hub.validate`.
+  */}}
+  PMF_ADMIN_ADDR: {{ printf ":%d" (int .Values.ports.admin) | quote }}
+  PMF_LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  PMF_LOG_FORMAT: {{ .Values.config.logFormat | quote }}
+  {{/*
+    Scratch only: the /tmp emptyDir. Durable state is the state Secret, and the
+    CA is mirrored into the CA Secret, so losing this directory costs nothing.
+  */}}
+  PMF_DATA_DIR: {{ .Values.config.dataDir | quote }}
+  PMF_STATE_BACKEND: {{ .Values.state.backend | quote }}
+  {{- if eq .Values.state.backend "secret" }}
+  PMF_STATE_SECRET_NAME: {{ include "prometheus-mcp-hub.stateSecretName" . | quote }}
+  PMF_CA_SECRET_NAME: {{ include "prometheus-mcp-hub.caSecretName" . | quote }}
+  {{- else }}
+  PMF_STATE_FILE: {{ .Values.state.file | quote }}
+  {{- end }}
+  {{- if .Values.bootstrap.existingSecret }}
+  {{- with .Values.bootstrap.pepperKey }}
+  PMF_PEPPER_FILE: {{ printf "%s/%s" (trimSuffix "/" $.Values.bootstrap.mountPath) . | quote }}
+  {{- end }}
+  {{- with .Values.bootstrap.caCertKey }}
+  PMF_CA_CERT_FILE: {{ printf "%s/%s" (trimSuffix "/" $.Values.bootstrap.mountPath) . | quote }}
+  {{- end }}
+  {{- with .Values.bootstrap.caKeyKey }}
+  PMF_CA_KEY_FILE: {{ printf "%s/%s" (trimSuffix "/" $.Values.bootstrap.mountPath) . | quote }}
+  {{- end }}
+  {{- end }}
+  PMF_TRUST_DOMAIN: {{ .Values.config.trustDomain | quote }}
+  {{- with .Values.tunnel.serverNames }}
+  PMF_TUNNEL_SERVER_NAMES: {{ join "," . | quote }}
+  {{- end }}
+  {{- if .Values.tunnel.tls.existingSecret }}
+  PMF_TUNNEL_TLS_CERT_FILE: {{ printf "%s/%s" (trimSuffix "/" .Values.tunnel.tls.mountPath) .Values.tunnel.tls.certKey | quote }}
+  PMF_TUNNEL_TLS_KEY_FILE: {{ printf "%s/%s" (trimSuffix "/" .Values.tunnel.tls.mountPath) .Values.tunnel.tls.keyKey | quote }}
+  {{- end }}
+  PMF_SPOKE_CERT_TTL: {{ .Values.config.spokeCertTTL | quote }}
+  PMF_ENROLLMENT_TOKEN_TTL: {{ .Values.config.enrollmentTokenTTL | quote }}
+  PMF_AGENT_KEY_TTL: {{ .Values.config.agentKeyTTL | quote }}
+  PMF_MAX_SPOKES: {{ .Values.config.maxSpokes | int64 | quote }}
+  PMF_QUERY_TIMEOUT: {{ .Values.config.queryTimeout | quote }}
+  PMF_RANGE_QUERY_TIMEOUT: {{ .Values.config.rangeQueryTimeout | quote }}
+  {{/*
+    int64 before quote, not just quote. Helm parses a large YAML integer as a
+    float64, so a bare `quote` renders 33554432 as "3.3554432e+07" -- which the
+    binary's strconv.ParseInt rejects, and the process refuses to start.
+  */}}
+  PMF_MAX_RESPONSE_BYTES: {{ .Values.config.maxResponseBytes | int64 | quote }}
+  PMF_MAX_INFLIGHT_PER_CLUSTER: {{ .Values.config.maxInflightPerCluster | int64 | quote }}
+  PMF_MAX_RESPONSE_BUDGET_BYTES: {{ .Values.config.maxResponseBudgetBytes | int64 | quote }}
+  PMF_FACTS_POLL_INTERVAL: {{ .Values.config.factsPollInterval | quote }}
+  PMF_SHUTDOWN_DRAIN_DELAY: {{ .Values.config.shutdownDrainDelay | quote }}
+  PMF_SHUTDOWN_GRACE: {{ .Values.config.shutdownGrace | quote }}
+  PMF_PPROF_ENABLED: {{ .Values.config.pprofEnabled | quote }}
+  PMF_ENABLE_STATUS_CONFIG: {{ .Values.config.enableStatusConfig | quote }}
+  {{- with .Values.config.publicURL }}
+  PMF_PUBLIC_URL: {{ . | quote }}
+  {{- end }}
+  {{- if .Values.tracing.enabled }}
+  PMF_OTEL_EXPORTER_OTLP_ENDPOINT: {{ .Values.tracing.endpoint | quote }}
+  PMF_TRACE_SAMPLE_RATIO: {{ .Values.tracing.sampleRatio | quote }}
+  {{- end }}

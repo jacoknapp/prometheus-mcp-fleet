@@ -1,0 +1,567 @@
+# Default values for prometheus-mcp-hub.
+# Every value carries a `# --` comment so helm-docs can regenerate README.md.
+#
+# There is deliberately no `persistence` section and no PersistentVolumeClaim.
+# All durable hub state (CA key, HMAC pepper, issued key records, enrollment
+# burn state, revoked serials) lives in a single Kubernetes Secret that the hub
+# reads and writes itself. See `state.*` and `rbac.*`.
+
+# -- Override the chart name used in resource names.
+nameOverride: ""
+# -- Override the fully qualified name of every object this chart renders.
+fullnameOverride: ""
+# -- Render every object into this namespace instead of `.Release.Namespace`.
+namespaceOverride: ""
+# -- Extra labels added to every object this chart renders.
+commonLabels: {}
+# -- Extra annotations added to every object this chart renders.
+commonAnnotations: {}
+
+image:
+  # -- Image registry.
+  registry: ghcr.io
+  # -- Image repository, without the registry.
+  repository: jacoknapp/prometheus-mcp-fleet/hub
+  # -- Image tag. Empty means `.Chart.AppVersion`. Ignored when `image.digest` is set.
+  tag: ""
+  # -- Image digest (`sha256:...`). When set the image is pinned by digest and the tag is ignored. Recommended for production and set automatically by the release workflow.
+  digest: ""
+  # -- Image pull policy.
+  pullPolicy: IfNotPresent
+# -- Image pull secrets for a private registry.
+imagePullSecrets: []
+
+# -- Number of hub replicas.
+# Read before raising above 1: a spoke tunnel is pinned to exactly one replica and there is
+# deliberately no hub-to-hub forwarding (BUILD_SPEC 1.11). Credential state is shared because it
+# lives in one Secret, but tunnels are not. Real HA needs every replica individually addressable
+# from outside the cluster and every spoke configured with all N addresses in `hub.endpoints`.
+replicaCount: 1
+# -- Number of old ReplicaSets retained.
+revisionHistoryLimit: 10
+
+updateStrategy:
+  # -- Deployment strategy type, `RollingUpdate` or `Recreate`.
+  type: RollingUpdate
+  # -- `spec.strategy.rollingUpdate`. Empty means the Kubernetes defaults.
+  rollingUpdate: {}
+
+serviceAccount:
+  # -- Create a ServiceAccount for the hub.
+  create: true
+  # -- Name of the ServiceAccount. Empty means the chart fullname.
+  name: ""
+  # -- Annotations for the ServiceAccount.
+  annotations: {}
+  # -- Mount the projected ServiceAccount token. The hub REQUIRES this: it reads and writes its own state Secret through the Kubernetes API. Setting it false makes the hub unable to start with `state.backend: secret`.
+  automountServiceAccountToken: true
+
+rbac:
+  # -- Render the namespaced Role and RoleBinding that let the hub read and write its own state Secret. Nothing cluster-scoped is ever rendered by this chart.
+  create: true
+  # -- Grant the unrestricted `create` verb on Secrets in this namespace. Kubernetes cannot restrict `create` by `resourceNames` (the object has no name at authorization time), so this one verb cannot be name-scoped. It permits creating a Secret, never reading one. Pre-create the state Secret and set this to false to leave the hub with nothing but name-restricted `get,update`.
+  allowCreate: true
+  # -- Extra `resourceNames` appended to the name-restricted Secret rule. Use only if you point `PMF_STATE_SECRET_NAME` elsewhere through `extraEnv`.
+  extraSecretNames: []
+
+state:
+  # -- `PMF_STATE_BACKEND`. `secret` stores all durable state in a Kubernetes Secret (production). `file` writes a single JSON file under `state.file` and is for local development only — in a pod it lives on an emptyDir and is LOST on restart, orphaning every enrolled spoke.
+  backend: secret
+  # -- `PMF_STATE_SECRET_NAME`. Name of the Secret the hub owns. Empty means `<fullname>-state`. This exact name is what the rendered Role restricts by `resourceNames`.
+  secretName: ""
+  # -- `PMF_CA_SECRET_NAME`. Name of the Secret holding the internal CA certificate and key. Empty means `<fullname>-ca`. Deliberately separate from the state Secret so the two have different blast radii; it is the second entry in the Role's `resourceNames`.
+  caSecretName: ""
+  # -- `PMF_STATE_FILE`. Only used when `state.backend` is `file`.
+  file: /tmp/prometheus-mcp-fleet/state.json
+
+bootstrap:
+  # -- Name of an existing Secret holding operator-supplied bootstrap material (HMAC pepper and/or CA keypair) to adopt instead of letting the hub self-generate. Mounted read-only; the chart never creates this Secret, so no key material is ever stored in Helm release values.
+  existingSecret: ""
+  # -- Key inside `bootstrap.existingSecret` holding the HMAC pepper. Empty leaves `PMF_PEPPER_FILE` unset.
+  pepperKey: ""
+  # -- Key inside `bootstrap.existingSecret` holding the PEM CA certificate. Empty leaves `PMF_CA_CERT_FILE` unset. Must be set together with `bootstrap.caKeyKey`.
+  caCertKey: ""
+  # -- Key inside `bootstrap.existingSecret` holding the PEM CA private key. Empty leaves `PMF_CA_KEY_FILE` unset.
+  caKeyKey: ""
+  # -- Where `bootstrap.existingSecret` is mounted.
+  mountPath: /etc/prometheus-mcp-fleet/bootstrap
+
+# -- Annotations for the hub pods.
+podAnnotations: {}
+# -- Extra labels for the hub pods.
+podLabels: {}
+
+podSecurityContext:
+  # -- Refuse to start any container in the pod as UID 0.
+  runAsNonRoot: true
+  # -- Pod UID. Set to `null` on OpenShift so the SCC can assign one from the namespace range.
+  runAsUser: 65532
+  # -- Pod GID. Set to `null` on OpenShift.
+  runAsGroup: 65532
+  # -- Supplemental filesystem group. Set to `null` on OpenShift.
+  fsGroup: 65532
+  # -- Seccomp profile for every container in the pod.
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  # -- Disallow gaining more privileges than the parent process.
+  allowPrivilegeEscalation: false
+  # -- Read-only root filesystem. The only writable path is the `/tmp` emptyDir.
+  readOnlyRootFilesystem: true
+  # -- Linux capabilities.
+  capabilities:
+    drop:
+      - ALL
+
+resources:
+  requests:
+    # -- CPU request.
+    cpu: 250m
+    # -- Memory request.
+    memory: 256Mi
+  limits:
+    # -- Memory limit. Also the source of `GOMEMLIMIT` via the downward API.
+    memory: 1Gi
+    # There is deliberately NO default CPU limit. CFS-throttling a process that terminates
+    # ~100 long-lived mTLS tunnels turns a CPU spike into fleet-wide latency. Set
+    # `resources.limits.cpu` only if a ResourceQuota forces you to.
+
+goRuntime:
+  # -- Set `GOMEMLIMIT` from `resources.limits.memory` via the downward API. Skipped when no memory limit is set, because the downward API would then report node allocatable.
+  memLimit: true
+  # -- Fraction of the memory limit used for `GOMEMLIMIT`, as a downward API divisor. 0.9 leaves headroom for non-Go allocations before the kernel OOM killer.
+  memLimitRatio: 0.9
+
+# -- `sizeLimit` of the `/tmp` emptyDir that makes `readOnlyRootFilesystem: true` workable.
+tmpDirSizeLimit: 64Mi
+
+ports:
+  # -- Container port of the agent-facing MCP listener (`PMF_MCP_ADDR`).
+  mcp: 8080
+  # -- Container port of the mTLS tunnel listener spokes dial (`PMF_TUNNEL_ADDR`).
+  tunnel: 8443
+  # -- Container port of the admin REST + metrics + health + pprof listener (`PMF_ADMIN_ADDR`). Never routed through an Ingress and never carried by a LoadBalancer or NodePort Service; the chart fails to render if you try.
+  admin: 9090
+
+config:
+  # -- `PMF_DATA_DIR`. Scratch directory for the self-generated HMAC pepper and the CA material materialised out of the CA Secret. NOTHING here is durable — it is the `/tmp` emptyDir. It must stay under `/tmp` unless you mount a writable volume elsewhere with `extraVolumes`/`extraVolumeMounts`; the chart refuses to render otherwise.
+  dataDir: /tmp/prometheus-mcp-fleet
+  # -- `PMF_LOG_LEVEL`. One of `debug`, `info`, `warn`, `error`.
+  logLevel: info
+  # -- `PMF_LOG_FORMAT`. One of `json`, `text`.
+  logFormat: json
+  # -- `PMF_TRUST_DOMAIN`. Appears in every spoke certificate URI SAN `pmf://<trust-domain>/spoke/<cluster-id>`. Changing it invalidates every issued spoke certificate.
+  trustDomain: fleet.local
+  # -- `PMF_SPOKE_CERT_TTL`. Lifetime of an issued spoke client certificate.
+  spokeCertTTL: 336h
+  # -- `PMF_ENROLLMENT_TOKEN_TTL`. Lifetime of a single-use `pmf_enr_` token.
+  enrollmentTokenTTL: 15m
+  # -- `PMF_AGENT_KEY_TTL`. Default lifetime of a minted `pmf_agt_` agent key.
+  agentKeyTTL: 720h
+  # -- `PMF_MAX_SPOKES`. Hard cap on enrolled clusters.
+  maxSpokes: 256
+  # -- `PMF_QUERY_TIMEOUT`. Instant and metadata query deadline.
+  queryTimeout: 30s
+  # -- `PMF_RANGE_QUERY_TIMEOUT`. Range query deadline.
+  rangeQueryTimeout: 120s
+  # -- `PMF_MAX_RESPONSE_BYTES`. Maximum bytes accepted from one upstream response.
+  maxResponseBytes: 33554432
+  # -- `PMF_MAX_INFLIGHT_PER_CLUSTER`. Per-cluster in-flight request semaphore.
+  maxInflightPerCluster: 8
+  # -- `PMF_MAX_RESPONSE_BUDGET_BYTES`. Process-wide in-flight response byte budget.
+  maxResponseBudgetBytes: 268435456
+  # -- `PMF_FACTS_POLL_INTERVAL`. How often the hub refreshes cluster facts.
+  factsPollInterval: 60s
+  # -- `PMF_SHUTDOWN_DRAIN_DELAY`. Time `/readyz` reports 503 before work stops, so load balancers notice.
+  shutdownDrainDelay: 5s
+  # -- `PMF_SHUTDOWN_GRACE`. Graceful shutdown budget for in-flight work.
+  shutdownGrace: 30s
+  # -- `PMF_PPROF_ENABLED`. Exposes `/debug/pprof` on the admin listener.
+  pprofEnabled: false
+  # -- `PMF_ENABLE_STATUS_CONFIG`. Ungates the `/api/v1/status/config` Prometheus endpoint. Off by default because scrape configurations routinely embed bearer tokens and basic-auth passwords in plain text, and this hub hands its output to an AI agent.
+  enableStatusConfig: false
+  # -- `PMF_PUBLIC_URL`. Canonical external MCP URL, used for the OAuth protected-resource-metadata document. Set this to whatever your Ingress publishes.
+  publicURL: ""
+
+tracing:
+  # -- Enable OTLP trace export.
+  enabled: false
+  # -- `PMF_OTEL_EXPORTER_OTLP_ENDPOINT`. OTLP/gRPC collector endpoint.
+  endpoint: ""
+  # -- `PMF_TRACE_SAMPLE_RATIO`. Head sampling ratio between 0 and 1, as a string so YAML never reformats it.
+  sampleRatio: "0.05"
+
+service:
+  # -- Type of the MCP + admin Service. Must stay `ClusterIP` while `service.admin.enabled` is true; the chart refuses to render a LoadBalancer or NodePort carrying the admin port.
+  type: ClusterIP
+  # -- Service port for MCP traffic.
+  mcpPort: 8080
+  # -- Static ClusterIP. Empty means allocated.
+  clusterIP: ""
+  # -- Annotations for the MCP Service.
+  annotations: {}
+  # -- Extra labels for the MCP Service.
+  labels: {}
+  # -- `spec.sessionAffinity`. The MCP transport is stateless (BUILD_SPEC 1.10), so `None` is correct.
+  sessionAffinity: None
+  # -- `spec.ipFamilyPolicy`. Empty means the cluster default.
+  ipFamilyPolicy: ""
+  admin:
+    # -- Publish the admin/metrics port on the ClusterIP Service so a ServiceMonitor can scrape it.
+    enabled: true
+    # -- Service port for admin/metrics traffic.
+    port: 9090
+
+tunnel:
+  # -- `PMF_TUNNEL_SERVER_NAMES`. SANs placed on the tunnel server certificate when the internal CA self-issues it. This MUST contain every host or IP a spoke will put in its `hub.endpoints`, or the spoke's TLS verification of the hub fails and no tunnel ever establishes. Leave empty only when you supply your own certificate through `tunnel.tls`.
+  serverNames: []
+  tls:
+    # -- Name of an existing Secret holding an operator-supplied tunnel server certificate, used instead of one self-issued by the internal CA. Mounted read-only; the chart never creates it.
+    existingSecret: ""
+    # -- Key inside `tunnel.tls.existingSecret` holding the PEM certificate (`PMF_TUNNEL_TLS_CERT_FILE`).
+    certKey: tls.crt
+    # -- Key inside `tunnel.tls.existingSecret` holding the PEM private key (`PMF_TUNNEL_TLS_KEY_FILE`).
+    keyKey: tls.key
+    # -- Where `tunnel.tls.existingSecret` is mounted.
+    mountPath: /etc/prometheus-mcp-fleet/tunnel-tls
+  service:
+    # -- Render a dedicated Service for the spoke tunnel port, separate from `service` so the tunnel can be published without ever exposing MCP or admin.
+    enabled: true
+    # -- Service type. `LoadBalancer` is the default because spokes live in other clusters. `NodePort` and `ClusterIP` are also accepted; `ClusterIP` is only useful for in-cluster testing.
+    type: LoadBalancer
+    # -- Service port for the tunnel.
+    port: 8443
+    # -- NodePort to request when `tunnel.service.type` is `NodePort`. Empty means allocated.
+    nodePort: ""
+    # -- Annotations for the tunnel Service. Cloud load balancer configuration goes here.
+    annotations: {}
+    # -- Extra labels for the tunnel Service.
+    labels: {}
+    # -- `spec.loadBalancerIP`.
+    loadBalancerIP: ""
+    # -- `spec.loadBalancerClass`.
+    loadBalancerClass: ""
+    # -- `spec.loadBalancerSourceRanges`. Narrow this to your fleet's egress ranges wherever you can.
+    loadBalancerSourceRanges: []
+    # -- `spec.externalTrafficPolicy`. `Local` preserves the spoke source IP.
+    externalTrafficPolicy: ""
+
+ingress:
+  # -- Render a standard `networking.k8s.io/v1` Ingress for the MCP port. The tunnel port cannot use this — an HTTP Ingress cannot pass a client certificate through to the hub — see `tunnel.service`.
+  enabled: false
+  # -- `spec.ingressClassName`.
+  className: ""
+  # -- Annotations for the Ingress.
+  annotations: {}
+  # -- Hostname. Required when `ingress.enabled` is true.
+  host: ""
+  # -- Path exposed. The MCP endpoint is served at the root of the MCP listener.
+  path: /
+  # -- `pathType`.
+  pathType: Prefix
+  # -- Name of the Service port to route to. Must be `mcp`; the chart refuses to route the admin port through an Ingress.
+  servicePortName: mcp
+  # -- Additional hosts, each an object with `host`, and optionally `path` and `pathType`.
+  extraHosts: []
+  tls:
+    # -- Terminate TLS at the Ingress.
+    enabled: false
+    # -- Secret holding the certificate. Empty with `enabled: true` means the controller's default certificate.
+    secretName: ""
+    # -- Override the hosts listed in the TLS block. Empty means `ingress.host` plus every `ingress.extraHosts` entry.
+    hosts: []
+
+podDisruptionBudget:
+  # -- Render a PodDisruptionBudget. It is force-disabled whenever `replicaCount < 2`: `minAvailable: 1` on a single-replica workload blocks every node drain forever.
+  enabled: true
+  # -- `spec.minAvailable`. Mutually exclusive with `maxUnavailable`.
+  minAvailable: 1
+  # -- `spec.maxUnavailable`. Empty means unset.
+  maxUnavailable: ""
+  # -- `spec.unhealthyPodEvictionPolicy` (Kubernetes >= 1.27). `AlwaysAllow` lets a broken pod be evicted.
+  unhealthyPodEvictionPolicy: ""
+
+networkPolicy:
+  # -- Render a NetworkPolicy. On by default: the hub terminates connections from outside the cluster and holds a CA.
+  enabled: true
+  # -- Extra labels for the NetworkPolicy.
+  labels: {}
+  mcp:
+    # -- Allow ingress to the MCP port from any source. Use when your Ingress controller's identity cannot be expressed as a selector.
+    allowAll: false
+    # -- `namespaceSelector` for clients allowed to reach the MCP port.
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: ingress-nginx
+    # -- `podSelector` for clients allowed to reach the MCP port. Empty selects every pod in the selected namespaces.
+    podSelector: {}
+    # -- Additional raw `ingress.from` entries for the MCP port.
+    extraFrom: []
+  tunnel:
+    # -- Allow ingress to the tunnel port from anywhere. On by default because spokes live in other clusters; narrow it with `networkPolicy.tunnel.cidrs` where you know your fleet's egress ranges.
+    allowAll: true
+    # -- CIDRs allowed to reach the tunnel port when `allowAll` is false.
+    cidrs: []
+  admin:
+    # -- `namespaceSelector` for the only namespace allowed to reach the admin/metrics port.
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: monitoring
+    # -- `podSelector` for scrapers allowed to reach the admin/metrics port.
+    podSelector: {}
+    # -- Additional raw `ingress.from` entries for the admin port.
+    extraFrom: []
+  egress:
+    # -- Restrict hub egress. On by default now that the hub talks to a known, small set: DNS, the Kubernetes API for its state Secret, and optionally an OTLP collector.
+    enabled: true
+    # -- Allow DNS egress to `kube-system`.
+    allowDNS: true
+    # -- Allow egress to the Kubernetes API server. Required whenever `state.backend` is `secret`.
+    allowKubeAPI: true
+    # -- Port of the Kubernetes API server for the egress rule.
+    kubeAPIPort: 443
+    # -- Raw additional `egress` rules, appended verbatim.
+    extraRules: []
+
+metrics:
+  serviceMonitor:
+    # -- Render a Prometheus Operator `ServiceMonitor` for the admin/metrics port. Requires the `monitoring.coreos.com/v1` CRDs.
+    enabled: false
+    # -- Namespace for the ServiceMonitor. Empty means the release namespace.
+    namespace: ""
+    # -- Extra labels. Must match your Prometheus' `serviceMonitorSelector`.
+    labels: {}
+    # -- Annotations for the ServiceMonitor.
+    annotations: {}
+    # -- Scrape interval.
+    interval: 30s
+    # -- Scrape timeout.
+    scrapeTimeout: 10s
+    # -- `honorLabels`.
+    honorLabels: false
+    # -- Metrics path on the admin listener.
+    path: /metrics
+    # -- `relabelings` applied before scraping.
+    relabelings: []
+    # -- `metricRelabelings` applied after scraping.
+    metricRelabelings: []
+    # -- Service labels copied onto scraped metrics.
+    targetLabels: []
+
+  prometheusRule:
+    # -- Render a Prometheus Operator `PrometheusRule`. Requires the `monitoring.coreos.com/v1` CRDs.
+    enabled: false
+    # -- Namespace for the PrometheusRule. Empty means the release namespace.
+    namespace: ""
+    # -- Extra labels. Must match your Prometheus' `ruleSelector`.
+    labels: {}
+    # -- Annotations for the PrometheusRule.
+    annotations: {}
+    # -- Label matcher appended to every shipped expression. Empty means `job="<fullname>"`, which is what a default ServiceMonitor produces.
+    selector: ""
+    # -- Extra labels added to every shipped alert.
+    additionalRuleLabels: {}
+    # -- Runbook URL prefix; the alert name is appended.
+    runbookUrlPrefix: https://github.com/jacoknapp/prometheus-mcp-fleet/blob/main/docs/runbooks/
+    rules:
+      # -- `PrometheusMCPHubDown` — no hub instance is being scraped successfully.
+      hubDown: true
+      # -- `PrometheusMCPSpokesDisconnected` — more than `thresholds.spokesDisconnectedRatio` of enrolled spokes have no tunnel.
+      spokesDisconnected: true
+      # -- `PrometheusMCPHubCACertExpiringSoon` — `promfleet_hub_ca_cert_expiry_seconds` below `thresholds.caCertExpirySeconds`.
+      caCertExpiringSoon: true
+      # -- `PrometheusMCPHubSpokeCertExpiringSoon` — `promfleet_hub_spoke_cert_expiry_seconds` below `thresholds.spokeCertExpirySeconds` for some cluster.
+      spokeCertExpiringSoon: true
+      # -- `PrometheusMCPHubProxyErrorRatioHigh` — 5xx ratio of proxied Prometheus requests above `thresholds.proxyErrorRatio`.
+      proxyErrorRatioHigh: true
+      # -- `PrometheusMCPHubRestartLoop` — container restarts above `thresholds.restartsPerHour`. Requires kube-state-metrics.
+      restartLoop: true
+      # -- `PrometheusMCPAutoUpdateFailed` — the auto-update CronJob failed. Requires kube-state-metrics. Only rendered when `autoUpdate.enabled` is true.
+      autoUpdateFailed: true
+    thresholds:
+      # -- Fraction of enrolled spokes that may be disconnected before `PrometheusMCPSpokesDisconnected` fires.
+      spokesDisconnectedRatio: 0.10
+      # -- Seconds of remaining CA certificate validity below which `PrometheusMCPHubCACertExpiringSoon` fires. 14 days. `promfleet_hub_ca_cert_expiry_seconds` is seconds REMAINING, not a unix timestamp.
+      caCertExpirySeconds: 1209600
+      # -- Seconds of remaining spoke certificate validity below which `PrometheusMCPSpokeCertExpiringSoon` fires. 3 days against a 14 day certificate TTL.
+      spokeCertExpirySeconds: 259200
+      # -- 5xx ratio of proxied requests above which `PrometheusMCPHubProxyErrorRatioHigh` fires.
+      proxyErrorRatio: 0.10
+      # -- Container restarts in one hour above which `PrometheusMCPHubRestartLoop` fires.
+      restartsPerHour: 3
+    # -- Extra rule groups appended verbatim to `spec.groups`.
+    additionalGroups: []
+
+autoUpdate:
+  # -- Render a CronJob that resolves `autoUpdate.channelTag` to a digest, verifies the signature and SLSA provenance with cosign, and patches this Deployment to that DIGEST.
+  # OFF BY DEFAULT AND DISCOURAGED ON THE HUB. An unattended weekly rollout across a fleet is a
+  # fleet-wide outage delivery mechanism, and the hub is the single point of failure for every
+  # agent. Read "Automatic updates" in the README before enabling.
+  enabled: false
+  # -- Explicit cron schedule. Empty derives one from a hash of the release identity so a fleet spreads across a whole week instead of updating simultaneously.
+  schedule: ""
+  # -- IANA time zone for the schedule (Kubernetes >= 1.27). Empty means the kube-controller-manager's zone.
+  timeZone: ""
+  # -- Release cohort. `canary` accepts a promotion immediately, `early` after 72h, `stable` after 7 days. The cohort also shifts the derived weekday so canaries always move first.
+  cohort: stable
+  # -- Moving OCI tag the updater resolves to a digest. It is never written into the pod spec.
+  channelTag: stable
+  # -- Refuse to patch anything. Set alongside an explicit `image.digest` to freeze the workload while keeping the CronJob's verification output.
+  pinned: false
+  # -- Extra string mixed into the stagger hash. Empty means release name plus namespace. Set it to your cluster identity when many clusters share a release name.
+  identity: ""
+  # -- `spec.concurrencyPolicy`.
+  concurrencyPolicy: Forbid
+  # -- `spec.startingDeadlineSeconds`.
+  startingDeadlineSeconds: 600
+  # -- `spec.successfulJobsHistoryLimit`.
+  successfulJobsHistoryLimit: 3
+  # -- `spec.failedJobsHistoryLimit`.
+  failedJobsHistoryLimit: 3
+  # -- `backoffLimit` of the update Job. 0 — a failed verified rollout must not be retried blindly.
+  backoffLimit: 0
+  # -- `activeDeadlineSeconds` of the update Job.
+  activeDeadlineSeconds: 900
+  # -- `ttlSecondsAfterFinished` of the update Job. Empty means unset.
+  ttlSecondsAfterFinished: ""
+  image:
+    # -- Registry of the updater image.
+    registry: ghcr.io
+    # -- Repository of the updater image. It MUST provide a POSIX shell plus `kubectl`, `cosign`, `crane` and `jq`; the hub and spoke images are distroless and have no shell. The job aborts if a tool is missing. Point this at your own internal image if you will not consume ours.
+    repository: jacoknapp/prometheus-mcp-fleet/updater
+    # -- Tag of the updater image. Empty means `.Chart.AppVersion`.
+    tag: ""
+    # -- Digest of the updater image. Strongly recommended: this image is handed write access to your workload.
+    digest: ""
+    # -- Pull policy for the updater image.
+    pullPolicy: IfNotPresent
+  # -- OIDC issuer that must have signed the image.
+  certificateOidcIssuer: https://token.actions.githubusercontent.com
+  # -- Regex the signing certificate's SAN identity must match. Narrow, never `.*`.
+  certificateIdentityRegexp: "^https://github\\.com/jacoknapp/prometheus-mcp-fleet/\\.github/workflows/.+@refs/tags/v.+$"
+  # -- Rekor transparency log URL. Empty uses cosign's default public instance.
+  rekorURL: ""
+  # -- `kubectl rollout status` timeout. On expiry the job runs `kubectl rollout undo`.
+  rolloutTimeout: 5m
+  resources:
+    requests:
+      # -- CPU request for the update job.
+      cpu: 50m
+      # -- Memory request for the update job.
+      memory: 128Mi
+    limits:
+      # -- Memory limit for the update job.
+      memory: 512Mi
+  # -- Pod security context for the update job. Deliberately does not pin a UID, because the updater image is not ours to make assumptions about.
+  podSecurityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  # -- Container security context for the update job.
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+  # -- `sizeLimit` of the writable scratch emptyDir the updater needs for cosign and crane caches.
+  scratchSizeLimit: 512Mi
+  # -- Node selector for the update job.
+  nodeSelector: {}
+  # -- Tolerations for the update job.
+  tolerations: []
+  # -- Extra environment variables for the update job, in raw `EnvVar` form. Proxy settings and registry credential helpers go here.
+  extraEnv: []
+
+tests:
+  image:
+    # -- Registry for the `helm test` image.
+    registry: docker.io
+    # -- Repository for the `helm test` image. Needs `wget`.
+    repository: busybox
+    # -- Tag for the `helm test` image.
+    tag: "1.37.0"
+    # -- Pull policy for the `helm test` image.
+    pullPolicy: IfNotPresent
+
+# -- Extra environment variables for the hub container, in raw `EnvVar` form. The only supported way to set a `PMF_` key this chart does not model.
+extraEnv: []
+# -- Extra `envFrom` sources for the hub container.
+extraEnvFrom: []
+# -- Extra volumes for the hub pod.
+extraVolumes: []
+# -- Extra volume mounts for the hub container.
+extraVolumeMounts: []
+# -- Init containers for the hub pod.
+initContainers: []
+# -- Extra containers (sidecars) for the hub pod.
+extraContainers: []
+# -- Extra arguments appended to the hub command line. Flags beat environment (`--foo-bar` == `PMF_FOO_BAR`).
+extraArgs: []
+
+# -- `spec.template.spec.nodeSelector`.
+nodeSelector: {}
+# -- `spec.template.spec.tolerations`.
+tolerations: []
+# -- `spec.template.spec.affinity`.
+affinity: {}
+# -- `spec.template.spec.topologySpreadConstraints`. Never use `DoNotSchedule` in a default; it turns a scheduling hint into an outage on small clusters.
+topologySpreadConstraints: []
+# -- `spec.template.spec.priorityClassName`.
+priorityClassName: ""
+# -- `spec.template.spec.terminationGracePeriodSeconds`. Must exceed `config.shutdownDrainDelay` plus `config.shutdownGrace`.
+terminationGracePeriodSeconds: 60
+# -- `spec.template.spec.dnsPolicy`. Empty means the cluster default.
+dnsPolicy: ""
+# -- `spec.template.spec.dnsConfig`.
+dnsConfig: {}
+# -- `spec.template.spec.hostNetwork`.
+hostNetwork: false
+# -- Roll the pods when the rendered ConfigMap changes, by stamping its checksum as a pod annotation.
+restartOnConfigChange: true
+
+startupProbe:
+  # -- Enable the startup probe on `/healthz`. It is what lets the liveness probe stay aggressive without killing a slow CA or state Secret read.
+  enabled: true
+  # -- Initial delay.
+  initialDelaySeconds: 0
+  # -- Probe period.
+  periodSeconds: 5
+  # -- Probe timeout.
+  timeoutSeconds: 3
+  # -- Failure threshold. 60 x 5s = 5 minutes to load the CA and open the state Secret.
+  failureThreshold: 60
+  # -- Success threshold.
+  successThreshold: 1
+
+livenessProbe:
+  # -- Enable the liveness probe. It targets `/healthz`, which never checks a dependency — a dead upstream must not restart the hub.
+  enabled: true
+  # -- Initial delay.
+  initialDelaySeconds: 0
+  # -- Probe period.
+  periodSeconds: 10
+  # -- Probe timeout.
+  timeoutSeconds: 3
+  # -- Failure threshold.
+  failureThreshold: 6
+  # -- Success threshold.
+  successThreshold: 1
+
+readinessProbe:
+  # -- Enable the readiness probe. It targets `/readyz`, which does check dependencies.
+  enabled: true
+  # -- Initial delay.
+  initialDelaySeconds: 0
+  # -- Probe period.
+  periodSeconds: 10
+  # -- Probe timeout.
+  timeoutSeconds: 3
+  # -- Failure threshold.
+  failureThreshold: 3
+  # -- Success threshold.
+  successThreshold: 1
+
+# -- Extra manifests rendered verbatim. Each entry is a full object and is passed through `tpl`, so it may contain Helm templating.
+extraManifests: []

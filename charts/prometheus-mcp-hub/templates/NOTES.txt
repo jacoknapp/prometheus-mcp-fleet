@@ -1,0 +1,97 @@
+prometheus-mcp-hub {{ .Chart.Version }} (app {{ .Chart.AppVersion }}) installed as {{ .Release.Name }} in {{ include "prometheus-mcp-hub.namespace" . }}.
+
+Image: {{ include "prometheus-mcp-hub.image" . }}
+{{- if not .Values.image.digest }}
+  Pinned by TAG, not digest. For production set image.digest.
+{{- end }}
+
+Listeners
+  MCP     {{ include "prometheus-mcp-hub.fullname" . }}.{{ include "prometheus-mcp-hub.namespace" . }}.svc:{{ int .Values.service.mcpPort }}  (agents and spoke enrollment)
+  Tunnel  {{ if .Values.tunnel.service.enabled }}{{ include "prometheus-mcp-hub.tunnelServiceName" . }}.{{ include "prometheus-mcp-hub.namespace" . }}.svc:{{ int .Values.tunnel.service.port }} ({{ .Values.tunnel.service.type }}){{ else }}NOT EXPOSED - tunnel.service.enabled=false, so no spoke can reach this hub{{ end }}
+  Admin   in-cluster only, container port {{ int .Values.ports.admin }} ({{ if .Values.service.admin.enabled }}published on the ClusterIP Service as port {{ int .Values.service.admin.port }}{{ else }}not on any Service{{ end }})
+
+State
+  There is no database and no PersistentVolumeClaim. Everything durable lives in
+  two Secrets this release owns, which the hub reads and writes itself:
+{{- if eq .Values.state.backend "secret" }}
+    state:  {{ include "prometheus-mcp-hub.stateSecretName" . }}
+    CA:     {{ include "prometheus-mcp-hub.caSecretName" . }}
+  {{ .Values.config.dataDir }} is an emptyDir and is scratch only.
+{{- else }}
+
+  ####################################################################
+  #  WARNING - state.backend={{ .Values.state.backend }}
+  #                                                                  #
+  #  {{ .Values.state.file }} is on the /tmp emptyDir.
+  #  When this pod restarts for ANY reason - node drain, image
+  #  update, OOM, eviction - the hub LOSES the internal CA key, the
+  #  HMAC pepper (so every issued admin and agent key becomes
+  #  unverifiable) and every spoke credential record. Every spoke in
+  #  every cluster then fails mTLS against a CA that no longer
+  #  exists and must be re-enrolled by hand.                         #
+  #                                                                  #
+  #  The file backend is for local development only. Set             #
+  #  state.backend=secret before anything depends on this hub.       #
+  ####################################################################
+{{- end }}
+
+{{- if and .Values.tunnel.service.enabled (not .Values.tunnel.serverNames) (not .Values.tunnel.tls.existingSecret) }}
+
+WARNING - tunnel.serverNames is empty and you supplied no tunnel.tls.existingSecret.
+  The internal CA self-issues the tunnel server certificate from that list, so with
+  it empty a spoke's TLS verification of the hub fails and NO TUNNEL EVER
+  ESTABLISHES. Set tunnel.serverNames to every host or IP your spokes will put in
+  their hub.endpoints.
+{{- end }}
+
+{{- if not (include "prometheus-mcp-hub.pdbEnabled" .) }}
+{{- if .Values.podDisruptionBudget.enabled }}
+
+No PodDisruptionBudget was rendered: replicaCount={{ .Values.replicaCount }}. A PDB in front
+of a single replica would block every node drain in this cluster forever. It appears
+automatically at replicaCount >= 2.
+{{- end }}
+{{- end }}
+
+{{- if gt (int .Values.replicaCount) 1 }}
+
+replicaCount={{ .Values.replicaCount }}. Read this before relying on it:
+  A spoke tunnel is pinned to ONE hub replica and there is deliberately no
+  hub-to-hub forwarding. Credential state is shared (it is one Secret), but tunnels
+  are not. Every replica must be individually reachable from outside the cluster and
+  every spoke must list all {{ .Values.replicaCount }} addresses in hub.endpoints. Putting several
+  replicas behind one Service does NOT give you HA; it gives you a fleet where each
+  cluster is visible to exactly one replica.
+{{- end }}
+
+Next steps
+  1. Mint an agent key from a pod that can reach the admin listener:
+       kubectl -n {{ include "prometheus-mcp-hub.namespace" . }} port-forward svc/{{ include "prometheus-mcp-hub.fullname" . }} {{ int .Values.ports.admin }}:{{ int .Values.service.admin.port }}
+       curl -X POST localhost:{{ int .Values.ports.admin }}/admin/v1/keys -d '{"class":"agent"}'
+  2. Mint a single-use enrollment token per cluster:
+       curl -X POST localhost:{{ int .Values.ports.admin }}/admin/v1/enrollments -d '{"clusterId":"<cluster>"}'
+     then install prometheus-mcp-spoke in that cluster with
+       enrollment.token=<the pmf_enr_ token>   (or enrollment.existingSecret)
+       hub.endpoints[0]={{ if .Values.tunnel.service.enabled }}<external tunnel address>:{{ int .Values.tunnel.service.port }}{{ else }}<external tunnel address>{{ end }}
+       hub.apiUrl={{ if .Values.config.publicURL }}{{ .Values.config.publicURL }}{{ else }}<external MCP URL>{{ end }}
+  3. Watch spokes attach:
+       kubectl -n {{ include "prometheus-mcp-hub.namespace" . }} logs deploy/{{ include "prometheus-mcp-hub.fullname" . }} -f
+
+{{- if .Values.autoUpdate.enabled }}
+
+AUTO-UPDATE IS ENABLED ON THE HUB.
+  Schedule: {{ include "prometheus-mcp-hub.autoUpdate.schedule" . }} (cohort {{ .Values.autoUpdate.cohort }}, minimum soak {{ include "prometheus-mcp-hub.autoUpdate.minAgeHours" . }}h)
+  An automatic weekly rollout across a fleet is a fleet-wide outage delivery
+  mechanism, and the hub is the single point of failure for every agent. The job
+  only ever applies a digest whose cosign signature AND SLSA provenance verified,
+  and it rolls back a failed rollout - but consider leaving autoUpdate.enabled=false
+  on the hub and updating it deliberately.
+{{- end }}
+
+{{- if .Values.config.pprofEnabled }}
+
+pprof is enabled on the admin listener. Confirm networkPolicy.enabled=true and that
+networkPolicy.admin.namespaceSelector is as narrow as you think it is.
+{{- end }}
+
+Run `helm test {{ .Release.Name }} -n {{ include "prometheus-mcp-hub.namespace" . }}` to verify reachability.

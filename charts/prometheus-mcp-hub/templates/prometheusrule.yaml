@@ -1,0 +1,174 @@
+{{/*
+Copyright The prometheus-mcp-fleet Authors.
+SPDX-License-Identifier: Apache-2.0
+
+Every metric name below is copied from internal/obs/metrics.go, which is the
+only definition of the promfleet_* series. Both *_cert_expiry_seconds gauges
+hold SECONDS REMAINING (obs sets them from time.Until), not a unix timestamp,
+so the comparison is a bare `< threshold` and never `- time()`.
+*/}}
+{{- if .Values.metrics.prometheusRule.enabled -}}
+{{- include "prometheus-mcp-hub.validate" . -}}
+{{- $sel := include "prometheus-mcp-hub.ruleSelector" . -}}
+{{- $fullname := include "prometheus-mcp-hub.fullname" . -}}
+{{- $ns := include "prometheus-mcp-hub.namespace" . -}}
+{{/* int64 on every integer threshold: Helm parses a large YAML integer as a
+     float64, so a bare render turns 1209600 into 1.2096e+06. PromQL accepts that,
+     but nobody reading the alert at 03:00 should have to. */}}
+{{- $t := .Values.metrics.prometheusRule.thresholds -}}
+{{- $runbook := .Values.metrics.prometheusRule.runbookUrlPrefix -}}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Values.metrics.prometheusRule.namespace | default $ns }}
+  labels:
+    {{- include "prometheus-mcp-hub.labels" . | nindent 4 }}
+    {{- with .Values.metrics.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- $ann := merge (dict) .Values.metrics.prometheusRule.annotations .Values.commonAnnotations }}
+  {{- with $ann }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  groups:
+    - name: {{ $fullname }}.rules
+      rules:
+        {{- if .Values.metrics.prometheusRule.rules.hubDown }}
+        - alert: PrometheusMCPHubDown
+          expr: absent(up{ {{ $sel }} } == 1)
+          for: 5m
+          labels:
+            severity: critical
+            {{- with .Values.metrics.prometheusRule.additionalRuleLabels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: prometheus-mcp-fleet hub is not being scraped successfully
+            description: >-
+              No hub instance matching {{ $sel }} has reported up==1 for 5 minutes.
+              Every AI agent has lost Prometheus access to the whole fleet and every
+              spoke tunnel is down.
+            runbook_url: {{ $runbook }}PrometheusMCPHubDown.md
+        {{- end }}
+        {{- if .Values.metrics.prometheusRule.rules.spokesDisconnected }}
+        - alert: PrometheusMCPSpokesDisconnected
+          expr: >-
+            (count(promfleet_hub_spoke_connected{ {{ $sel }} } == 0)
+            / count(promfleet_hub_spoke_connected{ {{ $sel }} })) > {{ $t.spokesDisconnectedRatio }}
+          for: 10m
+          labels:
+            severity: warning
+            {{- with .Values.metrics.prometheusRule.additionalRuleLabels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: More than {{ mulf $t.spokesDisconnectedRatio 100 }}% of registered spokes have no tunnel
+            description: >-
+              {{ printf "{{ $value | humanizePercentage }}" }} of the spokes known to the
+              hub have promfleet_hub_spoke_connected == 0 and have had for 10 minutes.
+              Queries against those clusters fail with a spoke-unreachable tool error.
+            runbook_url: {{ $runbook }}PrometheusMCPSpokesDisconnected.md
+        {{- end }}
+        {{- if .Values.metrics.prometheusRule.rules.caCertExpiringSoon }}
+        - alert: PrometheusMCPHubCACertExpiringSoon
+          expr: promfleet_hub_ca_cert_expiry_seconds{ {{ $sel }} } < {{ $t.caCertExpirySeconds | int64 }}
+          for: 1h
+          labels:
+            severity: critical
+            {{- with .Values.metrics.prometheusRule.additionalRuleLabels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: prometheus-mcp-fleet internal CA certificate expires soon
+            description: >-
+              The hub's internal CA expires in
+              {{ printf "{{ $value | humanizeDuration }}" }}. When it expires no spoke can
+              enrol or renew and every existing tunnel fails to re-establish. The hub
+              also reports NotReady once the CA is inside 24h of expiry.
+            runbook_url: {{ $runbook }}PrometheusMCPHubCACertExpiringSoon.md
+        {{- end }}
+        {{- if .Values.metrics.prometheusRule.rules.spokeCertExpiringSoon }}
+        - alert: PrometheusMCPHubSpokeCertExpiringSoon
+          expr: promfleet_hub_spoke_cert_expiry_seconds{ {{ $sel }} } < {{ $t.spokeCertExpirySeconds | int64 }}
+          for: 1h
+          labels:
+            severity: warning
+            {{- with .Values.metrics.prometheusRule.additionalRuleLabels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: An issued spoke certificate is close to expiry and has not been renewed
+            description: >-
+              The certificate issued to cluster {{ printf "{{ $labels.cluster }}" }}
+              expires in {{ printf "{{ $value | humanizeDuration }}" }} and the spoke has
+              not renewed it. That spoke drops off the fleet when it does.
+            runbook_url: {{ $runbook }}PrometheusMCPHubSpokeCertExpiringSoon.md
+        {{- end }}
+        {{- if .Values.metrics.prometheusRule.rules.proxyErrorRatioHigh }}
+        - alert: PrometheusMCPHubProxyErrorRatioHigh
+          expr: >-
+            (sum by (cluster) (rate(promfleet_hub_proxy_requests_total{ {{ $sel }}, code=~"5.." }[5m]))
+            / sum by (cluster) (rate(promfleet_hub_proxy_requests_total{ {{ $sel }} }[5m]))) > {{ $t.proxyErrorRatio }}
+          for: 10m
+          labels:
+            severity: warning
+            {{- with .Values.metrics.prometheusRule.additionalRuleLabels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: Proxied Prometheus requests are failing for cluster {{ printf "{{ $labels.cluster }}" }}
+            description: >-
+              {{ printf "{{ $value | humanizePercentage }}" }} of proxied requests to
+              cluster {{ printf "{{ $labels.cluster }}" }} returned 5xx over the last 5
+              minutes. Check that cluster's Prometheus and the spoke's logs.
+            runbook_url: {{ $runbook }}PrometheusMCPHubProxyErrorRatioHigh.md
+        {{- end }}
+        {{- if .Values.metrics.prometheusRule.rules.restartLoop }}
+        {{/* Requires kube-state-metrics. The hub is a Deployment, so its pods are
+             <fullname>-<replicaset hash>-<pod suffix>, never the ordinal suffix a
+             StatefulSet would give. Set rules.restartLoop=false without KSM. */}}
+        - alert: PrometheusMCPHubRestartLoop
+          expr: >-
+            increase(kube_pod_container_status_restarts_total{namespace="{{ $ns }}",
+            pod=~"{{ $fullname }}-[a-z0-9]+-[a-z0-9]+",container="hub"}[1h]) > {{ $t.restartsPerHour | int64 }}
+          for: 5m
+          labels:
+            severity: warning
+            {{- with .Values.metrics.prometheusRule.additionalRuleLabels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: prometheus-mcp-fleet hub is restarting repeatedly
+            description: >-
+              {{ printf "{{ $labels.pod }}" }} has restarted
+              {{ printf "{{ $value }}" }} times in the last hour. Every restart drops
+              every spoke tunnel and every in-flight agent request.
+            runbook_url: {{ $runbook }}PrometheusMCPHubRestartLoop.md
+        {{- end }}
+        {{- if and .Values.autoUpdate.enabled .Values.metrics.prometheusRule.rules.autoUpdateFailed }}
+        - alert: PrometheusMCPAutoUpdateFailed
+          expr: >-
+            kube_job_status_failed{namespace="{{ $ns }}",
+            job_name=~"{{ include "prometheus-mcp-hub.autoUpdateName" . }}-.*"} > 0
+          for: 15m
+          labels:
+            severity: warning
+            {{- with .Values.metrics.prometheusRule.additionalRuleLabels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: The hub auto-update job failed
+            description: >-
+              {{ printf "{{ $labels.job_name }}" }} failed. Either the cosign signature
+              or the SLSA provenance verification refused the new digest, or the rollout
+              was rolled back. The workload is still on its previous digest; nothing was
+              applied unverified.
+            runbook_url: {{ $runbook }}PrometheusMCPAutoUpdateFailed.md
+        {{- end }}
+    {{- with .Values.metrics.prometheusRule.additionalGroups }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

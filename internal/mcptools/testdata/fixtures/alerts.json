@@ -1,0 +1,28 @@
+{
+  "status": "success",
+  "data": {
+    "alerts": [
+      {
+        "labels": { "alertname": "KubePodCrashLooping", "namespace": "default", "pod": "api-7d9f", "severity": "warning" },
+        "annotations": { "summary": "Pod is crash looping." },
+        "state": "firing",
+        "activeAt": "2026-08-26T10:31:00.001Z",
+        "value": "1e+00"
+      },
+      {
+        "labels": { "alertname": "Watchdog", "severity": "none" },
+        "annotations": { "summary": "An alert that should always be firing." },
+        "state": "firing",
+        "activeAt": "2026-08-21T04:12:00.001Z",
+        "value": "1e+00"
+      },
+      {
+        "labels": { "alertname": "NodeFilesystemAlmostOutOfSpace", "instance": "10.42.0.11:9100", "severity": "warning" },
+        "annotations": { "summary": "Filesystem has less than 5% space left." },
+        "state": "pending",
+        "activeAt": "2026-08-26T10:58:00.001Z",
+        "value": "4.1e+00"
+      }
+    ]
+  }
+}

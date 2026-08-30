@@ -1,0 +1,22 @@
+{
+  "status": "success",
+  "data": {
+    "resultType": "vector",
+    "result": [
+      {
+        "metric": {
+          "__name__": "prometheus_build_info",
+          "job": "prometheus",
+          "instance": "10.42.0.20:9090",
+          "branch": "HEAD",
+          "goversion": "go1.25.1",
+          "revision": "7c9a1f2b3d4e5f60718293a4b5c6d7e8f9012345",
+          "version": "3.6.0",
+          "cluster": "prod-us-east-1",
+          "region": "us-east-1"
+        },
+        "value": [1787047200.412, "1"]
+      }
+    ]
+  }
+}

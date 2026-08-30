@@ -1,0 +1,155 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# An unattended weekly rollout to a fleet is an outage delivery mechanism. It is
+# off by default, and when on it must be digest-pinned, verified, staggered and
+# scoped to one workload.
+suite: hub auto-update
+tests:
+  - it: renders absolutely nothing when disabled, which is the default
+    templates:
+      - templates/autoupdate-cronjob.yaml
+      - templates/autoupdate-rbac.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders nothing even with a cohort, schedule and identity configured
+    set:
+      autoUpdate:
+        enabled: false
+        cohort: canary
+        schedule: "0 3 * * 1"
+        identity: cluster-a
+    templates:
+      - templates/autoupdate-cronjob.yaml
+      - templates/autoupdate-rbac.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: derives a staggered schedule from the release identity
+    template: templates/autoupdate-cronjob.yaml
+    set:
+      autoUpdate:
+        enabled: true
+    asserts:
+      - isKind:
+          of: CronJob
+      - matchRegex:
+          path: spec.schedule
+          pattern: "^[0-9]{1,2} [2-5] \\* \\* [0-6]$"
+
+  - it: puts two different cluster identities on different weekdays
+    template: templates/autoupdate-cronjob.yaml
+    set:
+      autoUpdate:
+        enabled: true
+        identity: cluster-alpha
+    asserts:
+      - equal:
+          path: spec.schedule
+          value: "30 4 * * 4"
+
+  - it: honours an explicit schedule override
+    template: templates/autoupdate-cronjob.yaml
+    set:
+      autoUpdate:
+        enabled: true
+        schedule: "17 4 * * 6"
+    asserts:
+      - equal:
+          path: spec.schedule
+          value: "17 4 * * 6"
+
+  - it: soaks a promotion for 0h as canary, 72h as early and 168h as stable
+    template: templates/autoupdate-cronjob.yaml
+    set:
+      autoUpdate:
+        enabled: true
+        cohort: canary
+    asserts:
+      - contains:
+          path: spec.jobTemplate.spec.template.spec.containers[0].env
+          content: { name: MIN_AGE_HOURS, value: "0" }
+
+  - it: soaks for 72h in the early cohort
+    template: templates/autoupdate-cronjob.yaml
+    set:
+      autoUpdate:
+        enabled: true
+        cohort: early
+    asserts:
+      - contains:
+          path: spec.jobTemplate.spec.template.spec.containers[0].env
+          content: { name: MIN_AGE_HOURS, value: "72" }
+
+  - it: soaks for 168h in the stable cohort
+    template: templates/autoupdate-cronjob.yaml
+    set:
+      autoUpdate:
+        enabled: true
+        cohort: stable
+    asserts:
+      - contains:
+          path: spec.jobTemplate.spec.template.spec.containers[0].env
+          content: { name: MIN_AGE_HOURS, value: "168" }
+
+  - it: verifies the signature and the provenance and patches a digest, never a tag
+    template: templates/autoupdate-cronjob.yaml
+    set:
+      autoUpdate:
+        enabled: true
+    asserts:
+      - matchRegex:
+          path: spec.jobTemplate.spec.template.spec.containers[0].command[3]
+          pattern: "cosign verify \\\\"
+      - matchRegex:
+          path: spec.jobTemplate.spec.template.spec.containers[0].command[3]
+          pattern: "cosign verify-attestation \\\\"
+      - matchRegex:
+          path: spec.jobTemplate.spec.template.spec.containers[0].command[3]
+          pattern: 'REF="\$IMAGE_REPO@\$DIGEST"'
+      - matchRegex:
+          path: spec.jobTemplate.spec.template.spec.containers[0].command[3]
+          pattern: "kubectl rollout undo"
+      - matchRegex:
+          path: spec.jobTemplate.spec.template.spec.containers[0].command[3]
+          pattern: "sha256:\\*\\) ;;"
+
+  - it: scopes its Role by resourceNames to exactly the one Deployment this release owns
+    template: templates/autoupdate-rbac.yaml
+    documentIndex: 1
+    set:
+      autoUpdate:
+        enabled: true
+    asserts:
+      - isKind:
+          of: Role
+      - equal:
+          path: rules[0].resources
+          value: [deployments]
+      - equal:
+          path: rules[0].resourceNames
+          value: [RELEASE-NAME-prometheus-mcp-hub]
+      - equal:
+          path: rules[0].verbs
+          value: [get, patch, update]
+      - notContains:
+          path: rules[1].verbs
+          content: patch
+      - notContains:
+          path: rules[1].verbs
+          content: update
+      - notContains:
+          path: rules[1].verbs
+          content: delete
+
+  - it: refuses a signer identity regexp that accepts anything
+    set:
+      autoUpdate:
+        enabled: true
+        certificateIdentityRegexp: ".*"
+    asserts:
+      - failedTemplate:
+          errorPattern: "which accepts any signer"

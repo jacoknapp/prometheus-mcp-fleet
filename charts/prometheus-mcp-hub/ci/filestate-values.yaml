@@ -1,0 +1,25 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# state.backend=file with no RBAC and no projected token: the development shape,
+# and the only one in which the hub touches no Kubernetes API at all. In a pod
+# the state file is on the /tmp emptyDir and is LOST on restart, which orphans
+# every enrolled spoke. NOTES.txt says so at install time.
+state:
+  backend: file
+  file: /tmp/prometheus-mcp-fleet/state.json
+rbac:
+  create: false
+serviceAccount:
+  automountServiceAccountToken: false
+networkPolicy:
+  egress:
+    allowKubeAPI: false
+config:
+  logLevel: debug
+  logFormat: text
+tunnel:
+  service:
+    type: ClusterIP
+  serverNames:
+    - localhost

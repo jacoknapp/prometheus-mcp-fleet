@@ -1,0 +1,74 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# The metric names here are the ones internal/obs/metrics.go actually registers.
+# An alert on a metric that does not exist is worse than no alert: it is silent.
+suite: hub PrometheusRule uses the real metric names
+templates:
+  - templates/prometheusrule.yaml
+set:
+  metrics:
+    prometheusRule:
+      enabled: true
+tests:
+  - it: alerts on the registered promfleet_hub_* series
+    asserts:
+      - isKind:
+          of: PrometheusRule
+      - matchRegex:
+          path: spec.groups[0].rules[1].expr
+          pattern: "promfleet_hub_spoke_connected"
+      - matchRegex:
+          path: spec.groups[0].rules[2].expr
+          pattern: "promfleet_hub_ca_cert_expiry_seconds"
+      - matchRegex:
+          path: spec.groups[0].rules[3].expr
+          pattern: "promfleet_hub_spoke_cert_expiry_seconds"
+      - matchRegex:
+          path: spec.groups[0].rules[4].expr
+          pattern: "promfleet_hub_proxy_requests_total"
+
+  - it: compares the expiry gauges as seconds remaining, never against time()
+    asserts:
+      - equal:
+          path: spec.groups[0].rules[2].expr
+          value: 'promfleet_hub_ca_cert_expiry_seconds{ job="prometheus-mcp-hub" } < 1209600'
+      - notMatchRegex:
+          path: spec.groups[0].rules[2].expr
+          pattern: "time\\(\\)"
+      - notMatchRegex:
+          path: spec.groups[0].rules[3].expr
+          pattern: "time\\(\\)"
+
+  - it: matches Deployment pod names, not StatefulSet ordinals
+    asserts:
+      - matchRegex:
+          path: spec.groups[0].rules[5].expr
+          pattern: "pod=~\"RELEASE-NAME-prometheus-mcp-hub-\\[a-z0-9\\]\\+-\\[a-z0-9\\]\\+\""
+
+  - it: omits the auto-update alert while auto-update is off
+    asserts:
+      - lengthEqual:
+          path: spec.groups[0].rules
+          count: 6
+
+  - it: adds the auto-update alert once auto-update is on
+    set:
+      autoUpdate:
+        enabled: true
+    asserts:
+      - lengthEqual:
+          path: spec.groups[0].rules
+          count: 7
+      - equal:
+          path: spec.groups[0].rules[6].alert
+          value: PrometheusMCPAutoUpdateFailed
+
+  - it: renders nothing when disabled
+    set:
+      metrics:
+        prometheusRule:
+          enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0

@@ -1,0 +1,89 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+suite: hub pod and container hardening
+templates:
+  - templates/deployment.yaml
+  - templates/configmap.yaml
+tests:
+  - it: keeps the whole securityContext through a render with unrelated overrides set
+    template: templates/deployment.yaml
+    set:
+      podAnnotations:
+        example.com/owner: platform
+      nodeSelector:
+        kubernetes.io/os: linux
+      tolerations:
+        - key: dedicated
+          operator: Exists
+      extraEnv:
+        - name: EXTRA
+          value: "1"
+    asserts:
+      - equal:
+          path: spec.template.spec.securityContext.runAsNonRoot
+          value: true
+      - equal:
+          path: spec.template.spec.securityContext.runAsUser
+          value: 65532
+      - equal:
+          path: spec.template.spec.securityContext.runAsGroup
+          value: 65532
+      - equal:
+          path: spec.template.spec.securityContext.fsGroup
+          value: 65532
+      - equal:
+          path: spec.template.spec.securityContext.seccompProfile.type
+          value: RuntimeDefault
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation
+          value: false
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem
+          value: true
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.capabilities.drop
+          value: [ALL]
+
+  - it: mounts an emptyDir at /tmp, which is what makes readOnlyRootFilesystem workable
+    template: templates/deployment.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: tmp
+            mountPath: /tmp
+      - equal:
+          path: spec.template.spec.volumes[0].name
+          value: tmp
+      - exists:
+          path: spec.template.spec.volumes[0].emptyDir
+      - equal:
+          path: spec.template.spec.volumes[0].emptyDir.sizeLimit
+          value: 64Mi
+
+  - it: lets OpenShift drop the numeric IDs without losing runAsNonRoot or seccomp
+    template: templates/deployment.yaml
+    set:
+      podSecurityContext:
+        runAsNonRoot: true
+        runAsUser: null
+        runAsGroup: null
+        fsGroup: null
+        seccompProfile:
+          type: RuntimeDefault
+    asserts:
+      - equal:
+          path: spec.template.spec.securityContext.runAsNonRoot
+          value: true
+      - equal:
+          path: spec.template.spec.securityContext.seccompProfile.type
+          value: RuntimeDefault
+      - notExists:
+          path: spec.template.spec.securityContext.runAsUser
+
+  - it: projects the service account token, because the hub owns its state Secret
+    template: templates/deployment.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.automountServiceAccountToken
+          value: true

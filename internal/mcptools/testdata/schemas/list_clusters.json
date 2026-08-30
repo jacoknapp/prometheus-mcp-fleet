@@ -1,0 +1,54 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "filter": {
+      "description": "Case-insensitive substring matched against the cluster name, display name and description.",
+      "examples": [
+        "prod",
+        "eu-west"
+      ],
+      "type": "string"
+    },
+    "format": {
+      "default": "compact",
+      "description": "Output encoding. \"table\" is the cheapest for this tool; \"json\" is not supported here because there is no upstream payload to pass through.",
+      "enum": [
+        "compact",
+        "table"
+      ],
+      "type": "string"
+    },
+    "labelSelector": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "Require every one of these labels to be present and equal, e.g. {\"env\":\"prod\",\"region\":\"eu-west\"}.",
+      "examples": [
+        {
+          "env": "prod",
+          "region": "eu-west"
+        }
+      ],
+      "type": "object"
+    },
+    "limit": {
+      "default": 100,
+      "description": "Maximum entries to return.",
+      "maximum": 500,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "status": {
+      "default": "all",
+      "description": "Availability filter.",
+      "enum": [
+        "all",
+        "healthy",
+        "degraded",
+        "unreachable"
+      ],
+      "type": "string"
+    }
+  },
+  "type": "object"
+}

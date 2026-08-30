@@ -1,0 +1,80 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# OpenSSF Scorecard.
+#
+# Scorecard grades this repository's own supply-chain posture: are actions
+# pinned, are permissions minimal, is there a security policy, is dependency
+# update automation present, is there branch protection. Publishing the result
+# is the point — the 100 platform teams asked to install the spoke into their
+# production clusters can read the score without taking our word for it.
+#
+# Deliberately NOT run on `pull_request`: Scorecard needs repository-level
+# metadata and `id-token: write`, neither of which a fork PR may have. Running
+# it on `push: main` and weekly is the supported configuration.
+name: scorecard
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Wednesday 05:23 UTC.
+    - cron: "23 5 * * 3"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scorecard-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  analysis:
+    name: scorecard analysis
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      # Upload the SARIF result to the security tab.
+      security-events: write
+      # Publish the result to the OpenSSF API so the badge resolves.
+      id-token: write
+      # Scorecard's Branch-Protection and CI-Tests checks read workflow runs.
+      actions: read
+      # Scorecard's Webhooks / Maintained checks read issue and check metadata.
+      checks: read
+      issues: read
+      pull-requests: read
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run analysis
+        uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          # Publishes to the public OpenSSF results API. This repository is
+          # public and its posture is meant to be independently checkable.
+          publish_results: true
+
+      - name: Upload the SARIF artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scorecard-sarif
+          path: results.sarif
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload to the code scanning dashboard
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          sarif_file: results.sarif
+          category: scorecard

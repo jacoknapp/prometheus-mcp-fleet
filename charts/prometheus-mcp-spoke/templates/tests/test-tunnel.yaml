@@ -1,0 +1,73 @@
+{{/*
+Copyright The prometheus-mcp-fleet Authors.
+SPDX-License-Identifier: Apache-2.0
+
+`helm test` probe. /readyz is the assertion that matters: the spoke reports 503
+there until a tunnel is attached to a hub endpoint AND the local Prometheus has
+answered. So a 200 from /readyz means the tunnel to the hub -- in another
+cluster, over this cluster's egress -- actually came up.
+*/}}
+{{- if .Values.service.enabled -}}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "prometheus-mcp-spoke.fullname" . }}-test-tunnel
+  namespace: {{ include "prometheus-mcp-spoke.namespace" . }}
+  labels:
+    {{- include "prometheus-mcp-spoke.componentLabels" (list . "spoke-test") | nindent 4 }}
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+    {{- with .Values.commonAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  securityContext:
+    {{- toYaml .Values.podSecurityContext | nindent 4 }}
+  containers:
+    - name: probe
+      image: {{ printf "%s/%s:%s" .Values.tests.image.registry .Values.tests.image.repository .Values.tests.image.tag | quote }}
+      imagePullPolicy: {{ .Values.tests.image.pullPolicy }}
+      securityContext:
+        {{- toYaml .Values.containerSecurityContext | nindent 8 }}
+      command:
+        - /bin/sh
+        - -eu
+        - -c
+        - |
+          HOST="{{ include "prometheus-mcp-spoke.fullname" . }}.{{ include "prometheus-mcp-spoke.namespace" . }}.svc"
+          PORT={{ int .Values.service.port }}
+
+          echo "GET http://$HOST:$PORT/healthz"
+          wget -q -T 10 -O - "http://$HOST:$PORT/healthz"
+
+          # /readyz is 503 until a tunnel is attached to a hub endpoint and the
+          # local Prometheus has answered. This is the real assertion.
+          echo "GET http://$HOST:$PORT/readyz"
+          if ! wget -q -T 30 -O - "http://$HOST:$PORT/readyz"; then
+            echo "FAIL: the spoke is not ready."
+            echo "  Either no tunnel is attached to any of {{ join ", " .Values.hub.endpoints }}"
+            echo "  or {{ .Values.prometheus.url }} has been failing."
+            echo "  See 'If the spoke cannot reach the hub' in this chart's install notes."
+            exit 1
+          fi
+
+          echo "checking the tunnel gauge"
+          wget -q -T 10 -O /tmp/metrics "http://$HOST:$PORT{{ .Values.metrics.serviceMonitor.path }}"
+          grep -q '^promfleet_spoke_build_info' /tmp/metrics
+          if ! grep -E '^promfleet_spoke_tunnel_up\{' /tmp/metrics | grep -q ' 1$'; then
+            echo "FAIL: promfleet_spoke_tunnel_up is 0 for every hub endpoint."
+            grep -E '^promfleet_spoke_tunnel_up' /tmp/metrics || true
+            exit 1
+          fi
+          echo OK
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: tmp
+      emptyDir:
+        sizeLimit: 16Mi
+{{- end }}

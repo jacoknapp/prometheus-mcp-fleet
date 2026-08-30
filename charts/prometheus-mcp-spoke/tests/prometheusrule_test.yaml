@@ -1,0 +1,77 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# The metric names here are the ones internal/obs/metrics.go actually registers.
+suite: spoke PrometheusRule uses the real metric names
+templates:
+  - templates/prometheusrule.yaml
+set:
+  cluster:
+    id: prod-us-east-1
+  hub:
+    endpoints:
+      - hub.example.com:8443
+    apiUrl: https://hub.example.com
+
+  metrics:
+    prometheusRule:
+      enabled: true
+tests:
+  - it: alerts on the registered promfleet_spoke_* series
+    asserts:
+      - isKind:
+          of: PrometheusRule
+      - matchRegex:
+          path: spec.groups[0].rules[1].expr
+          pattern: "promfleet_spoke_tunnel_up"
+      - matchRegex:
+          path: spec.groups[0].rules[2].expr
+          pattern: "promfleet_spoke_tunnel_reconnects_total"
+      - matchRegex:
+          path: spec.groups[0].rules[3].expr
+          pattern: "promfleet_spoke_prom_up"
+      - matchRegex:
+          path: spec.groups[0].rules[4].expr
+          pattern: "promfleet_spoke_client_cert_expiry_seconds"
+      - matchRegex:
+          path: spec.groups[0].rules[5].expr
+          pattern: "promfleet_spoke_prom_requests_total"
+      - matchRegex:
+          path: spec.groups[0].rules[6].expr
+          pattern: "promfleet_spoke_facts_refresh_total"
+
+  - it: compares the expiry gauge as seconds remaining, never against time()
+    asserts:
+      - equal:
+          path: spec.groups[0].rules[4].expr
+          value: 'promfleet_spoke_client_cert_expiry_seconds{ job="prometheus-mcp-spoke" } < 259200'
+      - notMatchRegex:
+          path: spec.groups[0].rules[4].expr
+          pattern: "time\\(\\)"
+
+  - it: omits the auto-update alert while auto-update is off
+    asserts:
+      - lengthEqual:
+          path: spec.groups[0].rules
+          count: 7
+
+  - it: adds the auto-update alert once auto-update is on
+    set:
+      autoUpdate:
+        enabled: true
+    asserts:
+      - lengthEqual:
+          path: spec.groups[0].rules
+          count: 8
+      - equal:
+          path: spec.groups[0].rules[7].alert
+          value: PrometheusMCPSpokeAutoUpdateFailed
+
+  - it: renders nothing when disabled
+    set:
+      metrics:
+        prometheusRule:
+          enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0

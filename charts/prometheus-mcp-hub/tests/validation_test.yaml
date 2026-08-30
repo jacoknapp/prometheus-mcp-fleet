@@ -1,0 +1,98 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Every case here would otherwise install cleanly and be wrong in production.
+suite: hub misconfiguration fails at render time, not at 03:00
+tests:
+  - it: refuses an Ingress with no host
+    set:
+      ingress:
+        enabled: true
+        host: ""
+    asserts:
+      - failedTemplate:
+          errorPattern: "ingress.enabled is true but ingress.host is empty"
+
+  - it: refuses the secret state backend without a projected token
+    set:
+      serviceAccount:
+        automountServiceAccountToken: false
+    asserts:
+      - failedTemplate:
+          errorPattern: "needs the projected token"
+
+  - it: refuses the secret state backend with no RBAC and no named ServiceAccount
+    set:
+      rbac:
+        create: false
+    asserts:
+      - failedTemplate:
+          errorPattern: "Grant get,create,update on the state Secret yourself"
+
+  - it: refuses a dataDir outside the one writable path
+    set:
+      config:
+        dataDir: /var/lib/prometheus-mcp-fleet
+    asserts:
+      - failedTemplate:
+          errorPattern: "readOnlyRootFilesystem is true and no extraVolumeMounts make that path writable"
+
+  - it: refuses a CA certificate supplied without its key
+    set:
+      bootstrap:
+        existingSecret: hub-bootstrap
+        caCertKey: ca.crt
+    asserts:
+      - failedTemplate:
+          errorPattern: "a certificate without its key cannot issue"
+
+  - it: refuses bootstrap keys with no Secret to read them from
+    set:
+      bootstrap:
+        pepperKey: pepper.key
+    asserts:
+      - failedTemplate:
+          errorPattern: "bootstrap.existingSecret is empty"
+
+  - it: refuses minAvailable and maxUnavailable together
+    set:
+      podDisruptionBudget:
+        minAvailable: 1
+        maxUnavailable: 1
+    asserts:
+      - failedTemplate:
+          errorPattern: "mutually exclusive"
+
+  - it: refuses tracing with no endpoint
+    set:
+      tracing:
+        enabled: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "tracing.enabled is true but tracing.endpoint is empty"
+
+  - it: refuses colliding listener ports
+    set:
+      ports:
+        mcp: 9090
+    asserts:
+      - failedTemplate:
+          errorPattern: "ports.mcp and ports.admin must differ"
+
+  # config.logLevel, config.logFormat, autoUpdate.cohort, state.backend and
+  # service.sessionAffinity are closed enums in values.schema.json, so an invalid
+  # one is rejected before a template ever runs. The matching `fail` guards stay
+  # in _helpers.tpl as defence for anyone rendering with --skip-schema-validation.
+
+  - it: refuses a file state backend with no file path
+    set:
+      state:
+        backend: file
+        file: ""
+      rbac:
+        create: false
+      serviceAccount:
+        name: hub
+    asserts:
+      - failedTemplate:
+          errorPattern: "state.backend is \"file\" but state.file is empty"

@@ -1,0 +1,37 @@
+{{/*
+Copyright The prometheus-mcp-fleet Authors.
+SPDX-License-Identifier: Apache-2.0
+
+Metrics only, and ClusterIP only. The spoke DIALS the hub, so it has no inbound
+listener to publish: the sole port here is the admin listener, which carries
+/metrics, /healthz, /readyz and (if enabled) pprof.
+`prometheus-mcp-spoke.validate` refuses any other Service type, and refuses an
+Ingress in extraManifests, for exactly that reason.
+*/}}
+{{- if .Values.service.enabled -}}
+{{- include "prometheus-mcp-spoke.validate" . -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "prometheus-mcp-spoke.fullname" . }}
+  namespace: {{ include "prometheus-mcp-spoke.namespace" . }}
+  labels:
+    {{- include "prometheus-mcp-spoke.labels" . | nindent 4 }}
+    {{- with .Values.service.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- $ann := merge (dict) .Values.service.annotations .Values.commonAnnotations }}
+  {{- with $ann }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "prometheus-mcp-spoke.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ .Values.service.port }}
+      targetPort: admin
+      protocol: TCP
+{{- end }}

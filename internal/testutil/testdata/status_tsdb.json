@@ -1,0 +1,32 @@
+{
+  "status": "success",
+  "data": {
+    "headStats": {
+      "numSeries": 482913,
+      "numLabelPairs": 61204,
+      "chunkCount": 1391204,
+      "minTime": 1787040000000,
+      "maxTime": 1787047200000
+    },
+    "seriesCountByMetricName": [
+      { "name": "kube_pod_container_status_restarts_total", "value": 41203 },
+      { "name": "container_cpu_usage_seconds_total", "value": 38812 },
+      { "name": "apiserver_request_duration_seconds_bucket", "value": 21044 },
+      { "name": "istio_request_duration_milliseconds_bucket", "value": 18990 },
+      { "name": "kube_pod_status_phase", "value": 12004 }
+    ],
+    "labelValueCountByLabelName": [
+      { "name": "__name__", "value": 2211 },
+      { "name": "pod", "value": 18422 },
+      { "name": "namespace", "value": 64 }
+    ],
+    "memoryInBytesByLabelName": [
+      { "name": "pod", "value": 812394 },
+      { "name": "__name__", "value": 402118 }
+    ],
+    "seriesCountByLabelValuePair": [
+      { "name": "job=kubelet", "value": 91204 },
+      { "name": "namespace=kube-system", "value": 40119 }
+    ]
+  }
+}

@@ -1,0 +1,19 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# OpenShift: the restricted-v2 SCC assigns a UID from the namespace's range and
+# rejects a pod that pins one. runAsNonRoot, seccompProfile and the container
+# hardening all stay; only the numeric IDs go.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: null
+  runAsGroup: null
+  fsGroup: null
+  seccompProfile:
+    type: RuntimeDefault
+tunnel:
+  serverNames:
+    - hub.apps.example.com
+  service:
+    type: NodePort
+    nodePort: 30443

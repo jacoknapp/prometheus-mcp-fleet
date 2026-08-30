@@ -1,0 +1,44 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "cluster": {
+      "description": "Cluster name, exactly as returned by list_clusters.",
+      "type": "string"
+    },
+    "limit": {
+      "default": 50,
+      "description": "Maximum metric names to return.",
+      "maximum": 500,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "mode": {
+      "default": "substring",
+      "description": "How to interpret pattern.",
+      "enum": [
+        "substring",
+        "regex"
+      ],
+      "type": "string"
+    },
+    "pattern": {
+      "description": "Text to search for in metric names, e.g. \"checkout\" or \"^container_cpu\".",
+      "examples": [
+        "checkout",
+        "^container_cpu"
+      ],
+      "maxLength": 200,
+      "type": "string"
+    },
+    "withMetadata": {
+      "default": true,
+      "description": "Join the metric type, unit and a clipped help string onto each match. Costs one extra upstream call.",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "cluster",
+    "pattern"
+  ],
+  "type": "object"
+}

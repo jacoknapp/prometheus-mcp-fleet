@@ -1,0 +1,40 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "cluster": {
+      "description": "Cluster name, exactly as returned by list_clusters.",
+      "type": "string"
+    },
+    "end": {
+      "default": "now",
+      "description": "Range end, same forms as start. Defaults to now.",
+      "type": "string"
+    },
+    "limit": {
+      "default": 200,
+      "description": "Maximum label names to return.",
+      "maximum": 2000,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "matchers": {
+      "description": "Optional series selectors scoping the lookup, e.g. [\"up{job=\\\"api\\\"}\"].",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "start": {
+      "default": "now-1h",
+      "description": "Range start. Relative (\"now-1h\") or RFC 3339. Defaults to now-1h.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "cluster"
+  ],
+  "type": "object"
+}

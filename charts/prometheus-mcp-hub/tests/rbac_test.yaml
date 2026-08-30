@@ -1,0 +1,69 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+suite: hub RBAC is namespaced and name-restricted
+templates:
+  - templates/rbac.yaml
+tests:
+  - it: restricts get and update by resourceNames to the state and CA Secrets only
+    documentIndex: 0
+    asserts:
+      - isKind:
+          of: Role
+      - equal:
+          path: rules[1].resourceNames
+          value:
+            - RELEASE-NAME-prometheus-mcp-hub-ca
+            - RELEASE-NAME-prometheus-mcp-hub-state
+      - equal:
+          path: rules[1].verbs
+          value: [get, update]
+      - equal:
+          path: rules[1].resources
+          value: [secrets]
+
+  - it: never grants list or watch on Secrets
+    documentIndex: 0
+    asserts:
+      - notContains:
+          path: rules[1].verbs
+          content: list
+      - notContains:
+          path: rules[1].verbs
+          content: watch
+      - notContains:
+          path: rules[0].verbs
+          content: list
+      - notContains:
+          path: rules[0].verbs
+          content: watch
+
+  - it: drops the unrestricted create verb when the operator pre-creates the Secrets
+    documentIndex: 0
+    set:
+      rbac:
+        allowCreate: false
+    asserts:
+      - equal:
+          path: rules[0].verbs
+          value: [get, update]
+
+  - it: renders nothing cluster-scoped
+    asserts:
+      - notEqual:
+          path: kind
+          value: ClusterRole
+      - notEqual:
+          path: kind
+          value: ClusterRoleBinding
+
+  - it: renders no RBAC at all with the file backend
+    set:
+      state:
+        backend: file
+      serviceAccount:
+        automountServiceAccountToken: false
+      rbac:
+        create: false
+    asserts:
+      - hasDocuments:
+          count: 0

@@ -1,0 +1,26 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Blank issues are disabled so that every report arrives with the fields a
+# maintainer needs. The security link is first and deliberately does NOT point
+# at the issue tracker: a vulnerability filed as a public issue is a disclosure,
+# and this project ships an agent into ~100 production clusters.
+blank_issues_enabled: false
+
+contact_links:
+  - name: Report a security vulnerability (do NOT open an issue)
+    url: https://github.com/jacoknapp/prometheus-mcp-fleet/blob/main/SECURITY.md
+    about: >
+      Vulnerabilities go through GitHub private vulnerability reporting or email,
+      never through the public issue tracker. SECURITY.md has the process and
+      the response targets.
+
+  - name: Question, idea or "am I holding it wrong?"
+    url: https://github.com/jacoknapp/prometheus-mcp-fleet/discussions
+    about: >
+      Usage questions, deployment topology advice and half-formed ideas belong in
+      Discussions. An issue is for something specific and actionable.
+
+  - name: Operator documentation
+    url: https://github.com/jacoknapp/prometheus-mcp-fleet/tree/main/docs
+    about: Configuration keys, chart values, runbooks and the wire-compatibility policy.

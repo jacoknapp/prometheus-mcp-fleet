@@ -1,0 +1,518 @@
+# Default values for prometheus-mcp-spoke.
+# Every value carries a `# --` comment so helm-docs can regenerate README.md.
+#
+# There is deliberately no `persistence` section and no PersistentVolumeClaim.
+# The only thing the spoke must keep across a restart is its issued client key
+# and certificate, and that lives in a Kubernetes Secret it writes itself. See
+# `identity.*`.
+
+# -- Override the chart name used in resource names.
+nameOverride: ""
+# -- Override the fully qualified name of every object this chart renders.
+fullnameOverride: ""
+# -- Render every object into this namespace instead of `.Release.Namespace`.
+namespaceOverride: ""
+# -- Extra labels added to every object this chart renders.
+commonLabels: {}
+# -- Extra annotations added to every object this chart renders.
+commonAnnotations: {}
+
+image:
+  # -- Image registry.
+  registry: ghcr.io
+  # -- Image repository, without the registry.
+  repository: jacoknapp/prometheus-mcp-fleet/spoke
+  # -- Image tag. Empty means `.Chart.AppVersion`. Ignored when `image.digest` is set.
+  tag: ""
+  # -- Image digest (`sha256:...`). When set the image is pinned by digest and the tag is ignored. Recommended for production and set automatically by the release workflow.
+  digest: ""
+  # -- Image pull policy.
+  pullPolicy: IfNotPresent
+# -- Image pull secrets for a private registry.
+imagePullSecrets: []
+
+# -- Number of spoke replicas. This must stay 1 and the chart refuses to render anything else.
+# A spoke's identity is one X.509 certificate bound to one cluster ID. Two pods sharing that
+# identity would renew over each other in the same Secret and each would deregister the other's
+# tunnel at the hub. Scale the hub, never the spoke.
+replicaCount: 1
+# -- Number of old ReplicaSets retained.
+revisionHistoryLimit: 5
+
+serviceAccount:
+  # -- Create a ServiceAccount for the spoke.
+  create: true
+  # -- Name of the ServiceAccount. Empty means the chart fullname.
+  name: ""
+  # -- Annotations for the ServiceAccount.
+  annotations: {}
+  # -- Mount the projected ServiceAccount token. Empty means "whatever `identity.backend` needs": true for `secret`, false for `memory` and `file`. Set it explicitly only to override that.
+  automountServiceAccountToken: ""
+
+rbac:
+  # -- Render the namespaced Role and RoleBinding that let the spoke write its own identity Secret. Only rendered when `identity.backend` is `secret`; in `memory` and `file` mode the spoke gets no RBAC at all.
+  create: true
+
+identity:
+  # -- `PMF_IDENTITY_BACKEND`. Where the issued client key and certificate live.
+  # `secret` (default) writes them to a Secret in this namespace, so a pod restart reuses the
+  # existing certificate. It costs exactly one `Role` with `get,create,update` on that one
+  # Secret by name — see the "RBAC" section of the README.
+  # `memory` needs NO RBAC at all, but the key is lost on every restart, so the spoke
+  # re-enrolls each time and therefore needs a MULTI-USE enrollment token. That is strictly
+  # weaker: a multi-use token is a standing credential that mints cluster identities.
+  # `file` writes under `config.dataDir`, which is the `/tmp` emptyDir, so in a pod it behaves
+  # like `memory` while looking durable. It exists for running the binary outside Kubernetes.
+  backend: secret
+  # -- `PMF_IDENTITY_SECRET_NAME`. Name of the Secret the spoke owns. Empty means `<fullname>-identity`. This exact name is what the rendered Role restricts by `resourceNames`.
+  secretName: ""
+
+cluster:
+  # -- `PMF_CLUSTER_ID`. REQUIRED, and deliberately has NO DEFAULT. Immutable, must match
+  # `^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`. This is the identity the hub binds into this
+  # spoke's certificate URI SAN. Two clusters that accidentally shared an ID would fight
+  # over one certificate identity at the hub and each would deregister the other, so there
+  # is nothing sensible to default it to.
+  id: ""
+  # -- `PMF_CLUSTER_DISPLAY_NAME`. Human-facing name an agent sees when choosing a cluster.
+  displayName: ""
+  # -- `PMF_CLUSTER_DESCRIPTION`. One line describing what this cluster runs, to orient an agent.
+  description: ""
+  # -- `PMF_CLUSTER_LABELS`. Operator-supplied selectors, rendered as `k=v,k=v`.
+  labels: {}
+
+# THE HUB IS IN A DIFFERENT CLUSTER. Every value below describes something outside this
+# cluster, reached over ordinary egress. There is deliberately no `.svc` default, no
+# `.Release.Namespace` interpolation and no reference to a hub Service, a hub Role or a hub
+# release name anywhere in this chart: a default that only works when the hub happens to be
+# local is a trap that fails on the other 99 installs.
+hub:
+  # -- `PMF_HUB_ENDPOINTS`. REQUIRED, no default. Hub tunnel endpoints as `host:port`, joined with commas — an external address such as `hub.example.com:8443`, whatever the hub's tunnel LoadBalancer publishes. The spoke holds ONE TUNNEL PER ENDPOINT: that is how hub HA works, because a tunnel is pinned to one hub replica and there is no hub-to-hub forwarding. List every hub replica's external address.
+  endpoints: []
+  # -- `PMF_HUB_API_URL`. REQUIRED, no default. `https://host[:port]` base URL of the hub's enrollment listener, which the hub serves on its MCP port. External, like `hub.endpoints`.
+  apiUrl: ""
+  # -- Inline PEM trust bundle for the hub's tunnel and enrollment server certificates, rendered into a ConfigMap and mounted as `PMF_HUB_CA_FILE`. The spoke needs this OUT OF BAND on first enrollment: the hub is in a different cluster and a different trust domain, so nothing in this cluster's trust store vouches for it. A CA certificate is public, so this is not secret material. Empty means the spoke trusts the bundle the hub returns at enrollment and caches it under `config.dataDir` — which is fine after the first successful enrollment, and is trust-on-first-use before it.
+  caBundle: ""
+  # -- Name of an existing Secret holding the hub trust bundle, used instead of `hub.caBundle`. The chart never creates it.
+  existingCASecret: ""
+  # -- Key inside `hub.existingCASecret` holding the PEM bundle.
+  caSecretKey: ca.crt
+  # -- Where the hub trust bundle is mounted.
+  caMountPath: /etc/prometheus-mcp-fleet/hub-ca
+  # -- `PMF_HUB_TLS_INSECURE`. Skips verification of the hub's server certificate, which lets anything on the network impersonate the hub and collect this cluster's metrics. It does nothing unless `hub.allowInsecure` is also true, and the chart refuses to render that combination without it.
+  tlsInsecure: false
+  # -- `PMF_ALLOW_INSECURE`. The second key that must be turned for any insecure option to take effect. Two independent settings mean an insecure spoke cannot be reached by a single typo.
+  allowInsecure: false
+
+enrollment:
+  # -- A single-use `pmf_enr_` enrollment token, rendered into a Secret by this chart. Convenient, but it puts the token into the Helm release values, which are stored in a Secret in this namespace and show up in `helm get values`. `enrollment.existingSecret` is better.
+  token: ""
+  # -- Name of an existing Secret holding the enrollment token. Preferred over `enrollment.token`. The chart never creates it.
+  existingSecret: ""
+  # -- Key inside the enrollment Secret holding the token.
+  secretKey: token
+  # -- Where the enrollment Secret is mounted, from which `PMF_ENROLLMENT_TOKEN_FILE` is derived.
+  mountPath: /etc/prometheus-mcp-fleet/enrollment
+
+prometheus:
+  # -- `PMF_PROMETHEUS_URL`. REQUIRED. The local, IN-CLUSTER Prometheus-compatible server this spoke proxies. Thanos Query, Mimir and Cortex all work: the spoke never parses the response body.
+  url: http://prometheus-operated.monitoring.svc:9090
+  # -- `PMF_PROMETHEUS_TIMEOUT`. Deliberately below the hub's `queryTimeout` so the spoke fails first and returns a useful error instead of the hub timing out blind.
+  timeout: 25s
+  # -- `PMF_PROMETHEUS_MAX_RESPONSE_BYTES`. Maximum bytes accepted from one Prometheus response.
+  maxResponseBytes: 33554432
+  bearerToken:
+    # -- Name of an existing Secret holding a bearer token for an authenticating Prometheus. Empty leaves `PMF_PROMETHEUS_BEARER_TOKEN_FILE` unset.
+    existingSecret: ""
+    # -- Key inside `prometheus.bearerToken.existingSecret`.
+    secretKey: token
+    # -- Where the bearer token Secret is mounted.
+    mountPath: /etc/prometheus-mcp-fleet/prometheus-auth
+  tls:
+    # -- Name of an existing Secret or ConfigMap holding the trust bundle for an https Prometheus. Empty leaves `PMF_PROMETHEUS_TLS_CA_FILE` unset.
+    existingSecret: ""
+    # -- Key inside `prometheus.tls.existingSecret` holding the PEM bundle.
+    secretKey: ca.crt
+    # -- Where the Prometheus trust bundle is mounted.
+    mountPath: /etc/prometheus-mcp-fleet/prometheus-ca
+    # -- `PMF_PROMETHEUS_TLS_SKIP_VERIFY`. Requires `hub.allowInsecure` as well; the chart refuses to render it otherwise.
+    skipVerify: false
+
+# -- Annotations for the spoke pods.
+podAnnotations: {}
+# -- Extra labels for the spoke pods.
+podLabels: {}
+
+podSecurityContext:
+  # -- Refuse to start any container in the pod as UID 0.
+  runAsNonRoot: true
+  # -- Pod UID. Set to `null` on OpenShift so the SCC can assign one from the namespace range.
+  runAsUser: 65532
+  # -- Pod GID. Set to `null` on OpenShift.
+  runAsGroup: 65532
+  # -- Supplemental filesystem group. Set to `null` on OpenShift.
+  fsGroup: 65532
+  # -- Seccomp profile for every container in the pod.
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  # -- Disallow gaining more privileges than the parent process.
+  allowPrivilegeEscalation: false
+  # -- Read-only root filesystem. The only writable path is the `/tmp` emptyDir.
+  readOnlyRootFilesystem: true
+  # -- Linux capabilities.
+  capabilities:
+    drop:
+      - ALL
+
+resources:
+  requests:
+    # -- CPU request. The spoke streams opaque bytes and never parses Prometheus JSON, so it is genuinely this small.
+    cpu: 25m
+    # -- Memory request.
+    memory: 64Mi
+  limits:
+    # -- Memory limit. Also the source of `GOMEMLIMIT` via the downward API.
+    memory: 256Mi
+    # There is deliberately NO default CPU limit. CFS-throttling the process that holds this
+    # cluster's only tunnel to the hub turns a CPU spike into a cluster that drops off the
+    # fleet. Set `resources.limits.cpu` only if a ResourceQuota forces you to.
+
+goRuntime:
+  # -- Set `GOMEMLIMIT` from `resources.limits.memory` via the downward API. Skipped when no memory limit is set, because the downward API would then report node allocatable.
+  memLimit: true
+  # -- Fraction of the memory limit used for `GOMEMLIMIT`, as a downward API divisor. 0.9 leaves headroom for non-Go allocations before the kernel OOM killer.
+  memLimitRatio: 0.9
+
+# -- `sizeLimit` of the `/tmp` emptyDir that makes `readOnlyRootFilesystem: true` workable.
+tmpDirSizeLimit: 32Mi
+
+ports:
+  # -- Container port of the metrics, health and pprof listener (`PMF_ADMIN_ADDR`). The spoke has no other listener: it DIALS the hub, so nothing ever connects in except a scraper and the kubelet.
+  admin: 9090
+
+config:
+  # -- `PMF_DATA_DIR`. Scratch directory for the cached hub trust bundle, and for the client key when `identity.backend` is `file`. It is the `/tmp` emptyDir; the chart refuses to render a path outside `/tmp` unless you mount a writable volume there yourself.
+  dataDir: /tmp/prometheus-mcp-fleet
+  # -- `PMF_LOG_LEVEL`. One of `debug`, `info`, `warn`, `error`.
+  logLevel: info
+  # -- `PMF_LOG_FORMAT`. One of `json`, `text`.
+  logFormat: json
+  # -- `PMF_FACTS_REFRESH_INTERVAL`. How often cluster facts are recollected and republished to the hub.
+  factsRefreshInterval: 10m
+  # -- `PMF_RECONNECT_MIN_BACKOFF`. Initial tunnel reconnect delay.
+  reconnectMinBackoff: 500ms
+  # -- `PMF_RECONNECT_MAX_BACKOFF`. Maximum tunnel reconnect delay. Keep it well under a scrape interval so a hub restart is invisible.
+  reconnectMaxBackoff: 30s
+  # -- `PMF_SHUTDOWN_DRAIN_DELAY`. Time `/readyz` reports 503 before the tunnels close.
+  shutdownDrainDelay: 5s
+  # -- `PMF_SHUTDOWN_GRACE`. Budget for draining in-flight Prometheus requests.
+  shutdownGrace: 30s
+  # -- `PMF_PPROF_ENABLED`. Exposes `/debug/pprof` on the admin listener.
+  pprofEnabled: false
+
+tracing:
+  # -- Enable OTLP trace export.
+  enabled: false
+  # -- `PMF_OTEL_EXPORTER_OTLP_ENDPOINT`. OTLP/gRPC collector endpoint.
+  endpoint: ""
+  # -- `PMF_TRACE_SAMPLE_RATIO`. Head sampling ratio between 0 and 1, as a string so YAML never reformats it.
+  sampleRatio: "0.05"
+
+service:
+  # -- Render a Service for the metrics port. This is the ONLY Service this chart renders: the spoke dials out and has nothing to publish. It is required for a ServiceMonitor.
+  enabled: true
+  # -- Service type. `ClusterIP` is the only sensible value; the chart refuses anything else, because publishing the spoke's admin listener outside the cluster exposes pprof and metrics.
+  type: ClusterIP
+  # -- Service port for metrics.
+  port: 9090
+  # -- Annotations for the Service.
+  annotations: {}
+  # -- Extra labels for the Service.
+  labels: {}
+
+networkPolicy:
+  # -- Render a NetworkPolicy. On by default: the spoke's egress set is small, known and worth pinning down, because this pod holds a credential that can read the whole cluster's metrics.
+  enabled: true
+  # -- Extra labels for the NetworkPolicy.
+  labels: {}
+  ingress:
+    # -- Allow ingress to the metrics port. The spoke accepts nothing else — the tunnel is outbound.
+    enabled: true
+    # -- `namespaceSelector` for the only namespace allowed to scrape the metrics port.
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: monitoring
+    # -- `podSelector` for scrapers allowed to reach the metrics port. Empty selects every pod in the selected namespaces.
+    podSelector: {}
+    # -- Additional raw `ingress.from` entries for the metrics port.
+    extraFrom: []
+  egress:
+    # -- Restrict spoke egress to DNS, the hub, Prometheus and the Kubernetes API.
+    enabled: true
+    # -- Allow DNS egress to `kube-system`.
+    allowDNS: true
+    hub:
+      # -- Allow egress to every port named in `hub.endpoints`. Without this the tunnel never establishes.
+      enabled: true
+      # -- CIDRs the hub may be reached at. `0.0.0.0/0` is the honest default: the hub lives outside this cluster and a NetworkPolicy cannot resolve a DNS name. Narrow it to your hub's addresses. Any `hub.endpoints` entry that is already an IP literal is added as an exact `/32` (or `/128`) rule automatically and does not need to appear here.
+      cidrs:
+        - 0.0.0.0/0
+    prometheus:
+      # -- Allow egress to the local Prometheus, on the port parsed from `prometheus.url`.
+      enabled: true
+      # -- `namespaceSelector` for the namespace Prometheus runs in.
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+      # -- `podSelector` for the Prometheus pods. Empty selects every pod in the selected namespaces.
+      podSelector: {}
+    kubeAPI:
+      # -- Allow egress to the Kubernetes API server. Required whenever `identity.backend` is `secret`; pointless otherwise.
+      enabled: true
+      # -- Port of the Kubernetes API server for the egress rule.
+      port: 443
+    # -- Raw additional `egress` rules, appended verbatim.
+    extraRules: []
+
+metrics:
+  serviceMonitor:
+    # -- Render a Prometheus Operator `ServiceMonitor` for the metrics port. Requires the `monitoring.coreos.com/v1` CRDs and `service.enabled`.
+    enabled: false
+    # -- Namespace for the ServiceMonitor. Empty means the release namespace.
+    namespace: ""
+    # -- Extra labels. Must match your Prometheus' `serviceMonitorSelector`.
+    labels: {}
+    # -- Annotations for the ServiceMonitor.
+    annotations: {}
+    # -- Scrape interval.
+    interval: 30s
+    # -- Scrape timeout.
+    scrapeTimeout: 10s
+    # -- `honorLabels`.
+    honorLabels: false
+    # -- Metrics path on the admin listener.
+    path: /metrics
+    # -- `relabelings` applied before scraping.
+    relabelings: []
+    # -- `metricRelabelings` applied after scraping.
+    metricRelabelings: []
+    # -- Service labels copied onto scraped metrics.
+    targetLabels: []
+
+  prometheusRule:
+    # -- Render a Prometheus Operator `PrometheusRule`. Requires the `monitoring.coreos.com/v1` CRDs.
+    enabled: false
+    # -- Namespace for the PrometheusRule. Empty means the release namespace.
+    namespace: ""
+    # -- Extra labels. Must match your Prometheus' `ruleSelector`.
+    labels: {}
+    # -- Annotations for the PrometheusRule.
+    annotations: {}
+    # -- Label matcher appended to every shipped expression. Empty means `job="<chart name>"`, which is what a default ServiceMonitor produces.
+    selector: ""
+    # -- Extra labels added to every shipped alert.
+    additionalRuleLabels: {}
+    # -- Runbook URL prefix; the alert name is appended.
+    runbookUrlPrefix: https://github.com/jacoknapp/prometheus-mcp-fleet/blob/main/docs/runbooks/
+    rules:
+      # -- `PrometheusMCPSpokeDown` — this spoke is not being scraped successfully.
+      spokeDown: true
+      # -- `PrometheusMCPSpokeTunnelDown` — `promfleet_spoke_tunnel_up` is 0 for some hub endpoint, so this cluster is invisible to every agent.
+      tunnelDown: true
+      # -- `PrometheusMCPSpokeTunnelFlapping` — `promfleet_spoke_tunnel_reconnects_total` rising faster than `thresholds.reconnectsPerHour`.
+      tunnelFlapping: true
+      # -- `PrometheusMCPSpokePrometheusDown` — `promfleet_spoke_prom_up` is 0, so the local Prometheus is unreachable.
+      prometheusDown: true
+      # -- `PrometheusMCPSpokeCertExpiringSoon` — `promfleet_spoke_client_cert_expiry_seconds` below `thresholds.certExpirySeconds`. Renewal happens at half life, so this firing means renewal is failing.
+      certExpiringSoon: true
+      # -- `PrometheusMCPSpokePromErrorRatioHigh` — 5xx ratio from the local Prometheus above `thresholds.promErrorRatio`.
+      promErrorRatioHigh: true
+      # -- `PrometheusMCPSpokeFactsRefreshFailing` — `promfleet_spoke_facts_refresh_total{result="error"}` rising, so the hub's view of this cluster is going stale.
+      factsRefreshFailing: true
+      # -- `PrometheusMCPSpokeAutoUpdateFailed` — the auto-update CronJob failed. Requires kube-state-metrics. Only rendered when `autoUpdate.enabled` is true.
+      autoUpdateFailed: true
+    thresholds:
+      # -- Tunnel reconnects in one hour above which `PrometheusMCPSpokeTunnelFlapping` fires.
+      reconnectsPerHour: 12
+      # -- Seconds of remaining client certificate validity below which `PrometheusMCPSpokeCertExpiringSoon` fires. 3 days against the hub's 14 day default TTL, which is well after the half-life renewal should have happened.
+      certExpirySeconds: 259200
+      # -- 5xx ratio from the local Prometheus above which `PrometheusMCPSpokePromErrorRatioHigh` fires.
+      promErrorRatio: 0.10
+    # -- Extra rule groups appended verbatim to `spec.groups`.
+    additionalGroups: []
+
+autoUpdate:
+  # -- Render a CronJob that resolves `autoUpdate.channelTag` to a digest, verifies the signature and SLSA provenance with cosign, and patches this Deployment to that DIGEST.
+  # OFF BY DEFAULT. An automatic weekly rollout to 100 production clusters is a fleet-wide
+  # outage delivery mechanism. That is why it is opt-in, digest-pinned, signature-verified,
+  # staggered by a hash of the release identity and split into cohorts. Read "Automatic
+  # updates" in the README before enabling it.
+  enabled: false
+  # -- Explicit cron schedule. Empty derives one from a hash of the release identity so a fleet spreads across a whole week instead of updating simultaneously.
+  schedule: ""
+  # -- IANA time zone for the schedule (Kubernetes >= 1.27). Empty means the kube-controller-manager's zone.
+  timeZone: ""
+  # -- Release cohort. `canary` accepts a promotion immediately, `early` after 72h, `stable` after 7 days. The cohort also shifts the derived weekday so canaries always move first.
+  cohort: stable
+  # -- Moving OCI tag the updater resolves to a digest. It is never written into the pod spec.
+  channelTag: stable
+  # -- Refuse to patch anything. Set alongside an explicit `image.digest` to freeze the workload while keeping the CronJob's verification output.
+  pinned: false
+  # -- Extra string mixed into the stagger hash. Empty means release name plus namespace. Set it to `cluster.id` when every cluster in your fleet uses the same release name and namespace, or all 100 will land on the same slot.
+  identity: ""
+  # -- `spec.concurrencyPolicy`.
+  concurrencyPolicy: Forbid
+  # -- `spec.startingDeadlineSeconds`.
+  startingDeadlineSeconds: 600
+  # -- `spec.successfulJobsHistoryLimit`.
+  successfulJobsHistoryLimit: 3
+  # -- `spec.failedJobsHistoryLimit`.
+  failedJobsHistoryLimit: 3
+  # -- `backoffLimit` of the update Job. 0 — a failed verified rollout must not be retried blindly.
+  backoffLimit: 0
+  # -- `activeDeadlineSeconds` of the update Job.
+  activeDeadlineSeconds: 900
+  # -- `ttlSecondsAfterFinished` of the update Job. Empty means unset.
+  ttlSecondsAfterFinished: ""
+  image:
+    # -- Registry of the updater image.
+    registry: ghcr.io
+    # -- Repository of the updater image. It MUST provide a POSIX shell plus `kubectl`, `cosign`, `crane` and `jq`; the hub and spoke images are distroless and have no shell. The job aborts if a tool is missing. Point this at your own internal image if you will not consume ours.
+    repository: jacoknapp/prometheus-mcp-fleet/updater
+    # -- Tag of the updater image. Empty means `.Chart.AppVersion`.
+    tag: ""
+    # -- Digest of the updater image. Strongly recommended: this image is handed write access to your workload.
+    digest: ""
+    # -- Pull policy for the updater image.
+    pullPolicy: IfNotPresent
+  # -- OIDC issuer that must have signed the image.
+  certificateOidcIssuer: https://token.actions.githubusercontent.com
+  # -- Regex the signing certificate's SAN identity must match. Narrow, never `.*`.
+  certificateIdentityRegexp: "^https://github\\.com/jacoknapp/prometheus-mcp-fleet/\\.github/workflows/.+@refs/tags/v.+$"
+  # -- Rekor transparency log URL. Empty uses cosign's default public instance.
+  rekorURL: ""
+  # -- `kubectl rollout status` timeout. On expiry the job runs `kubectl rollout undo`.
+  rolloutTimeout: 5m
+  resources:
+    requests:
+      # -- CPU request for the update job.
+      cpu: 50m
+      # -- Memory request for the update job.
+      memory: 128Mi
+    limits:
+      # -- Memory limit for the update job.
+      memory: 512Mi
+  # -- Pod security context for the update job. Deliberately does not pin a UID, because the updater image is not ours to make assumptions about.
+  podSecurityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  # -- Container security context for the update job.
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+  # -- `sizeLimit` of the writable scratch emptyDir the updater needs for cosign and crane caches.
+  scratchSizeLimit: 512Mi
+  # -- Node selector for the update job.
+  nodeSelector: {}
+  # -- Tolerations for the update job.
+  tolerations: []
+  # -- Extra environment variables for the update job, in raw `EnvVar` form. Proxy settings and registry credential helpers go here.
+  extraEnv: []
+
+tests:
+  image:
+    # -- Registry for the `helm test` image.
+    registry: docker.io
+    # -- Repository for the `helm test` image. Needs `wget`.
+    repository: busybox
+    # -- Tag for the `helm test` image.
+    tag: "1.37.0"
+    # -- Pull policy for the `helm test` image.
+    pullPolicy: IfNotPresent
+
+# -- Extra environment variables for the spoke container, in raw `EnvVar` form. The only supported way to set a `PMF_` key this chart does not model.
+extraEnv: []
+# -- Extra `envFrom` sources for the spoke container.
+extraEnvFrom: []
+# -- Extra volumes for the spoke pod.
+extraVolumes: []
+# -- Extra volume mounts for the spoke container.
+extraVolumeMounts: []
+# -- Init containers for the spoke pod.
+initContainers: []
+# -- Extra containers (sidecars) for the spoke pod.
+extraContainers: []
+# -- Extra arguments appended to the spoke command line. Flags beat environment (`--foo-bar` == `PMF_FOO_BAR`).
+extraArgs: []
+
+# -- `spec.template.spec.nodeSelector`.
+nodeSelector: {}
+# -- `spec.template.spec.tolerations`.
+tolerations: []
+# -- `spec.template.spec.affinity`.
+affinity: {}
+# -- `spec.template.spec.topologySpreadConstraints`. Never use `DoNotSchedule` in a default; it turns a scheduling hint into an outage on small clusters.
+topologySpreadConstraints: []
+# -- `spec.template.spec.priorityClassName`. The spoke is this cluster's only path to the fleet, so a system-cluster-critical class is defensible.
+priorityClassName: ""
+# -- `spec.template.spec.terminationGracePeriodSeconds`. Must exceed `config.shutdownDrainDelay` plus `config.shutdownGrace`.
+terminationGracePeriodSeconds: 60
+# -- `spec.template.spec.dnsPolicy`. Empty means the cluster default.
+dnsPolicy: ""
+# -- `spec.template.spec.dnsConfig`.
+dnsConfig: {}
+# -- `spec.template.spec.hostNetwork`.
+hostNetwork: false
+# -- Roll the pod when the rendered ConfigMap changes, by stamping its checksum as a pod annotation.
+restartOnConfigChange: true
+
+startupProbe:
+  # -- Enable the startup probe on `/healthz`. It is what lets the liveness probe stay aggressive while a first enrollment round-trips to the hub.
+  enabled: true
+  # -- Initial delay.
+  initialDelaySeconds: 0
+  # -- Probe period.
+  periodSeconds: 5
+  # -- Probe timeout.
+  timeoutSeconds: 3
+  # -- Failure threshold. 60 x 5s = 5 minutes to enrol against a hub that may be cold.
+  failureThreshold: 60
+  # -- Success threshold.
+  successThreshold: 1
+
+livenessProbe:
+  # -- Enable the liveness probe. It targets `/healthz`, which never checks a dependency — a dead Prometheus or an unreachable hub must NOT restart this pod, because a restart in `memory` identity mode burns another enrollment.
+  enabled: true
+  # -- Initial delay.
+  initialDelaySeconds: 0
+  # -- Probe period.
+  periodSeconds: 10
+  # -- Probe timeout.
+  timeoutSeconds: 3
+  # -- Failure threshold.
+  failureThreshold: 6
+  # -- Success threshold.
+  successThreshold: 1
+
+readinessProbe:
+  # -- Enable the readiness probe. It targets `/readyz`, which is 503 while no tunnel is attached or the local Prometheus has been failing for more than two refresh intervals.
+  enabled: true
+  # -- Initial delay.
+  initialDelaySeconds: 0
+  # -- Probe period.
+  periodSeconds: 10
+  # -- Probe timeout.
+  timeoutSeconds: 3
+  # -- Failure threshold.
+  failureThreshold: 3
+  # -- Success threshold.
+  successThreshold: 1
+
+# -- Extra manifests rendered verbatim. Each entry is a full object and is passed through `tpl`, so it may contain Helm templating.
+extraManifests: []

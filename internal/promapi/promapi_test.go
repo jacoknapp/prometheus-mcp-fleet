@@ -1,0 +1,468 @@
+// Copyright The prometheus-mcp-fleet Authors.
+// SPDX-License-Identifier: Apache-2.0
+
+package promapi
+
+import (
+	"errors"
+	"net/url"
+	"strings"
+	"testing"
+)
+
+func TestGetKnownAndUnknown(t *testing.T) {
+	t.Parallel()
+
+	for _, e := range Endpoints() {
+		r, err := Get(e)
+		if err != nil {
+			t.Fatalf("Get(%q): %v", e, err)
+		}
+		if r.Endpoint != e {
+			t.Errorf("Get(%q).Endpoint = %q", e, r.Endpoint)
+		}
+		if r.Method != "GET" && r.Method != "POST" {
+			t.Errorf("Get(%q).Method = %q, want GET or POST", e, r.Method)
+		}
+		if !strings.HasPrefix(r.PathTemplate, "/api/v1/") {
+			t.Errorf("Get(%q).PathTemplate = %q, want an /api/v1/ path", e, r.PathTemplate)
+		}
+		if r.Summary == "" {
+			t.Errorf("Get(%q) has no Summary; the docs generator needs one", e)
+		}
+	}
+
+	if _, err := Get("delete_series"); !errors.Is(err, ErrUnknownEndpoint) {
+		t.Fatalf("Get(unknown) error = %v, want ErrUnknownEndpoint", err)
+	}
+}
+
+// TestNoDestructiveEndpointExists is the structural guarantee that matters
+// most: the endpoints an attacker would want simply are not in the table, so
+// there is no filter to bypass.
+func TestNoDestructiveEndpointExists(t *testing.T) {
+	t.Parallel()
+
+	forbidden := []string{
+		"/api/v1/admin/tsdb/delete_series",
+		"/api/v1/admin/tsdb/clean_tombstones",
+		"/api/v1/admin/tsdb/snapshot",
+		"/api/v1/write",
+		"/api/v1/read",
+		"/-/reload",
+		"/-/quit",
+		"/debug/pprof/heap",
+	}
+	for _, path := range forbidden {
+		for _, method := range []string{"GET", "POST", "PUT", "DELETE"} {
+			if _, _, ok := Lookup(method, path); ok {
+				t.Errorf("Lookup(%q, %q) resolved; it must not exist in the allow-list", method, path)
+			}
+		}
+	}
+}
+
+func TestBuildPath(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		endpoint  Endpoint
+		labelName string
+		want      string
+		wantErr   error
+	}{
+		{
+			name: "plain path", endpoint: EndpointQuery, want: "/api/v1/query",
+		},
+		{
+			name:     "label values substitutes the label",
+			endpoint: EndpointLabelValues, labelName: "job",
+			want: "/api/v1/label/job/values",
+		},
+		{
+			name:     "label values with underscores",
+			endpoint: EndpointLabelValues, labelName: "_internal_id",
+			want: "/api/v1/label/_internal_id/values",
+		},
+		{
+			name:     "label name is required for label values",
+			endpoint: EndpointLabelValues, labelName: "",
+			wantErr: ErrInvalidLabelName,
+		},
+		{
+			name:     "label name rejected for other endpoints",
+			endpoint: EndpointQuery, labelName: "job",
+			wantErr: ErrInvalidParam,
+		},
+		{
+			name: "unknown endpoint", endpoint: "nope", wantErr: ErrUnknownEndpoint,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := BuildPath(tc.endpoint, tc.labelName)
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("BuildPath error = %v, want %v", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("BuildPath: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("BuildPath = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBuildPathRejectsTraversal covers the only user-influenced path component
+// in the whole system.
+func TestBuildPathRejectsTraversal(t *testing.T) {
+	t.Parallel()
+
+	hostile := []string{
+		"../../admin/tsdb/delete_series",
+		"..",
+		"job/../../..",
+		"job%2f..%2f..",
+		"job/values",
+		"job values",
+		"job\x00",
+		"job\n",
+		"jöb",
+		"job}",
+		"1job", // must start with a letter or underscore
+		strings.Repeat("a", 5000),
+	}
+	for _, label := range hostile {
+		t.Run(url.PathEscape(label), func(t *testing.T) {
+			t.Parallel()
+			got, err := BuildPath(EndpointLabelValues, label)
+			if err == nil {
+				t.Fatalf("BuildPath accepted hostile label %q and produced %q", label, got)
+			}
+			if !errors.Is(err, ErrInvalidLabelName) {
+				t.Fatalf("BuildPath(%q) error = %v, want ErrInvalidLabelName", label, err)
+			}
+		})
+	}
+}
+
+func TestValidate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		endpoint Endpoint
+		form     url.Values
+		gated    bool
+		wantErr  error
+	}{
+		{
+			name: "instant query", endpoint: EndpointQuery,
+			form: url.Values{"query": {"up"}},
+		},
+		{
+			name: "instant query with optional params", endpoint: EndpointQuery,
+			form: url.Values{
+				"query": {"rate(http_requests_total[5m])"},
+				"time":  {"2026-08-29T12:00:00Z"},
+				// A Unix timestamp is equally acceptable to Prometheus.
+				"timeout": {"30s"},
+				"limit":   {"100"},
+			},
+		},
+		{
+			name: "missing required query", endpoint: EndpointQuery,
+			form: url.Values{}, wantErr: ErrInvalidParam,
+		},
+		{
+			name: "unknown parameter is rejected, not dropped", endpoint: EndpointQuery,
+			form: url.Values{"query": {"up"}, "dedup": {"true"}}, wantErr: ErrInvalidParam,
+		},
+		{
+			name: "repeated non-repeatable parameter", endpoint: EndpointQuery,
+			form: url.Values{"query": {"up", "down"}}, wantErr: ErrInvalidParam,
+		},
+		{
+			name: "repeated matcher is fine", endpoint: EndpointSeries,
+			form: url.Values{"match[]": {`up`, `{job="api"}`}},
+		},
+		{
+			name: "range query needs start end and step", endpoint: EndpointQueryRange,
+			form:    url.Values{"query": {"up"}, "start": {"0"}, "end": {"60"}},
+			wantErr: ErrInvalidParam,
+		},
+		{
+			name: "range query complete", endpoint: EndpointQueryRange,
+			form: url.Values{"query": {"up"}, "start": {"0"}, "end": {"60"}, "step": {"15s"}},
+		},
+		{
+			name: "bad time", endpoint: EndpointQuery,
+			form: url.Values{"query": {"up"}, "time": {"yesterday"}}, wantErr: ErrInvalidParam,
+		},
+		{
+			name: "bad duration", endpoint: EndpointQuery,
+			form: url.Values{"query": {"up"}, "timeout": {"soon"}}, wantErr: ErrInvalidParam,
+		},
+		{
+			name: "negative integer", endpoint: EndpointQuery,
+			form: url.Values{"query": {"up"}, "limit": {"-1"}}, wantErr: ErrInvalidParam,
+		},
+		{
+			name: "enum out of range", endpoint: EndpointTargets,
+			form: url.Values{"state": {"everything"}}, wantErr: ErrInvalidParam,
+		},
+		{
+			name: "enum in range", endpoint: EndpointTargets,
+			form: url.Values{"state": {"active"}},
+		},
+		{
+			name: "control character in PromQL", endpoint: EndpointQuery,
+			form: url.Values{"query": {"up\x00"}}, wantErr: ErrInvalidParam,
+		},
+		{
+			name: "newline in PromQL is rejected", endpoint: EndpointQuery,
+			form: url.Values{"query": {"up\nDROP"}}, wantErr: ErrInvalidParam,
+		},
+		{
+			name: "oversized PromQL", endpoint: EndpointQuery,
+			form: url.Values{"query": {strings.Repeat("a", MaxPromQLBytes+1)}}, wantErr: ErrInvalidParam,
+		},
+		{
+			name: "too many repeats", endpoint: EndpointSeries,
+			form: url.Values{"match[]": repeat(`up`, MaxRepeatedParams+1)}, wantErr: ErrInvalidParam,
+		},
+		{
+			name: "gated endpoint refused by default", endpoint: EndpointConfig,
+			form: url.Values{}, wantErr: ErrEndpointGated,
+		},
+		{
+			name: "gated endpoint allowed when enabled", endpoint: EndpointConfig,
+			form: url.Values{}, gated: true,
+		},
+		{
+			name: "invalid metric name", endpoint: EndpointMetadata,
+			form: url.Values{"metric": {"has-a-dash"}}, wantErr: ErrInvalidParam,
+		},
+		{
+			name: "recording rule name with a colon is valid", endpoint: EndpointMetadata,
+			form: url.Values{"metric": {"job:requests:rate5m"}},
+		},
+		{
+			name: "empty matcher", endpoint: EndpointSeries,
+			form: url.Values{"match[]": {"   "}}, wantErr: ErrInvalidParam,
+		},
+		{
+			name: "unknown endpoint", endpoint: "nope", wantErr: ErrUnknownEndpoint,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := Validate(tc.endpoint, tc.form, tc.gated)
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("Validate error = %v, want %v", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Validate: %v", err)
+			}
+		})
+	}
+}
+
+func TestLookup(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		method    string
+		path      string
+		wantOK    bool
+		wantEP    Endpoint
+		wantLabel string
+	}{
+		{"instant query", "POST", "/api/v1/query", true, EndpointQuery, ""},
+		{"method is case insensitive", "post", "/api/v1/query", true, EndpointQuery, ""},
+		{"wrong method for the route", "GET", "/api/v1/query", false, "", ""},
+		{"label values", "GET", "/api/v1/label/job/values", true, EndpointLabelValues, "job"},
+		{"label values percent-encoded", "GET", "/api/v1/label/my_label/values", true, EndpointLabelValues, "my_label"},
+		{"targets", "GET", "/api/v1/targets", true, EndpointTargets, ""},
+		{"trailing slash is not the same route", "POST", "/api/v1/query/", false, "", ""},
+		{"prefix is not enough", "POST", "/api/v1/query_extra", false, "", ""},
+		{"relative traversal", "POST", "/api/v1/query/../../admin", false, "", ""},
+		{"double slash", "POST", "//api/v1/query", false, "", ""},
+		{"backslash", "POST", `\api\v1\query`, false, "", ""},
+		{"null byte", "POST", "/api/v1/query\x00", false, "", ""},
+		{"empty path", "POST", "", false, "", ""},
+		{"relative path", "POST", "api/v1/query", false, "", ""},
+		{"label segment with a slash", "GET", "/api/v1/label/a/b/values", false, "", ""},
+		{"label segment traversal encoded", "GET", "/api/v1/label/%2e%2e/values", false, "", ""},
+		{"label segment empty", "GET", "/api/v1/label//values", false, "", ""},
+		{"gated route still resolves", "GET", "/api/v1/status/config", true, EndpointConfig, ""},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r, label, ok := Lookup(tc.method, tc.path)
+			if ok != tc.wantOK {
+				t.Fatalf("Lookup(%q, %q) ok = %v, want %v", tc.method, tc.path, ok, tc.wantOK)
+			}
+			if !ok {
+				return
+			}
+			if r.Endpoint != tc.wantEP {
+				t.Errorf("endpoint = %q, want %q", r.Endpoint, tc.wantEP)
+			}
+			if label != tc.wantLabel {
+				t.Errorf("label = %q, want %q", label, tc.wantLabel)
+			}
+		})
+	}
+}
+
+// TestBuildPathLookupRoundTrip proves the hub and the spoke agree: anything the
+// hub can construct, the spoke will accept, and nothing else.
+func TestBuildPathLookupRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	for _, e := range Endpoints() {
+		r, err := Get(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		label := ""
+		if r.HasPathParam() {
+			label = "job"
+		}
+		path, err := BuildPath(e, label)
+		if err != nil {
+			t.Fatalf("BuildPath(%q): %v", e, err)
+		}
+		got, gotLabel, ok := Lookup(r.Method, path)
+		if !ok {
+			t.Fatalf("Lookup(%q, %q) failed for a path BuildPath produced", r.Method, path)
+		}
+		if got.Endpoint != e {
+			t.Errorf("round trip for %q resolved to %q", e, got.Endpoint)
+		}
+		if gotLabel != label {
+			t.Errorf("round trip for %q returned label %q, want %q", e, gotLabel, label)
+		}
+	}
+}
+
+func TestValidateLabelName(t *testing.T) {
+	t.Parallel()
+
+	valid := []string{"job", "_x", "a1", "A_B_9", "__name__"}
+	invalid := []string{"", "1a", "a-b", "a.b", "a b", "a/b", "ä", "a\x00"}
+
+	for _, s := range valid {
+		if err := ValidateLabelName(s); err != nil {
+			t.Errorf("ValidateLabelName(%q) = %v, want nil", s, err)
+		}
+	}
+	for _, s := range invalid {
+		if err := ValidateLabelName(s); !errors.Is(err, ErrInvalidLabelName) {
+			t.Errorf("ValidateLabelName(%q) = %v, want ErrInvalidLabelName", s, err)
+		}
+	}
+}
+
+func TestValidateDuration(t *testing.T) {
+	t.Parallel()
+
+	valid := []string{"5m", "1h30m", "500ms", "1w", "2d", "1y", "30", "0.5"}
+	invalid := []string{"", "soon", "5 m", "-5m", "0", "m5", "5x"}
+
+	for _, s := range valid {
+		if err := validateDuration(s); err != nil {
+			t.Errorf("validateDuration(%q) = %v, want nil", s, err)
+		}
+	}
+	for _, s := range invalid {
+		if err := validateDuration(s); err == nil {
+			t.Errorf("validateDuration(%q) = nil, want an error", s)
+		}
+	}
+}
+
+func TestValidateTime(t *testing.T) {
+	t.Parallel()
+
+	valid := []string{"2026-08-29T12:00:00Z", "2026-08-29T12:00:00.123Z", "1756468800", "1756468800.5", "0"}
+	invalid := []string{"", "yesterday", "2026-08-29", "now-1h"}
+
+	for _, s := range valid {
+		if err := validateTime(s); err != nil {
+			t.Errorf("validateTime(%q) = %v, want nil", s, err)
+		}
+	}
+	for _, s := range invalid {
+		if err := validateTime(s); err == nil {
+			t.Errorf("validateTime(%q) = nil, want an error", s)
+		}
+	}
+}
+
+// FuzzLookup asserts that no input can make the allow-list resolve to a path
+// outside the table, and that Lookup never panics.
+func FuzzLookup(f *testing.F) {
+	seeds := []string{
+		"/api/v1/query", "/api/v1/label/job/values", "/api/v1/../admin",
+		"/api/v1/label/%2e%2e%2f/values", "", "/", "//", "/api/v1/label//values",
+	}
+	for _, s := range seeds {
+		f.Add("GET", s)
+		f.Add("POST", s)
+	}
+	f.Fuzz(func(t *testing.T, method, path string) {
+		r, label, ok := Lookup(method, path)
+		if !ok {
+			return
+		}
+		// Whatever resolved must be a real route, and rebuilding its path from
+		// the captured label must reproduce the input exactly. If it does not,
+		// two different strings map to one route and the spoke's re-validation
+		// is not equivalent to the hub's construction.
+		rebuilt, err := BuildPath(r.Endpoint, label)
+		if err != nil {
+			t.Fatalf("Lookup(%q, %q) resolved to %q but BuildPath failed: %v",
+				method, path, r.Endpoint, err)
+		}
+		if rebuilt != path {
+			t.Fatalf("Lookup(%q, %q) resolved to a path that rebuilds as %q",
+				method, path, rebuilt)
+		}
+	})
+}
+
+// FuzzValidate asserts Validate never panics on arbitrary parameter input.
+func FuzzValidate(f *testing.F) {
+	f.Add("query", "query", "up")
+	f.Add("query_range", "step", "15s")
+	f.Add("targets", "state", "active")
+	f.Fuzz(func(t *testing.T, endpoint, key, value string) {
+		_ = Validate(Endpoint(endpoint), url.Values{key: {value}}, false)
+		_ = Validate(Endpoint(endpoint), url.Values{key: {value}}, true)
+	})
+}
+
+func repeat(s string, n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = s
+	}
+	return out
+}

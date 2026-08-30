@@ -1,0 +1,86 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# ---------------------------------------------------------------------------
+# CHART VALUE CONTRACT (charts/prometheus-mcp-hub)
+# ---------------------------------------------------------------------------
+# This file, plus the two --set-string flags the workflow passes, is the only
+# place the e2e job depends on the hub chart's values schema. If the chart
+# renames a key, fix it here and in .github/workflows/e2e.yml and nowhere else.
+# `.github/workflows/e2e.yml` preflights this with `helm template` before it
+# builds anything, so a schema drift fails in seconds with a named cause.
+#
+# The chart deliberately provides no way to inject credentials through values:
+# Helm stores release values in a Secret that anyone with namespace read can
+# render with `helm get values`. The e2e job therefore reads the bootstrap
+# admin token out of the hub's own log, mints an agent key and an enrollment
+# token through the admin API, and reads the CA bundle from `GET /pki/bundle`.
+# Nothing credential-shaped belongs in this file.
+# ---------------------------------------------------------------------------
+image:
+  # `make images REGISTRY=localhost/prometheus-mcp-fleet` produces this name.
+  registry: localhost
+  repository: prometheus-mcp-fleet/hub
+  tag: e2e
+  # Digest is deliberately empty: the image is side-loaded into kind, so there
+  # is no registry to resolve a digest against.
+  digest: ""
+  # Never means kind's side-loaded copy is authoritative and a typo in the
+  # image name fails immediately instead of hanging on ImagePullBackOff.
+  pullPolicy: Never
+
+replicaCount: 1
+
+# No `persistence` block: BUILD_SPEC addendum 7a removed the PVC entirely. Hub
+# state is a Kubernetes Secret and the hub is a plain Deployment.
+
+service:
+  type: ClusterIP
+tunnel:
+  serverNames:
+    - pmf-hub-tunnel.prometheus-mcp-hub.svc
+  service:
+    type: ClusterIP
+
+# A PDB on a single-replica workload blocks node drains; off in CI as in the
+# production defaults.
+podDisruptionBudget:
+  enabled: false
+
+# kind's default CNI does not enforce NetworkPolicy, so an enabled policy would
+# be silently inert and give false confidence. Policy rendering is covered by
+# helm-unittest and kubeconform instead.
+networkPolicy:
+  enabled: false
+
+# Standard Ingress only (BUILD_SPEC 1.12). Not exercised here: the suite reaches
+# MCP through `kubectl port-forward`, so an Ingress controller would be one more
+# moving part between the assertion and the thing being asserted.
+ingress:
+  enabled: false
+
+metrics:
+  serviceMonitor:
+    enabled: false
+  prometheusRule:
+    enabled: false
+
+autoUpdate:
+  enabled: false
+
+config:
+  logLevel: debug
+  logFormat: json
+  trustDomain: e2e.local
+  # Required: it is the RFC 9728 "resource" and the target of the 401 challenge.
+  publicURL: http://pmf-hub.prometheus-mcp-hub.svc:8080/mcp
+  # Short TTLs keep the suite honest about renewal paths without slowing it.
+  spokeCertTTL: 1h
+  enrollmentTokenTTL: 30m
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 1Gi

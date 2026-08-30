@@ -1,0 +1,20 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# The minimum a real install must supply. cluster.id, hub.endpoints and
+# hub.apiUrl have NO defaults on purpose: the hub is in a different cluster, so
+# there is no in-cluster address to fall back to, and two clusters sharing an ID
+# would fight over one certificate identity.
+cluster:
+  id: prod-us-east-1
+  displayName: Production US East 1
+  description: Customer-facing workloads, us-east-1
+  labels:
+    env: prod
+    region: us-east-1
+hub:
+  endpoints:
+    - hub.example.com:8443
+  apiUrl: https://hub.example.com
+enrollment:
+  existingSecret: spoke-enrollment

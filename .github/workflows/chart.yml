@@ -1,0 +1,315 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Helm chart quality gates for charts/prometheus-mcp-hub and
+# charts/prometheus-mcp-spoke. Unprivileged: `contents: read` everywhere, so a
+# fork PR runs the identical set with no secrets.
+name: chart
+
+on:
+  pull_request:
+    paths:
+      - "charts/**"
+      - ".github/workflows/chart.yml"
+      - ".github/ct.yaml"
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chart-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # renovate: datasource=github-releases depName=helm/helm
+  HELM_VERSION: "v3.21.4"
+  # renovate: datasource=github-releases depName=helm-unittest/helm-unittest
+  HELM_UNITTEST_VERSION: "1.1.2"
+  # renovate: datasource=github-releases depName=norwoodj/helm-docs
+  HELM_DOCS_VERSION: "v1.14.2"
+  # renovate: datasource=github-releases depName=kubernetes-sigs/kind
+  KIND_VERSION: "v0.33.0"
+  CHARTS: "charts/prometheus-mcp-hub charts/prometheus-mcp-spoke"
+
+jobs:
+  lint:
+    name: helm lint
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # `make helm-lint` loops over each chart's ci/ directory. An empty loop is
+      # silent, so a chart with no ci/ values file would lint only its defaults
+      # while the job still reports "helm lint --strict over every ci/ values
+      # file". Assert the inputs exist rather than trusting a green tick.
+      - name: Require both charts and their ci/ values files to exist
+        run: |
+          set -euo pipefail
+          missing=0
+          for c in ${CHARTS}; do
+            if [ ! -f "${c}/Chart.yaml" ]; then
+              echo "::error::${c}/Chart.yaml is missing; the chart workflow cannot be a no-op"
+              missing=1
+              continue
+            fi
+            if ! ls "${c}"/ci/*.yaml >/dev/null 2>&1; then
+              echo "::error file=${c}/Chart.yaml::${c}/ci/ has no values files. Every chart must ship at least one ci/*-values.yaml, otherwise 'helm lint --strict' and kubeconform only ever see the defaults."
+              missing=1
+            fi
+          done
+          exit "${missing}"
+
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      # `make helm-lint` runs `helm lint --strict` on each chart and then again
+      # once per file in that chart's ci/ directory.
+      - name: helm lint --strict (all ci/ values files)
+        run: make helm-lint
+
+      - name: helm template smoke test
+        run: make helm-template
+
+  unittest:
+    name: helm unittest
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Installs Helm and the helm-unittest plugin, then runs the suites in
+      # charts/*/tests including the __snapshot__ golden files.
+      - name: helm unittest
+        uses: d3adb5/helm-unittest-action@985d798b675caa501251573380b5e026ff768c50 # v2.5.1
+        with:
+          helm-version: ${{ env.HELM_VERSION }}
+          unittest-version: ${{ env.HELM_UNITTEST_VERSION }}
+          github-token: ${{ github.token }}
+          charts: charts/prometheus-mcp-hub charts/prometheus-mcp-spoke
+
+  kubeconform:
+    name: kubeconform k8s ${{ matrix.k8s }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # The three supported control-plane versions. Keep in step with the
+        # `ct` matrix below and with the support statement in the chart READMEs.
+        k8s: ["1.28.15", "1.31.14", "1.34.11"]
+    env:
+      # kubeconform is run from its own digest-pinned image so the schema
+      # validator itself is reproducible.
+      KUBECONFORM_IMAGE: ghcr.io/yannh/kubeconform:v0.8.0@sha256:faffaf43f95aa6425306e1ab8d6fcad72acb9049158f38e574c085ea1ec0f64e
+      # ServiceMonitor / PrometheusRule / HTTPRoute have no schema in the
+      # upstream catalogue; datree's CRD catalogue supplies them.
+      CRD_SCHEMA: "https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json"
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Render and validate every chart x ci/ values combination
+        env:
+          K8S_VERSION: ${{ matrix.k8s }}
+        run: |
+          set -euo pipefail
+          docker pull --quiet "${KUBECONFORM_IMAGE}"
+
+          validate() {
+            local chart="$1" values="$2"
+            echo "==> ${chart} (${values:-defaults}) against k8s ${K8S_VERSION}"
+            local args=(template release-name "${chart}" --kube-version "${K8S_VERSION}")
+            if [ -n "${values}" ]; then
+              args+=(--values "${values}")
+            fi
+            helm "${args[@]}" \
+              | docker run --rm -i "${KUBECONFORM_IMAGE}" \
+                  -strict \
+                  -summary \
+                  -verbose \
+                  -kubernetes-version "${K8S_VERSION}" \
+                  -schema-location default \
+                  -schema-location "${CRD_SCHEMA}" \
+                  -
+          }
+
+          rc=0
+          for chart in ${CHARTS}; do
+            validate "${chart}" "" || rc=1
+            for values in "${chart}"/ci/*.yaml; do
+              [ -e "${values}" ] || continue
+              validate "${chart}" "${values}" || rc=1
+            done
+          done
+          exit "${rc}"
+
+  chart-testing:
+    name: ct k8s ${{ matrix.k8s }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - k8s: "1.28.15"
+            node_image: "kindest/node:v1.28.15@sha256:a7c05c7ae043a0b8c818f5a06188bc2c4098f6cb59ca7d1856df00375d839251"
+          - k8s: "1.31.14"
+            node_image: "kindest/node:v1.31.14@sha256:6f86cf509dbb42767b6e79debc3f2c32e4ee01386f0489b3b2be24b0a55aac2b"
+          - k8s: "1.34.11"
+            node_image: "kindest/node:v1.34.11@sha256:44e222ee2132dab25ff87301682f89eb82c7880ea3a1bf543bfe9708fd08d67d"
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # ct diffs against the target branch to find changed charts.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Set up chart-testing
+        uses: helm/chart-testing-action@6ec842c01de15ebb84c8627d2744a0c2f2755c9f # v2.8.0
+
+      - name: ct lint
+        env:
+          # On a push to main there is no diff base, so lint everything.
+          CT_SCOPE: ${{ github.event_name == 'pull_request' && '--target-branch main' || '--all' }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086 # CT_SCOPE is a deliberate word-split flag pair.
+          ct lint --config .github/ct.yaml --check-version-increment ${CT_SCOPE}
+
+      - name: Create kind cluster
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        with:
+          version: ${{ env.KIND_VERSION }}
+          node_image: ${{ matrix.node_image }}
+          cluster_name: ct-${{ matrix.k8s }}
+          wait: 300s
+
+      - name: ct install
+        env:
+          CT_SCOPE: ${{ github.event_name == 'pull_request' && '--target-branch main' || '--all' }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086 # CT_SCOPE is a deliberate word-split flag pair.
+          ct install --config .github/ct.yaml ${CT_SCOPE}
+
+      - name: Dump cluster state on failure
+        if: failure()
+        run: |
+          set +e
+          mkdir -p ct-debug
+          kubectl cluster-info dump --all-namespaces --output-directory ct-debug/cluster-dump
+          kubectl get events --all-namespaces --sort-by=.lastTimestamp > ct-debug/events.txt
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ct-debug-${{ matrix.k8s }}
+          path: ct-debug
+          if-no-files-found: warn
+          retention-days: 7
+
+  helm-docs:
+    name: helm-docs (verify only)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Verify only: `git-push` stays false so this job never needs write
+      # access and can therefore run safely on fork pull requests.
+      - name: Verify chart READMEs are regenerated
+        uses: losisin/helm-docs-github-action@3a4528e97c49a5e83de6b78c50c61c8ee5c9f944 # v2.0.0
+        with:
+          version: ${{ env.HELM_DOCS_VERSION }}
+          chart-search-root: charts
+          git-push: "false"
+          fail-on-diff: "true"
+
+  chart-required:
+    name: chart-required
+    if: always()
+    needs: [lint, unittest, kubeconform, chart-testing, helm-docs]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Fail if any required job did not succeed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          set -euo pipefail
+          echo "upstream results: ${RESULTS}"
+          for r in ${RESULTS}; do
+            if [ "${r}" != "success" ]; then
+              echo "::error::a required chart job reported '${r}'"
+              exit 1
+            fi
+          done

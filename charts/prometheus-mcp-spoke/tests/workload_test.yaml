@@ -1,0 +1,220 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+suite: spoke workload shape, probes, resources and PMF_ environment
+templates:
+  - templates/deployment.yaml
+  - templates/configmap.yaml
+  - templates/service.yaml
+  - templates/serviceaccount.yaml
+  - templates/rbac.yaml
+  - templates/networkpolicy.yaml
+set:
+  cluster:
+    id: prod-us-east-1
+  hub:
+    endpoints:
+      - hub.example.com:8443
+    apiUrl: https://hub.example.com
+
+tests:
+  - it: renders no StatefulSet and no PersistentVolumeClaim anywhere
+    asserts:
+      - notEqual:
+          path: kind
+          value: StatefulSet
+      - notEqual:
+          path: kind
+          value: PersistentVolumeClaim
+
+  - it: is a Deployment with no volumeClaimTemplates
+    template: templates/deployment.yaml
+    asserts:
+      - isKind:
+          of: Deployment
+      - notExists:
+          path: spec.volumeClaimTemplates
+      - notExists:
+          path: spec.serviceName
+
+  - it: uses Recreate, because two spokes sharing one cluster ID would fight over one identity
+    template: templates/deployment.yaml
+    asserts:
+      - equal:
+          path: spec.strategy.type
+          value: Recreate
+      - notExists:
+          path: spec.strategy.rollingUpdate
+      - equal:
+          path: spec.replicas
+          value: 1
+
+  - it: probes /healthz for startup and liveness and /readyz for readiness, all on admin
+    template: templates/deployment.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe.httpGet.path
+          value: /healthz
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe.httpGet.port
+          value: admin
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.httpGet.path
+          value: /healthz
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.httpGet.port
+          value: admin
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet.path
+          value: /readyz
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet.port
+          value: admin
+
+  - it: requests 25m/64Mi, limits memory to 256Mi and sets NO cpu limit
+    template: templates/deployment.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.requests.cpu
+          value: 25m
+      - equal:
+          path: spec.template.spec.containers[0].resources.requests.memory
+          value: 64Mi
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits.memory
+          value: 256Mi
+      - notExists:
+          path: spec.template.spec.containers[0].resources.limits.cpu
+
+  - it: takes GOMEMLIMIT from the memory limit and PMF_NAMESPACE from the downward API
+    template: templates/deployment.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GOMEMLIMIT
+            valueFrom:
+              resourceFieldRef:
+                containerName: spoke
+                resource: limits.memory
+                divisor: "1.1111"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PMF_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+
+  - it: exposes only the admin port, because the spoke dials out
+    template: templates/deployment.yaml
+    asserts:
+      - lengthEqual:
+          path: spec.template.spec.containers[0].ports
+          count: 1
+      - equal:
+          path: spec.template.spec.containers[0].ports[0].name
+          value: admin
+      - equal:
+          path: spec.template.spec.containers[0].ports[0].containerPort
+          value: 9090
+
+  - it: emits every PMF_ key from internal/config/spoke.go and no invented one
+    template: templates/configmap.yaml
+    documentIndex: 0
+    asserts:
+      - equal:
+          path: "data.PMF_HUB_ENDPOINTS"
+          value: "hub.example.com:8443"
+      - equal:
+          path: "data.PMF_HUB_API_URL"
+          value: "https://hub.example.com"
+      - equal:
+          path: "data.PMF_CLUSTER_ID"
+          value: "prod-us-east-1"
+      - equal:
+          path: "data.PMF_IDENTITY_BACKEND"
+          value: "secret"
+      - equal:
+          path: "data.PMF_IDENTITY_SECRET_NAME"
+          value: "RELEASE-NAME-prometheus-mcp-spoke-identity"
+      - equal:
+          path: "data.PMF_ADMIN_ADDR"
+          value: ":9090"
+      - equal:
+          path: "data.PMF_PROMETHEUS_URL"
+          value: "http://prometheus-operated.monitoring.svc:9090"
+      - equal:
+          path: "data.PMF_DATA_DIR"
+          value: "/tmp/prometheus-mcp-fleet"
+
+  - it: renders byte counts as integers, not as Go float notation the loader would reject
+    template: templates/configmap.yaml
+    documentIndex: 0
+    asserts:
+      - equal:
+          path: "data.PMF_PROMETHEUS_MAX_RESPONSE_BYTES"
+          value: "33554432"
+
+  - it: joins multiple hub endpoints with commas, one tunnel per endpoint
+    template: templates/configmap.yaml
+    documentIndex: 0
+    set:
+      hub:
+        endpoints:
+          - hub-0.example.com:8443
+          - hub-1.example.com:8443
+    asserts:
+      - equal:
+          path: "data.PMF_HUB_ENDPOINTS"
+          value: "hub-0.example.com:8443,hub-1.example.com:8443"
+
+  - it: renders cluster labels deterministically as k=v pairs
+    template: templates/configmap.yaml
+    documentIndex: 0
+    set:
+      cluster:
+        labels:
+          region: us-east-1
+          env: prod
+    asserts:
+      - equal:
+          path: "data.PMF_CLUSTER_LABELS"
+          value: "env=prod,region=us-east-1"
+
+  - it: never references a hub Service, hub namespace or hub release name
+    template: templates/configmap.yaml
+    documentIndex: 0
+    asserts:
+      - notMatchRegex:
+          path: "data.PMF_HUB_ENDPOINTS"
+          pattern: "\\.svc"
+      - notMatchRegex:
+          path: "data.PMF_HUB_API_URL"
+          pattern: "\\.svc"
+
+  - it: pins the image by digest when one is given, ignoring the tag
+    template: templates/deployment.yaml
+    set:
+      image:
+        tag: v9.9.9
+        digest: sha256:2222222222222222222222222222222222222222222222222222222222222222
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/jacoknapp/prometheus-mcp-fleet/spoke@sha256:2222222222222222222222222222222222222222222222222222222222222222
+
+  - it: publishes only a ClusterIP metrics Service
+    template: templates/service.yaml
+    asserts:
+      - equal:
+          path: spec.type
+          value: ClusterIP
+      - lengthEqual:
+          path: spec.ports
+          count: 1
+      - equal:
+          path: spec.ports[0].name
+          value: metrics
+      - equal:
+          path: spec.ports[0].targetPort
+          value: admin

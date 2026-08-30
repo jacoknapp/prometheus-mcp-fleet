@@ -1,0 +1,14 @@
+{
+  "status": "success",
+  "data": {
+    "up": [
+      { "type": "gauge", "help": "1 if the target is reachable, 0 otherwise.", "unit": "" }
+    ],
+    "kube_pod_info": [
+      { "type": "gauge", "help": "Information about pod.", "unit": "" }
+    ],
+    "node_cpu_seconds_total": [
+      { "type": "counter", "help": "Seconds the CPUs spent in each mode.", "unit": "seconds" }
+    ]
+  }
+}

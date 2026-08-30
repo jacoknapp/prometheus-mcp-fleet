@@ -1,0 +1,129 @@
+prometheus-mcp-spoke {{ .Chart.Version }} (app {{ .Chart.AppVersion }}) installed as {{ .Release.Name }} in {{ include "prometheus-mcp-spoke.namespace" . }}.
+
+Cluster ID: {{ .Values.cluster.id }}
+Image:      {{ include "prometheus-mcp-spoke.image" . }}
+{{- if not .Values.image.digest }}
+  Pinned by TAG, not digest. For production set image.digest.
+{{- end }}
+
+This spoke DIALS OUT. It opens nothing inbound except the metrics port on {{ int .Values.ports.admin }}.
+  Hub tunnel:     {{ join ", " .Values.hub.endpoints }}
+  Hub enrollment: {{ .Values.hub.apiUrl }}
+  Prometheus:     {{ .Values.prometheus.url }}
+
+Identity ({{ .Values.identity.backend }})
+{{- if eq .Values.identity.backend "secret" }}
+  The issued key and certificate are written to the Secret
+  {{ include "prometheus-mcp-spoke.identitySecretName" . }}, so a restart reuses the
+  existing certificate and does NOT need another enrollment token. That costs exactly
+  one namespaced Role with get,create,update on that one Secret by name -- see the
+  chart README, section "RBAC".
+{{- else if eq .Values.identity.backend "memory" }}
+
+  ####################################################################
+  #  identity.backend=memory - ZERO RBAC, AND A WEAKER TOKEN         #
+  #                                                                  #
+  #  The client key exists only in this pod's memory. Every restart  #
+  #  - node drain, image update, OOM, eviction - throws it away and  #
+  #  the spoke RE-ENROLS from scratch. A single-use enrollment token #
+  #  is therefore not enough: you must issue a MULTI-USE token,      #
+  #  which is a standing credential that mints cluster identities    #
+  #  and lives in this cluster indefinitely.                         #
+  #                                                                  #
+  #  That is a strictly worse security posture than the one Role     #
+  #  that identity.backend=secret needs. Use memory only if your     #
+  #  policy forbids the spoke any RBAC at all.                       #
+  ####################################################################
+{{- else }}
+
+  ####################################################################
+  #  identity.backend=file                                           #
+  #                                                                  #
+  #  {{ .Values.config.dataDir }} is the /tmp emptyDir, so in a pod
+  #  this behaves exactly like "memory" while looking durable: the   #
+  #  key is lost on every restart and re-enrollment needs a          #
+  #  multi-use token. The file backend is for running the binary     #
+  #  outside Kubernetes. Use "secret" here.                          #
+  ####################################################################
+{{- end }}
+
+{{- if not (include "prometheus-mcp-spoke.hasEnrollment" .) }}
+
+WARNING - no enrollment token was supplied.
+  Neither enrollment.token nor enrollment.existingSecret is set, so the spoke has no
+  way to obtain a certificate and will stay NotReady until it does. Mint one on the
+  hub and either upgrade with enrollment.existingSecret=<secret> or create the Secret
+  {{ include "prometheus-mcp-spoke.enrollmentSecretName" . }} with key {{ .Values.enrollment.secretKey }}.
+{{- end }}
+
+{{- if and (not .Values.hub.caBundle) (not .Values.hub.existingCASecret) }}
+
+NOTE - no hub trust bundle was supplied (hub.caBundle / hub.existingCASecret are empty).
+  The hub is in another cluster and another trust domain, so nothing here vouches for
+  it. The spoke will accept the bundle the hub returns at enrollment and cache it --
+  trust on first use. That is fine on a trusted path and not fine on the open internet.
+  Supply the bundle out of band for a properly authenticated first enrollment.
+{{- end }}
+
+{{- if .Values.hub.allowInsecure }}
+
+WARNING - hub.allowInsecure is TRUE.
+  {{ if .Values.hub.tlsInsecure }}hub.tlsInsecure is on: anything on the network can impersonate the hub and
+  collect this cluster's metrics. {{ end }}{{ if .Values.prometheus.tls.skipVerify }}prometheus.tls.skipVerify is on. {{ end }}This is a lab setting. Remove it.
+{{- end }}
+
+Verify
+  kubectl -n {{ include "prometheus-mcp-spoke.namespace" . }} rollout status deploy/{{ include "prometheus-mcp-spoke.fullname" . }}
+  kubectl -n {{ include "prometheus-mcp-spoke.namespace" . }} logs deploy/{{ include "prometheus-mcp-spoke.fullname" . }} -f
+  helm test {{ .Release.Name }} -n {{ include "prometheus-mcp-spoke.namespace" . }}
+
+If the spoke cannot reach the hub
+  This is the usual first-install failure, and it is almost always a network or DNS
+  problem in THIS cluster, on the outbound path. The hub never dials in, so there is
+  nothing to fix on the hub's firewall. Work down this list:
+
+  1. The pod stays Running but NotReady, and the log repeats a dial error. That is
+     correct behaviour: /healthz never checks a dependency, so an unreachable hub must
+     not restart the pod.
+  2. DNS. Resolve the hub name from inside this cluster:
+       kubectl -n {{ include "prometheus-mcp-spoke.namespace" . }} exec deploy/{{ include "prometheus-mcp-spoke.fullname" . }} -- nslookup {{ if .Values.hub.endpoints }}{{ include "prometheus-mcp-spoke.endpointHost" (first .Values.hub.endpoints) }}{{ else }}<hub host>{{ end }}
+     (the spoke image is distroless, so run this from a debug pod if exec has no shell).
+  3. Egress. {{ if .Values.networkPolicy.enabled }}This release rendered a NetworkPolicy. Its hub rule is an ipBlock, because
+     the hub is not in this cluster and cannot be selected by namespace. Confirm the
+     hub's real address falls inside networkPolicy.egress.hub.cidrs
+     ({{ join ", " .Values.networkPolicy.egress.hub.cidrs }}), and that {{ range $i, $e := .Values.hub.endpoints }}{{ if $i }}, {{ end }}port {{ include "prometheus-mcp-spoke.endpointPort" $e }}{{ end }} is allowed.
+     Also check any OTHER NetworkPolicy in this namespace: policies are additive only
+     for allow, and a default-deny egress policy elsewhere still applies.{{ else }}networkPolicy.enabled=false here, so check for a cluster-wide default-deny
+     egress policy, a service mesh sidecar, or an egress gateway in front of you.{{ end }}
+  4. Corporate proxy or egress NAT. The tunnel is raw mTLS over TCP, NOT HTTP, so an
+     HTTP forward proxy cannot carry it and HTTPS_PROXY is not consulted. It needs a
+     real TCP path to {{ join ", " .Values.hub.endpoints }}.
+  5. TLS. "certificate signed by unknown authority" means the trust bundle is wrong:
+     set hub.caBundle or hub.existingCASecret. "certificate is valid for X, not Y"
+     means the hub's tunnel.serverNames does not list the address you put in
+     hub.endpoints -- that is fixed on the hub, not here.
+  6. Enrollment 401/409. A single-use token that was already redeemed returns a replay
+     error; mint a fresh one. In identity.backend=memory every restart redeems again,
+     which is why that mode needs a multi-use token.
+
+{{- if .Values.autoUpdate.enabled }}
+
+AUTO-UPDATE IS ENABLED.
+  Schedule: {{ include "prometheus-mcp-spoke.autoUpdate.schedule" . }} (cohort {{ .Values.autoUpdate.cohort }}, minimum soak {{ include "prometheus-mcp-spoke.autoUpdate.minAgeHours" . }}h)
+  An automatic weekly rollout to 100 production clusters is a fleet-wide outage
+  delivery mechanism. It is off by default for that reason. The job only ever applies
+  a digest whose cosign signature AND SLSA provenance verified, and it rolls back a
+  failed rollout.
+  {{- if not .Values.autoUpdate.identity }}
+  autoUpdate.identity is empty, so the stagger hash is derived from
+  "{{ .Release.Name }}/{{ include "prometheus-mcp-spoke.namespace" . }}". If every cluster in your fleet uses that same
+  release name and namespace, ALL of them landed on the same slot and the stagger did
+  nothing. Set autoUpdate.identity={{ .Values.cluster.id }}.
+  {{- end }}
+{{- end }}
+
+{{- if .Values.config.pprofEnabled }}
+
+pprof is enabled on the metrics listener. Confirm networkPolicy.enabled=true and that
+networkPolicy.ingress.namespaceSelector is as narrow as you think it is.
+{{- end }}

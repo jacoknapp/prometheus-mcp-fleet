@@ -1,0 +1,21 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "cluster": {
+      "description": "Optional cluster to check the referenced metric names against. Costs one cheap metadata call and turns a typo into a named suggestion.",
+      "type": "string"
+    },
+    "query": {
+      "description": "PromQL expression to check. It is never evaluated, so this is safe to call on an expression you are unsure about.",
+      "examples": [
+        "rate(http_requests_total{job=\"api\"}[5m])"
+      ],
+      "maxLength": 8192,
+      "type": "string"
+    }
+  },
+  "required": [
+    "query"
+  ],
+  "type": "object"
+}

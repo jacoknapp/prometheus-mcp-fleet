@@ -1,0 +1,203 @@
+{{/*
+Copyright The prometheus-mcp-fleet Authors.
+SPDX-License-Identifier: Apache-2.0
+
+An unattended weekly rollout to a fleet of clusters is a fleet-wide outage
+delivery mechanism. That is why this is off by default, why it only ever
+applies a DIGEST whose cosign signature and SLSA provenance both verified, why
+the schedule is derived from a hash of the release identity so 100 clusters
+spread across a week, why cohorts exist, and why a failed rollout is rolled
+back. Read "Automatic updates" in the README before enabling it.
+*/}}
+{{- if .Values.autoUpdate.enabled -}}
+{{- include "prometheus-mcp-hub.validate" . -}}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "prometheus-mcp-hub.autoUpdateName" . }}
+  namespace: {{ include "prometheus-mcp-hub.namespace" . }}
+  labels:
+    {{- include "prometheus-mcp-hub.componentLabels" (list . "hub-autoupdate") | nindent 4 }}
+  {{- with (include "prometheus-mcp-hub.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  {{/*
+    Schedule is DERIVED, not fixed: minute = h%60, hour = 2 + h%4,
+    weekday = (h + cohortShift) % 7 with h = adler32(release/namespace). A fleet
+    installing the same chart therefore spreads its updates across a whole week
+    instead of every cluster pulling one new digest in the same minute.
+  */}}
+  schedule: {{ include "prometheus-mcp-hub.autoUpdate.schedule" . | quote }}
+  {{- with .Values.autoUpdate.timeZone }}
+  timeZone: {{ . | quote }}
+  {{- end }}
+  concurrencyPolicy: {{ .Values.autoUpdate.concurrencyPolicy }}
+  startingDeadlineSeconds: {{ .Values.autoUpdate.startingDeadlineSeconds }}
+  successfulJobsHistoryLimit: {{ .Values.autoUpdate.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.autoUpdate.failedJobsHistoryLimit }}
+  jobTemplate:
+    metadata:
+      labels:
+        {{- include "prometheus-mcp-hub.componentLabels" (list . "hub-autoupdate") | nindent 8 }}
+    spec:
+      backoffLimit: {{ .Values.autoUpdate.backoffLimit }}
+      activeDeadlineSeconds: {{ .Values.autoUpdate.activeDeadlineSeconds }}
+      {{- if ne (toString .Values.autoUpdate.ttlSecondsAfterFinished) "" }}
+      ttlSecondsAfterFinished: {{ int .Values.autoUpdate.ttlSecondsAfterFinished }}
+      {{- end }}
+      template:
+        metadata:
+          labels:
+            {{- include "prometheus-mcp-hub.componentLabels" (list . "hub-autoupdate") | nindent 12 }}
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ include "prometheus-mcp-hub.autoUpdate.serviceAccountName" . }}
+          automountServiceAccountToken: true
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.autoUpdate.podSecurityContext | nindent 12 }}
+          {{- with .Values.autoUpdate.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.autoUpdate.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: update
+              image: {{ include "prometheus-mcp-hub.autoUpdate.image" . | quote }}
+              imagePullPolicy: {{ .Values.autoUpdate.image.pullPolicy }}
+              securityContext:
+                {{- toYaml .Values.autoUpdate.containerSecurityContext | nindent 16 }}
+              env:
+                - name: HOME
+                  value: /tmp
+                - name: WORKLOAD_KIND
+                  value: deployment
+                - name: WORKLOAD_NAME
+                  value: {{ include "prometheus-mcp-hub.fullname" . | quote }}
+                - name: CONTAINER_NAME
+                  value: hub
+                - name: IMAGE_REPO
+                  value: {{ include "prometheus-mcp-hub.imageRepository" . | quote }}
+                - name: CHANNEL_TAG
+                  value: {{ .Values.autoUpdate.channelTag | quote }}
+                - name: COHORT
+                  value: {{ .Values.autoUpdate.cohort | quote }}
+                {{/* Minimum soak before this cohort accepts a promotion:
+                     canary 0h, early 72h, stable 168h. */}}
+                - name: MIN_AGE_HOURS
+                  value: {{ include "prometheus-mcp-hub.autoUpdate.minAgeHours" . | quote }}
+                - name: PINNED
+                  value: {{ .Values.autoUpdate.pinned | quote }}
+                - name: CERT_OIDC_ISSUER
+                  value: {{ .Values.autoUpdate.certificateOidcIssuer | quote }}
+                - name: CERT_IDENTITY_REGEXP
+                  value: {{ .Values.autoUpdate.certificateIdentityRegexp | quote }}
+                - name: REKOR_URL
+                  value: {{ .Values.autoUpdate.rekorURL | quote }}
+                - name: ROLLOUT_TIMEOUT
+                  value: {{ .Values.autoUpdate.rolloutTimeout | quote }}
+                {{- with .Values.autoUpdate.extraEnv }}
+                {{- toYaml . | nindent 16 }}
+                {{- end }}
+              resources:
+                {{- toYaml .Values.autoUpdate.resources | nindent 16 }}
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+              command:
+                - /bin/sh
+                - -eu
+                - -c
+                - |
+                  log() { echo "[auto-update] $*"; }
+
+                  if [ "$PINNED" = "true" ]; then
+                    log "autoUpdate.pinned=true - refusing to patch $WORKLOAD_KIND/$WORKLOAD_NAME"
+                    exit 0
+                  fi
+
+                  for bin in kubectl cosign crane jq date; do
+                    if ! command -v "$bin" >/dev/null 2>&1; then
+                      log "FATAL: '$bin' is not in this image. autoUpdate.image must provide a POSIX shell plus kubectl, cosign, crane and jq. Refusing to update."
+                      exit 1
+                    fi
+                  done
+
+                  REKOR_ARGS=""
+                  if [ -n "$REKOR_URL" ]; then REKOR_ARGS="--rekor-url $REKOR_URL"; fi
+
+                  log "resolving $IMAGE_REPO:$CHANNEL_TAG to a digest"
+                  DIGEST="$(crane digest "$IMAGE_REPO:$CHANNEL_TAG")"
+                  case "$DIGEST" in
+                    sha256:*) ;;
+                    *) log "FATAL: '$DIGEST' is not a sha256 digest"; exit 1 ;;
+                  esac
+                  REF="$IMAGE_REPO@$DIGEST"
+                  log "candidate is $REF"
+
+                  # Both verifications must pass. Neither is advisory: `set -e` aborts
+                  # the job on a non-zero exit, the image is never patched, and the
+                  # failed Job raises PrometheusMCPAutoUpdateFailed.
+                  log "verifying cosign signature"
+                  cosign verify \
+                    --certificate-oidc-issuer "$CERT_OIDC_ISSUER" \
+                    --certificate-identity-regexp "$CERT_IDENTITY_REGEXP" \
+                    $REKOR_ARGS "$REF" > /tmp/cosign-verify.json
+                  log "verifying SLSA provenance attestation"
+                  cosign verify-attestation \
+                    --type slsaprovenance \
+                    --certificate-oidc-issuer "$CERT_OIDC_ISSUER" \
+                    --certificate-identity-regexp "$CERT_IDENTITY_REGEXP" \
+                    $REKOR_ARGS "$REF" > /tmp/cosign-attest.json
+
+                  # Cohort soak gate, approximated by the image build timestamp, which
+                  # is never later than promotion. An unparseable timestamp fails closed.
+                  if [ "$MIN_AGE_HOURS" -gt 0 ]; then
+                    CREATED="$(crane config "$REF" | jq -r '.created // empty')"
+                    CREATED_EPOCH="$(date -u -d "$CREATED" +%s 2>/dev/null || true)"
+                    if [ -z "$CREATED_EPOCH" ]; then
+                      log "FATAL: cannot determine the age of $REF (created='$CREATED'); cohort $COHORT requires ${MIN_AGE_HOURS}h of soak, so refusing"
+                      exit 1
+                    fi
+                    AGE_HOURS=$(( ( $(date -u +%s) - CREATED_EPOCH ) / 3600 ))
+                    if [ "$AGE_HOURS" -lt "$MIN_AGE_HOURS" ]; then
+                      log "cohort $COHORT requires ${MIN_AGE_HOURS}h of soak, digest is ${AGE_HOURS}h old - not updating yet"
+                      exit 0
+                    fi
+                    log "cohort $COHORT satisfied: digest is ${AGE_HOURS}h old"
+                  fi
+
+                  CURRENT="$(kubectl get "$WORKLOAD_KIND" "$WORKLOAD_NAME" \
+                    -o "jsonpath={.spec.template.spec.containers[?(@.name=='$CONTAINER_NAME')].image}")"
+                  if [ "$CURRENT" = "$REF" ]; then
+                    log "already running $DIGEST - nothing to do"
+                    exit 0
+                  fi
+
+                  log "patching $WORKLOAD_KIND/$WORKLOAD_NAME from '$CURRENT' to the verified digest"
+                  kubectl patch "$WORKLOAD_KIND" "$WORKLOAD_NAME" --type=strategic \
+                    -p "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"$CONTAINER_NAME\",\"image\":\"$REF\"}]}}}}"
+
+                  if ! kubectl rollout status "$WORKLOAD_KIND/$WORKLOAD_NAME" --timeout="$ROLLOUT_TIMEOUT"; then
+                    log "rollout did not become healthy within $ROLLOUT_TIMEOUT - rolling back"
+                    kubectl rollout undo "$WORKLOAD_KIND/$WORKLOAD_NAME"
+                    kubectl rollout status "$WORKLOAD_KIND/$WORKLOAD_NAME" --timeout="$ROLLOUT_TIMEOUT" || true
+                    log "FATAL: update to $DIGEST rolled back"
+                    exit 1
+                  fi
+                  log "updated to $DIGEST"
+          volumes:
+            # cosign and crane need a writable HOME and cache; the container
+            # still runs with readOnlyRootFilesystem: true.
+            - name: tmp
+              emptyDir:
+                sizeLimit: {{ .Values.autoUpdate.scratchSizeLimit }}
+{{- end }}

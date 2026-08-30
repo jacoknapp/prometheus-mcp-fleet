@@ -1,0 +1,104 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "clusters": {
+      "description": "Explicit cluster names. Omit to select by labelSelector.",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "concurrency": {
+      "default": 8,
+      "description": "How many clusters to query at once.",
+      "maximum": 32,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "deadline": {
+      "default": "60s",
+      "description": "Overall budget for the whole fan-out, e.g. \"60s\". On expiry the clusters that finished are returned; the rest are reported as timed out.",
+      "examples": [
+        "60s",
+        "5m"
+      ],
+      "type": "string"
+    },
+    "end": {
+      "default": "now",
+      "description": "Range end for mode \"range\". Defaults to now.",
+      "type": "string"
+    },
+    "labelSelector": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "Select clusters whose labels all match, e.g. {\"env\":\"prod\"}. One of clusters or labelSelector is required unless the fleet is small.",
+      "examples": [
+        {
+          "env": "prod"
+        }
+      ],
+      "type": "object"
+    },
+    "maxClusters": {
+      "default": 25,
+      "description": "Maximum clusters to query.",
+      "maximum": 100,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "maxSeriesPerCluster": {
+      "default": 5,
+      "description": "Maximum series to keep from each cluster. Deliberately small: 100 clusters times 20 series would defeat every other budget here. Aggregate in the expression instead.",
+      "maximum": 50,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "mode": {
+      "default": "instant",
+      "description": "Evaluation mode.",
+      "enum": [
+        "instant",
+        "range"
+      ],
+      "type": "string"
+    },
+    "onError": {
+      "default": "partial",
+      "description": "What to do when some clusters fail.",
+      "enum": [
+        "partial",
+        "fail"
+      ],
+      "type": "string"
+    },
+    "query": {
+      "description": "PromQL expression to run on every selected cluster. It is validated once at the hub before dispatch.",
+      "examples": [
+        "sum(up == 0)"
+      ],
+      "type": "string"
+    },
+    "start": {
+      "default": "now-1h",
+      "description": "Range start for mode \"range\". Relative (\"now-6h\") or RFC 3339. Defaults to now-1h.",
+      "type": "string"
+    },
+    "step": {
+      "description": "Resolution for mode \"range\". Omit to let the hub choose one step common to every cluster; the applied step is reported in downsampled.",
+      "type": "string"
+    },
+    "time": {
+      "description": "Evaluation instant for mode \"instant\". Relative (\"now-15m\") or RFC 3339. Defaults to now.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "query"
+  ],
+  "type": "object"
+}

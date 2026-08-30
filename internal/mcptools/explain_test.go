@@ -1,0 +1,442 @@
+// Copyright The prometheus-mcp-fleet Authors.
+// SPDX-License-Identifier: Apache-2.0
+
+package mcptools
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/google/go-cmp/cmp"
+
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/promapi"
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/promproxy"
+)
+
+// TestExplainPromQLNeverErrors is the defining property of this tool: an
+// invalid expression is the answer, not a failure. An isError result would tell
+// the model its call went wrong rather than its query.
+func TestExplainPromQLNeverErrors(t *testing.T) {
+	t.Parallel()
+	inputs := []string{
+		"",
+		"   ",
+		"up",
+		`rate(http_requests_total{job="api"}[5m])`,
+		`rate(http_requests_total{job=api}[5m])`,
+		"sum(",
+		")",
+		"}",
+		"]",
+		"up{",
+		`up{job="`,
+		"up[",
+		"up[5x]",
+		"up[]",
+		"up offset",
+		"{__name__=~\".+\"}",
+		strings.Repeat("(", 5000),
+		strings.Repeat("a", MaxPromQLBytes+1),
+		"\x00\x01\x02",
+		"日本語メトリクス",
+		"# just a comment",
+		"1 + 1",
+		"up # comment {",
+		"topk(5, sum by(job) (rate(x_total[5m])))",
+		"quantile_over_time(0.99, up[1h:5m])",
+		`label_replace(up, "x", "$1", "job", "(.*)")`,
+	}
+	for _, in := range inputs {
+		t.Run(shortName(in), func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t)
+			fn := run(h.tools, ToolExplainPromQL,
+				func() *ExplainPromQLOut { return &ExplainPromQLOut{} }, h.tools.explainPromQL)
+			out, res, err := fn(ctx(t), request(ToolExplainPromQL, h.p), ExplainPromQLIn{Query: in})
+			if err != nil {
+				t.Fatalf("explain_promql returned an error for %q: %v", in, err)
+			}
+			if res.IsError {
+				t.Errorf("explain_promql marked %q as a tool error", in)
+			}
+			if out == nil {
+				t.Fatal("nil result")
+			}
+			if out.Error != nil {
+				t.Errorf("explain_promql produced a tool error body: %+v", out.Error)
+			}
+			if !out.Valid && out.Message == "" {
+				t.Errorf("%q was rejected without a message", in)
+			}
+		})
+	}
+}
+
+// shortName makes a readable subtest name from an expression.
+func shortName(s string) string {
+	s = strings.ReplaceAll(s, "/", "_")
+	s = strings.ReplaceAll(s, " ", "_")
+	if len(s) > 32 {
+		s = s[:32]
+	}
+	if s == "" {
+		return "empty"
+	}
+	return s
+}
+
+// TestExplainPromQLValid covers the analysis of well-formed expressions.
+func TestExplainPromQLValid(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name         string
+		query        string
+		wantMetrics  []string
+		wantFuncs    []string
+		wantAggs     []string
+		wantWindows  []string
+		wantLabels   []string
+		wantSelector int
+	}{
+		{
+			name: "bare selector", query: "up",
+			wantMetrics: []string{"up"}, wantSelector: 1,
+		},
+		{
+			name:        "rate over a counter",
+			query:       `rate(http_requests_total{job="api",code=~"5.."}[5m])`,
+			wantMetrics: []string{"http_requests_total"}, wantFuncs: []string{"rate"},
+			wantWindows: []string{"5m"}, wantLabels: []string{"code", "job"}, wantSelector: 1,
+		},
+		{
+			name:         "aggregation with grouping",
+			query:        `sum by(namespace) (rate(container_cpu_usage_seconds_total[5m]))`,
+			wantMetrics:  []string{"container_cpu_usage_seconds_total"},
+			wantFuncs:    []string{"rate"},
+			wantAggs:     []string{"sum"},
+			wantWindows:  []string{"5m"},
+			wantLabels:   []string{"namespace"},
+			wantSelector: 1,
+		},
+		{
+			name:  "binary operator over two metrics",
+			query: `node_filesystem_avail_bytes / node_filesystem_size_bytes`,
+			wantMetrics: []string{
+				"node_filesystem_avail_bytes", "node_filesystem_size_bytes"},
+			wantSelector: 2,
+		},
+		{
+			name:         "histogram quantile",
+			query:        `histogram_quantile(0.99, sum by(le) (rate(x_bucket[5m])))`,
+			wantMetrics:  []string{"x_bucket"},
+			wantFuncs:    []string{"histogram_quantile", "rate"},
+			wantAggs:     []string{"sum"},
+			wantWindows:  []string{"5m"},
+			wantLabels:   []string{"le"},
+			wantSelector: 1,
+		},
+		{
+			name: "constant", query: "1 + 2", wantSelector: 0,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t)
+			out, terr := h.tools.explainPromQL(ctx(t), h.p, ExplainPromQLIn{Query: tc.query})
+			if terr != nil {
+				t.Fatalf("explainPromQL: %v", terr)
+			}
+			if !out.Valid {
+				t.Fatalf("%q was rejected: %s", tc.query, out.Message)
+			}
+			if diff := cmp.Diff(tc.wantMetrics, out.MetricsReferenced); diff != "" {
+				t.Errorf("metrics (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(tc.wantFuncs, out.Functions); diff != "" {
+				t.Errorf("functions (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(tc.wantAggs, out.Aggregations); diff != "" {
+				t.Errorf("aggregations (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(tc.wantWindows, out.RangeWindows); diff != "" {
+				t.Errorf("rangeWindows (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(tc.wantLabels, out.LabelsReferenced); diff != "" {
+				t.Errorf("labels (-want +got):\n%s", diff)
+			}
+			if out.Summary == "" {
+				t.Error("no summary")
+			}
+		})
+	}
+}
+
+// TestExplainPromQLInvalid covers each structural fault and its caret.
+func TestExplainPromQLInvalid(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name        string
+		query       string
+		wantMessage string
+		wantCaretAt int
+	}{
+		{
+			name: "unquoted matcher value", query: `up{job=api}`,
+			wantMessage: "expected string", wantCaretAt: 8,
+		},
+		{
+			name: "unclosed brace", query: `up{job="api"`,
+			wantMessage: "unclosed", wantCaretAt: 3,
+		},
+		{
+			name: "unclosed paren", query: `sum(rate(x[5m])`,
+			wantMessage: "unclosed", wantCaretAt: 4,
+		},
+		{
+			name: "unexpected close", query: `up)`,
+			wantMessage: "unexpected", wantCaretAt: 3,
+		},
+		{
+			name: "mismatched close", query: `sum(up}`,
+			wantMessage: "expected to close", wantCaretAt: 7,
+		},
+		{
+			name: "unterminated string", query: `up{job="api}`,
+			wantMessage: "unterminated string", wantCaretAt: 8,
+		},
+		{
+			name: "bad duration", query: `rate(up[5x])`,
+			wantMessage: "not a valid duration", wantCaretAt: 9,
+		},
+		{
+			name: "unclosed range", query: `rate(up[5m)`,
+			wantMessage: "unclosed range selector", wantCaretAt: 8,
+		},
+		{
+			name: "stray close bracket", query: `up]`,
+			wantMessage: "unexpected", wantCaretAt: 3,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t)
+			out, terr := h.tools.explainPromQL(ctx(t), h.p, ExplainPromQLIn{Query: tc.query})
+			if terr != nil {
+				t.Fatalf("explainPromQL: %v", terr)
+			}
+			if out.Valid {
+				t.Fatalf("%q was accepted", tc.query)
+			}
+			if !strings.Contains(out.Message, tc.wantMessage) {
+				t.Errorf("message = %q, want it to contain %q", out.Message, tc.wantMessage)
+			}
+			if out.Caret == "" {
+				t.Fatal("no caret")
+			}
+			if len(out.Caret) != tc.wantCaretAt {
+				t.Errorf("caret is %d characters, want %d so it lands on the fault:\n%s\n%s",
+					len(out.Caret), tc.wantCaretAt, tc.query, out.Caret)
+			}
+			if strings.TrimSpace(out.Caret) != "^" {
+				t.Errorf("caret = %q", out.Caret)
+			}
+		})
+	}
+}
+
+// TestExplainPromQLCounterAdvice covers the advisory that stops a model
+// graphing a monotonically rising counter and calling it a spike.
+func TestExplainPromQLCounterAdvice(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	out, terr := h.tools.explainPromQL(ctx(t), h.p,
+		ExplainPromQLIn{Query: "http_requests_total"})
+	if terr != nil {
+		t.Fatalf("explainPromQL: %v", terr)
+	}
+	if len(out.Suggestions) == 0 {
+		t.Fatal("no advice about reading a counter raw")
+	}
+	if !strings.Contains(out.Suggestions[0], "rate(") {
+		t.Errorf("suggestion does not offer the fix: %q", out.Suggestions[0])
+	}
+
+	// Wrapped in rate(), the advice must not fire.
+	wrapped, terr := h.tools.explainPromQL(ctx(t), h.p,
+		ExplainPromQLIn{Query: "rate(http_requests_total[5m])"})
+	if terr != nil {
+		t.Fatalf("explainPromQL: %v", terr)
+	}
+	for _, s := range wrapped.Suggestions {
+		if strings.Contains(s, "looks like a counter") {
+			t.Errorf("counter advice fired on a rated counter: %q", s)
+		}
+	}
+}
+
+// TestExplainPromQLUnknownFunction covers the advisory for a misspelled
+// function, which must not make the expression "invalid": this hub's function
+// list will fall behind upstream and a false rejection is worse than a hint.
+func TestExplainPromQLUnknownFunction(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	out, terr := h.tools.explainPromQL(ctx(t), h.p,
+		ExplainPromQLIn{Query: "raet(up[5m])"})
+	if terr != nil {
+		t.Fatalf("explainPromQL: %v", terr)
+	}
+	if !out.Valid {
+		t.Error("an unrecognised function name made the expression invalid")
+	}
+	var advised bool
+	for _, s := range out.Suggestions {
+		if strings.Contains(s, "not one this hub recognises") {
+			advised = true
+		}
+	}
+	if !advised {
+		t.Errorf("no advisory for an unknown function: %v", out.Suggestions)
+	}
+}
+
+// TestExplainPromQLChecksMetricExistence covers the cluster-aware path and its
+// did-you-mean.
+func TestExplainPromQLChecksMetricExistence(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	out, terr := h.tools.explainPromQL(ctx(t), h.p, ExplainPromQLIn{
+		Query: "rate(container_cpu_usage_second_total[5m])", Cluster: okCluster,
+	})
+	if terr != nil {
+		t.Fatalf("explainPromQL: %v", terr)
+	}
+	if out.ClusterChecked != okCluster {
+		t.Errorf("clusterChecked = %q", out.ClusterChecked)
+	}
+	if diff := cmp.Diff([]string{"container_cpu_usage_second_total"},
+		out.UnknownMetrics); diff != "" {
+		t.Errorf("unknownMetrics (-want +got):\n%s", diff)
+	}
+	var suggested bool
+	for _, s := range out.Suggestions {
+		if strings.Contains(s, "container_cpu_usage_seconds_total") {
+			suggested = true
+		}
+	}
+	if !suggested {
+		t.Errorf("no did-you-mean for a one-character typo: %v", out.Suggestions)
+	}
+
+	// A metric that does exist produces no complaint.
+	good, terr := h.tools.explainPromQL(ctx(t), h.p, ExplainPromQLIn{
+		Query: "rate(container_cpu_usage_seconds_total[5m])", Cluster: okCluster,
+	})
+	if terr != nil {
+		t.Fatalf("explainPromQL: %v", terr)
+	}
+	if len(good.UnknownMetrics) != 0 {
+		t.Errorf("unknownMetrics = %v", good.UnknownMetrics)
+	}
+}
+
+// TestExplainPromQLSkipsCheckGracefully proves an unreachable cluster degrades
+// the enrichment, not the answer.
+func TestExplainPromQLSkipsCheckGracefully(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		cluster string
+		setup   func(*harness)
+	}{
+		{name: "unknown cluster", cluster: "no-such-cluster"},
+		{
+			name: "upstream failure", cluster: okCluster,
+			setup: func(h *harness) {
+				h.prom.set(string(promapi.EndpointLabelValues)+"/__name__",
+					fakeResponse{err: promproxy.ErrUpstream})
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t)
+			if tc.setup != nil {
+				tc.setup(h)
+			}
+			out, terr := h.tools.explainPromQL(ctx(t), h.p,
+				ExplainPromQLIn{Query: "rate(up[5m])", Cluster: tc.cluster})
+			if terr != nil {
+				t.Fatalf("explainPromQL errored: %v", terr)
+			}
+			if !out.Valid {
+				t.Error("the structural answer was lost with the enrichment")
+			}
+			if out.CheckSkipped == "" {
+				t.Error("the skipped check was not explained; an empty unknownMetrics " +
+					"would read as 'everything exists'")
+			}
+			if out.ClusterChecked != "" {
+				t.Errorf("clusterChecked = %q despite the check not happening",
+					out.ClusterChecked)
+			}
+		})
+	}
+}
+
+// TestExplainPromQLNoClusterSaysSo covers the no-cluster notice.
+func TestExplainPromQLNoClusterSaysSo(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	out, terr := h.tools.explainPromQL(ctx(t), h.p, ExplainPromQLIn{Query: "up"})
+	if terr != nil {
+		t.Fatalf("explainPromQL: %v", terr)
+	}
+	if !strings.Contains(out.CheckSkipped, "No cluster") {
+		t.Errorf("checkSkipped = %q", out.CheckSkipped)
+	}
+}
+
+// TestValidDuration covers the duration grammar the range-selector check uses.
+func TestValidDuration(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		in   string
+		want bool
+	}{
+		{"5m", true}, {"1h30m", true}, {"500ms", true}, {"1d", true}, {"1w", true},
+		{"1y", true}, {"300", true}, {"", false}, {"5x", false}, {"m5", false},
+		{"5m5", false}, {"-5m", false}, {"5.5m", false},
+	}
+	for _, tc := range tests {
+		if got := validDuration(tc.in); got != tc.want {
+			t.Errorf("validDuration(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestNearestNames covers the metric did-you-mean ranking.
+func TestNearestNames(t *testing.T) {
+	t.Parallel()
+	candidates := []string{
+		"node_cpu_seconds_total", "node_memory_MemAvailable_bytes",
+		"container_cpu_usage_seconds_total", "up",
+	}
+	got := nearestNames("node_cpu_second_total", candidates, 3)
+	if len(got) == 0 || got[0] != "node_cpu_seconds_total" {
+		t.Errorf("nearestNames = %v", got)
+	}
+	// Nothing remotely similar produces nothing, rather than a confident wrong
+	// suggestion.
+	if got := nearestNames("zzzzzzzzzzzzzzzz", candidates, 3); len(got) != 0 {
+		t.Errorf("nearestNames on an unrelated name = %v, want none", got)
+	}
+	if got := nearestNames("up", candidates, 0); got != nil {
+		t.Errorf("n=0 returned %v", got)
+	}
+	if got := nearestNames("up", nil, 3); got != nil {
+		t.Errorf("no candidates returned %v", got)
+	}
+}

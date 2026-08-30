@@ -1,0 +1,66 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Renovate (`renovate.json`) owns routine dependency updates: it groups them,
+# pins digests, and honours the closed dependency budget in BUILD_SPEC section 2.
+# Dependabot is kept for exactly two things:
+#
+#   1. GitHub Security Advisory updates. Dependabot security updates are enabled
+#      in the repository settings and are NOT configured by this file; they fire
+#      regardless of the `open-pull-requests-limit: 0` below, which is precisely
+#      the trick that disables *version* updates while leaving *security*
+#      updates on.
+#
+#   2. `github-actions`. This overlaps with Renovate's github-actions manager on
+#      purpose. Renovate does the useful work (grouping, digest pinning, the
+#      `# vX.Y.Z` comment refresh); Dependabot is the backstop that keeps action
+#      pins moving if the Renovate app is ever uninstalled or its runs stop,
+#      which is a failure mode with no other alarm on it. Expect the occasional
+#      duplicate PR; a duplicate PR is cheaper than a year of silently stale
+#      action pins. If the duplication becomes annoying, delete the
+#      `github-actions` block here rather than weakening Renovate.
+version: 2
+
+updates:
+  # ---- security updates only -----------------------------------------------
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    # 0 disables version-update PRs. Security updates are unaffected.
+    open-pull-requests-limit: 0
+    labels:
+      - dependencies
+      - security
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    labels:
+      - dependencies
+      - security
+
+  # ---- github-actions ------------------------------------------------------
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - github-actions
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      actions:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch

@@ -1,0 +1,26 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Every path has an owner. The last matching pattern wins, so the catch-all is
+# first and the more specific entries below it only exist to make the intent
+# legible in a review — the owner is the same person either way today.
+#
+# CODEOWNERS is only enforced when branch protection on `main` has
+# "Require review from Code Owners" enabled. Turn it on.
+
+*                       @jacoknapp
+
+# Supply chain. A change here can publish or promote an artifact to ~100
+# production clusters, so it is called out explicitly.
+/.github/                @jacoknapp
+/.github/workflows/      @jacoknapp
+/.goreleaser.yaml        @jacoknapp
+/renovate.json           @jacoknapp
+/Dockerfile              @jacoknapp
+/SECURITY.md             @jacoknapp
+
+# Charts are the operator-facing contract for 100 clusters that are not ours.
+/charts/                 @jacoknapp
+
+# The wire protocol. Breaking it breaks hub/spoke skew tolerance.
+/api/proto/              @jacoknapp

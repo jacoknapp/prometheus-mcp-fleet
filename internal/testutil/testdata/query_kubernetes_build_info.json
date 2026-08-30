@@ -1,0 +1,20 @@
+{
+  "status": "success",
+  "data": {
+    "resultType": "vector",
+    "result": [
+      {
+        "metric": {
+          "__name__": "kubernetes_build_info",
+          "job": "apiserver",
+          "instance": "10.42.0.1:6443",
+          "git_version": "v1.32.4",
+          "major": "1",
+          "minor": "32",
+          "platform": "linux/amd64"
+        },
+        "value": [1787047200.412, "1"]
+      }
+    ]
+  }
+}

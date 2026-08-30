@@ -1,0 +1,30 @@
+# Build output
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Coverage
+coverage.txt
+coverage.html
+
+# Local state
+/.local/
+/tmp/
+*.db
+*.db-shm
+*.db-wal
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# Secrets — never commit
+*.pem
+*.key
+!testdata/**/*.pem
+!testdata/**/*.key
+.env

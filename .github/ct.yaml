@@ -1,0 +1,32 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# helm/chart-testing configuration, consumed by `.github/workflows/chart.yml`
+# and reproducible locally with:
+#
+#   ct lint    --config .github/ct.yaml --check-version-increment --all
+#   ct install --config .github/ct.yaml --all      # needs a kube context
+remote: origin
+target-branch: main
+
+chart-dirs:
+  - charts
+
+# The hub and the spoke are installed into different clusters in production, so
+# there is deliberately no umbrella chart and no chart-to-chart dependency.
+chart-repos: []
+
+# Chart.yaml must name a maintainer; ct verifies it against GitHub accounts.
+validate-maintainers: true
+
+# A chart change without a Chart.yaml version bump is the single most common
+# way a fleet of 100 clusters ends up unable to tell two renders apart.
+check-version-increment: true
+
+# `ct install` gets a fresh namespace per chart so a leaked resource in one
+# chart cannot mask a bug in the other.
+namespace: ""
+release-label: app.kubernetes.io/instance
+
+# Give the tunnel listener and the CA bootstrap time on a cold kind node.
+helm-extra-args: --timeout 600s

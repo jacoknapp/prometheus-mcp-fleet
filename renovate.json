@@ -1,0 +1,174 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:best-practices",
+    ":semanticCommits",
+    ":semanticCommitTypeAll(chore)"
+  ],
+  "timezone": "Etc/UTC",
+  "schedule": [
+    "* 0-6 * * 1"
+  ],
+  "prConcurrentLimit": 5,
+  "prHourlyLimit": 2,
+  "rebaseWhen": "conflicted",
+  "semanticCommitScope": "deps",
+  "labels": [
+    "dependencies"
+  ],
+  "enabledManagers": [
+    "gomod",
+    "github-actions",
+    "dockerfile",
+    "helm-values",
+    "custom.regex"
+  ],
+  "postUpdateOptions": [
+    "gomodTidy",
+    "gomodUpdateImportPaths"
+  ],
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": [
+      "* 0-6 * * 1"
+    ]
+  },
+  "osvVulnerabilityAlerts": true,
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "labels": [
+      "security"
+    ],
+    "schedule": [
+      "at any time"
+    ],
+    "prCreation": "immediate",
+    "minimumReleaseAge": null
+  },
+  "github-actions": {
+    "pinDigests": true
+  },
+  "docker": {
+    "pinDigests": true
+  },
+  "packageRules": [
+    {
+      "description": "Give a release a few days to be pulled before we adopt it. Security updates bypass this via vulnerabilityAlerts.",
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "digest"
+      ],
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Group every Go module minor/patch bump into one PR. Reviewing 30 separate transitive bumps is how a real change gets rubber-stamped.",
+      "groupName": "go modules (minor and patch)",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "semanticCommitType": "chore",
+      "semanticCommitScope": "deps"
+    },
+    {
+      "description": "Go toolchain and the `go` directive move on their own schedule and need a manual toolchain review; never fold them into the grouped module PR.",
+      "groupName": "go toolchain",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchDepTypes": [
+        "golang",
+        "toolchain"
+      ],
+      "matchPackageNames": [
+        "go",
+        "golang",
+        "toolchain"
+      ],
+      "minimumReleaseAge": "14 days"
+    },
+    {
+      "description": "Major Go module bumps are always their own PR with a written justification; the dependency budget in BUILD_SPEC section 2 is a closed set.",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "groupName": null,
+      "addLabels": [
+        "dependency-budget-review"
+      ],
+      "minimumReleaseAge": "14 days"
+    },
+    {
+      "description": "Group GitHub Actions bumps. Digest pinning is on, so this PR is also what keeps the 40-char SHA pins fresh.",
+      "groupName": "github actions",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "pinDigests": true,
+      "semanticCommitType": "chore",
+      "semanticCommitScope": "actions"
+    },
+    {
+      "description": "Base images are rebuilt weekly by weekly-rebuild.yml; Renovate still owns the digest in the Dockerfile so the recorded base is auditable.",
+      "groupName": "container base images",
+      "matchManagers": [
+        "dockerfile"
+      ],
+      "pinDigests": true,
+      "semanticCommitType": "chore",
+      "semanticCommitScope": "docker"
+    },
+    {
+      "description": "Chart image references live in values.yaml and are updated by the release workflow, not by Renovate. Renovate only tracks third-party images referenced from chart values.",
+      "matchManagers": [
+        "helm-values"
+      ],
+      "matchPackageNames": [
+        "ghcr.io/jacoknapp/prometheus-mcp-fleet/hub",
+        "ghcr.io/jacoknapp/prometheus-mcp-fleet/spoke"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Third-party images referenced from chart values (helm-test busybox, the auto-update kubectl image) are pinned by digest.",
+      "groupName": "chart image references",
+      "matchManagers": [
+        "helm-values"
+      ],
+      "pinDigests": true,
+      "semanticCommitType": "chore",
+      "semanticCommitScope": "charts"
+    }
+  ],
+  "customManagers": [
+    {
+      "description": "Tool versions declared as workflow env vars, marked with a `# renovate:` comment.",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/.+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "#\\s*renovate:\\s*datasource=(?<datasource>[a-z-]+?)\\s+depName=(?<depName>[^\\s]+?)(?:\\s+versioning=(?<versioning>[^\\s]+?))?(?:\\s+registryUrl=(?<registryUrl>[^\\s]+?))?\\s*\\n\\s+[A-Z0-9_]+:\\s*[\"']?(?<currentValue>[^\"'\\s]+)[\"']?"
+      ],
+      "versioningTemplate": "{{#if versioning}}{{{versioning}}}{{else}}semver{{/if}}"
+    },
+    {
+      "description": "kindest/node images pinned by tag@digest in the chart and e2e workflow matrices.",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/.+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "(?<depName>kindest/node):(?<currentValue>v[0-9.]+)@(?<currentDigest>sha256:[0-9a-f]+)"
+      ],
+      "datasourceTemplate": "docker"
+    }
+  ]
+}

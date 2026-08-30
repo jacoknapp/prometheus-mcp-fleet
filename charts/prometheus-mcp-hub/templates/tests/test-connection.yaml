@@ -1,0 +1,61 @@
+{{/*
+Copyright The prometheus-mcp-fleet Authors.
+SPDX-License-Identifier: Apache-2.0
+
+`helm test` probe. It asserts only what a test with no credentials legitimately
+can: that the admin listener is healthy and ready, and that the MCP listener
+answers. It deliberately does NOT call an authenticated endpoint, because a
+test that needs an agent key would need the chart to hold one.
+*/}}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "prometheus-mcp-hub.fullname" . }}-test-connection
+  namespace: {{ include "prometheus-mcp-hub.namespace" . }}
+  labels:
+    {{- include "prometheus-mcp-hub.componentLabels" (list . "hub-test") | nindent 4 }}
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+    {{- with .Values.commonAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  securityContext:
+    {{- toYaml .Values.podSecurityContext | nindent 4 }}
+  containers:
+    - name: probe
+      image: {{ printf "%s/%s:%s" .Values.tests.image.registry .Values.tests.image.repository .Values.tests.image.tag | quote }}
+      imagePullPolicy: {{ .Values.tests.image.pullPolicy }}
+      securityContext:
+        {{- toYaml .Values.containerSecurityContext | nindent 8 }}
+      command:
+        - /bin/sh
+        - -eu
+        - -c
+        - |
+          HOST="{{ include "prometheus-mcp-hub.fullname" . }}.{{ include "prometheus-mcp-hub.namespace" . }}.svc"
+          {{- if .Values.service.admin.enabled }}
+          echo "GET http://$HOST:{{ int .Values.service.admin.port }}/healthz"
+          wget -q -T 10 -O - "http://$HOST:{{ int .Values.service.admin.port }}/healthz"
+          echo "GET http://$HOST:{{ int .Values.service.admin.port }}/readyz"
+          wget -q -T 10 -O - "http://$HOST:{{ int .Values.service.admin.port }}/readyz"
+          echo "GET http://$HOST:{{ int .Values.service.admin.port }}/metrics (spot check)"
+          wget -q -T 10 -O - "http://$HOST:{{ int .Values.service.admin.port }}/metrics" | grep -q '^promfleet_hub_build_info'
+          {{- else }}
+          echo "service.admin.enabled=false - skipping the health and metrics probes"
+          {{- end }}
+          # The MCP listener answers unauthenticated requests with 401, which wget
+          # reports as a failure. Reaching it at all is the assertion here.
+          echo "TCP http://$HOST:{{ int .Values.service.mcpPort }}/"
+          wget -q -T 10 -S -O /dev/null "http://$HOST:{{ int .Values.service.mcpPort }}/" 2>&1 | grep -qE 'HTTP/1\.[01] [0-9]{3}'
+          echo OK
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: tmp
+      emptyDir:
+        sizeLimit: 16Mi

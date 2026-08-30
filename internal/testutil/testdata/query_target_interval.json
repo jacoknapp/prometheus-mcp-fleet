@@ -1,0 +1,12 @@
+{
+  "status": "success",
+  "data": {
+    "resultType": "vector",
+    "result": [
+      {
+        "metric": { "__name__": "prometheus_target_interval_length_seconds", "interval": "30s", "job": "prometheus", "quantile": "0.99" },
+        "value": [1787047200.412, "30.000891"]
+      }
+    ]
+  }
+}

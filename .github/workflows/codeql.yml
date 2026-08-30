@@ -1,0 +1,80 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# CodeQL static analysis for Go.
+#
+# `security-events: write` is the one elevated scope here and it is scoped to a
+# single job. On a fork pull request GitHub downgrades that scope to read and
+# the upload is skipped; the analysis still runs and still fails the check on a
+# query error, so a fork PR gets real feedback without write access to this
+# repository's security tab.
+name: codeql
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "**/*.go"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/codeql.yml"
+  push:
+    branches: [main]
+  schedule:
+    # Tuesday 04:41 UTC. Weekly re-analysis catches new queries shipped by
+    # GitHub against source that has not changed.
+    - cron: "41 4 * * 2"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  analyze:
+    name: analyze go
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      # Upload the SARIF results to the security tab.
+      security-events: write
+      # CodeQL reads workflow run metadata to attribute results.
+      actions: read
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Pin the toolchain rather than letting CodeQL's autobuild pick whatever
+      # Go the runner image happens to ship; a version skew shows up as a
+      # spurious "extraction failed" that is tedious to diagnose.
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.x"
+          check-latest: true
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          languages: go
+          build-mode: autobuild
+          # `security-extended` adds the query set that actually finds the
+          # classes of bug this project cares about (SSRF, path traversal,
+          # unsafe TLS configuration) rather than only the default high-signal
+          # subset.
+          queries: security-extended
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          category: "/language:go"

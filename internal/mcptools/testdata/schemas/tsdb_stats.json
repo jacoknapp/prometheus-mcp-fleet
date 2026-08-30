@@ -1,0 +1,31 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "cluster": {
+      "description": "Cluster name, exactly as returned by list_clusters.",
+      "type": "string"
+    },
+    "dimension": {
+      "default": "metric",
+      "description": "Which cardinality ranking to return.",
+      "enum": [
+        "metric",
+        "labelName",
+        "labelValuePairs",
+        "labelMemory"
+      ],
+      "type": "string"
+    },
+    "topN": {
+      "default": 20,
+      "description": "How many entries of the ranking to return.",
+      "maximum": 100,
+      "minimum": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "cluster"
+  ],
+  "type": "object"
+}

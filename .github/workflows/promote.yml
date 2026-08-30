@@ -1,0 +1,372 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# THE FLEET-WIDE KILL SWITCH.
+#
+# ~100 production clusters follow the `stable` OCI tag (directly, or through
+# the chart's opt-in auto-update CronJob, which resolves `stable` to a digest
+# and cosign-verifies it before patching anything). Moving `stable` is the only
+# action in this repository that can reach all of them. Therefore:
+#
+#   * `release.yml` publishes but never promotes.
+#   * `weekly-rebuild.yml` publishes but never promotes.
+#   * Only this workflow moves `stable`, only on `workflow_dispatch`, and only
+#     after a human approves the `production` GitHub Environment.
+#   * Stop approving here and the entire fleet freezes on the last vetted
+#     digest. That is the intended emergency behaviour, not a side effect.
+#
+# Order of operations is deliberate: verification runs in an UNPRIVILEGED job
+# first, and the environment-protected job only starts (and only then asks a
+# human) once the signature, the SLSA provenance and the soak age have all
+# checked out. A reviewer should never be asked to approve something the
+# machine already knows is unverifiable.
+#
+# Repository setup required before this works:
+#   Settings -> Environments -> New environment `production`
+#     - Required reviewers: at least one
+#     - Deployment branches and tags: `main` only
+name: promote
+
+on:
+  workflow_dispatch:
+    inputs:
+      hub_image_digest:
+        description: "Digest of the hub image to promote (sha256:...). Leave empty to skip."
+        required: false
+        type: string
+        default: ""
+      spoke_image_digest:
+        description: "Digest of the spoke image to promote (sha256:...). Leave empty to skip."
+        required: false
+        type: string
+        default: ""
+      hub_chart_digest:
+        description: "Digest of the prometheus-mcp-hub chart artifact (sha256:...). Leave empty to skip."
+        required: false
+        type: string
+        default: ""
+      spoke_chart_digest:
+        description: "Digest of the prometheus-mcp-spoke chart artifact (sha256:...). Leave empty to skip."
+        required: false
+        type: string
+        default: ""
+      min_soak_hours:
+        description: "Refuse to promote an artifact younger than this many hours. 0 disables the check (canary cohort only)."
+        required: false
+        type: string
+        default: "72"
+      reason:
+        description: "Why this digest is being promoted. Recorded in the run summary and the deployment record."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# Never cancel a promotion; a half-moved `stable` across four artifacts is the
+# worst possible state for the fleet to observe.
+concurrency:
+  group: promote-stable
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAMESPACE: ghcr.io/${{ github.repository }}
+  CHART_REGISTRY: ghcr.io/jacoknapp/charts
+  COSIGN_ISSUER: https://token.actions.githubusercontent.com
+  COSIGN_IDENTITY_REGEXP: ^https://github\.com/jacoknapp/prometheus-mcp-fleet/\.github/workflows/.+@refs/(tags/v.+|heads/main)$
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Unprivileged pre-flight. No environment, no write scopes, no tag movement.
+  # ---------------------------------------------------------------------------
+  verify:
+    name: verify signatures and provenance
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+      # `gh attestation verify` reads the repository's attestation records.
+      attestations: read
+    outputs:
+      targets: ${{ steps.plan.outputs.targets }}
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            api.github.com:443
+            fulcio.sigstore.dev:443
+            ghcr.io:443
+            github.com:443
+            objects.githubusercontent.com:443
+            pkg-containers.githubusercontent.com:443
+            rekor.sigstore.dev:443
+            search.sigstore.dev:443
+            release-assets.githubusercontent.com:443
+            storage.googleapis.com:443
+            tuf-repo-cdn.sigstore.dev:443
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Install crane
+        uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build the promotion plan
+        id: plan
+        env:
+          HUB_IMAGE_DIGEST: ${{ inputs.hub_image_digest }}
+          SPOKE_IMAGE_DIGEST: ${{ inputs.spoke_image_digest }}
+          HUB_CHART_DIGEST: ${{ inputs.hub_chart_digest }}
+          SPOKE_CHART_DIGEST: ${{ inputs.spoke_chart_digest }}
+        run: |
+          set -euo pipefail
+          targets=""
+          add() {
+            local repo="$1" digest="$2"
+            [ -n "${digest}" ] || return 0
+            case "${digest}" in
+              sha256:[0-9a-f][0-9a-f]*) : ;;
+              *) echo "::error::'${digest}' is not a sha256:... digest"; exit 1 ;;
+            esac
+            targets="${targets}${repo}@${digest}"$'\n'
+          }
+
+          add "${IMAGE_NAMESPACE}/hub"                    "${HUB_IMAGE_DIGEST}"
+          add "${IMAGE_NAMESPACE}/spoke"                  "${SPOKE_IMAGE_DIGEST}"
+          add "${CHART_REGISTRY}/prometheus-mcp-hub"      "${HUB_CHART_DIGEST}"
+          add "${CHART_REGISTRY}/prometheus-mcp-spoke"    "${SPOKE_CHART_DIGEST}"
+
+          if [ -z "${targets}" ]; then
+            echo "::error::no digests supplied; nothing to promote"
+            exit 1
+          fi
+
+          {
+            echo "targets<<EOF"
+            printf '%s' "${targets}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "promotion plan:"
+          printf '%s' "${targets}"
+
+      - name: Verify cosign signature, SLSA provenance and soak age
+        env:
+          TARGETS: ${{ steps.plan.outputs.targets }}
+          MIN_SOAK_HOURS: ${{ inputs.min_soak_hours }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          now="$(date -u +%s)"
+          fail=0
+
+          {
+            echo "## Verification"
+            echo
+            echo "| artifact | cosign | provenance | age |"
+            echo "| --- | --- | --- | --- |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          while IFS= read -r ref; do
+            [ -n "${ref}" ] || continue
+            echo "==> ${ref}"
+            sig="fail"; prov="fail"; age="unknown"
+
+            if cosign verify \
+                 --certificate-oidc-issuer "${COSIGN_ISSUER}" \
+                 --certificate-identity-regexp "${COSIGN_IDENTITY_REGEXP}" \
+                 "${ref}" > /dev/null; then
+              sig="ok"
+            else
+              echo "::error::cosign verify failed for ${ref}"
+              fail=1
+            fi
+
+            # `gh attestation verify` is the native verifier for the bundles
+            # actions/attest-build-provenance publishes. It checks the SLSA
+            # predicate AND that the workload identity is this repository.
+            if gh attestation verify "oci://${ref}" \
+                 --repo "${GITHUB_REPOSITORY}" \
+                 --predicate-type https://slsa.dev/provenance/v1 > /dev/null 2>&1; then
+              prov="ok"
+            else
+              echo "::error::SLSA provenance verification failed for ${ref}"
+              fail=1
+            fi
+
+            # Soak age: an artifact that has not been in the wild long enough
+            # has not been observed by the canary cohort yet.
+            #
+            # The GHCR packages API is the primary source because it answers the
+            # question we actually care about — "when did this digest become
+            # pullable" — and it answers it identically for an image and for a
+            # Helm chart artifact. `crane config` only works for images (a chart
+            # has no image config blob), so it is the fallback, not the default.
+            repo_path="${ref%@*}"                 # ghcr.io/owner/a/b
+            digest_only="${ref#*@}"
+            pkg="${repo_path#"ghcr.io/${GITHUB_REPOSITORY_OWNER}/"}"   # a/b
+            pkg_encoded="${pkg//\//%2F}"
+
+            created="$(gh api --paginate \
+              "/users/${GITHUB_REPOSITORY_OWNER}/packages/container/${pkg_encoded}/versions" \
+              --jq ".[] | select(.name == \"${digest_only}\") | .created_at" 2>/dev/null \
+              | head -1 || true)"
+
+            if [ -z "${created}" ]; then
+              created="$(crane config "${ref}" 2>/dev/null \
+                | grep -o '"org.opencontainers.image.created":"[^"]*"' \
+                | head -1 | cut -d'"' -f4 || true)"
+            fi
+            if [ -z "${created}" ]; then
+              created="$(crane config "${ref}" 2>/dev/null \
+                | grep -o '"created":"[^"]*"' | head -1 | cut -d'"' -f4 || true)"
+            fi
+
+            if [ "${MIN_SOAK_HOURS}" = "0" ]; then
+              age="soak check disabled"
+            elif [ -z "${created}" ]; then
+              age="unknown"
+              echo "::error::${ref} has no discoverable publication time (neither the GHCR packages API nor the image config carried one), so the ${MIN_SOAK_HOURS}h soak cannot be enforced. Re-run with min_soak_hours=0 only if you are deliberately promoting an unsoaked artifact."
+              fail=1
+            else
+              created_epoch="$(date -u -d "${created}" +%s 2>/dev/null || echo 0)"
+              hours=$(( (now - created_epoch) / 3600 ))
+              age="${hours}h"
+              if [ "${created_epoch}" -eq 0 ] || [ "${hours}" -lt "${MIN_SOAK_HOURS}" ]; then
+                echo "::error::${ref} is ${hours}h old, below the ${MIN_SOAK_HOURS}h soak floor"
+                fail=1
+              fi
+            fi
+
+            echo "| \`${ref}\` | ${sig} | ${prov} | ${age} |" >> "${GITHUB_STEP_SUMMARY}"
+          done <<< "${TARGETS}"
+
+          exit "${fail}"
+
+  # ---------------------------------------------------------------------------
+  # The privileged half. Starting this job is what triggers the human approval
+  # prompt on the `production` environment.
+  # ---------------------------------------------------------------------------
+  promote:
+    name: move the stable tag
+    needs: [verify]
+    runs-on: ubuntu-24.04
+    environment:
+      name: production
+      url: https://github.com/${{ github.repository }}/pkgs/container/prometheus-mcp-fleet%2Fhub
+    permissions:
+      contents: read
+      packages: write
+      attestations: read
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            api.github.com:443
+            fulcio.sigstore.dev:443
+            ghcr.io:443
+            github.com:443
+            objects.githubusercontent.com:443
+            pkg-containers.githubusercontent.com:443
+            rekor.sigstore.dev:443
+            release-assets.githubusercontent.com:443
+            storage.googleapis.com:443
+            tuf-repo-cdn.sigstore.dev:443
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Install crane
+        uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Re-verify after the approval gate. The inputs cannot change between
+      # jobs, but the check is nearly free and it means the log line that
+      # immediately precedes a fleet-wide tag move is a fresh verification
+      # rather than a reference to one from ten minutes ago.
+      - name: Re-verify immediately before moving the tag
+        env:
+          TARGETS: ${{ needs.verify.outputs.targets }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r ref; do
+            [ -n "${ref}" ] || continue
+            cosign verify \
+              --certificate-oidc-issuer "${COSIGN_ISSUER}" \
+              --certificate-identity-regexp "${COSIGN_IDENTITY_REGEXP}" \
+              "${ref}" > /dev/null
+            echo "re-verified ${ref}"
+          done <<< "${TARGETS}"
+
+      - name: Record the digest stable currently points at
+        id: previous
+        env:
+          TARGETS: ${{ needs.verify.outputs.targets }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Rollback"
+            echo
+            echo "\`stable\` pointed at these digests before this run. To roll back,"
+            echo "re-run this workflow with them."
+            echo
+            echo "| repository | previous stable digest |"
+            echo "| --- | --- |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          while IFS= read -r ref; do
+            [ -n "${ref}" ] || continue
+            repo="${ref%@*}"
+            prev="$(crane digest "${repo}:stable" 2>/dev/null || echo "<unset>")"
+            echo "| \`${repo}\` | \`${prev}\` |" >> "${GITHUB_STEP_SUMMARY}"
+          done <<< "${TARGETS}"
+
+      - name: Move stable
+        env:
+          TARGETS: ${{ needs.verify.outputs.targets }}
+          REASON: ${{ inputs.reason }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Promoted"
+            echo
+            echo "Reason: ${REASON}"
+            echo
+            echo "| repository | new stable digest |"
+            echo "| --- | --- |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          while IFS= read -r ref; do
+            [ -n "${ref}" ] || continue
+            repo="${ref%@*}"
+            digest="${ref#*@}"
+
+            # `crane tag` re-points the tag at an existing manifest without
+            # re-uploading or re-computing it, so the promoted digest is
+            # bit-identical to the verified one.
+            crane tag "${ref}" stable
+
+            observed="$(crane digest "${repo}:stable")"
+            if [ "${observed}" != "${digest}" ]; then
+              echo "::error::${repo}:stable resolved to ${observed}, expected ${digest}"
+              exit 1
+            fi
+            echo "| \`${repo}\` | \`${digest}\` |" >> "${GITHUB_STEP_SUMMARY}"
+          done <<< "${TARGETS}"
