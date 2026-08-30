@@ -32,7 +32,7 @@ agent can reach.
 | Flag / `PMF_` variable | Default | Description |
 |---|---|---|
 | `--mcp-addr` | `:8080` | Agent-facing MCP endpoint. Exposed through a standard Ingress. |
-| `--tunnel-addr` | `:8443` | Address spokes dial with mutual TLS. Needs a LoadBalancer or NodePort Service — an HTTP Ingress cannot pass a client certificate through. |
+| `--tunnel-path` | `/tunnel` | Path on the MCP listener where spokes open a WebSocket. There is no separate tunnel port: an Ingress terminates TLS, so mutual authentication happens inside the connection (ADR-0014). |
 | `--admin-addr` | `127.0.0.1:9090` | Admin API, metrics, health and pprof. **Never expose this.** The chart fails the render if you try. |
 | `--public-url` | — | Canonical external URL of the MCP endpoint, used in the RFC 9728 protected-resource document. |
 
@@ -62,9 +62,6 @@ startup error naming the rule you are missing.
 | `--ca-cert-file` | — | Internal CA certificate. Empty self-initialises inside `--data-dir`. |
 | `--ca-key-file` | — | Private key for the above. Both must be set or neither. |
 | `--spoke-cert-ttl` | `336h` (14d) | Lifetime of an issued spoke certificate. Spokes renew at half life with jitter. |
-| `--tunnel-server-names` | — | Comma-separated SANs for the self-issued tunnel server certificate. Set this to the hostname spokes dial. |
-| `--tunnel-tls-cert-file` | — | Operator-supplied tunnel server certificate. Empty self-issues from the internal CA. |
-| `--tunnel-tls-key-file` | — | Private key for the above. |
 
 ### Credentials
 
@@ -115,7 +112,7 @@ widen them past what is set here.
 
 | Flag / `PMF_` variable | Default | Description |
 |---|---|---|
-| `--hub-endpoints` | **required** | Comma-separated hub tunnel endpoints as `host:port`. List one per hub replica; the spoke holds a tunnel to each. |
+| `--hub-endpoints` | **required** | Comma-separated hub tunnel URLs, e.g. `wss://pmf.example.com/tunnel`. List one per hub replica; the spoke holds a tunnel to each. |
 | `--hub-api-url` | **required** | HTTPS base URL of the hub's enrollment listener. |
 | `--hub-ca-file` | — | Trust bundle for the hub. Empty uses the bundle cached in `--data-dir` from enrollment. |
 | `--hub-tls-insecure` | `false` | Skips verification of the hub certificate. Requires `--allow-insecure` as a second, deliberate opt-in. |
@@ -188,10 +185,6 @@ local Prometheus probe has failed twice consecutively.
 env:
   - name: PMF_MCP_ADDR
     value: ":8080"
-  - name: PMF_TUNNEL_ADDR
-    value: ":8443"
-  - name: PMF_TUNNEL_SERVER_NAMES
-    value: "pmf-tunnel.example.com"
   - name: PMF_PUBLIC_URL
     value: "https://pmf.example.com/mcp"
   - name: PMF_TRUST_DOMAIN
@@ -209,7 +202,7 @@ env:
   - name: PMF_CLUSTER_LABELS
     value: "env=prod,region=us-east-1,tier=customer-facing"
   - name: PMF_HUB_ENDPOINTS
-    value: "pmf-tunnel.example.com:8443"
+    value: "wss://pmf.example.com/tunnel"
   - name: PMF_HUB_API_URL
     value: "https://pmf.example.com"
   - name: PMF_PROMETHEUS_URL

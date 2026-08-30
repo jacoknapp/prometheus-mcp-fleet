@@ -49,7 +49,7 @@ func TestLoadHubDefaults(t *testing.T) {
 	}
 	want := &Hub{
 		MCPAddr:                DefaultMCPAddr,
-		TunnelAddr:             DefaultTunnelAddr,
+		TunnelPath:             DefaultTunnelPath,
 		AdminAddr:              DefaultHubAdminAddr,
 		LogLevel:               DefaultLogLevel,
 		LogFormat:              DefaultLogFormat,
@@ -215,17 +215,17 @@ func TestLoadHubPrecedence(t *testing.T) {
 			got:  true,
 		},
 		{
-			name: "list from env",
-			kv:   map[string]string{"PMF_TUNNEL_SERVER_NAMES": "hub.example.com, 10.0.0.1 ,"},
-			want: func(c *Hub) any { return c.TunnelServerNames },
-			got:  []string{"hub.example.com", "10.0.0.1"},
+			name: "tunnel path from env",
+			kv:   map[string]string{"PMF_TUNNEL_PATH": "/pmf/tunnel"},
+			want: func(c *Hub) any { return c.TunnelPath },
+			got:  "/pmf/tunnel",
 		},
 		{
-			name: "list flag beats env",
-			args: []string{"--tunnel-server-names=a.example.com"},
-			kv:   map[string]string{"PMF_TUNNEL_SERVER_NAMES": "b.example.com"},
-			want: func(c *Hub) any { return c.TunnelServerNames },
-			got:  []string{"a.example.com"},
+			name: "tunnel path flag beats env",
+			args: []string{"--tunnel-path=/a"},
+			kv:   map[string]string{"PMF_TUNNEL_PATH": "/b"},
+			want: func(c *Hub) any { return c.TunnelPath },
+			got:  "/a",
 		},
 		{
 			name: "explicit pepper file is kept",
@@ -282,16 +282,16 @@ func TestLoadSpokePrecedence(t *testing.T) {
 	}{
 		{
 			name: "endpoints from env",
-			kv:   map[string]string{"PMF_HUB_ENDPOINTS": "a:8443,b:8443"},
+			kv:   map[string]string{"PMF_HUB_ENDPOINTS": "wss://a/tunnel,wss://b/tunnel"},
 			want: func(c *Spoke) any { return c.HubEndpoints },
-			got:  []string{"a:8443", "b:8443"},
+			got:  []string{"wss://a/tunnel", "wss://b/tunnel"},
 		},
 		{
 			name: "endpoints flag beats env",
-			args: []string{"--hub-endpoints=c:8443"},
-			kv:   map[string]string{"PMF_HUB_ENDPOINTS": "a:8443,b:8443"},
+			args: []string{"--hub-endpoints=wss://c/tunnel"},
+			kv:   map[string]string{"PMF_HUB_ENDPOINTS": "wss://a/tunnel,wss://b/tunnel"},
 			want: func(c *Spoke) any { return c.HubEndpoints },
-			got:  []string{"c:8443"},
+			got:  []string{"wss://c/tunnel"},
 		},
 		{
 			name: "labels from env",

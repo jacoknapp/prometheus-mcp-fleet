@@ -53,7 +53,8 @@ mkdir -p /tmp/pmf
   --state-backend=file --state-file=/tmp/pmf/state.json \
   --pepper-file=/tmp/pmf/pepper --ca-cert-file=/tmp/pmf/ca.crt \
   --ca-key-file=/tmp/pmf/ca.key \
-  --mcp-addr=:8080 --tunnel-addr=:8443 --admin-addr=127.0.0.1:9091 \
+  --mcp-addr=:8080 --admin-addr=127.0.0.1:9091 \
+  --public-url=http://127.0.0.1:8080/mcp \
   --log-level=debug
 # The bootstrap admin key is printed once on first start. Save it.
 
@@ -64,7 +65,7 @@ export PMF_ADMIN_TOKEN=pmf_adm_...
 
 # Terminal 4 — the spoke
 ./bin/spoke \
-  --cluster-id=local-dev --hub-endpoints=127.0.0.1:8443 \
+  --cluster-id=local-dev --hub-endpoints=ws://127.0.0.1:8080/tunnel \
   --hub-api-url=https://127.0.0.1:8080 --hub-ca-file=/tmp/pmf/ca.crt \
   --enrollment-token-file=/tmp/pmf/enroll.token \
   --identity-backend=file --data-dir=/tmp/pmf/spoke \
@@ -96,7 +97,7 @@ The three packages worth reading first, in order:
 1. `internal/promapi` — the allow-list. Everything the system can ask Prometheus
    to do is one table in one file.
 2. `internal/tunnel` — the transport contract, with no gRPC in it. Read this
-   before `grpctun`, or the role reversal will make no sense.
+   before `wstun`, or the role reversal will make no sense.
 3. `internal/fleet` — the domain types the whole graph hangs off.
 
 ## Protobuf
@@ -121,10 +122,11 @@ errors. No testify, no gomock — fakes are hand-written and live next to the co
 that needs them.
 
 **The tunnel conformance suite** is the interesting one.
-`internal/tunnel/tunneltest` is a single suite run against *both* the in-process
-transport (`memtun`) and the real one (`grpctun`) over a real socket with real
-TLS. That is what proves the transport is genuinely swappable, and it means hub
-routing can be tested with no network at all.
+`internal/tunnel/tunneltest` is a single suite run against **all three**
+transports: the in-process one (`memtun`), the gRPC-over-socket one (`grpctun`),
+and the production WebSocket one (`wstun`) over a real `httptest.Server`. That is
+what proves the transport is genuinely swappable, and it means hub routing can be
+tested with no network at all.
 
 A fake that is easier than reality is worse than no fake — `memtun` reproduces
 cancellation, deadlines, byte caps and close semantics faithfully, and if you

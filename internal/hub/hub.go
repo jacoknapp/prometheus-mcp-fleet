@@ -47,7 +47,7 @@ import (
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/store/secretstore"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/token"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel"
-	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel/grpctun"
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel/wstun"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/version"
 	"golang.org/x/sync/errgroup"
 )
@@ -68,7 +68,7 @@ func Run(ctx context.Context, cfg *config.Hub) error {
 	health := obs.NewHealth(logger)
 	health.Set("store", false, "not opened yet")
 	health.Set("ca", false, "not loaded yet")
-	health.Set("tunnel", false, "listener not bound yet")
+	health.Set("tunnel", false, "handler not mounted yet")
 
 	shutdownTracing, err := obs.InitTracing(ctx, obs.TracingConfig{
 		Endpoint:    cfg.OTLPEndpoint,
@@ -117,6 +117,7 @@ type hub struct {
 	registry  *registry.Registry
 	proxy     *promproxy.Proxy
 	mcp       *mcpsurface.Server
+	tunnel    *wstun.Server
 	// now is injectable for tests; nil means time.Now.
 	now func() time.Time
 }
@@ -147,18 +148,22 @@ func (h *hub) run(ctx context.Context) error {
 	}
 	defer h.shutdown(admin, "admin")
 
+	// The tunnel is a route on the MCP listener now, so it has to exist before
+	// that listener is built rather than after it.
+	if h.tunnel, err = h.newTunnelServer(); err != nil {
+		return err
+	}
+
 	public, err := h.startPublic()
 	if err != nil {
 		return err
 	}
 	defer h.shutdown(public, "mcp")
 
-	listener, err := h.tunnelListener()
-	if err != nil {
-		return err
-	}
+	listener := h.tunnel.Listener()
 	h.health.Set("tunnel", true, "")
-	h.logger.Info("tunnel listener ready", "addr", listener.Addr())
+	h.logger.Info("tunnel endpoint ready",
+		"path", h.cfg.TunnelPath, "addr", public.Addr(), "max_spokes", h.cfg.MaxSpokes)
 
 	group, gctx := errgroup.WithContext(ctx)
 	group.Go(func() error { return h.serveTunnel(gctx, listener) })
@@ -380,6 +385,9 @@ func (h *hub) startPublic() (*httpx.Server, error) {
 		mux.Handle("/mcp", mcp)
 		mux.Handle("/mcp/", mcp)
 	}
+	// The tunnel shares this listener with MCP: one port, one Ingress rule,
+	// one certificate for the whole product (ADR-0014).
+	mux.Handle(h.cfg.TunnelPath, h.tunnel.Handler())
 
 	srv := httpx.NewServer(httpx.ServerConfig{
 		Name:   "mcp",
@@ -397,32 +405,6 @@ func (h *hub) startPublic() (*httpx.Server, error) {
 	}
 	h.logger.Info("mcp listener ready", "addr", srv.Addr())
 	return srv, nil
-}
-
-// tunnelListener builds the mutually authenticated listener spokes dial.
-func (h *hub) tunnelListener() (tunnel.Listener, error) {
-	serverCert, err := h.tunnelCertificate()
-	if err != nil {
-		return nil, err
-	}
-
-	revoked, err := h.revokedSerials()
-	if err != nil {
-		return nil, err
-	}
-
-	tlsCfg := h.authority.ServerTLSConfig(serverCert, revoked)
-	listener, err := grpctun.NewListener(grpctun.ListenerConfig{
-		Addr:             h.cfg.TunnelAddr,
-		TLSConfig:        tlsCfg,
-		IdentityFromCert: h.authority.IdentityFromCert,
-		Logger:           h.logger,
-		MaxSessions:      h.cfg.MaxSpokes,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("build the tunnel listener: %w", err)
-	}
-	return listener, nil
 }
 
 // serveTunnel dispatches accepted sessions into the registry.

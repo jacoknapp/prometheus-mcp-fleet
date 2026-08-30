@@ -32,11 +32,10 @@ import (
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/clusterfacts"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/config"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/httpx"
-	"github.com/jacoknapp/prometheus-mcp-fleet/internal/mtls"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/obs"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/promclient"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel"
-	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel/grpctun"
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel/wstun"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/version"
 	"golang.org/x/sync/errgroup"
 )
@@ -385,6 +384,18 @@ func (s *spoke) probeLoop(ctx context.Context) {
 // denial of service.
 func (s *spoke) dialLoop(ctx context.Context, endpoint string) {
 	log := s.logger.With("endpoint", endpoint)
+
+	// Normalise once, so the log line and the error an operator sees name a
+	// URL rather than whatever shorthand was configured. A value that cannot
+	// be normalised will never work, so there is nothing to retry.
+	target, err := wstun.NormalizeEndpoint(endpoint)
+	if err != nil {
+		log.Error("hub endpoint is unusable", "error", err)
+		return
+	}
+	if target != endpoint {
+		log.Info("hub endpoint normalised", "url", target)
+	}
 	attempt := 0
 
 	// Stagger the very first dial so a fleet-wide rollout does not arrive at
@@ -395,9 +406,9 @@ func (s *spoke) dialLoop(ctx context.Context, endpoint string) {
 
 	for ctx.Err() == nil {
 		connected := time.Now()
-		reason := s.dialOnce(ctx, endpoint, log)
-		s.metrics.TunnelUp.WithLabelValues(endpoint).Set(0)
-		s.health.Set("tunnel", false, "no tunnel to "+endpoint)
+		reason := s.dialOnce(ctx, target, log)
+		s.metrics.TunnelUp.WithLabelValues(target).Set(0)
+		s.health.Set("tunnel", false, "no tunnel to "+target)
 
 		if ctx.Err() != nil {
 			return
@@ -425,17 +436,6 @@ func (s *spoke) dialOnce(ctx context.Context, endpoint string, log *slog.Logger)
 	if id == nil {
 		return "no-identity"
 	}
-	tlsCfg, err := mtls.ClientTLSConfig(id.Certificate, id.CABundle, hostOf(endpoint))
-	if err != nil {
-		log.Error("building the tunnel TLS configuration failed", "error", err)
-		return "tls-config"
-	}
-
-	dialer := grpctun.NewDialer(grpctun.DialerConfig{
-		TLSConfig:  tlsCfg,
-		Logger:     log,
-		Generation: s.started.UnixNano(),
-	})
 
 	// A renewal closes this context so the tunnel is rebuilt with the new
 	// certificate rather than waiting out the old one.
@@ -451,9 +451,21 @@ func (s *spoke) dialOnce(ctx context.Context, endpoint string, log *slog.Logger)
 
 	s.metrics.TunnelUp.WithLabelValues(endpoint).Set(1)
 	s.health.Set("tunnel", true, "")
-	log.Info("tunnel established")
 
-	if err := dialer.Dial(dialCtx, endpoint, s); err != nil {
+	// The certificate is presented inside the connection, not in a TLS
+	// handshake: an Ingress terminates TLS and the hub would never see it.
+	// CABundle here verifies whatever answers on the hub's behalf.
+	err := wstun.Dial(dialCtx, wstun.ClientConfig{
+		URL:          endpoint,
+		Certificate:  id.Certificate,
+		CABundle:     id.CABundle,
+		TLSInsecure:  s.cfg.HubTLSInsecure,
+		ClusterID:    s.cfg.ClusterID,
+		AgentVersion: s.build.Version,
+		Logger:       log,
+		Generation:   s.started.UnixNano(),
+	}, s)
+	if err != nil {
 		return classify(err)
 	}
 	return "closed"

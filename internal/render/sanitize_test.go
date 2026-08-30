@@ -376,11 +376,16 @@ func TestUntrustedNotice(t *testing.T) {
 	}
 }
 
-// FuzzSanitizeUntrusted proves the sanitiser is total: it never panics, always
-// returns valid UTF-8, and always removes every forbidden codepoint, for any
-// input at all. It is the control the whole prompt-injection defence rests on,
-// so it is tested as a property rather than by example.
-func FuzzSanitizeUntrusted(f *testing.F) {
+// FuzzSanitize proves the sanitiser is total: it never panics, always returns
+// valid UTF-8, and always removes every forbidden codepoint, for any input at
+// all. It is the control the whole prompt-injection defence rests on, so it is
+// tested as a property rather than by example.
+//
+// The seed corpus is checked in under testdata/fuzz/FuzzSanitize so the
+// interesting inputs - bidi overrides, fence delimiters, chat sentinels,
+// invalid UTF-8 - are exercised by a plain `go test` run in CI and not only by
+// an explicit fuzzing run.
+func FuzzSanitize(f *testing.F) {
 	seeds := []string{
 		"", " ", "up", "\x00", "\x1b[0m", "‮exe.txt", "a\u200bb", "\ufeff",
 		"```", "````", "<|im_start|>", "\xff\xfe", "メトリクス",

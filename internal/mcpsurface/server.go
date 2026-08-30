@@ -166,9 +166,20 @@ func (s *Server) snapshot(p *[]string) []string {
 	return slices.Clone(*p)
 }
 
+// record adds name to a registration list, replacing an existing entry rather
+// than appending a second one.
+//
+// The SDK replaces a tool registered twice under the same name, so appending
+// here would make ToolNames report a catalogue larger than the one that
+// actually exists. The hub logs that count on startup, so the discrepancy would
+// be a number an operator reads and trusts while it quietly disagrees with the
+// server.
 func (s *Server) record(p *[]string, name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if slices.Contains(*p, name) {
+		return
+	}
 	*p = append(*p, name)
 }
 

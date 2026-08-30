@@ -102,7 +102,7 @@ helm install pmf-spoke oci://ghcr.io/jacoknapp/charts/prometheus-mcp-spoke \
   --set cluster.id=prod-us-east-1 \
   --set cluster.labels.env=prod \
   --set cluster.labels.region=us-east-1 \
-  --set hub.endpoints[0]=pmf-tunnel.example.com:8443 \
+  --set hub.endpoints[0]=wss://pmf.example.com/tunnel \
   --set hub.apiUrl=https://pmf.example.com \
   --set hub.existingCASecret=pmf-hub-ca \
   --set enrollment.existingSecret=pmf-enrollment \
@@ -118,7 +118,7 @@ happened to work in one place would be a trap in the other ninety-nine.
 ```bash
 kubectl -n prometheus-mcp logs deploy/pmf-spoke | grep -E 'certificate|tunnel'
 # obtained client certificate  cluster_id=prod-us-east-1 not_after=…
-# tunnel established           endpoint=pmf-tunnel.example.com:8443
+# tunnel established           endpoint=wss://pmf.example.com/tunnel
 ```
 
 From the agent side, `list_clusters` should now show it as `connected`.

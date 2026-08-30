@@ -56,6 +56,10 @@ var layer = map[string]int{
 	"promclient":        1,
 	"tunnel/grpctun":    1,
 	"tunnel/memtun":     1,
+	// wstun carries the tunnel over a WebSocket on the hub's HTTP listener
+	// (ADR-0014). It sits beside grpctun rather than above it: it supplies an
+	// authenticated net.Conn and grpctun does everything after that.
+	"tunnel/wstun":      1,
 	"tunnel/tunneltest": 1,
 	"gen/fleet/v1":      1,
 
@@ -139,6 +143,10 @@ var forbidden = []struct {
 // allowedDirectRequires is the closed dependency budget of ADR-0010. Anything
 // in go.mod's direct require block that is not listed here needs an ADR.
 var allowedDirectRequires = []string{
+	// ADR-0014: the WebSocket tunnel needs RFC 6455 framing and a net.Conn
+	// adapter. It has zero transitive dependencies, which is the only reason
+	// it clears the budget.
+	"github.com/coder/websocket",
 	"github.com/google/go-cmp",
 	// jsonschema-go is the MCP SDK's own schema type: mcp.Tool.InputSchema is
 	// a *jsonschema.Schema, so any code that inspects or emits a tool schema

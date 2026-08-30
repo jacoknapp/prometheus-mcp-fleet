@@ -130,6 +130,27 @@ things then matter:
   `pmf://<trustDomain>/spoke/<clusterID>`, `clientAuth` extended key usage only,
   and a 14-day lifetime.
 
+**How the certificate is presented.** The tunnel is a WebSocket behind a
+standard Ingress, and an Ingress terminates TLS, so the hub cannot see a TLS
+client certificate. Mutual authentication therefore happens inside the
+connection: the hub issues a single-use 32-byte nonce, and the spoke replies
+with its certificate chain and a signature over a length-prefixed transcript
+binding that nonce, the protocol version and the cluster ID. The hub verifies
+the chain against its CA, checks the revocation denylist, verifies the
+signature, and derives the identity. This is TLS's own `CertificateVerify` step
+performed one layer up, and it preserves the properties that matter: the private
+key never transits, and a captured response cannot be replayed against a fresh
+nonce or re-scoped to another cluster.
+
+**What this costs, stated plainly.** The terminating Ingress is inside the trust
+boundary. It sees the frames, and a compromised Ingress could relay a live
+connection. It cannot *impersonate* a spoke — it never holds a spoke's private
+key — but this is a genuine reduction against end-to-end mTLS. It is also
+unavoidable when the deployment target provides only an HTTP Ingress, and it is
+the same concession every product behind an Ingress makes. Operators who do have
+`ssl-passthrough` can restore end-to-end mTLS; see
+[ADR-0014](adr/0014-websocket-tunnel-through-standard-ingress.md).
+
 **Identity extraction** reads the cluster ID *only* from the URI SAN, verifying
 the scheme is `pmf`, the host equals the configured trust domain, and the path is
 exactly `/spoke/<id>` with `<id>` matching
@@ -292,7 +313,8 @@ successful injection worthless than pretend to detect one.
 | **Hub compromise** | Read across the whole fleet; mint certificates | The pepper is stored outside the credential document; the admin API is on a separate listener with separate credentials; every mint, burn and revocation is an immutable audit event; the spoke's independent allow-list still blocks destructive endpoints |
 | **Prompt-injected agent** | Acts maliciously with its *own* legitimate key | Read-only by construction; destructive endpoints absent for everyone; scope confines it; the admin API is unreachable from an agent key |
 | **Stolen enrollment token** | One certificate, for one cluster | Single use with atomic burn; 15-minute lifetime; bound to one cluster ID; a replay attempt raises a security event |
-| **Network attacker** | — | TLS 1.3 only, mutual authentication on the tunnel, no plaintext listener; the spoke verifies the hub, the hub verifies the spoke |
+| **Network attacker** | — | HTTPS only; the spoke verifies the hub's server certificate, and the hub verifies the spoke's certificate and a signature over a nonce it chose. Observing traffic is not enough to impersonate either side |
+| **Compromised Ingress** | Observe tunnel traffic; relay a live connection | Cannot impersonate a spoke — it holds no spoke private key, and the signature covers a fresh hub-chosen nonce. This is the accepted cost of Ingress-only exposure; see ADR-0014 |
 | **Malicious CSR** | — | Subject and SANs discarded; only the public key is used; key type and size are checked |
 
 ## Secrets in Kubernetes

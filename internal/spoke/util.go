@@ -7,11 +7,12 @@ import (
 	"context"
 	"errors"
 	"math/rand/v2"
-	"net"
 	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel/grpctun"
 )
 
 // prometheusRegistry is the small slice of the Prometheus registry this package
@@ -68,19 +69,20 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// hostOf strips the port from a host:port endpoint, for use as the TLS server
-// name. An endpoint with no port is returned unchanged.
-func hostOf(endpoint string) string {
-	if host, _, err := net.SplitHostPort(endpoint); err == nil {
-		return host
-	}
-	return endpoint
-}
-
 // classify reduces a dial error to one of a closed set of metric label values.
 // The set is closed deliberately: an unbounded reason label on a reconnect
 // counter is exactly the cardinality mistake this project exists to avoid.
+//
+// The transport already classifies its own failures — that is what
+// grpctun.Reason is — so a *grpctun.DialError is believed outright. The string
+// matching below is the fallback for the few errors that come from somewhere
+// else, and it is not where new cases should be added.
 func classify(err error) string {
+	var de *grpctun.DialError
+	if errors.As(err, &de) && de.Reason != "" {
+		return string(de.Reason)
+	}
+
 	switch {
 	case err == nil:
 		return "closed"

@@ -36,15 +36,17 @@ const (
 // Spoke is the fully resolved configuration of the spoke binary. Every field
 // maps to one --flag and one PMF_ variable; see [EnvKey].
 type Spoke struct {
-	// HubEndpoints are the hub tunnel endpoints to dial, comma separated as
-	// host:port. The spoke holds one tunnel per endpoint, which is how hub HA
-	// works: there is no hub-to-hub forwarding.
+	// HubEndpoints are the hub tunnel endpoints to dial, comma separated, as
+	// URLs such as wss://hub.example.com/tunnel. A bare host:port from before
+	// ADR-0014 is still accepted and read as wss://<host:port>/tunnel. The
+	// spoke holds one tunnel per endpoint, which is how hub HA works: there is
+	// no hub-to-hub forwarding.
 	HubEndpoints []string
 	// HubAPIURL is the https base URL of the hub's enrollment listener.
 	HubAPIURL string
-	// HubCAFile is the trust bundle used to verify the hub's tunnel and
-	// enrollment server certificates. When empty the bundle returned by
-	// enrollment and cached in DataDir is used.
+	// HubCAFile is the trust bundle used to verify the hub's server
+	// certificate, which behind an Ingress is the Ingress's certificate. When
+	// empty the bundle returned by enrollment and cached in DataDir is used.
 	HubCAFile string
 	// HubTLSInsecure disables verification of the hub's server certificate.
 	// It exists only for bootstrapping a lab and is refused by Validate
@@ -135,7 +137,7 @@ func LoadSpoke(args []string, getenv func(string) string) (*Spoke, error) {
 	l := newLoader("spoke", getenv)
 	c := &Spoke{}
 
-	l.list(&c.HubEndpoints, "hub-endpoints", nil, "comma-separated hub tunnel endpoints as host:port")
+	l.list(&c.HubEndpoints, "hub-endpoints", nil, "comma-separated hub tunnel URLs, e.g. wss://hub.example.com/tunnel")
 	l.str(&c.HubAPIURL, "hub-api-url", "", "https base URL of the hub's enrollment listener")
 	l.str(&c.HubCAFile, "hub-ca-file", "", "trust bundle for the hub; empty uses the bundle cached in <data-dir>")
 	l.boolean(&c.HubTLSInsecure, "hub-tls-insecure", false, "skip verification of the hub certificate; requires --allow-insecure")
@@ -196,11 +198,11 @@ func (c *Spoke) Validate() error {
 	}
 
 	if len(c.HubEndpoints) == 0 {
-		add(problem("hub-endpoints", "is required (comma-separated host:port)"))
+		add(problem("hub-endpoints", "is required (comma-separated URLs, e.g. wss://hub.example.com/tunnel)"))
 	}
 	seen := make(map[string]struct{}, len(c.HubEndpoints))
 	for _, e := range c.HubEndpoints {
-		add(checkEndpoint("hub-endpoints", e))
+		add(checkHubEndpoint("hub-endpoints", e))
 		if _, dup := seen[e]; dup {
 			add(problem("hub-endpoints", "%q appears twice", e))
 		}

@@ -58,7 +58,7 @@ func FuzzTokenParse(f *testing.F) {
 		// stays deterministic; a nondeterministic target makes Go's fuzzing
 		// engine treat every run as newly interesting and stall.
 		class := classes[len(in)%len(classes)]
-		m, err := mintWith(class, seededReader(in))
+		m, err := mintWith(class, "", seededReader(in))
 		if err != nil {
 			t.Fatalf("mintWith(%q): %v", class, err)
 		}

@@ -5,15 +5,14 @@ package hub
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
-	"net"
 	"os"
 	"slices"
 	"sync"
 	"time"
 
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/store"
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel/wstun"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -22,57 +21,44 @@ import (
 // exactly one implementation and nothing here benefits from indirection.
 type prometheusRegistry = prometheus.Registry
 
-// tunnelCertificate resolves the server certificate the tunnel listener
-// presents.
+// newTunnelServer builds the hub side of the WebSocket tunnel.
 //
-// An operator-supplied certificate is used when both files are configured;
-// otherwise the internal CA issues one covering the configured server names.
-// Getting the names wrong is the single most common way to break a whole fleet
-// at once — every spoke verifies against them — so an empty list is refused
-// rather than silently producing a certificate nothing can validate.
-func (h *hub) tunnelCertificate() (tls.Certificate, error) {
-	if h.cfg.TunnelTLSCertFile != "" && h.cfg.TunnelTLSKeyFile != "" {
-		cert, err := tls.LoadX509KeyPair(h.cfg.TunnelTLSCertFile, h.cfg.TunnelTLSKeyFile)
-		if err != nil {
-			return tls.Certificate{}, fmt.Errorf("load the supplied tunnel certificate: %w", err)
-		}
-		h.logger.Info("using the operator-supplied tunnel certificate",
-			"cert_file", h.cfg.TunnelTLSCertFile)
-		return cert, nil
-	}
-
-	names, ips := splitServerNames(h.cfg.TunnelServerNames)
-	if len(names) == 0 && len(ips) == 0 {
-		return tls.Certificate{}, fmt.Errorf(
-			"--tunnel-server-names is required when no tunnel certificate is supplied: " +
-				"spokes verify the hub against these names, and a certificate " +
-				"covering none of them would fail every handshake in the fleet")
-	}
-
-	cert, err := h.authority.IssueServer(names, ips)
+// There is no tunnel certificate and no tunnel listener any more. An Ingress
+// terminates TLS, so the hub cannot see a client certificate and does not
+// present a server one of its own: it serves plain HTTP, the tunnel is a
+// WebSocket on the same listener as MCP, and mutual authentication happens
+// inside the connection (ADR-0014).
+//
+// What survives from the old listener is the part that was never about TLS:
+// the revocation predicate, consulted on every connection.
+func (h *hub) newTunnelServer() (*wstun.Server, error) {
+	revoked, err := h.revokedSerials()
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("issue the tunnel certificate: %w", err)
+		return nil, err
 	}
-	h.logger.Info("issued a tunnel certificate from the internal CA",
-		"dns_names", names, "ip_addresses", ips)
-	return cert, nil
+
+	// Name the replica in the ServerHello so a spoke's logs say which hub
+	// accepted it. It is diagnostic only and never authenticates anything.
+	serverID, err := os.Hostname()
+	if err != nil {
+		serverID = ""
+	}
+
+	srv, err := wstun.NewServer(wstun.ServerConfig{
+		Verify:      h.authority.VerifyChain,
+		IsRevoked:   revoked,
+		Logger:      h.logger,
+		MaxSessions: h.cfg.MaxSpokes,
+		ServerID:    serverID,
+		Path:        h.cfg.TunnelPath,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("build the tunnel server: %w", err)
+	}
+	return srv, nil
 }
 
-// splitServerNames separates DNS names from IP literals, because a certificate
-// needs them in different SAN fields and an IP placed in dNSName matches
-// nothing.
-func splitServerNames(values []string) (dns []string, ips []net.IP) {
-	for _, v := range values {
-		if ip := net.ParseIP(v); ip != nil {
-			ips = append(ips, ip)
-			continue
-		}
-		dns = append(dns, v)
-	}
-	return dns, ips
-}
-
-// revokedSerials returns a predicate consulted on every TLS handshake.
+// revokedSerials returns a predicate consulted on every tunnel handshake.
 //
 // It is cached rather than read from the store per handshake: a handshake is on
 // the hot path for reconnecting spokes, and a fleet-wide reconnect after a hub
@@ -166,6 +152,3 @@ func (c *revocationCache) refresh(ctx context.Context) error {
 	c.mu.Unlock()
 	return nil
 }
-
-// ensure os stays referenced for the file-backed paths above.
-var _ = os.ReadFile

@@ -149,9 +149,11 @@ did:
 Read that before reasoning about a spike — averaged data hides them. If you need
 raw resolution, shorten the range rather than raising `maxPoints`.
 
-For scale: a six-hour range over 84 series is roughly 4.6 MB of native
-Prometheus JSON, on the order of 1.4 million tokens, which fits in no context
-window that exists. The same query in `compact` is about 34 KB.
+For scale: a six-hour range over 84 series is roughly 4.1 MB of native
+Prometheus JSON, on the order of a million tokens, which fits in no context
+window that exists. The same query in `compact` is about 15 KB — 272 times
+smaller, and `internal/render` has a regression test that fails if that ratio
+ever drops below tenfold.
 
 ### `series`
 

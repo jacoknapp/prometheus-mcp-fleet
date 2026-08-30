@@ -86,12 +86,20 @@ Work outward from the common cause:
    after an infrastructure change. A LoadBalancer that lost its address, a DNS
    record that moved, or a firewall change affects every spoke at once.
    ```bash
-   kubectl -n $HUB_NS get svc pmf-hub-tunnel
-   openssl s_client -connect pmf-tunnel.example.com:8443 -alpn h2 </dev/null | head -20
+   # The tunnel is a WebSocket on the hub's ordinary Ingress path.
+   curl -sS -o /dev/null -w '%{http_code}\n' \
+     -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+     -H 'Sec-WebSocket-Version: 13' \
+     -H 'Sec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==' \
+     https://pmf.example.com/tunnel
    ```
-3. **Did the tunnel server certificate change?** If the hub re-issued it with
-   different SANs, every spoke will now fail verification. Check
-   `PMF_TUNNEL_SERVER_NAMES` matches the name spokes actually dial.
+   Expect `101`, or a `4xx` from the hub itself. **`404` means the Ingress is not
+   routing `/tunnel`**, which is the single most common cause of a fleet-wide
+   disconnect after an Ingress change.
+3. **Did the Ingress idle timeout drop?** Controllers close idle upgraded
+   connections; the tunnel's HTTP/2 pings run every 10 seconds, so anything above
+   about 30 seconds is safe. A timeout below that disconnects the whole fleet on
+   a rolling basis.
 4. **Are the spokes' certificates expiring en masse?** A fleet enrolled on the
    same afternoon expires on the same afternoon. Check
    `promfleet_hub_spoke_cert_expiry_seconds`.
@@ -115,7 +123,8 @@ kubectl -n prometheus-mcp logs deploy/pmf-spoke --tail=50
 | `dial tcp: i/o timeout` | Egress to the hub is blocked | Check the NetworkPolicy and the cluster's egress firewall |
 | `x509: certificate signed by unknown authority` | The spoke does not trust the hub's CA | Re-supply `hub.caBundle`; fetch it from `GET /pki/bundle` |
 | `x509: certificate has expired` | The spoke's own certificate lapsed | Mint a fresh enrollment token and re-enroll |
-| `remote error: tls: bad certificate` | The hub rejected it — usually revoked | Check the hub's audit log for the serial |
+| `auth-rejected` | The hub refused the handshake — usually a revoked certificate | Check the hub's audit log for the serial |
+| `upgrade-rejected` / `404` | The Ingress is not routing `/tunnel` | Fix the Ingress path |
 | `no such host` | DNS in that cluster cannot resolve the hub | Check the cluster's DNS and the NetworkPolicy's DNS egress rule |
 
 The spoke retries with full jitter forever, so there is nothing to restart once

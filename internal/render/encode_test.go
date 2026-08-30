@@ -81,10 +81,6 @@ func TestEncodeRangeGapsAndNonFinite(t *testing.T) {
 			{T: float64(start.Add(2 * time.Minute).Unix()), V: math.NaN()},
 			{T: float64(start.Add(3 * time.Minute).Unix()), V: math.Inf(1)},
 			{T: float64(start.Add(4 * time.Minute).Unix()), V: 5},
-			// Out of range on both sides: silently ignored rather than
-			// shifting every later index.
-			{T: float64(start.Add(-time.Hour).Unix()), V: 99},
-			{T: float64(start.Add(time.Hour).Unix()), V: 99},
 		},
 	}}
 	got := EncodeRange(RangeInput{
@@ -99,6 +95,33 @@ func TestEncodeRangeGapsAndNonFinite(t *testing.T) {
 	}
 	if got.Series[0].Max == nil || *got.Series[0].Max != 5 {
 		t.Errorf("max = %v, want the largest finite value", got.Series[0].Max)
+	}
+}
+
+// TestEncodeRangeIgnoresOutOfWindowSamples proves a sample outside the
+// requested window is dropped rather than shifting every later index, which
+// would silently misalign the whole series.
+func TestEncodeRangeIgnoresOutOfWindowSamples(t *testing.T) {
+	t.Parallel()
+	start := baseTime
+	m := Matrix{{
+		Metric: map[string]string{"job": "api"},
+		Values: []Point{
+			{T: float64(start.Add(-time.Hour).Unix()), V: 99},
+			{T: float64(start.Unix()), V: 1},
+			{T: float64(start.Add(time.Minute).Unix()), V: 2},
+			{T: float64(start.Add(time.Hour).Unix()), V: 99},
+		},
+	}}
+	got := EncodeRange(RangeInput{
+		Matrix: m, Start: start, End: start.Add(time.Minute), Step: time.Minute,
+	}, Options{})
+	encoded, err := json.Marshal(got.Series[0].Values)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(encoded) != "[1,2]" {
+		t.Errorf("values = %s, want the out-of-window samples dropped", encoded)
 	}
 }
 
@@ -134,8 +157,10 @@ func TestEncodeRangeAllNonFiniteSeriesSortLast(t *testing.T) {
 	got := EncodeRange(RangeInput{
 		Matrix: m, Start: baseTime, End: baseTime, Step: time.Minute,
 	}, Options{MaxSeries: 1})
-	if got.Series[0].Labels["i"] != "real" {
-		t.Errorf("an all-NaN series outranked one with data: %+v", got.Series)
+	// One survivor, so every label factors into sharedLabels.
+	if got.SharedLabels["i"] != "real" {
+		t.Errorf("an all-NaN series outranked one with data: shared=%v series=%+v",
+			got.SharedLabels, got.Series)
 	}
 	if got.Truncated == nil || got.Truncated.Selection != "top_1_by_max" {
 		t.Errorf("truncated = %+v", got.Truncated)

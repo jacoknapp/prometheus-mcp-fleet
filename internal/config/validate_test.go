@@ -26,7 +26,7 @@ func validHub(t *testing.T) *Hub {
 func validSpoke(t *testing.T) *Spoke {
 	t.Helper()
 	c, err := LoadSpoke(nil, env(map[string]string{
-		"PMF_HUB_ENDPOINTS": "hub.example.com:8443",
+		"PMF_HUB_ENDPOINTS": "wss://hub.example.com/tunnel",
 		"PMF_HUB_API_URL":   "https://hub.example.com",
 		"PMF_CLUSTER_ID":    "prod-us-east-1",
 	}))
@@ -51,7 +51,9 @@ func TestHubValidate(t *testing.T) {
 		{"mcp addr not host:port", func(c *Hub) { c.MCPAddr = "8080" }, "--mcp-addr"},
 		{"mcp addr bad port", func(c *Hub) { c.MCPAddr = ":notaport" }, "invalid port"},
 		{"mcp addr port out of range", func(c *Hub) { c.MCPAddr = ":70000" }, "invalid port"},
-		{"tunnel addr", func(c *Hub) { c.TunnelAddr = "nope" }, "--tunnel-addr"},
+		{"tunnel path relative", func(c *Hub) { c.TunnelPath = "tunnel" }, "--tunnel-path"},
+		{"tunnel path root", func(c *Hub) { c.TunnelPath = "/" }, "--tunnel-path"},
+		{"tunnel path empty", func(c *Hub) { c.TunnelPath = "" }, "--tunnel-path"},
 		{"admin addr", func(c *Hub) { c.AdminAddr = "nope" }, "--admin-addr"},
 		{"admin addr host with space", func(c *Hub) { c.AdminAddr = "bad host:9090" }, "--admin-addr"},
 		{"log level", func(c *Hub) { c.LogLevel = "verbose" }, "--log-level"},
@@ -60,8 +62,6 @@ func TestHubValidate(t *testing.T) {
 		{"pepper file", func(c *Hub) { c.PepperFile = "" }, "--pepper-file"},
 		{"ca cert without key", func(c *Hub) { c.CACertFile, c.CAKeyFile = "/ca.pem", "" }, "--ca-key-file"},
 		{"ca key without cert", func(c *Hub) { c.CACertFile, c.CAKeyFile = "", "/ca.key" }, "--ca-cert-file"},
-		{"tunnel cert without key", func(c *Hub) { c.TunnelTLSCertFile = "/t.pem" }, "--tunnel-tls-key-file"},
-		{"tunnel key without cert", func(c *Hub) { c.TunnelTLSKeyFile = "/t.key" }, "--tunnel-tls-cert-file"},
 		{"trust domain empty", func(c *Hub) { c.TrustDomain = "" }, "--trust-domain"},
 		{"trust domain uppercase", func(c *Hub) { c.TrustDomain = "Fleet.Local" }, "--trust-domain"},
 		{"spoke cert ttl", func(c *Hub) { c.SpokeCertTTL = 0 }, "--spoke-cert-ttl"},
@@ -137,7 +137,7 @@ func TestHubValidateAcceptsPublicURLAndPairs(t *testing.T) {
 	c := validHub(t)
 	c.PublicURL = "https://mcp.example.com/mcp"
 	c.CACertFile, c.CAKeyFile = "/ca.pem", "/ca.key"
-	c.TunnelTLSCertFile, c.TunnelTLSKeyFile = "/t.pem", "/t.key"
+	c.TunnelPath = "/pmf/tunnel"
 	c.ShutdownDrainDelay = 0
 	c.MCPAddr = "0.0.0.0:0"
 	if err := c.Validate(); err != nil {
@@ -154,13 +154,17 @@ func TestSpokeValidate(t *testing.T) {
 		contains string
 	}{
 		{"no endpoints", func(c *Spoke) { c.HubEndpoints = nil }, "--hub-endpoints"},
-		{"endpoint not host:port", func(c *Spoke) { c.HubEndpoints = []string{"hub.example.com"} }, "--hub-endpoints"},
+		{"endpoint neither url nor host:port", func(c *Spoke) { c.HubEndpoints = []string{"hub.example.com"} }, "--hub-endpoints"},
 		{"endpoint without host", func(c *Spoke) { c.HubEndpoints = []string{":8443"} }, "has no host"},
 		{"endpoint port zero", func(c *Spoke) { c.HubEndpoints = []string{"hub:0"} }, "invalid port"},
 		{"endpoint port not numeric", func(c *Spoke) { c.HubEndpoints = []string{"hub:https"} }, "invalid port"},
+		{"endpoint bad scheme", func(c *Spoke) { c.HubEndpoints = []string{"ftp://hub/tunnel"} }, "scheme"},
+		{"endpoint url without host", func(c *Spoke) { c.HubEndpoints = []string{"wss:///tunnel"} }, "has no host"},
+		{"endpoint url with credentials", func(c *Spoke) { c.HubEndpoints = []string{"wss://u:p@hub/tunnel"} }, "credentials"},
+		{"endpoint url with query", func(c *Spoke) { c.HubEndpoints = []string{"wss://hub/tunnel?a=1"} }, "query or fragment"},
 		{
 			"duplicate endpoint",
-			func(c *Spoke) { c.HubEndpoints = []string{"hub:8443", "hub:8443"} },
+			func(c *Spoke) { c.HubEndpoints = []string{"wss://hub/tunnel", "wss://hub/tunnel"} },
 			"appears twice",
 		},
 		{"hub api url missing", func(c *Spoke) { c.HubAPIURL = "" }, "--hub-api-url"},

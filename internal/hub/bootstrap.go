@@ -4,12 +4,14 @@
 package hub
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/ca"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/config"
@@ -46,9 +48,19 @@ type caMaterial struct {
 	certPEM, keyPEM, pepper []byte
 }
 
-// empty reports whether nothing has been generated yet.
+// empty reports whether nothing at all is stored.
 func (m caMaterial) empty() bool {
 	return len(m.certPEM) == 0 && len(m.keyPEM) == 0 && len(m.pepper) == 0
+}
+
+// complete reports whether every field the hub needs is present.
+//
+// The distinction from empty matters: a Secret holding a CA but no pepper is
+// neither. Treating it as complete would leave each replica hashing keys with
+// its own emptyDir-local pepper, so a key minted on one replica would be
+// unverifiable on any other and would stop verifying at all after a restart.
+func (m caMaterial) complete() bool {
+	return len(m.certPEM) > 0 && len(m.keyPEM) > 0 && len(m.pepper) > 0
 }
 
 // prepare ensures the CA and pepper exist both on disk and, when running in a
@@ -142,6 +154,13 @@ func (b *bootstrapper) materialise(m caMaterial, cfg *config.Hub) error {
 		if len(data) == 0 || path == "" {
 			return nil
 		}
+		// Skip the write when the file already holds exactly these bytes. That
+		// is not just an optimisation: the configured path may be a projected
+		// Secret mount, which is read-only, and rewriting identical content
+		// there would turn a correct configuration into a startup failure.
+		if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, data) {
+			return nil
+		}
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			return err
 		}
@@ -176,7 +195,7 @@ func (b *bootstrapper) persist(
 	if b.client == nil {
 		return false, nil
 	}
-	if !stored.empty() {
+	if stored.complete() {
 		return false, nil // nothing was generated; the Secret is authoritative
 	}
 
@@ -193,6 +212,14 @@ func (b *bootstrapper) persist(
 		secretKeyCACert: certPEM,
 		secretKeyCAKey:  keyPEM,
 		secretKeyPepper: pepper,
+	}
+
+	// A Secret that already exists but is missing a field is completed in
+	// place. Only the absent fields are written: overwriting a live CA would
+	// invalidate every certificate in the fleet, so an existing value always
+	// wins over the one this process just generated.
+	if !stored.empty() {
+		return b.complete(ctx, stored, data)
 	}
 
 	_, err = b.client.CreateSecret(ctx, &kube.Secret{
@@ -240,4 +267,50 @@ func reloadAfterAdoption(cfg *config.Hub) (*ca.CA, error) {
 		TrustDomain:  cfg.TrustDomain,
 		SpokeCertTTL: cfg.SpokeCertTTL,
 	})
+}
+
+// complete fills in the fields a partially populated Secret is missing.
+//
+// It never replaces a field that already has a value. That is the whole safety
+// property: a hub that overwrote a live CA key would orphan every spoke in the
+// fleet, and no failure mode is worth risking that.
+func (b *bootstrapper) complete(
+	ctx context.Context, stored caMaterial, generated map[string][]byte,
+) (adopted bool, err error) {
+	sec, err := b.client.GetSecret(ctx, b.secret)
+	if err != nil {
+		return false, fmt.Errorf("read CA secret %s: %w", b.secret, err)
+	}
+	if sec.Data == nil {
+		sec.Data = make(map[string][]byte, len(generated))
+	}
+
+	var filled []string
+	for key, value := range generated {
+		if len(sec.Data[key]) > 0 {
+			continue // an existing value always wins
+		}
+		sec.Data[key] = value
+		filled = append(filled, key)
+	}
+	if len(filled) == 0 {
+		return false, nil
+	}
+	slices.Sort(filled)
+
+	if _, err := b.client.UpdateSecret(ctx, sec); err != nil {
+		if errors.Is(err, kube.ErrConflict) {
+			// Another replica completed it first. Adopt whatever is there now.
+			return true, nil
+		}
+		return false, fmt.Errorf("complete CA secret %s: %w", b.secret, err)
+	}
+	b.logger.Warn("completed a partially populated CA secret",
+		"secret", b.secret, "filled", filled,
+		"note", "existing fields were left untouched")
+
+	// The fields we did not fill came from the Secret and are already on disk;
+	// the ones we did fill are ours. Nothing to re-adopt.
+	_ = stored
+	return false, nil
 }

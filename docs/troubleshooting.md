@@ -173,9 +173,10 @@ revoked; check the hub's audit log for the serial.
 certificate's lifetime. The spoke's logs have the renewal error. An expired
 identity needs a fresh single-use enrollment token, deliberately.
 
-**The whole fleet fails verification at once** — the hub's tunnel certificate
-changed and its SANs no longer match the name spokes dial. Check
-`PMF_TUNNEL_SERVER_NAMES`.
+**The whole fleet disconnects at once** — almost always the Ingress. Either it
+stopped routing `/tunnel` (spokes report a 404 on upgrade), or its idle timeout
+for upgraded connections dropped below the tunnel's 10-second keepalive
+interval.
 
 ## Nothing here matches
 

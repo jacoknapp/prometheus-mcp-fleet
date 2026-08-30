@@ -82,23 +82,21 @@ flowchart LR
 **Each replica must be individually addressable from outside the cluster.** This
 is the part people underestimate. You need:
 
-1. A distinct external address per replica — three DNS names, or three
-   LoadBalancer Services, or a per-pod Service plus an ssl-passthrough route
-   each. An ordinary Ingress cannot front the tunnel port because it terminates
-   TLS and the hub must see each spoke's client certificate.
-2. **Every one of those names in the tunnel certificate's SANs.** Set
-   `PMF_TUNNEL_SERVER_NAMES` to all of them, or supply your own certificate.
-   Miss one and every spoke fails verification against that replica only —
-   which presents as an intermittent, partial outage that is genuinely
-   unpleasant to diagnose.
+1. A distinct external hostname per replica, each routed by the Ingress to that
+   replica's pod. Since the tunnel is now ordinary HTTP
+   ([ADR-0014](../adr/0014-websocket-tunnel-through-standard-ingress.md)) this is
+   plain Ingress routing rather than per-replica TLS endpoints — considerably
+   less work than it used to be, though still work.
+2. A certificate covering those names, which your existing Ingress TLS already
+   handles.
 3. Every spoke configured with all of them:
 
    ```yaml
    hub:
      endpoints:
-       - pmf-hub-0.example.com:8443
-       - pmf-hub-1.example.com:8443
-       - pmf-hub-2.example.com:8443
+       - wss://pmf-hub-0.example.com/tunnel
+       - wss://pmf-hub-1.example.com/tunnel
+       - wss://pmf-hub-2.example.com/tunnel
    ```
 
    The spoke opens one tunnel per endpoint and maintains each independently

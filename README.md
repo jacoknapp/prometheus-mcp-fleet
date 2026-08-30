@@ -43,10 +43,11 @@ at fleet scale for three reasons, and this project is shaped by all three.
    — so the hub can answer "which clusters even have this metric?" without
    fanning a query out to all of them.
 3. **Context economy.** Prometheus' native JSON will bury a model. A six-hour
-   range query over 84 series is roughly 4.6 MB of JSON, which fits in no
+   range query over 84 series is roughly 4.1 MB of JSON, which fits in no
    context window that exists. The hub re-encodes it columnar, auto-selects the
    step, caps series, and marks every truncation explicitly — the same query
-   comes back at about 34 KB.
+   comes back at about 15 KB — a 272-fold reduction, measured by a regression
+   test rather than asserted here.
 
 ### No database
 
@@ -89,16 +90,27 @@ flowchart LR
     end
 
     A1 -->|"HTTPS + Bearer pmf_agt_…<br/>MCP Streamable HTTP"| H
-    S1 -.->|"dials out · mTLS · gRPC"| H
-    S2 -.->|"dials out · mTLS · gRPC"| H
-    SN -.->|"dials out · mTLS · gRPC"| H
+    S1 -.->|"dials out · wss:// · gRPC"| H
+    S2 -.->|"dials out · wss:// · gRPC"| H
+    SN -.->|"dials out · wss:// · gRPC"| H
 ```
 
-Every arrow from a spoke points *at* the hub: spokes always initiate. Once the
-mTLS handshake completes the roles invert and the spoke serves gRPC over the
-connection it opened, so the hub gets HTTP/2 stream multiplexing, per-request
-cancellation and deadline propagation without any bespoke framing. See
-[ADR-0002](docs/adr/0002-spoke-dialed-reversed-grpc-tunnel.md).
+Every arrow from a spoke points *at* the hub: spokes always initiate, over
+ordinary outbound HTTPS. The tunnel is a **WebSocket on the hub's normal HTTP
+port**, so it reaches the hub through a standard Ingress — no TCP passthrough,
+no LoadBalancer, no NodePort, no second hostname
+([ADR-0014](docs/adr/0014-websocket-tunnel-through-standard-ingress.md)).
+
+Once the WebSocket is up the roles invert and the spoke serves gRPC over the
+connection it opened, so the hub still gets HTTP/2 stream multiplexing,
+per-request cancellation and deadline propagation without any bespoke framing
+([ADR-0002](docs/adr/0002-spoke-dialed-reversed-grpc-tunnel.md)).
+
+Because an Ingress terminates TLS, the hub cannot see a client certificate, so
+mutual authentication happens **inside** the connection: the hub sends a
+single-use nonce and the spoke returns its certificate plus a signature over it.
+That is TLS's own `CertificateVerify` step performed one layer up — the private
+key never leaves the spoke, and identity still comes only from the certificate.
 
 ### Request path
 
@@ -133,17 +145,16 @@ helm install pmf-hub oci://ghcr.io/jacoknapp/charts/prometheus-mcp-hub \
   --namespace prometheus-mcp --create-namespace \
   --set ingress.enabled=true \
   --set ingress.host=pmf.example.com \
-  --set tunnel.serverNames[0]=pmf-tunnel.example.com
+  --set ingress.tls.enabled=true
 ```
 
 The hub generates its own CA and HMAC pepper on first boot and writes them to a
 Secret it owns, using a Role scoped by `resourceNames` to exactly that Secret.
 Nothing sensitive goes in `values.yaml`, and there is no volume to provision.
 
-MCP traffic is exposed through a standard `networking.k8s.io/v1` Ingress. The
-tunnel port is mutually authenticated TLS and the hub must see each spoke's
-client certificate, which an HTTP Ingress cannot pass through, so it gets its own
-`Service` of type LoadBalancer.
+Everything — the MCP endpoint and the spoke tunnel alike — is served on one HTTP
+port behind one standard `networking.k8s.io/v1` Ingress. There is no second
+Service, no LoadBalancer and no passthrough annotation to arrange.
 
 ### 2. Mint an agent key
 
@@ -174,7 +185,7 @@ kubectl create secret generic pmf-enrollment -n prometheus-mcp \
 helm install pmf-spoke oci://ghcr.io/jacoknapp/charts/prometheus-mcp-spoke \
   --namespace prometheus-mcp \
   --set cluster.id=prod-us-east-1 \
-  --set hub.endpoints[0]=pmf-tunnel.example.com:8443 \
+  --set hub.endpoints[0]=wss://pmf.example.com/tunnel \
   --set hub.apiUrl=https://pmf.example.com \
   --set enrollment.existingSecret=pmf-enrollment \
   --set prometheus.url=http://prometheus-operated.monitoring.svc:9090
@@ -242,6 +253,12 @@ error codes: [docs/mcp-tools.md](docs/mcp-tools.md).
   certificate's URI SAN; nothing it reports at runtime can override it.
 - **Keys are stored as HMAC-SHA256 with an out-of-database pepper**, compared in
   constant time. A database leak alone yields nothing usable.
+- **The Ingress is inside the trust boundary.** It terminates TLS, so it can
+  observe tunnel traffic. It cannot impersonate a spoke — it never holds a
+  spoke's private key and the signature covers a nonce the hub chose — but this
+  is a real reduction against end-to-end mTLS, and
+  [ADR-0014](docs/adr/0014-websocket-tunnel-through-standard-ingress.md) states
+  it rather than glossing it.
 - **The spoke's RBAC is one Secret.** It needs `get,create,update` on exactly the
   one Secret holding its own client key and certificate, restricted by
   `resourceNames` — nothing cluster-scoped, nothing else in the namespace. It

@@ -3,6 +3,7 @@ module github.com/jacoknapp/prometheus-mcp-fleet
 go 1.25.0
 
 require (
+	github.com/coder/websocket v1.8.15
 	github.com/google/go-cmp v0.7.0
 	github.com/google/jsonschema-go v0.4.3
 	github.com/modelcontextprotocol/go-sdk v1.7.0

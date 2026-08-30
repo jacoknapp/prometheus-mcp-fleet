@@ -8,9 +8,9 @@
 // # Role reversal
 //
 // The spoke dials the hub, because asking a hundred cluster operators to open
-// an inbound firewall hole is not a plan. Once the mTLS handshake completes the
-// transport roles invert: the side that dialled runs the gRPC *server* and the
-// side that accepted runs the gRPC *client*.
+// an inbound firewall hole is not a plan. Once the peer has been authenticated
+// the transport roles invert: the side that dialled runs the gRPC *server* and
+// the side that accepted runs the gRPC *client*.
 //
 //	        spoke process                                 hub process
 //	┌───────────────────────────┐              ┌───────────────────────────┐
@@ -19,13 +19,22 @@
 //	│   (bridges tunnel.Handler)│              │   (implements tunnel.     │
 //	│                           │              │    Session)               │
 //	└────────────┬──────────────┘              └─────────────┬─────────────┘
-//	             │ Serve(oneShotListener{c})                 │ NewClient(
+//	             │ ServeConn(c)                              │ NewClient(
 //	             │                                           │  "passthrough:///spoke",
 //	             │                                           │  WithContextDialer(->c))
 //	             │        ┌──────────────────────────┐       │
-//	             └───────►│  one TCP conn + mTLS     │◄──────┘
-//	               dial   │  HTTP/2, multiplexed     │  accept
+//	             └───────►│  one authenticated conn  │◄──────┘
+//	               dial   │  HTTP/2, multiplexed     │  ConnSource.Accept
 //	                      └──────────────────────────┘
+//
+// # Where the connection comes from
+//
+// This package does not dial, listen, or authenticate. Both halves take a
+// net.Conn whose peer identity is already settled: the hub through
+// [ConnSource], the spoke by handing one to [ServeConn]. Transports plug in at
+// that seam, which is why the WebSocket transport of ADR-0014
+// (internal/tunnel/wstun) replaced raw mTLS on its own port without a second
+// copy of anything below.
 //
 // Everything that makes this transport pleasant falls out of that inversion for
 // free, because it is all standard HTTP/2 machinery: many concurrent Proxy

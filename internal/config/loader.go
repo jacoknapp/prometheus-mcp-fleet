@@ -313,19 +313,72 @@ func checkAddr(flagName, addr string) error {
 	return nil
 }
 
-// checkEndpoint validates a dial target, which unlike a listen address must
-// name a host and a non-zero port.
-func checkEndpoint(flagName, endpoint string) error {
-	host, port, err := net.SplitHostPort(endpoint)
+// checkPath validates an absolute URL path used as a mount point. A bare "/"
+// is refused: mounting the tunnel there would swallow every other route on the
+// listener it shares.
+func checkPath(flagName, path string) error {
+	switch {
+	case path == "":
+		return problem(flagName, "is required")
+	case !strings.HasPrefix(path, "/"):
+		return problem(flagName, "%q must start with /", path)
+	case path == "/":
+		return problem(flagName, "must not be %q: it shares a listener with the MCP endpoint", path)
+	case strings.ContainsAny(path, "?# \t"):
+		return problem(flagName, "%q must be a plain path with no query or fragment", path)
+	default:
+		return nil
+	}
+}
+
+// checkHubEndpoint validates one hub tunnel endpoint.
+//
+// Since ADR-0014 the tunnel arrives as a WebSocket on the hub's ordinary HTTP
+// listener, so an endpoint is a URL. The previous release configured a
+// host:port, and that form is still accepted and read as
+// wss://<host:port>/tunnel — an operator upgrading a hundred spokes should not
+// have to rewrite every one of them in the same change.
+func checkHubEndpoint(flagName, endpoint string) error {
+	if endpoint == "" {
+		return problem(flagName, "is empty; expected a URL such as wss://hub.example.com/tunnel")
+	}
+	if !strings.Contains(endpoint, "://") {
+		host, port, err := net.SplitHostPort(endpoint)
+		if err != nil || strings.ContainsAny(endpoint, "/?#") {
+			return problem(flagName,
+				"%q is neither a URL nor host:port; expected a URL such as wss://hub.example.com/tunnel",
+				endpoint)
+		}
+		if host == "" {
+			return problem(flagName, "%q has no host", endpoint)
+		}
+		n, cerr := strconv.Atoi(port)
+		if cerr != nil || n < 1 || n > 65535 {
+			return problem(flagName, "%q has an invalid port %q", endpoint, port)
+		}
+		return nil
+	}
+
+	u, err := url.Parse(endpoint)
 	if err != nil {
-		return problem(flagName, "%q is not host:port", endpoint)
+		return problem(flagName, "%q is not a URL", redactURL(endpoint))
 	}
-	if host == "" {
-		return problem(flagName, "%q has no host", endpoint)
+	switch u.Scheme {
+	case "ws", "wss", "http", "https":
+	default:
+		return problem(flagName, "%q uses the %q scheme; expected wss (or ws for a plaintext hub)",
+			redactURL(endpoint), u.Scheme)
 	}
-	n, err := strconv.Atoi(port)
-	if err != nil || n < 1 || n > 65535 {
-		return problem(flagName, "%q has an invalid port %q", endpoint, port)
+	if u.Host == "" {
+		return problem(flagName, "%q has no host", redactURL(endpoint))
+	}
+	if u.User != nil {
+		return problem(flagName, "%q carries credentials in the URL, which the tunnel never uses",
+			redactURL(endpoint))
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return problem(flagName, "%q carries a query or fragment; expected a URL such as wss://hub.example.com/tunnel",
+			redactURL(endpoint))
 	}
 	return nil
 }

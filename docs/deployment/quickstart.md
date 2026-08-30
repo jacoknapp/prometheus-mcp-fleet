@@ -15,17 +15,17 @@ trust bundle and a single-use token.
 
 ## Prerequisites
 
-- A cluster for the hub, with an Ingress controller and the ability to allocate
-  a LoadBalancer (or a NodePort you can reach).
+- A cluster for the hub with a standard Ingress controller. No LoadBalancer, no
+  NodePort and no TCP passthrough are needed.
 - One or more clusters to monitor, each running Prometheus, each with **egress**
   to the hub. No inbound access to them is needed — that is the point.
 - `helm` 3.19+, `kubectl`.
-- Two DNS names pointing at the hub cluster: one for MCP (`pmf.example.com`),
-  one for the tunnel (`pmf-tunnel.example.com`).
+- One DNS name pointing at the hub cluster (`pmf.example.com`).
 
-Two names because the tunnel is mutually authenticated TLS and the hub must see
-each spoke's client certificate. An HTTP Ingress terminates TLS and cannot pass
-that through, so the tunnel gets its own Service.
+One name, because the tunnel is a WebSocket on the same HTTP listener as the
+MCP endpoint. Mutual authentication happens inside the connection rather than at
+the TLS layer, which is what lets it traverse an ordinary Ingress
+([ADR-0014](../adr/0014-websocket-tunnel-through-standard-ingress.md)).
 
 ## 1. Install the hub
 
@@ -39,8 +39,6 @@ helm install pmf-hub oci://ghcr.io/jacoknapp/charts/prometheus-mcp-hub \
   --set ingress.host=pmf.example.com \
   --set ingress.tls.enabled=true \
   --set ingress.tls.secretName=pmf-tls \
-  --set tunnel.service.type=LoadBalancer \
-  --set tunnel.serverNames[0]=pmf-tunnel.example.com \
   --set config.publicURL=https://pmf.example.com/mcp \
   --set config.trustDomain=fleet.example.com
 ```
@@ -49,12 +47,9 @@ On first boot the hub generates its own CA and HMAC pepper into a Secret it
 owns, using a Role scoped by `resourceNames` to exactly that object. There is no
 volume to provision and nothing sensitive in `values.yaml`.
 
-Point `pmf-tunnel.example.com` at the LoadBalancer address:
-
-```bash
-kubectl -n prometheus-mcp-hub get svc pmf-hub-tunnel \
-  -o jsonpath='{.status.loadBalancer.ingress[0].ip}{"\n"}'
-```
+One hostname carries everything: the MCP endpoint at `/mcp` and the spoke
+tunnel at `/tunnel`, both plain HTTP through the Ingress. There is no second
+Service and no passthrough to arrange.
 
 Confirm it is up:
 
@@ -134,7 +129,7 @@ helm install pmf-spoke oci://ghcr.io/jacoknapp/charts/prometheus-mcp-spoke \
   --set cluster.id=prod-us-east-1 \
   --set cluster.labels.env=prod \
   --set cluster.labels.region=us-east-1 \
-  --set hub.endpoints[0]=pmf-tunnel.example.com:8443 \
+  --set hub.endpoints[0]=wss://pmf.example.com/tunnel \
   --set hub.apiUrl=https://pmf.example.com \
   --set hub.existingCASecret=pmf-hub-ca \
   --set enrollment.existingSecret=pmf-enrollment \
@@ -150,7 +145,7 @@ Verify:
 ```bash
 kubectl -n prometheus-mcp logs deploy/pmf-spoke | grep -E 'certificate|tunnel'
 # obtained client certificate  cluster_id=prod-us-east-1 not_after=…
-# tunnel established           endpoint=pmf-tunnel.example.com:8443
+# tunnel established           endpoint=wss://pmf.example.com/tunnel
 ```
 
 Now repeat for `prod-eu-west-1`, and so on.

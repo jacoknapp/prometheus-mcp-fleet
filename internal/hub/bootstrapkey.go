@@ -19,6 +19,18 @@ import (
 // after issuing a properly scoped replacement.
 const bootstrapKeyName = "bootstrap"
 
+// bootstrapKID is the fixed public identifier of the automatically minted first
+// admin credential.
+//
+// It is deliberately well-known. Two hub replicas starting against an empty
+// store would otherwise each observe "no admin key exists", mint credentials
+// with different random identifiers, both succeed, and both print a valid admin
+// token to the log. A fixed identifier turns that race into a uniqueness
+// conflict the store already knows how to reject, so exactly one replica wins
+// and the other stays silent. The identifier is public by design -- it appears
+// in audit logs -- and the secret is still 256 bits of CSPRNG output.
+const bootstrapKID = "bootstrap0"
+
 // bootstrapAdminKey mints the first admin credential, once, if none exists.
 //
 // Without it a freshly installed hub cannot be administered at all: there is no
@@ -37,8 +49,12 @@ func (h *hub) bootstrapAdminKey(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list admin keys: %w", err)
 	}
+	now := h.clock()
 	for _, k := range existing {
-		if !k.Revoked() {
+		// Usable, not merely unrevoked. An expired-but-unrevoked record would
+		// otherwise suppress recovery forever, leaving a hub with no
+		// administrative credential and no way to mint one.
+		if k.Usable(now) {
 			// An admin credential already exists. Say nothing: logging even the
 			// KID here on every start would be noise, and logging more would be
 			// a leak.
@@ -46,12 +62,23 @@ func (h *hub) bootstrapAdminKey(ctx context.Context) error {
 		}
 	}
 
-	minted, err := token.Mint(fleet.ClassAdmin)
+	// An unusable record under the well-known identifier blocks the replacement
+	// this function exists to create, so clear it first. Doing so is safe
+	// precisely because the record is expired or revoked: it can no longer
+	// authenticate anything.
+	if _, err := h.store.GetKey(ctx, bootstrapKID); err == nil {
+		if derr := h.store.DeleteKey(ctx, bootstrapKID); derr != nil {
+			return fmt.Errorf("clear the unusable bootstrap admin key: %w", derr)
+		}
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return fmt.Errorf("read the bootstrap admin key: %w", err)
+	}
+
+	minted, err := token.MintWithKID(fleet.ClassAdmin, bootstrapKID)
 	if err != nil {
 		return fmt.Errorf("mint the bootstrap admin key: %w", err)
 	}
 
-	now := h.clock()
 	record := &fleet.Key{
 		KID:        minted.KID,
 		Class:      fleet.ClassAdmin,
@@ -64,6 +91,10 @@ func (h *hub) bootstrapAdminKey(ctx context.Context) error {
 		// Losing a create race with another replica is fine and expected: the
 		// winner's key is the one that counts, and ours was never revealed.
 		if errors.Is(err, store.ErrAlreadyExists) {
+			// Another replica won the race under the same well-known
+			// identifier. Its token is the one that counts and ours was never
+			// revealed, so say nothing at all.
+			h.logger.Info("another replica minted the bootstrap admin key first")
 			return nil
 		}
 		return fmt.Errorf("store the bootstrap admin key: %w", err)

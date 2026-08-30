@@ -16,7 +16,7 @@ per series and a full timestamp per sample, and encodes every value as a string:
 
 Take a realistic request: `rate(container_cpu_usage_seconds_total{namespace="prod"}[5m])`
 over six hours at a 15-second scrape interval, matching 84 series. That is
-120,960 samples, roughly 4.6 MB of JSON, on the order of 1.4 million tokens. It
+121,044 samples, roughly 4.1 MB of JSON, on the order of 1.03 million tokens. It
 does not fit in any context window that exists, and an agent that requests it has
 destroyed its own session — including the part of the session holding the
 incident it was investigating.
@@ -51,7 +51,7 @@ The default output encoding is **columnar and lossy in stated ways**.
   any result regardless of the caller's `limit`. An agent must not be able to
   blow its own context in a single call, even by asking for it.
 
-The same query above comes back at roughly 34 KB — about 11,500 tokens, some
+The same query above comes back at roughly 15 KB — about 3,800 tokens, some
 5% of a 200k window, leaving room to actually think.
 
 ## Consequences

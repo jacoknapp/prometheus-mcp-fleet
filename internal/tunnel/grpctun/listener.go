@@ -5,8 +5,6 @@ package grpctun
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -28,44 +26,64 @@ import (
 // bug this transport exists to avoid.
 const maxCallBytes = 1 << 20
 
-// defaultHandshakeTimeout bounds the mTLS handshake plus the HTTP/2 preface.
+// defaultHandshakeTimeout bounds the HTTP/2 preface exchange that follows
+// adoption of an authenticated connection.
 const defaultHandshakeTimeout = 10 * time.Second
+
+// ConnSource supplies connections whose peer identity is already established.
+//
+// It is the seam between "how a spoke reaches the hub" and "what the hub does
+// with the connection once it has". Authentication belongs entirely to the
+// implementation — by the time Accept returns, the identity is settled and
+// this package treats it as certificate-derived fact. That is what lets the
+// WebSocket transport in internal/tunnel/wstun reuse this reversed-role gRPC
+// machinery without a second copy of it existing.
+//
+// Implementations must be safe for concurrent use.
+type ConnSource interface {
+	// Accept blocks until an authenticated connection is available, ctx is
+	// cancelled, or the source is closed. The returned connection is owned by
+	// the caller, which closes it when the session ends.
+	Accept(ctx context.Context) (net.Conn, tunnel.Identity, error)
+	// Addr describes where the source takes connections from, for logs and
+	// readiness reporting. It need not be a network address.
+	Addr() string
+	// Close stops the source and unblocks any Accept in progress. It is
+	// idempotent.
+	Close() error
+}
 
 // ListenerConfig configures the hub side of the tunnel.
 type ListenerConfig struct {
-	// Addr is the TCP address to bind, e.g. ":8443".
-	Addr string
-	// TLSConfig must already be configured to require and verify client
-	// certificates: NewListener refuses anything weaker, because spoke identity
-	// is the certificate and nothing else.
-	TLSConfig *tls.Config
-	// IdentityFromCert derives the spoke identity from the verified leaf
-	// certificate. Returning an error rejects the connection. Required.
-	IdentityFromCert func(*x509.Certificate) (tunnel.Identity, error)
 	// Logger receives connection lifecycle events. Defaults to slog.Default().
 	Logger *slog.Logger
 	// MaxSessions caps concurrently attached spokes. Zero means unlimited.
-	// Connections beyond the cap are logged and closed, not accepted and
-	// dropped on the floor.
+	// The cap is claimed before any per-connection goroutine exists, so a
+	// burst of simultaneous connections cannot exceed it.
+	//
+	// A ConnSource that can reject a peer more cheaply than this — the
+	// WebSocket source answers 503 before it upgrades — should do so and leave
+	// this at zero rather than counting the same sessions twice.
 	MaxSessions int
-	// HandshakeTimeout bounds TLS and the initial HTTP/2 exchange. Default 10s.
+	// HandshakeTimeout bounds the initial HTTP/2 exchange on an adopted
+	// connection. Default 10s.
 	HandshakeTimeout time.Duration
 	// Keepalive configures HTTP/2 PING liveness. See KeepaliveParams.
 	Keepalive KeepaliveParams
 }
 
-// listener is the tunnel.Listener implementation returned by NewListener.
+// listener is the tunnel.Listener implementation returned by NewSourceListener.
 type listener struct {
 	cfg  ListenerConfig
 	log  *slog.Logger
-	net  net.Listener
+	src  ConnSource
 	ka   KeepaliveParams
 	hsTO time.Duration
 
 	mu sync.Mutex
 	// active counts reserved session slots: it is incremented before the
 	// session exists and decremented after it has fully ended, so MaxSessions
-	// cannot be exceeded by a burst of simultaneous handshakes.
+	// cannot be exceeded by a burst of simultaneous connections.
 	active   int
 	sessions map[*session]struct{}
 	closed   bool
@@ -77,19 +95,14 @@ type listener struct {
 
 var _ tunnel.Listener = (*listener)(nil)
 
-// NewListener binds cfg.Addr and returns a hub-side tunnel listener.
+// NewSourceListener returns a tunnel.Listener that adopts connections from src.
 //
-// The returned listener owns the socket immediately, so /readyz can report
-// "tunnel listener bound" before Serve is called.
-func NewListener(cfg ListenerConfig) (tunnel.Listener, error) {
-	if cfg.TLSConfig == nil {
-		return nil, errors.New("grpctun: TLSConfig is required")
-	}
-	if cfg.TLSConfig.ClientAuth != tls.RequireAndVerifyClientCert {
-		return nil, fmt.Errorf("grpctun: TLSConfig.ClientAuth must be RequireAndVerifyClientCert, got %v", cfg.TLSConfig.ClientAuth)
-	}
-	if cfg.IdentityFromCert == nil {
-		return nil, errors.New("grpctun: IdentityFromCert is required")
+// The listener owns src from this point on and closes it during Shutdown. It
+// does not authenticate anything: src has already done that, which is the
+// whole point of the seam.
+func NewSourceListener(src ConnSource, cfg ListenerConfig) (tunnel.Listener, error) {
+	if src == nil {
+		return nil, errors.New("grpctun: ConnSource is required")
 	}
 	if cfg.MaxSessions < 0 {
 		return nil, fmt.Errorf("grpctun: MaxSessions must not be negative, got %d", cfg.MaxSessions)
@@ -102,15 +115,10 @@ func NewListener(cfg ListenerConfig) (tunnel.Listener, error) {
 	if hsTO <= 0 {
 		hsTO = defaultHandshakeTimeout
 	}
-
-	raw, err := net.Listen("tcp", cfg.Addr)
-	if err != nil {
-		return nil, fmt.Errorf("listen %s: %w", cfg.Addr, err)
-	}
 	return &listener{
 		cfg:      cfg,
 		log:      log,
-		net:      tls.NewListener(raw, cfg.TLSConfig),
+		src:      src,
 		ka:       cfg.Keepalive,
 		hsTO:     hsTO,
 		sessions: make(map[*session]struct{}),
@@ -119,23 +127,23 @@ func NewListener(cfg ListenerConfig) (tunnel.Listener, error) {
 }
 
 // Addr implements tunnel.Listener.
-func (l *listener) Addr() string { return l.net.Addr().String() }
+func (l *listener) Addr() string { return l.src.Addr() }
 
 // Serve implements tunnel.Listener. It blocks until ctx is cancelled, Shutdown
-// is called, or accepting fails unrecoverably.
+// is called, or the source fails unrecoverably.
 func (l *listener) Serve(ctx context.Context, h tunnel.SessionHandler) error {
 	if h == nil {
 		return errors.New("grpctun: SessionHandler is required")
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	// Cancelling ctx must unblock Accept, and only closing the socket does
-	// that.
+	// Cancelling ctx must unblock Accept, and only closing the source reliably
+	// does that for every implementation.
 	stopWatch := context.AfterFunc(ctx, func() { l.stopAccepting() })
 	defer stopWatch()
 
 	for {
-		conn, err := l.net.Accept()
+		conn, id, err := l.src.Accept(ctx)
 		if err != nil {
 			l.wg.Wait()
 			switch {
@@ -144,86 +152,53 @@ func (l *listener) Serve(ctx context.Context, h tunnel.SessionHandler) error {
 			case l.isClosed():
 				return ErrListenerClosed
 			default:
-				return fmt.Errorf("accept on %s: %w", l.Addr(), err)
+				return fmt.Errorf("accept from %s: %w", l.Addr(), err)
 			}
+		}
+		// Claim the slot here, on the accept goroutine, before anything else
+		// exists. A cap applied inside the per-connection goroutine is not a
+		// cap: the goroutine, its buffers and its handshake have already been
+		// paid for by the time it says no.
+		if !l.reserve() {
+			l.log.Warn("tunnel rejected",
+				slog.String("remote", id.RemoteAddr),
+				slog.String("cluster", id.ClusterID),
+				slog.Int("max_sessions", l.cfg.MaxSessions),
+				slog.Any("err", ErrTooManySessions))
+			_ = conn.Close()
+			continue
 		}
 		l.wg.Add(1)
 		go func() {
 			defer l.wg.Done()
-			l.attach(ctx, conn, h)
+			l.attach(ctx, conn, id, h)
 		}()
 	}
 }
 
-// attach completes the handshake, derives the identity and, if everything
-// checks out, builds the reversed-role gRPC client and hands the session to h.
-func (l *listener) attach(ctx context.Context, raw net.Conn, h tunnel.SessionHandler) {
-	remote := raw.RemoteAddr().String()
-
-	tlsConn, ok := raw.(*tls.Conn)
-	if !ok {
-		l.log.Warn("tunnel connection is not TLS", slog.String("remote", remote))
-		_ = raw.Close()
-		return
-	}
-	hsCtx, cancel := context.WithTimeout(ctx, l.hsTO)
-	defer cancel()
-	if err := tlsConn.HandshakeContext(hsCtx); err != nil {
-		l.log.Warn("tunnel handshake failed", slog.String("remote", remote), slog.Any("err", err))
-		_ = raw.Close()
-		return
+// attach builds the reversed-role gRPC client over an authenticated connection
+// and hands the resulting session to h. It owns the session slot reserved by
+// Serve and releases it on every path.
+func (l *listener) attach(ctx context.Context, conn net.Conn, id tunnel.Identity, h tunnel.SessionHandler) {
+	if id.RemoteAddr == "" && conn.RemoteAddr() != nil {
+		id.RemoteAddr = conn.RemoteAddr().String()
 	}
 
-	certs := tlsConn.ConnectionState().PeerCertificates
-	if len(certs) == 0 {
-		// Unreachable with RequireAndVerifyClientCert, but identity is the only
-		// thing standing between a stranger and the fleet, so check anyway.
-		l.log.Warn("tunnel peer presented no certificate", slog.String("remote", remote))
-		_ = raw.Close()
-		return
-	}
-	leaf := certs[0]
-	id, err := l.cfg.IdentityFromCert(leaf)
-	if err != nil {
-		l.log.Warn("tunnel identity rejected",
-			slog.String("remote", remote),
-			slog.String("subject", leaf.Subject.String()),
-			slog.Any("err", err))
-		_ = raw.Close()
-		return
-	}
-	id.RemoteAddr = remote
-	if id.CertSerial == "" && leaf.SerialNumber != nil {
-		id.CertSerial = fmt.Sprintf("%x", leaf.SerialNumber)
-	}
-	if id.CertNotAfter.IsZero() {
-		id.CertNotAfter = leaf.NotAfter
-	}
-
-	if !l.reserve() {
-		l.log.Warn("tunnel rejected: session limit reached",
-			slog.String("remote", remote),
-			slog.String("cluster", id.ClusterID),
-			slog.Int("max_sessions", l.cfg.MaxSessions))
-		_ = raw.Close()
-		return
-	}
-
-	sess, err := l.newSession(ctx, tlsConn, id)
+	sess, err := l.newSession(ctx, conn, id)
 	if err != nil {
 		l.release()
 		l.log.Warn("tunnel setup failed",
-			slog.String("remote", remote),
+			slog.String("remote", id.RemoteAddr),
 			slog.String("cluster", id.ClusterID),
 			slog.Any("err", err))
-		_ = raw.Close()
+		_ = conn.Close()
 		return
 	}
 
 	release, err := h.OnSession(ctx, sess)
 	if err != nil {
 		l.log.Warn("tunnel refused by session handler",
-			slog.String("remote", remote),
+			slog.String("remote", id.RemoteAddr),
 			slog.String("cluster", id.ClusterID),
 			slog.Any("err", err))
 		_ = sess.Close("rejected by hub: " + err.Error())
@@ -233,7 +208,7 @@ func (l *listener) attach(ctx context.Context, raw net.Conn, h tunnel.SessionHan
 	}
 
 	l.log.Info("tunnel session established",
-		slog.String("remote", remote),
+		slog.String("remote", id.RemoteAddr),
 		slog.String("cluster", id.ClusterID),
 		slog.String("cert_serial", id.CertSerial))
 
@@ -255,8 +230,8 @@ func (l *listener) newSession(ctx context.Context, raw net.Conn, id tunnel.Ident
 	od := newOneShotDialer(nc)
 
 	cc, err := grpc.NewClient("passthrough:///"+id.ClusterID,
-		// The socket is already mTLS; a second TLS layer inside it would be
-		// theatre.
+		// The peer is already authenticated by the ConnSource; a second TLS
+		// layer inside the connection would be theatre.
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithContextDialer(od.dial),
 		// Idle mode would drop the transport after 30 minutes of quiet and try
@@ -386,14 +361,14 @@ func (l *listener) isClosed() bool {
 	return l.closed
 }
 
-// stopAccepting closes the socket and marks the listener closed.
+// stopAccepting closes the source and marks the listener closed.
 func (l *listener) stopAccepting() {
 	l.stopOnce.Do(func() {
 		l.mu.Lock()
 		l.closed = true
 		l.mu.Unlock()
 		close(l.stopped)
-		_ = l.net.Close()
+		_ = l.src.Close()
 	})
 }
 

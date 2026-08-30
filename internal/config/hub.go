@@ -17,8 +17,10 @@ import (
 const (
 	// DefaultMCPAddr is the listen address of the agent-facing MCP endpoint.
 	DefaultMCPAddr = ":8080"
-	// DefaultTunnelAddr is the listen address spokes dial.
-	DefaultTunnelAddr = ":8443"
+	// DefaultTunnelPath is the path on the MCP listener where spokes open the
+	// tunnel WebSocket. It shares a listener with MCP so the whole product
+	// needs exactly one Ingress rule; see ADR-0014.
+	DefaultTunnelPath = "/tunnel"
 	// DefaultHubAdminAddr is loopback-only: the admin listener carries key
 	// administration, metrics, health and pprof.
 	DefaultHubAdminAddr = "127.0.0.1:9090"
@@ -74,8 +76,11 @@ var trustDomainRE = regexp.MustCompile(`^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$`)
 type Hub struct {
 	// MCPAddr is where the agent-facing MCP (Streamable HTTP) endpoint listens.
 	MCPAddr string
-	// TunnelAddr is where spokes dial in with mTLS.
-	TunnelAddr string
+	// TunnelPath is the path on MCPAddr where spokes open the tunnel
+	// WebSocket. There is no separate tunnel listener: an Ingress terminates
+	// TLS and cannot pass a client certificate through, so the tunnel arrives
+	// as ordinary HTTP and authenticates inside the connection (ADR-0014).
+	TunnelPath string
 	// AdminAddr carries the admin REST API, /metrics, health and pprof. It
 	// defaults to loopback because it is the credential-issuing surface.
 	AdminAddr string
@@ -116,20 +121,6 @@ type Hub struct {
 	CAKeyFile string
 	// TrustDomain is the authority component of spoke certificate URI SANs.
 	TrustDomain string
-
-	// TunnelServerNames are the subject alternative names placed on the
-	// tunnel's server certificate when the internal CA self-issues it. They
-	// must include every name or IP a spoke will use in PMF_HUB_ENDPOINTS, or
-	// the spoke's TLS verification of the hub will fail. Not named in the
-	// spec's key list but required to make a self-issued server certificate
-	// usable.
-	TunnelServerNames []string
-	// TunnelTLSCertFile and TunnelTLSKeyFile let an operator supply the tunnel
-	// server certificate instead (for instance one issued by a corporate CA).
-	// When empty the internal CA self-issues using TunnelServerNames.
-	TunnelTLSCertFile string
-	// TunnelTLSKeyFile is the private key matching TunnelTLSCertFile.
-	TunnelTLSKeyFile string
 
 	// SpokeCertTTL is the lifetime of an issued spoke client certificate.
 	SpokeCertTTL time.Duration
@@ -191,7 +182,7 @@ func LoadHub(args []string, getenv func(string) string) (*Hub, error) {
 	c := &Hub{}
 
 	l.str(&c.MCPAddr, "mcp-addr", DefaultMCPAddr, "listen address of the agent-facing MCP endpoint")
-	l.str(&c.TunnelAddr, "tunnel-addr", DefaultTunnelAddr, "listen address spokes dial with mTLS")
+	l.str(&c.TunnelPath, "tunnel-path", DefaultTunnelPath, "path on --mcp-addr where spokes open the tunnel websocket")
 	l.str(&c.AdminAddr, "admin-addr", DefaultHubAdminAddr, "listen address of the admin API, metrics, health and pprof")
 
 	l.str(&c.LogLevel, "log-level", DefaultLogLevel, "log level: debug, info, warn or error")
@@ -207,10 +198,6 @@ func LoadHub(args []string, getenv func(string) string) (*Hub, error) {
 	l.str(&c.CACertFile, "ca-cert-file", "", "internal CA certificate; empty self-initialises in <data-dir>")
 	l.str(&c.CAKeyFile, "ca-key-file", "", "internal CA private key; empty self-initialises in <data-dir>")
 	l.str(&c.TrustDomain, "trust-domain", DefaultTrustDomain, "trust domain in spoke certificate URI SANs")
-
-	l.list(&c.TunnelServerNames, "tunnel-server-names", nil, "comma-separated SANs for the self-issued tunnel server certificate")
-	l.str(&c.TunnelTLSCertFile, "tunnel-tls-cert-file", "", "operator-supplied tunnel server certificate; empty self-issues from the internal CA")
-	l.str(&c.TunnelTLSKeyFile, "tunnel-tls-key-file", "", "private key for --tunnel-tls-cert-file")
 
 	l.duration(&c.SpokeCertTTL, "spoke-cert-ttl", 336*time.Hour, "lifetime of an issued spoke client certificate")
 	l.duration(&c.EnrollmentTokenTTL, "enrollment-token-ttl", 15*time.Minute, "lifetime of a single-use enrollment token")
@@ -271,7 +258,7 @@ func (c *Hub) Validate() error {
 	}
 
 	add(checkAddr("mcp-addr", c.MCPAddr))
-	add(checkAddr("tunnel-addr", c.TunnelAddr))
+	add(checkPath("tunnel-path", c.TunnelPath))
 	add(checkAddr("admin-addr", c.AdminAddr))
 
 	add(checkEnum("log-level", c.LogLevel, logLevels))
@@ -291,7 +278,6 @@ func (c *Hub) Validate() error {
 		add(problem("state-file", "is required when --state-backend=file and --data-dir is empty"))
 	}
 	add(checkPair("ca-cert-file", c.CACertFile, "ca-key-file", c.CAKeyFile))
-	add(checkPair("tunnel-tls-cert-file", c.TunnelTLSCertFile, "tunnel-tls-key-file", c.TunnelTLSKeyFile))
 	if c.PublicURL == "" {
 		add(problem("public-url",
 			"is required: it is the canonical external URL agents reach, and it "+
@@ -341,7 +327,7 @@ func (c *Hub) LogValue() slog.Value {
 	}
 	return slog.GroupValue(
 		slog.String("mcpAddr", c.MCPAddr),
-		slog.String("tunnelAddr", c.TunnelAddr),
+		slog.String("tunnelPath", c.TunnelPath),
 		slog.String("adminAddr", c.AdminAddr),
 		slog.String("logLevel", c.LogLevel),
 		slog.String("logFormat", c.LogFormat),
@@ -350,9 +336,6 @@ func (c *Hub) LogValue() slog.Value {
 		slog.String("caCertFile", c.CACertFile),
 		slog.String("caKeyFile", c.CAKeyFile),
 		slog.String("trustDomain", c.TrustDomain),
-		slog.Any("tunnelServerNames", c.TunnelServerNames),
-		slog.String("tunnelTLSCertFile", c.TunnelTLSCertFile),
-		slog.String("tunnelTLSKeyFile", c.TunnelTLSKeyFile),
 		slog.Duration("spokeCertTTL", c.SpokeCertTTL),
 		slog.Duration("enrollmentTokenTTL", c.EnrollmentTokenTTL),
 		slog.Duration("agentKeyTTL", c.AgentKeyTTL),

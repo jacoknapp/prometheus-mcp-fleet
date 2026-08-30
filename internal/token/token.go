@@ -129,20 +129,39 @@ func (m Minted) MarshalJSON() ([]byte, error) {
 // The returned Secret is live secret material. Hash it with [Hasher.Sum],
 // store the digest, and let the slice go out of scope.
 func Mint(class fleet.KeyClass) (Minted, error) {
-	return mintWith(class, randRead)
+	return mintWith(class, "", randRead)
+}
+
+// MintWithKID generates a credential whose public identifier is fixed.
+//
+// It exists for exactly one caller: the hub's automatically minted first admin
+// credential. A well-known KID lets two hub replicas racing to bootstrap an
+// empty store collide on the store's uniqueness constraint, so one wins and the
+// other stays silent, instead of both minting a valid admin token and both
+// printing it. The KID is public and non-secret by design -- it appears in
+// audit logs -- and the secret remains 256 bits of CSPRNG output, so fixing it
+// costs nothing.
+//
+// kid must be exactly [KIDLen] base62 characters.
+func MintWithKID(class fleet.KeyClass, kid string) (Minted, error) {
+	return mintWith(class, kid, randRead)
 }
 
 // mintWith is Mint with an injectable entropy source. Fuzzing needs a
 // deterministic Mint -- Go's fuzzing engine treats a target whose coverage
 // varies between runs on the same input as unstable and stops making progress
 // -- and the entropy-failure paths need to be reachable from a test.
-func mintWith(class fleet.KeyClass, read func([]byte) (int, error)) (Minted, error) {
+func mintWith(class fleet.KeyClass, kid string, read func([]byte) (int, error)) (Minted, error) {
 	if !class.Valid() {
 		return Minted{}, fmt.Errorf("mint %q: %w", string(class), ErrUnknownClass)
 	}
-	kid, err := randomBase62(KIDLen, read)
-	if err != nil {
-		return Minted{}, fmt.Errorf("mint kid: %w", err)
+	if kid == "" {
+		var err error
+		if kid, err = randomBase62(KIDLen, read); err != nil {
+			return Minted{}, fmt.Errorf("mint kid: %w", err)
+		}
+	} else if len(kid) != KIDLen || !isBase62(kid) {
+		return Minted{}, fmt.Errorf("mint kid %q: %w", kid, ErrMalformed)
 	}
 	secret := make([]byte, SecretBytes)
 	if _, err := read(secret); err != nil {
@@ -311,4 +330,15 @@ func randomBase62(n int, read func([]byte) (int, error)) (string, error) {
 		}
 	}
 	return string(out), nil
+}
+
+// isBase62 reports whether every byte of s is a base62 digit.
+func isBase62(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'A' || c > 'Z') && (c < 'a' || c > 'z') {
+			return false
+		}
+	}
+	return len(s) > 0
 }

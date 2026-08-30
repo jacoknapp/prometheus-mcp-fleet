@@ -45,10 +45,20 @@ var (
 type Reason string
 
 const (
-	// ReasonDial means the TCP connection could not be established.
+	// ReasonDial means the connection could not be established at all: DNS,
+	// TCP connect, or a proxy that never answered.
 	ReasonDial Reason = "dial"
-	// ReasonTLSHandshake means TCP succeeded but the mTLS handshake did not.
+	// ReasonTLSHandshake means the connection was made but TLS to the hub (or
+	// to the ingress terminating on its behalf) did not complete.
 	ReasonTLSHandshake Reason = "tls-handshake"
+	// ReasonUpgradeRejected means the HTTP request reached something that
+	// answered, and that something did not switch protocols. The usual cause
+	// is an ingress that is not routing the tunnel path to the hub.
+	ReasonUpgradeRejected Reason = "upgrade-rejected"
+	// ReasonAuthRejected means the transport was established and the hub
+	// refused the spoke's identity: an untrusted, revoked or mismatched
+	// certificate, or a signature that did not verify.
+	ReasonAuthRejected Reason = "auth-rejected"
 	// ReasonConnClosed means an established tunnel dropped: the hub closed the
 	// session, the process on the far end died, or keepalive timed out.
 	ReasonConnClosed Reason = "conn-closed"
@@ -64,7 +74,8 @@ const (
 // io.EOF: a reconnect loop needs a reason it can log and label a metric with,
 // and "EOF" is neither.
 type DialError struct {
-	// Endpoint is the host:port that was dialled.
+	// Endpoint is the hub endpoint that was dialled, in whatever form the
+	// caller configured it.
 	Endpoint string
 	// Reason is the closed-enum classification, safe as a metric label.
 	Reason Reason

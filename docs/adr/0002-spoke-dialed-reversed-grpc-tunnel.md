@@ -2,6 +2,11 @@
 
 * Status: Accepted
 * Date: 2026-08-29
+* Amended by [ADR-0014](0014-websocket-tunnel-through-standard-ingress.md): the
+  connection is now a WebSocket through a standard Ingress rather than a raw
+  mTLS socket, and mutual authentication moved into the connection. The
+  reversed-role gRPC design recorded here is unchanged and runs over the
+  WebSocket's `net.Conn` exactly as it ran over a TLS one.
 
 ## Context
 

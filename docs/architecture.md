@@ -54,7 +54,7 @@ flowchart TB
         AUTHN["authn<br/><small>key verification, LRU, revocation epoch</small>"]
         PROXY["promproxy<br/><small>authorize, validate, budget, route</small>"]
         REG["registry<br/><small>live fleet view, in memory</small>"]
-        LIS["tunnel/grpctun listener<br/><small>mTLS, identity from cert</small>"]
+        LIS["tunnel/wstun<br/><small>WebSocket + signed-nonce auth</small>"]
         API["hubapi<br/><small>admin REST, enrollment, PKI</small>"]
         CA["ca<br/><small>issue / renew / revoke</small>"]
         ST["store/secretstore<br/><small>one Kubernetes Secret</small>"]
@@ -71,7 +71,7 @@ flowchart TB
 
     subgraph spoke ["spoke — one per cluster"]
         direction TB
-        DIAL["tunnel/grpctun dialer"]
+        DIAL["tunnel/wstun dialer"]
         PC["promclient<br/><small>re-validates the allow-list</small>"]
         CF["clusterfacts<br/><small>what this cluster is</small>"]
         DIAL --> PC
@@ -79,7 +79,7 @@ flowchart TB
     end
 
     AGENT(["AI agent"]) -->|"POST /mcp<br/>Bearer pmf_agt_…"| MCP
-    DIAL -.->|"dials out"| LIS
+    DIAL -.->|"dials out · wss://"| LIS
     PC --> PROMETHEUS[("Prometheus")]
 ```
 
@@ -90,11 +90,14 @@ One deployment per fleet. It runs three listeners, deliberately separated:
 | Listener | Default | Exposure | Carries |
 |---|---|---|---|
 | MCP | `:8080` | Ingress | Agent traffic, `pmf_agt_` keys |
-| Tunnel | `:8443` | LoadBalancer Service | Spoke mTLS. Needs the client certificate, so it cannot sit behind an HTTP Ingress |
+| Tunnel | `/tunnel` on `:8080` | Same Ingress | Spoke WebSocket. Shares the MCP listener, so there is nothing extra to expose |
 | Admin | `:9090` | ClusterIP only | Admin REST (`pmf_adm_`), metrics, health, pprof |
 
 The separation is the point. An agent key reaching the admin API would be a
 privilege escalation, so the admin API is not on the port the agent can reach.
+The tunnel shares the MCP listener because both are ordinary HTTP and both are
+authenticated independently — the agent path by bearer key, the tunnel path by a
+signed certificate challenge.
 
 ### spoke
 
@@ -110,19 +113,31 @@ connection it dialed:
 
 ## The tunnel
 
-The spoke dials the hub. Then the roles invert: the spoke runs the *gRPC server*
-on the connection it opened, and the hub runs the *gRPC client* over the socket
-it accepted.
+The spoke opens a **WebSocket** to `wss://<hub>/tunnel` through the ordinary
+Ingress. Then the roles invert: the spoke runs the *gRPC server* on the
+connection it opened, and the hub runs the *gRPC client* over the socket it
+accepted.
+
+The WebSocket exists because the deployment target offers a standard Ingress and
+nothing else — no TCP passthrough, no LoadBalancer, no NodePort. Every Ingress
+controller proxies `Connection: Upgrade` natively, so a WebSocket is the one
+bidirectional byte stream that is universally available. Above it, nothing
+changed: the frame stream is adapted to a `net.Conn` and the reversed-role gRPC
+runs over it unmodified.
 
 ```mermaid
 sequenceDiagram
     participant S as spoke
     participant H as hub
 
-    S->>H: TCP connect
-    S->>H: TLS 1.3 handshake, client certificate
-    H->>H: verify chain, check revocation denylist
-    H->>H: IdentityFromCert → clusterID from URI SAN
+    S->>H: HTTPS GET /tunnel, Upgrade: websocket
+    Note over S,H: the Ingress terminates TLS and proxies the upgrade
+    H-->>S: 101 Switching Protocols
+    H->>S: ServerHello{nonce}
+    S->>H: ClientAuth{certificate chain, signature over the transcript}
+    H->>H: verify chain against the CA, check revocation denylist
+    H->>H: verify signature, derive clusterID from the URI SAN
+    H-->>S: Accepted
     Note over S,H: roles invert here
     S->>S: grpc.Server.Serve(one-shot listener)
     H->>H: grpc.NewClient over the accepted conn
@@ -150,7 +165,19 @@ evaluating. Full reasoning in
 
 Liveness is HTTP/2 keepalive PINGs — hub side `Time: 10s, Timeout: 5s`,
 `PermitWithoutStream: true`. A dead spoke is detected in about 15 seconds with
-no payload and no application heartbeat code.
+no payload and no application heartbeat code. Those pings also keep the
+WebSocket busy, which matters because Ingress controllers close idle upgraded
+connections — nginx defaults to 60 seconds, comfortably outside a 10-second ping
+interval.
+
+Because the Ingress terminates TLS, mutual authentication happens inside the
+connection rather than at the TLS layer: the hub issues a single-use nonce and
+the spoke returns its certificate chain plus a signature over a length-prefixed
+transcript binding that nonce, the protocol version and the cluster ID. Identity
+is still derived only from the certificate's URI SAN, and a spoke whose
+self-reported cluster ID disagrees with its certificate is refused rather than
+corrected. The trade-off — the Ingress is inside the trust boundary — is
+recorded in [ADR-0014](adr/0014-websocket-tunnel-through-standard-ingress.md).
 
 The response body is **opaque to the spoke**. It never parses Prometheus JSON;
 it copies bytes into 64 KiB chunks. That keeps the spoke tiny, keeps it
@@ -306,7 +333,7 @@ L1  obs        slog, metrics, tracing, health, pprof
     ca         internal PKI
     authn      credential verification and caching
     promclient spoke-side Prometheus client
-    tunnel/grpctun · tunnel/memtun · tunnel/tunneltest
+    tunnel/wstun · tunnel/grpctun · tunnel/memtun · tunnel/tunneltest
 L2  registry   live fleet view
     promproxy  authorize, budget, route
     clusterfacts spoke-side facts

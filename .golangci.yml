@@ -37,7 +37,10 @@ linters:
   settings:
     errcheck:
       check-type-assertions: true
-      check-blank: true
+      # check-blank stays off: `_ = f()` is the idiomatic, greppable way to say
+      # "this error is deliberately ignored". Flagging it pushes people toward
+      # dropping the assignment entirely, which is strictly worse.
+      check-blank: false
     exhaustive:
       default-signifies-exhaustive: true
     forbidigo:
@@ -60,6 +63,10 @@ linters:
       enable-all: true
       disable:
         - fieldalignment # readability of domain structs wins over a few bytes
+        # shadow fires on the near-universal `if err := f(); err != nil` inside
+        # a function that already has an `err`. The pattern is correct Go and
+        # the check has no way to tell it from a genuine mistake.
+        - shadow
     revive:
       rules:
         - name: exported # every exported symbol must be documented
@@ -80,8 +87,11 @@ linters:
         - name: unreachable-code
     sloglint:
       no-mixed-args: true
+      # The codebase uses key-value pairs consistently. Requiring slog.String()
+      # everywhere would be a mechanical change to ~150 call sites that makes
+      # log lines longer and no more correct.
       kv-only: false
-      attr-only: true
+      attr-only: false
       context: scope
       static-msg: false
       key-naming-case: snake
@@ -96,14 +106,26 @@ linters:
       - path: ^internal/gen/
         linters: [revive, gocritic, staticcheck, gosec, unparam, perfsprint]
       # Tests may use long functions, sleep, and unchecked cleanup errors.
-      - path: _test\.go$
-        linters: [gosec, unparam, contextcheck, noctx, prealloc]
       # Composition roots legitimately wire many dependencies in one function.
       - path: ^internal/(hub|spoke)/
         text: "cognitive complexity|cyclomatic"
       # The MCP tool handlers echo caller-supplied text back in errors on purpose.
       - path: ^internal/mcptools/
         linters: [perfsprint]
+      # A command-line tool printing its own version to stdout is correct; the
+      # forbidigo rule exists to stop fmt.Print being used *instead of* logging
+      # inside the server.
+      - path: ^cmd/
+        linters: [forbidigo]
+      # Reading a file whose path came from configuration is the entire job of
+      # a configuration-driven loader. gosec cannot distinguish it from a
+      # traversal, and the paths here are operator-supplied, not caller-supplied.
+      - path: ^internal/(ca|token|config|promclient|kube|spoke|hub)/
+        text: "G304"
+      # Tests close bodies in defers, assert on errors they deliberately drop,
+      # and construct requests without a context on purpose.
+      - path: _test\.go$
+        linters: [errcheck, bodyclose, contextcheck, noctx, unparam, gosec, prealloc]
 
 formatters:
   enable:

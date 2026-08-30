@@ -38,13 +38,15 @@ var (
 const maxEnrollResponseBytes = 1 << 20
 
 // enrollRequest is the body of POST /enroll and POST /renew.
+//
+// It carries the CSR and nothing else, matching hubapi.EnrollRequest exactly.
+// The hub decodes strictly and rejects unknown fields, which is the right
+// behaviour: the cluster identity comes from the enrollment token on /enroll
+// and from the client certificate on /renew, so a client-supplied cluster ID
+// here would be either redundant or an attempt to claim something.
 type enrollRequest struct {
 	// CSR is the DER certificate signing request, base64 encoded.
 	CSR string `json:"csr"`
-	// ClusterID is advisory. The hub takes the authoritative value from the
-	// enrollment token (on /enroll) or the client certificate (on /renew), so
-	// this field exists only to make a mismatch visible in the audit log.
-	ClusterID string `json:"clusterId,omitempty"`
 }
 
 // enrollResponse is the hub's reply.
@@ -132,8 +134,7 @@ func (e *enroller) post(
 	ctx context.Context, client *http.Client, path, token string, csrDER []byte, clusterID string,
 ) (*enrollResponse, error) {
 	body, err := json.Marshal(enrollRequest{
-		CSR:       base64.StdEncoding.EncodeToString(csrDER),
-		ClusterID: clusterID,
+		CSR: base64.StdEncoding.EncodeToString(csrDER),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("encode request: %w", err)
@@ -209,8 +210,9 @@ func (e *enroller) assemble(keyPEM []byte, resp *enrollResponse) (*Identity, err
 	if err != nil {
 		return nil, err
 	}
+	// cluster_id is already bound on the spoke's logger; repeating it here
+	// produced a duplicate key in every JSON line.
 	e.logger.Info("obtained client certificate",
-		"cluster_id", resp.ClusterID,
 		"serial", id.Leaf.SerialNumber.Text(16),
 		"not_after", id.Leaf.NotAfter.Format(time.RFC3339))
 	return id, nil

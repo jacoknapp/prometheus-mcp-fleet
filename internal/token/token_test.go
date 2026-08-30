@@ -400,7 +400,7 @@ func TestEntropyFailure(t *testing.T) {
 			}
 			return 0, boom
 		}
-		if _, err := mintWith(fleet.ClassAgent, read); !errors.Is(err, boom) {
+		if _, err := mintWith(fleet.ClassAgent, "", read); !errors.Is(err, boom) {
 			t.Fatalf("mintWith error = %v, want %v", err, boom)
 		}
 	})
