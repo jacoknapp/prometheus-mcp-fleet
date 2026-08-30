@@ -693,11 +693,15 @@ func TestAttachFailureRejectionAndRelease(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			h := handlerFuncs{
-				do: func(context.Context, *tunnel.Request) (*tunnel.Response, error) { return &tunnel.Response{Body: io.NopCloser(strings.NewReader(""))}, nil },
+				do: func(context.Context, *tunnel.Request) (*tunnel.Response, error) {
+					return &tunnel.Response{Body: io.NopCloser(strings.NewReader(""))}, nil
+				},
 				describe: func(context.Context, string) (tunnel.Facts, error) { return tunnel.Facts{}, nil },
 			}
 			spokeDone := make(chan error, 1)
-			go func() { spokeDone <- ServeConn(ctx, peer, DialerConfig{Endpoint: "fixture", Logger: discardLogger()}, h) }()
+			go func() {
+				spokeDone <- ServeConn(ctx, peer, DialerConfig{Endpoint: "fixture", Logger: discardLogger()}, h)
+			}()
 			var captured tunnel.Session
 			released := make(chan struct{})
 			l.active = 1
@@ -779,8 +783,13 @@ func TestWatchStoppedAndCloseError(t *testing.T) {
 	if err := s.cc.Close(); err != nil {
 		t.Fatalf("pre-close ClientConn: %v", err)
 	}
-	if err := s.Close("again"); err == nil {
-		t.Error("Close hid the already-closed ClientConn error")
+	// Closing a ClientConn that is already closed reports Canceled, and that
+	// is the idempotent case rather than a fault: Close documents itself as
+	// idempotent, so surfacing it would make every ordinary double-close look
+	// like a failure. A genuine, non-Canceled error from cc.Close must still
+	// propagate, which is what closeErr exists for.
+	if err := s.Close("again"); err != nil {
+		t.Errorf("second Close returned %v, want nil for the idempotent case", err)
 	}
 }
 

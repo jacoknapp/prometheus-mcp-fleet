@@ -313,6 +313,23 @@ func randomBase62(n int, read func([]byte) (int, error)) (string, error) {
 	return string(out), nil
 }
 
+// Pattern returns the regular expression matching any well-formed credential
+// this package mints.
+//
+// It exists to be published: to GitHub secret scanning, to a log scrubber, to
+// whatever greps a repository for leaked credentials. That is why the prefix is
+// there at all — a high-entropy string with no marker is invisible to every
+// scanner, so the marker is the feature.
+//
+// The pattern matches shape, not validity: it deliberately does not verify the
+// CRC, because a scanner wants to flag a truncated or corrupted paste of a real
+// credential just as loudly as an intact one.
+func Pattern() string {
+	return fmt.Sprintf(`%s(%s|%s|%s)_[0-9A-Za-z]{%d}_[0-9A-Za-z]{%d}`,
+		Prefix, fleet.ClassAdmin, fleet.ClassAgent, fleet.ClassEnrollment,
+		KIDLen+SecretLen, CRCLen)
+}
+
 // isBase62 reports whether every byte of s is a base62 digit.
 func isBase62(s string) bool {
 	for i := 0; i < len(s); i++ {

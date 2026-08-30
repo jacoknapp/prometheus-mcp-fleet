@@ -905,11 +905,32 @@ func (h *harness) tlsServer(clientAuth tls.ClientAuthType) *httptest.Server {
 // serverCert issues the listener's own certificate.
 func (h *harness) serverCert() tls.Certificate {
 	h.t.Helper()
-	cert, err := h.ca.IssueServer(nil, []net.IP{net.ParseIP("127.0.0.1")})
+	// Self-signed and local: the CA no longer issues server certificates,
+	// because behind the ingress of ADR-0014 the hub presents none. The client
+	// in this test skips verification anyway -- the point is only that a TLS
+	// layer exists for the handler to ignore.
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		h.t.Fatalf("IssueServer: %v", err)
+		h.t.Fatalf("generate server key: %v", err)
 	}
-	return cert
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		// Wall clock, not the harness clock: crypto/tls checks validity
+		// against real time, and the harness clock is pinned to a fixed
+		// instant in the past.
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		h.t.Fatalf("create server certificate: %v", err)
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
 }
 
 // startTLS mounts the public mux on a TLS listener with the given config.
@@ -926,7 +947,10 @@ func (h *harness) startTLS(conf *tls.Config) *httptest.Server {
 // given identity. A zero identity presents no client certificate.
 func (h *harness) tlsClient(id spokeIdentity) *http.Client {
 	h.t.Helper()
-	conf := &tls.Config{RootCAs: h.ca.Pool(), MinVersion: tls.VersionTLS13}
+	// The server certificate is self-signed and irrelevant: this harness
+	// exists to prove the handler ignores the TLS layer, not to exercise
+	// server trust, and the CA no longer issues server certificates at all.
+	conf := &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13} //nolint:gosec // G402: test-only listener; see comment
 	if len(id.tlsCert.Certificate) > 0 {
 		conf.Certificates = []tls.Certificate{id.tlsCert}
 	}

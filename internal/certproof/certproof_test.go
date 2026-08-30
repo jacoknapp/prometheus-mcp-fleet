@@ -311,12 +311,10 @@ func TestSignAndVerifyRejectOversizedTranscriptFields(t *testing.T) {
 	key := newECDSA(t)
 	leaf := selfSigned(t, key)
 
-	if sig, err := certproof.Sign(key, []byte("nonce"), "v1", oversized);
-		!errors.Is(err, certproof.ErrFieldTooLarge) || sig != nil {
+	if sig, err := certproof.Sign(key, []byte("nonce"), "v1", oversized); !errors.Is(err, certproof.ErrFieldTooLarge) || sig != nil {
 		t.Errorf("Sign() = (%x, %v), want nil and ErrFieldTooLarge", sig, err)
 	}
-	if err := certproof.Verify(leaf, []byte("signature"), []byte("nonce"), "v1", oversized);
-		!errors.Is(err, certproof.ErrFieldTooLarge) {
+	if err := certproof.Verify(leaf, []byte("signature"), []byte("nonce"), "v1", oversized); !errors.Is(err, certproof.ErrFieldTooLarge) {
 		t.Errorf("Verify() = %v, want ErrFieldTooLarge", err)
 	}
 }
