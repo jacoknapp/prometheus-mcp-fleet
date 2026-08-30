@@ -9,7 +9,6 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"errors"
-	"github.com/jacoknapp/prometheus-mcp-fleet/internal/mtls"
 	"net"
 	"sync"
 	"testing"
@@ -133,70 +132,29 @@ func TestServerTLSConfigShape(t *testing.T) {
 	}
 }
 
-func TestClientTLSConfigShape(t *testing.T) {
-	t.Parallel()
-
-	c, _, clientCert := tunnelPair(t, Options{}, "prod")
-	cfg, err := mtls.ClientTLSConfig(clientCert, c.BundlePEM(), "hub.test")
-	if err != nil {
-		t.Fatalf("ClientTLSConfig: %v", err)
+// clientTLSConfig builds the spoke side of a handshake against
+// [CA.ServerTLSConfig]: it presents clientCert, verifies the hub against caPEM,
+// speaks TLS 1.3 only and offers the "h2" ALPN the server pins.
+//
+// It lives here rather than in a package of its own because nothing in the
+// product builds a configuration like this any more. Under ADR-0014 the hub is
+// behind an ingress that terminates TLS, so neither the tunnel nor renewal
+// presents a client certificate at the TLS layer; both prove possession inside
+// the connection instead. What remains is a server-side configuration that is
+// still worth testing, and a test needs something to point at it.
+func clientTLSConfig(t *testing.T, clientCert tls.Certificate, caPEM []byte, serverName string) *tls.Config {
+	t.Helper()
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		t.Fatalf("trust bundle contains no certificates (%d bytes)", len(caPEM))
 	}
-	if cfg.MinVersion != tls.VersionTLS13 || cfg.MaxVersion != tls.VersionTLS13 {
-		t.Errorf("versions = %x..%x, want TLS 1.3 only", cfg.MinVersion, cfg.MaxVersion)
-	}
-	if cfg.ServerName != "hub.test" {
-		t.Errorf("ServerName = %q", cfg.ServerName)
-	}
-	if cfg.InsecureSkipVerify {
-		t.Error("InsecureSkipVerify is set")
-	}
-	if diff := cmp.Diff([]string{"h2"}, cfg.NextProtos); diff != "" {
-		t.Errorf("NextProtos (-want +got):\n%s", diff)
-	}
-	if cfg.RootCAs == nil {
-		t.Error("RootCAs is nil")
-	}
-}
-
-func TestClientTLSConfigErrors(t *testing.T) {
-	t.Parallel()
-
-	c, _, clientCert := tunnelPair(t, Options{}, "prod")
-
-	tests := []struct {
-		name       string
-		bundle     []byte
-		serverName string
-		wantErr    error
-	}{
-		{name: "ok", bundle: c.BundlePEM(), serverName: "hub.test"},
-		{name: "empty server name", bundle: c.BundlePEM(), wantErr: mtls.ErrNoServerName},
-		{name: "nil bundle", serverName: "hub.test", wantErr: mtls.ErrInvalidBundle},
-		{name: "garbage bundle", bundle: []byte("not pem"), serverName: "hub.test", wantErr: mtls.ErrInvalidBundle},
-		{
-			name:       "pem without certificates",
-			bundle:     pemBlock("PRIVATE KEY", []byte{1, 2, 3}),
-			serverName: "hub.test",
-			wantErr:    mtls.ErrInvalidBundle,
-		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			got, err := mtls.ClientTLSConfig(clientCert, tc.bundle, tc.serverName)
-			if tc.wantErr != nil {
-				if !errors.Is(err, tc.wantErr) {
-					t.Fatalf("got %v, want %v", err, tc.wantErr)
-				}
-				if got != nil {
-					t.Error("a config was returned alongside an error")
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-		})
+	return &tls.Config{
+		Certificates: []tls.Certificate{clientCert},
+		RootCAs:      pool,
+		ServerName:   serverName,
+		MinVersion:   tls.VersionTLS13,
+		MaxVersion:   tls.VersionTLS13,
+		NextProtos:   []string{"h2"},
 	}
 }
 
@@ -204,10 +162,7 @@ func TestHandshakeSucceedsAndCarriesIdentity(t *testing.T) {
 	t.Parallel()
 
 	c, serverCert, clientCert := tunnelPair(t, Options{TrustDomain: "fleet.local"}, "prod-us-east-1")
-	clientCfg, err := mtls.ClientTLSConfig(clientCert, c.BundlePEM(), "hub.test")
-	if err != nil {
-		t.Fatal(err)
-	}
+	clientCfg := clientTLSConfig(t, clientCert, c.BundlePEM(), "hub.test")
 	res := doHandshake(t, c.ServerTLSConfig(serverCert, nil), clientCfg)
 	if res.serverErr != nil {
 		t.Fatalf("server handshake: %v", res.serverErr)
@@ -242,10 +197,7 @@ func TestHandshakeRejectsForeignCA(t *testing.T) {
 	rogue := mustCA(t, Options{TrustDomain: "fleet.local"})
 	rogueClient := spokeCert(t, rogue, "prod")
 
-	clientCfg, err := mtls.ClientTLSConfig(rogueClient, hub.BundlePEM(), "hub.test")
-	if err != nil {
-		t.Fatal(err)
-	}
+	clientCfg := clientTLSConfig(t, rogueClient, hub.BundlePEM(), "hub.test")
 	res := doHandshake(t, hub.ServerTLSConfig(serverCert, nil), clientCfg)
 	if res.serverErr == nil {
 		t.Fatal("server accepted a certificate from a foreign CA")
@@ -276,10 +228,7 @@ func TestHandshakeRejectsRevokedSerial(t *testing.T) {
 		return serial == revoked
 	}
 
-	clientCfg, err := mtls.ClientTLSConfig(clientCert, c.BundlePEM(), "hub.test")
-	if err != nil {
-		t.Fatal(err)
-	}
+	clientCfg := clientTLSConfig(t, clientCert, c.BundlePEM(), "hub.test")
 	res := doHandshake(t, c.ServerTLSConfig(serverCert, isRevoked), clientCfg)
 	if !errors.Is(res.serverErr, ErrCertRevoked) {
 		t.Fatalf("server error = %v, want ErrCertRevoked", res.serverErr)
@@ -295,10 +244,7 @@ func TestHandshakeRejectsRevokedSerial(t *testing.T) {
 
 	// The same predicate must let a different, unrevoked spoke through.
 	other := spokeCert(t, c, "staging")
-	otherCfg, err := mtls.ClientTLSConfig(other, c.BundlePEM(), "hub.test")
-	if err != nil {
-		t.Fatal(err)
-	}
+	otherCfg := clientTLSConfig(t, other, c.BundlePEM(), "hub.test")
 	res = doHandshake(t, c.ServerTLSConfig(serverCert, isRevoked), otherCfg)
 	if res.serverErr != nil {
 		t.Errorf("unrevoked spoke was rejected: %v", res.serverErr)
@@ -321,12 +267,9 @@ func TestHandshakeRejectsCertificateWithoutIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	clientCfg, err := mtls.ClientTLSConfig(
+	clientCfg := clientTLSConfig(t,
 		tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key, Leaf: leaf},
 		c.BundlePEM(), "hub.test")
-	if err != nil {
-		t.Fatal(err)
-	}
 	res := doHandshake(t, c.ServerTLSConfig(serverCert, nil), clientCfg)
 	if !errors.Is(res.serverErr, ErrNoIdentity) {
 		t.Fatalf("server error = %v, want ErrNoIdentity", res.serverErr)
@@ -365,10 +308,7 @@ func TestHandshakeRejectsExpiredClientCertificate(t *testing.T) {
 		Clock:         clock.Now,
 	}, "prod")
 
-	clientCfg, err := mtls.ClientTLSConfig(clientCert, c.BundlePEM(), "hub.test")
-	if err != nil {
-		t.Fatal(err)
-	}
+	clientCfg := clientTLSConfig(t, clientCert, c.BundlePEM(), "hub.test")
 	clientCfg.Time = clock.Now
 
 	if res := doHandshake(t, c.ServerTLSConfig(serverCert, nil), clientCfg); res.serverErr != nil {
@@ -390,10 +330,7 @@ func TestHandshakeClientRejectsWrongServerName(t *testing.T) {
 	t.Parallel()
 
 	c, serverCert, clientCert := tunnelPair(t, Options{}, "prod")
-	clientCfg, err := mtls.ClientTLSConfig(clientCert, c.BundlePEM(), "not-the-hub.test")
-	if err != nil {
-		t.Fatal(err)
-	}
+	clientCfg := clientTLSConfig(t, clientCert, c.BundlePEM(), "not-the-hub.test")
 	res := doHandshake(t, c.ServerTLSConfig(serverCert, nil), clientCfg)
 	if res.clientErr == nil {
 		t.Fatal("client accepted a certificate for the wrong name")

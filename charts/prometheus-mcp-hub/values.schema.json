@@ -69,7 +69,7 @@
       }
     },
     "replicaCount": {
-      "description": "Number of hub replicas. A spoke tunnel is pinned to one replica and there is deliberately no hub-to-hub forwarding, so above 1 every replica must be individually addressable and every spoke must list all of them.",
+      "description": "Number of hub replicas. A spoke tunnel is pinned to one replica and there is deliberately no hub-to-hub forwarding, so above 1 every replica must be individually routable and every spoke must list all of them.",
       "type": "integer",
       "minimum": 0
     },
@@ -323,7 +323,7 @@
       }
     },
     "resources": {
-      "description": "Compute resources. There is deliberately no default CPU limit: CFS-throttling a process terminating ~100 long-lived mTLS tunnels turns a CPU spike into fleet-wide latency.",
+      "description": "Compute resources. There is deliberately no default CPU limit: CFS-throttling a process terminating ~100 long-lived spoke tunnels turns a CPU spike into fleet-wide latency.",
       "type": "object",
       "properties": {
         "requests": {
@@ -377,17 +377,11 @@
       "type": "string"
     },
     "ports": {
-      "description": "Container ports.",
+      "description": "Container ports. There is no tunnel port: the tunnel is a WebSocket on the MCP listener (ADR-0014).",
       "type": "object",
       "properties": {
         "mcp": {
           "description": "Agent-facing MCP listener (PMF_MCP_ADDR).",
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 65535
-        },
-        "tunnel": {
-          "description": "mTLS tunnel listener spokes dial (PMF_TUNNEL_ADDR).",
           "type": "integer",
           "minimum": 1,
           "maximum": 65535
@@ -585,110 +579,23 @@
       }
     },
     "tunnel": {
-      "description": "The mTLS tunnel listener spokes dial. It cannot go behind an HTTP Ingress, which terminates TLS and cannot pass a client certificate through.",
+      "description": "The spoke tunnel, which is a WebSocket on the MCP listener rather than a listener of its own. An Ingress terminates TLS and cannot pass a client certificate through, so mutual authentication happens inside the connection over the spoke's certificate; the Ingress is a plain proxy and verifies nothing (ADR-0014).",
       "type": "object",
       "properties": {
-        "serverNames": {
-          "description": "PMF_TUNNEL_SERVER_NAMES. SANs on the self-issued tunnel server certificate. This MUST contain every host or IP a spoke puts in its hub.endpoints, or the spoke's TLS verification fails and no tunnel ever establishes.",
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "tls": {
-          "description": "Operator-supplied tunnel server certificate, instead of one self-issued by the internal CA.",
-          "type": "object",
-          "properties": {
-            "existingSecret": {
-              "description": "Name of the existing Secret. The chart never creates it.",
-              "type": "string"
-            },
-            "certKey": {
-              "description": "Key holding the PEM certificate (PMF_TUNNEL_TLS_CERT_FILE).",
-              "type": "string"
-            },
-            "keyKey": {
-              "description": "Key holding the PEM private key (PMF_TUNNEL_TLS_KEY_FILE).",
-              "type": "string"
-            },
-            "mountPath": {
-              "description": "Where the Secret is mounted.",
-              "type": "string"
-            }
-          }
-        },
-        "service": {
-          "description": "Dedicated Service for the tunnel port, separate from `service` so the tunnel can be published without ever exposing MCP or admin.",
-          "type": "object",
-          "properties": {
-            "enabled": {
-              "description": "Render the tunnel Service.",
-              "type": "boolean"
-            },
-            "type": {
-              "description": "LoadBalancer is the default because spokes live in other clusters.",
-              "type": "string",
-              "enum": [
-                "LoadBalancer",
-                "NodePort",
-                "ClusterIP"
-              ]
-            },
-            "port": {
-              "description": "Service port for the tunnel.",
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 65535
-            },
-            "nodePort": {
-              "description": "NodePort to request when type is NodePort. Empty means allocated.",
-              "type": [
-                "integer",
-                "string"
-              ]
-            },
-            "annotations": {
-              "description": "Annotations for the tunnel Service; cloud LB configuration goes here.",
-              "type": "object"
-            },
-            "labels": {
-              "description": "Extra labels for the tunnel Service.",
-              "type": "object"
-            },
-            "loadBalancerIP": {
-              "description": "spec.loadBalancerIP.",
-              "type": "string"
-            },
-            "loadBalancerClass": {
-              "description": "spec.loadBalancerClass.",
-              "type": "string"
-            },
-            "loadBalancerSourceRanges": {
-              "description": "spec.loadBalancerSourceRanges. Narrow this to your fleet's egress ranges wherever you can.",
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
-            },
-            "externalTrafficPolicy": {
-              "description": "Local preserves the spoke source IP.",
-              "type": "string",
-              "enum": [
-                "",
-                "Local",
-                "Cluster"
-              ]
-            }
-          }
+        "path": {
+          "description": "PMF_TUNNEL_PATH. Path on the MCP listener where spokes open the tunnel WebSocket. A spoke's hub.endpoints entry is wss://<ingress host><tunnel.path>. It may not be \"/\", which would swallow the MCP endpoint; the binary refuses that too.",
+          "type": "string",
+          "minLength": 2,
+          "pattern": "^/[^?# \\t{}]*$"
         }
       }
     },
     "ingress": {
-      "description": "Standard networking.k8s.io/v1 Ingress for the MCP port only. There is no Gateway API HTTPRoute and no OpenShift Route in this chart, and the admin port may never be routed here.",
+      "description": "Standard networking.k8s.io/v1 Ingress for the MCP port, which publishes BOTH the agent-facing MCP endpoint and the spoke tunnel WebSocket at tunnel.path. A path that does not cover tunnel.path gets a second rule rendered automatically.",
       "type": "object",
       "properties": {
         "enabled": {
-          "description": "Render the Ingress.",
+          "description": "Render the Ingress. It carries MCP and the spoke tunnel alike; there is no second Service and no ssl-passthrough to arrange.",
           "type": "boolean"
         },
         "className": {
@@ -696,7 +603,7 @@
           "type": "string"
         },
         "annotations": {
-          "description": "Annotations for the Ingress.",
+          "description": "Annotations for the Ingress. Idle timeouts matter here: the tunnel is a long-lived WebSocket and a controller that closes idle upgraded connections below ~30s disconnects the whole fleet. nginx's 60s default is fine against the tunnel's 10s keepalive pings; raise it with nginx.ingress.kubernetes.io/proxy-read-timeout where a controller is stricter.",
           "type": "object"
         },
         "host": {
@@ -704,7 +611,7 @@
           "type": "string"
         },
         "path": {
-          "description": "Path exposed.",
+          "description": "Path exposed. \"/\" publishes MCP and the tunnel together. A narrower path that does not cover tunnel.path causes a second path entry to be rendered for the tunnel.",
           "type": "string"
         },
         "pathType": {
@@ -717,7 +624,7 @@
           ]
         },
         "servicePortName": {
-          "description": "Name of the Service port to route to. Must be `mcp`. This is deliberately NOT a schema enum: the template's own check explains why the admin port must never be routed and why the tunnel port cannot survive an HTTP proxy, and that message is worth more than a one-line schema rejection.",
+          "description": "Name of the Service port to route to. Must be `mcp`. This is deliberately NOT a schema enum: the template's own check explains why the admin port must never be routed and that the mcp port carries the spoke tunnel too, and that message is worth more than a one-line schema rejection.",
           "type": "string"
         },
         "extraHosts": {
@@ -736,7 +643,7 @@
               "type": "boolean"
             },
             "secretName": {
-              "description": "Secret holding the certificate. Empty means the controller default.",
+              "description": "Secret holding the serving certificate. Empty with enabled: true means the controller's default certificate -- unless certManager.enabled is true, in which case this is wired automatically to the Secret cert-manager writes.",
               "type": "string"
             },
             "hosts": {
@@ -745,6 +652,75 @@
               "items": {
                 "type": "string"
               }
+            }
+          }
+        }
+      }
+    },
+    "certManager": {
+      "description": "cert-manager resources. It supplies the hub's SERVING certificate and nothing else. The hub's internal CA is NOT a cert-manager Certificate: it signs spoke identities, so the hub must hold its private key, and it is generated on first boot into the CA Secret the hub owns. Spoke certificates come from the hub's enrollment API for the same reason. Every resource is guarded by the cert-manager.io/v1 capability, and certManager.enabled on a cluster without the CRDs is a render-time failure.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Render cert-manager resources. Requires the cert-manager.io/v1 CRDs.",
+          "type": "boolean"
+        },
+        "issuerRef": {
+          "description": "The existing Issuer or ClusterIssuer that signs the hub's serving certificate. The chart never creates one.",
+          "type": "object",
+          "properties": {
+            "name": {
+              "description": "Issuer name. Required when certManager.serving.enabled.",
+              "type": "string"
+            },
+            "kind": {
+              "description": "Issuer or ClusterIssuer.",
+              "type": "string",
+              "enum": [
+                "Issuer",
+                "ClusterIssuer"
+              ]
+            },
+            "group": {
+              "description": "API group of the issuer.",
+              "type": "string"
+            }
+          }
+        },
+        "serving": {
+          "description": "The hub's serving certificate, wired to ingress.tls.secretName automatically.",
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "description": "Render the Certificate.",
+              "type": "boolean"
+            },
+            "secretName": {
+              "description": "Secret cert-manager writes to. Empty means <fullname>-serving-tls.",
+              "type": "string"
+            },
+            "dnsNames": {
+              "description": "DNS names on the certificate. Empty means ingress.host plus every ingress.extraHosts entry.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "duration": {
+              "description": "spec.duration. Empty leaves the issuer's default.",
+              "type": "string"
+            },
+            "renewBefore": {
+              "description": "spec.renewBefore. Empty leaves the issuer's default.",
+              "type": "string"
+            },
+            "secretAnnotations": {
+              "description": "Annotations placed on the generated Secret through spec.secretTemplate.",
+              "type": "object"
+            },
+            "privateKey": {
+              "description": "spec.privateKey. rotationPolicy: Always issues a fresh key on renewal instead of re-signing the old one.",
+              "type": "object"
             }
           }
         }
@@ -796,7 +772,7 @@
           "type": "object"
         },
         "mcp": {
-          "description": "Ingress to the MCP port.",
+          "description": "Ingress to the MCP port. This carries spoke tunnels as well as agent traffic -- both arrive on this port from the Ingress controller -- so there is no separate tunnel rule.",
           "type": "object",
           "properties": {
             "allowAll": {
@@ -816,23 +792,6 @@
               "type": "array",
               "items": {
                 "type": "object"
-              }
-            }
-          }
-        },
-        "tunnel": {
-          "description": "Ingress to the tunnel port.",
-          "type": "object",
-          "properties": {
-            "allowAll": {
-              "description": "Allow the tunnel port from anywhere. On by default because spokes live in other clusters.",
-              "type": "boolean"
-            },
-            "cidrs": {
-              "description": "CIDRs allowed to reach the tunnel port when allowAll is false.",
-              "type": "array",
-              "items": {
-                "type": "string"
               }
             }
           }

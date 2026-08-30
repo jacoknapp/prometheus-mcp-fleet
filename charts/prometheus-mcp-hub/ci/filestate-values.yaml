@@ -18,8 +18,3 @@ networkPolicy:
 config:
   logLevel: debug
   logFormat: text
-tunnel:
-  service:
-    type: ClusterIP
-  serverNames:
-    - localhost

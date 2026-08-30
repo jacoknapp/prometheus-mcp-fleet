@@ -121,15 +121,55 @@ type RevokedCertListResponse struct {
 	Count   int           `json:"count"`
 }
 
-// EnrollRequest is the body of POST /enroll and POST /renew.
+// EnrollRequest is the body of POST /enroll.
+//
+// POST /renew takes [RenewRequest] instead: it carries the proof of possession
+// that route needs, and the two are separate types because this package decodes
+// strictly and an unknown field is an error rather than a silently ignored one.
 type EnrollRequest struct {
 	// CSR is a base64 (standard encoding) DER certificate signing request.
 	//
 	// Everything it asks for except the public key is discarded. The subject,
 	// the SANs and the extensions of the issued certificate are decided by the
 	// hub from the identity it already bound to the enrollment token or read
-	// from the client certificate.
+	// from the certificate the caller proved it holds.
 	CSR string `json:"csr"`
+}
+
+// RenewChallengeResponse is the body of GET /renew/challenge.
+type RenewChallengeResponse struct {
+	// Nonce is the challenge to sign, base64 encoded on the wire. It is
+	// self-authenticating rather than remembered, so the replica that verifies
+	// it need not be the one that issued it; see [server.issueRenewNonce].
+	Nonce []byte `json:"nonce"`
+	// ExpiresAt is when the challenge stops being accepted. A spoke that misses
+	// the window fetches another; there is no penalty for doing so.
+	ExpiresAt time.Time `json:"expiresAt"`
+}
+
+// RenewRequest is the body of POST /renew.
+//
+// There is deliberately no cluster field. The identity is read from the URI SAN
+// of the verified certificate in Chain and from nowhere else, so a spoke cannot
+// renew its way into being a different cluster, and the strict decoder turns any
+// attempt to name one into a 400 rather than a value somebody has to remember to
+// ignore.
+type RenewRequest struct {
+	// CSR is a base64 (standard encoding) DER certificate signing request, as
+	// on [EnrollRequest]. Only its public key is used.
+	CSR string `json:"csr"`
+	// Chain is the spoke's current certificate followed by any intermediates,
+	// DER encoded, leaf first. encoding/json renders each entry as base64.
+	//
+	// It is the credential this route accepts, and on its own it proves
+	// nothing: a certificate is public. Signature is what turns it into one.
+	Chain [][]byte `json:"chain"`
+	// Signature is over the transcript binding Nonce, the renewal protocol
+	// version and the cluster ID the hub derives from the leaf. See
+	// [github.com/jacoknapp/prometheus-mcp-fleet/internal/certproof].
+	Signature []byte `json:"signature"`
+	// Nonce is the challenge from GET /renew/challenge, echoed back unchanged.
+	Nonce []byte `json:"nonce"`
 }
 
 // EnrollResponse is the body returned by POST /enroll and POST /renew.

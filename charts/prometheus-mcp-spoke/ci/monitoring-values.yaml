@@ -7,8 +7,8 @@ cluster:
   id: prod-eu-west-1
 hub:
   endpoints:
-    - hub.example.com:8443
-    - hub-2.example.com:8443
+    - wss://hub.example.com/tunnel
+    - wss://hub-2.example.com/tunnel
   apiUrl: https://hub.example.com
 enrollment:
   existingSecret: spoke-enrollment

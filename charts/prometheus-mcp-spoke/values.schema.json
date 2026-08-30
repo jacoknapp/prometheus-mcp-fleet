@@ -182,13 +182,13 @@
       ],
       "properties": {
         "endpoints": {
-          "description": "PMF_HUB_ENDPOINTS. REQUIRED, no default. External host:port entries, one per hub replica: the spoke holds one tunnel per endpoint, which is how hub HA works.",
+          "description": "PMF_HUB_ENDPOINTS. REQUIRED, no default. Hub tunnel URLs, one per hub replica: the spoke holds one tunnel per endpoint, which is how hub HA works. Since ADR-0014 the tunnel is a WebSocket on the hub's ordinary MCP listener behind a standard Ingress, so an entry is a wss:// URL such as wss://hub.example.com/tunnel, not host:port. A bare host:port is read by the binary as wss://<host:port>/tunnel, which for the old :8443 default is the wrong port and never connects.",
           "type": "array",
           "minItems": 1,
           "items": {
             "type": "string",
-            "minLength": 3,
-            "pattern": "^.+:[0-9]{1,5}$"
+            "minLength": 7,
+            "pattern": "^wss?://[^/?#]+(/[^?#]*)?$"
           }
         },
         "apiUrl": {
@@ -198,11 +198,11 @@
           "pattern": "^https?://.+"
         },
         "caBundle": {
-          "description": "Inline PEM trust bundle for the hub, needed OUT OF BAND on first enrollment because the hub is in a different trust domain. A CA certificate is public, so it is rendered into a ConfigMap, not a Secret. Empty means trust-on-first-use.",
+          "description": "Inline PEM trust bundle for the hub's SERVER certificate -- the one its Ingress terminates on hub.endpoints and hub.apiUrl. It is not client-certificate material: the spoke's own identity comes from enrollment. Needed OUT OF BAND on first enrollment when the hub uses a private CA; unnecessary when its Ingress serves a publicly trusted certificate. A CA certificate is public, so it is rendered into a ConfigMap, not a Secret. Empty means trust-on-first-use.",
           "type": "string"
         },
         "existingCASecret": {
-          "description": "Existing Secret holding the hub trust bundle, instead of hub.caBundle.",
+          "description": "Existing Secret holding the hub's server trust bundle, instead of hub.caBundle.",
           "type": "string"
         },
         "caSecretKey": {
@@ -214,7 +214,7 @@
           "type": "string"
         },
         "tlsInsecure": {
-          "description": "PMF_HUB_TLS_INSECURE. Lets anything on the network impersonate the hub. Inert without hub.allowInsecure, and the chart refuses the combination.",
+          "description": "PMF_HUB_TLS_INSECURE. Skips verification of the hub's server certificate, so anything on the network can impersonate the hub. Inert without hub.allowInsecure, and the chart refuses the combination.",
           "type": "boolean"
         },
         "allowInsecure": {
@@ -663,11 +663,11 @@
               "type": "boolean"
             },
             "hub": {
-              "description": "The hub, in another cluster. An ipBlock, never a namespaceSelector: there is no namespace to select. Ports come from hub.endpoints, and any endpoint that is already an IP literal is pinned to an exact /32 or /128 automatically.",
+              "description": "The hub, in another cluster. An ipBlock, never a namespaceSelector: there is no namespace to select. Ports are derived from the hub.endpoints URLs -- 443 for a wss:// URL with no explicit port, because the tunnel arrives on the hub's ordinary HTTPS Ingress -- and any endpoint that is already an IP literal is pinned to an exact /32 or /128 automatically.",
               "type": "object",
               "properties": {
                 "enabled": {
-                  "description": "Allow egress to every port named in hub.endpoints.",
+                  "description": "Allow egress to the hub. Without this the tunnel never establishes.",
                   "type": "boolean"
                 },
                 "cidrs": {
@@ -675,6 +675,15 @@
                   "type": "array",
                   "items": {
                     "type": "string"
+                  }
+                },
+                "ports": {
+                  "description": "Override the ports opened towards the hub. Empty derives them from the hub.endpoints URLs, which is almost always right. Set this only when something in the path moves the port.",
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 65535
                   }
                 }
               }

@@ -87,19 +87,42 @@ cluster:
 # release name anywhere in this chart: a default that only works when the hub happens to be
 # local is a trap that fails on the other 99 installs.
 hub:
-  # -- `PMF_HUB_ENDPOINTS`. REQUIRED, no default. Hub tunnel endpoints as `host:port`, joined with commas — an external address such as `hub.example.com:8443`, whatever the hub's tunnel LoadBalancer publishes. The spoke holds ONE TUNNEL PER ENDPOINT: that is how hub HA works, because a tunnel is pinned to one hub replica and there is no hub-to-hub forwarding. List every hub replica's external address.
+  # -- `PMF_HUB_ENDPOINTS`. REQUIRED, no default. Hub tunnel endpoints as `wss://` URLs, joined
+  # with commas — for example `wss://hub.example.com/tunnel`, which is the hub's Ingress host
+  # plus the hub's `tunnel.path`. Since ADR-0014 the tunnel is a WebSocket on the hub's ordinary
+  # MCP listener behind a standard Ingress, so this is a URL and the port is the ordinary HTTPS
+  # port unless you name another. A bare `host:port` is read by the binary as
+  # `wss://<host:port>/tunnel`, which for the old `:8443` default is simply the wrong port and
+  # never connects; the chart refuses it rather than let you find out in production.
+  # The spoke holds ONE TUNNEL PER ENDPOINT: that is how hub HA works, because a tunnel is
+  # pinned to one hub replica and there is no hub-to-hub forwarding. List every hub replica's
+  # external URL.
   endpoints: []
-  # -- `PMF_HUB_API_URL`. REQUIRED, no default. `https://host[:port]` base URL of the hub's enrollment listener, which the hub serves on its MCP port. External, like `hub.endpoints`.
+  # -- `PMF_HUB_API_URL`. REQUIRED, no default. `https://host[:port]` base URL of the hub's
+  # enrollment listener, which the hub serves on its MCP port — the same listener and the same
+  # Ingress host as `hub.endpoints`, so in practice this is the `https://` form of it without
+  # the tunnel path. External, like `hub.endpoints`.
   apiUrl: ""
-  # -- Inline PEM trust bundle for the hub's tunnel and enrollment server certificates, rendered into a ConfigMap and mounted as `PMF_HUB_CA_FILE`. The spoke needs this OUT OF BAND on first enrollment: the hub is in a different cluster and a different trust domain, so nothing in this cluster's trust store vouches for it. A CA certificate is public, so this is not secret material. Empty means the spoke trusts the bundle the hub returns at enrollment and caches it under `config.dataDir` — which is fine after the first successful enrollment, and is trust-on-first-use before it.
+  # -- Trust bundle for the hub's SERVER certificate, rendered into a ConfigMap and mounted as
+  # `PMF_HUB_CA_FILE`. This is inline PEM.
+  # It verifies the certificate the hub's Ingress presents on `hub.endpoints` and `hub.apiUrl`
+  # — it is NOT client-certificate material and has nothing to do with the spoke's own identity,
+  # which comes from enrollment. If your hub's Ingress serves a publicly trusted certificate
+  # (Let's Encrypt, a corporate CA already in the image's trust store) you do not need this at
+  # all; it exists for a private CA. The spoke needs it OUT OF BAND on first enrollment,
+  # because the hub is in a different cluster and nothing here vouches for it yet. A CA
+  # certificate is public, so this is not secret material. Empty means the spoke trusts the
+  # bundle the hub returns at enrollment and caches it under `config.dataDir` — fine after the
+  # first successful enrollment, trust-on-first-use before it.
   caBundle: ""
-  # -- Name of an existing Secret holding the hub trust bundle, used instead of `hub.caBundle`. The chart never creates it.
+  # -- Name of an existing Secret holding the hub's SERVER trust bundle, used instead of
+  # `hub.caBundle`. Same thing, out of a Secret you already have. The chart never creates it.
   existingCASecret: ""
   # -- Key inside `hub.existingCASecret` holding the PEM bundle.
   caSecretKey: ca.crt
   # -- Where the hub trust bundle is mounted.
   caMountPath: /etc/prometheus-mcp-fleet/hub-ca
-  # -- `PMF_HUB_TLS_INSECURE`. Skips verification of the hub's server certificate, which lets anything on the network impersonate the hub and collect this cluster's metrics. It does nothing unless `hub.allowInsecure` is also true, and the chart refuses to render that combination without it.
+  # -- `PMF_HUB_TLS_INSECURE`. Skips verification of the hub's server certificate — the one its Ingress terminates — which lets anything on the network impersonate the hub and collect this cluster's metrics. It does nothing unless `hub.allowInsecure` is also true, and the chart refuses to render that combination without it.
   tlsInsecure: false
   # -- `PMF_ALLOW_INSECURE`. The second key that must be turned for any insecure option to take effect. Two independent settings mean an insecure spoke cannot be reached by a single typo.
   allowInsecure: false
@@ -254,11 +277,20 @@ networkPolicy:
     # -- Allow DNS egress to `kube-system`.
     allowDNS: true
     hub:
-      # -- Allow egress to every port named in `hub.endpoints`. Without this the tunnel never establishes.
+      # -- Allow egress to the hub. Without this the tunnel never establishes.
       enabled: true
-      # -- CIDRs the hub may be reached at. `0.0.0.0/0` is the honest default: the hub lives outside this cluster and a NetworkPolicy cannot resolve a DNS name. Narrow it to your hub's addresses. Any `hub.endpoints` entry that is already an IP literal is added as an exact `/32` (or `/128`) rule automatically and does not need to appear here.
+      # -- CIDRs the hub may be reached at. `0.0.0.0/0` is the honest default: the hub lives
+      # outside this cluster and a NetworkPolicy cannot resolve a DNS name. Narrow it to your
+      # hub's addresses. Any `hub.endpoints` entry that is already an IP literal is added as an
+      # exact `/32` (or `/128`) rule automatically and does not need to appear here.
       cidrs:
         - 0.0.0.0/0
+      # -- Ports the hub is reached on. Empty derives them from the `hub.endpoints` URLs, which
+      # is what you want: a `wss://` URL with no explicit port means 443, because the tunnel now
+      # arrives on the hub's ordinary HTTPS Ingress rather than a dedicated 8443 listener.
+      # Set this only when something between here and the hub — an egress gateway, a NAT — moves
+      # the port.
+      ports: []
     prometheus:
       # -- Allow egress to the local Prometheus, on the port parsed from `prometheus.url`.
       enabled: true

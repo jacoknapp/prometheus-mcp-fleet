@@ -33,9 +33,15 @@ cluster:
 hub:
   # Cross-namespace: the hub runs in pmf-hub, the spoke in pmf-spoke, which is
   # the same shape as the real deployment (different clusters entirely).
+  #
+  # A URL, not host:port, and it points at the hub's ORDINARY MCP Service port:
+  # since ADR-0014 the tunnel is a WebSocket on that listener at the hub's
+  # tunnel.path, and there is no 8443 listener left to dial. ws:// rather than
+  # wss:// because there is no Ingress in this cluster to terminate TLS, so the
+  # MCP listener is plaintext -- and enrollment, on the same listener, is http://.
   endpoints:
-    - "prometheus-mcp-hub-tunnel.pmf-hub.svc.cluster.local:8443"
-  apiUrl: "https://prometheus-mcp-hub.pmf-hub.svc.cluster.local:8080"
+    - "ws://prometheus-mcp-hub.pmf-hub.svc.cluster.local:8080/tunnel"
+  apiUrl: "http://prometheus-mcp-hub.pmf-hub.svc.cluster.local:8080"
 
 prometheus:
   # Created by the Prometheus operator from .github/e2e/prometheus-values.yaml.

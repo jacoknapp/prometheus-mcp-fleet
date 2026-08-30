@@ -1,0 +1,58 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# tunnel.path and certManager.issuerRef.kind are constrained in
+# values.schema.json as well as by a `fail` in _helpers.tpl. The schema wins the
+# race, so these cases can only reach the template guard when schema validation
+# is skipped. That is not a hypothetical: `helm install --skip-schema-validation`
+# is a real flag, and the guards are what stand behind it.
+#
+# This suite therefore lives outside the default tests/*_test.yaml glob and is
+# run explicitly:
+#
+#   helm unittest --skip-schema-validation \
+#     -f 'tests/skip-schema-validation/*_test.yaml' charts/prometheus-mcp-hub
+suite: hub template guards behind the schema
+tests:
+  # tunnel.path is a mount point on the MCP listener, not a listener of its own.
+  # "/" would swallow every MCP request; the binary's checkPath refuses it too.
+  - it: refuses a tunnel.path that would swallow the MCP endpoint
+    set:
+      tunnel:
+        path: /
+    asserts:
+      - failedTemplate:
+          errorPattern: "tunnel.path must not be"
+
+  - it: refuses a relative tunnel.path
+    set:
+      tunnel:
+        path: tunnel
+    asserts:
+      - failedTemplate:
+          errorPattern: "must start with /"
+
+  - it: refuses a tunnel.path carrying a query or a ServeMux wildcard
+    set:
+      tunnel:
+        path: /tunnel/{id}
+    asserts:
+      - failedTemplate:
+          errorPattern: "must be a plain path"
+
+  - it: refuses an unknown certManager.issuerRef.kind
+    capabilities:
+      apiVersions:
+        - cert-manager.io/v1
+    set:
+      ingress:
+        enabled: true
+        host: mcp.example.com
+      certManager:
+        enabled: true
+        issuerRef:
+          name: letsencrypt
+          kind: Nonsense
+    asserts:
+      - failedTemplate:
+          errorPattern: "certManager.issuerRef.kind must be Issuer or ClusterIssuer"

@@ -8,7 +8,7 @@ cluster:
   id: ocp-lab-1
 hub:
   endpoints:
-    - hub.apps.example.com:8443
+    - wss://hub.apps.example.com/tunnel
   apiUrl: https://hub.apps.example.com
 enrollment:
   token: pmf_enr_ci_placeholder_token_not_a_real_credential

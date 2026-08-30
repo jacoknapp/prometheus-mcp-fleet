@@ -28,8 +28,11 @@
 // ordinary HTTP listener, plus a [github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel.Listener]
 // that hands authenticated connections to
 // [github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel/grpctun]. [Dial]
-// is the spoke half. handshake.go holds the wire messages and the transcript
-// construction both sides share.
+// is the spoke half. handshake.go holds the wire messages and the framing both
+// sides share; the transcript they sign and verify lives in
+// [github.com/jacoknapp/prometheus-mcp-fleet/internal/certproof], because the
+// hub's certificate renewal endpoint proves possession of the same certificates
+// with the same construction and must not have a second copy of it.
 //
 // Nothing above the transport knows any of this exists: the reversed-role gRPC,
 // the registry, the proxy and the session semantics are untouched.

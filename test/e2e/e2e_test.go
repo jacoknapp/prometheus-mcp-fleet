@@ -217,8 +217,9 @@ func installHub(ctx context.Context, t *testing.T, env []string) {
 		"--set", "image.tag=e2e",
 		"--set", "image.pullPolicy=Never",
 		"--set", "image.digest=",
-		"--set", "tunnel.service.type=ClusterIP",
-		"--set", "tunnel.serverNames[0]=pmf-hub-tunnel."+hubNamespace+".svc",
+		// No tunnel Service and no tunnel serverNames since ADR-0014: the tunnel
+		// is a WebSocket on the hub's MCP listener, so the default chart values
+		// already expose everything the spoke needs.
 		"--wait", "--timeout", installTimeout.String())
 }
 
@@ -237,10 +238,14 @@ func installSpoke(ctx context.Context, t *testing.T, env []string, enrollToken s
 		"--set", "image.digest=",
 		"--set", "cluster.id="+clusterID,
 		"--set", "cluster.labels.env=e2e",
-		"--set", "hub.endpoints[0]=pmf-hub-tunnel."+hubNamespace+".svc:8443",
-		"--set", "hub.apiUrl=https://pmf-hub."+hubNamespace+".svc:8080",
-		"--set", "hub.tlsInsecure=true",
-		"--set", "hub.allowInsecure=true",
+		// The tunnel URL, not host:port. There is no Ingress in this suite, so the
+		// spoke dials the hub's ClusterIP Service directly on the MCP port and
+		// ws:// (plaintext) is what that listener actually speaks.
+		"--set", "hub.endpoints[0]=ws://pmf-hub."+hubNamespace+".svc:8080/tunnel",
+		// Enrollment is served on that same plaintext MCP listener, so http://.
+		// No Ingress means no TLS to terminate and nothing to skip verifying,
+		// which is why hub.tlsInsecure is not set here.
+		"--set", "hub.apiUrl=http://pmf-hub."+hubNamespace+".svc:8080",
 		"--set", "enrollment.existingSecret=pmf-enrollment",
 		"--set", "prometheus.url=http://prom-prometheus-server."+promNamespace+".svc:80",
 		"--wait", "--timeout", installTimeout.String())

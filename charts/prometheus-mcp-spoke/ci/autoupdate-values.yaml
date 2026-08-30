@@ -9,7 +9,7 @@ cluster:
   id: prod-ap-south-1
 hub:
   endpoints:
-    - hub.example.com:8443
+    - wss://hub.example.com/tunnel
   apiUrl: https://hub.example.com
 enrollment:
   existingSecret: spoke-enrollment

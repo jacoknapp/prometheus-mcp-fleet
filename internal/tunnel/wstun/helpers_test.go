@@ -26,6 +26,7 @@ import (
 
 	"github.com/coder/websocket"
 
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/certproof"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel/grpctun"
 )
@@ -291,9 +292,9 @@ func signedAuth(t *testing.T, cert tls.Certificate, nonce []byte, clusterID stri
 	if err != nil {
 		t.Fatalf("signerFor: %v", err)
 	}
-	sig, err := signTranscript(signer, nonce, ProtocolVersion, clusterID)
+	sig, err := certproof.Sign(signer, nonce, ProtocolVersion, clusterID)
 	if err != nil {
-		t.Fatalf("signTranscript: %v", err)
+		t.Fatalf("certproof.Sign: %v", err)
 	}
 	return clientAuth{
 		Chain:           cert.Certificate,

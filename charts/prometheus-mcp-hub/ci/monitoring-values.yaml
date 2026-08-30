@@ -26,6 +26,3 @@ tracing:
   enabled: true
   endpoint: otel-collector.observability.svc:4317
   sampleRatio: "0.10"
-tunnel:
-  serverNames:
-    - hub.example.com

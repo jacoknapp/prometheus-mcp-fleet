@@ -55,7 +55,7 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 Labels with app.kubernetes.io/component replaced. The base label set already
 carries component=hub, so a template that appended its own produced a DUPLICATE
 YAML key -- which parses under Helm and is rejected by a strict decoder. Call as
-(list . "hub-tunnel").
+(list . "hub-test").
 */}}
 {{- define "prometheus-mcp-hub.componentLabels" -}}
 {{- $root := index . 0 -}}
@@ -171,10 +171,6 @@ produces for this chart.
 {{- printf "%s-config" (include "prometheus-mcp-hub.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
-{{- define "prometheus-mcp-hub.tunnelServiceName" -}}
-{{- printf "%s-tunnel" (include "prometheus-mcp-hub.fullname" .) | trunc 63 | trimSuffix "-" -}}
-{{- end -}}
-
 {{- define "prometheus-mcp-hub.autoUpdateName" -}}
 {{- printf "%s-autoupdate" (include "prometheus-mcp-hub.fullname" .) | trunc 52 | trimSuffix "-" -}}
 {{- end -}}
@@ -214,6 +210,77 @@ minute = h % 60, hour = 2 + h % 4, weekday = (h + cohortShift) % 7.
 {{- end -}}
 
 {{/*
+Does an Ingress path route the tunnel WebSocket as well?
+
+This is not cosmetic. The tunnel shares the MCP listener, so an Ingress whose
+rule does not cover tunnel.path produces a hub that passes every probe, serves
+MCP perfectly and accepts ZERO spokes. templates/ingress.yaml renders a second
+path entry for the tunnel wherever this returns empty.
+
+Call as (list . $path $pathType). Returns "true" or "".
+*/}}
+{{- define "prometheus-mcp-hub.pathCoversTunnel" -}}
+{{- $root := index . 0 -}}
+{{- $path := index . 1 | toString -}}
+{{- $pathType := index . 2 | toString -}}
+{{- $tunnel := $root.Values.tunnel.path -}}
+{{- if eq $path $tunnel -}}
+true
+{{- else if eq $pathType "Prefix" -}}
+{{/* Prefix matches on whole path segments: "/" covers everything, "/mcp" does not cover "/tunnel". */}}
+{{- $base := trimSuffix "/" $path -}}
+{{- if or (eq $base "") (hasPrefix (printf "%s/" $base) $tunnel) -}}
+true
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+cert-manager. It supplies the hub's SERVING certificate and nothing else: the internal CA that
+signs spoke identities needs its private key inside the hub to sign enrollments, so it is
+generated into the hub's own CA Secret and is not a Certificate resource.
+*/}}
+{{- define "prometheus-mcp-hub.servingCertSecretName" -}}
+{{- if .Values.certManager.serving.secretName -}}
+{{- .Values.certManager.serving.secretName -}}
+{{- else -}}
+{{- printf "%s-serving-tls" (include "prometheus-mcp-hub.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+
+{{/* True when the cert-manager CRDs are present on the target cluster. */}}
+{{- define "prometheus-mcp-hub.certManagerAvailable" -}}
+{{- if .Capabilities.APIVersions.Has "cert-manager.io/v1" -}}true{{- end -}}
+{{- end -}}
+
+{{/* True when a cert-manager Certificate for the serving cert is actually rendered. */}}
+{{- define "prometheus-mcp-hub.servingCertEnabled" -}}
+{{- if and .Values.certManager.enabled .Values.certManager.serving.enabled (include "prometheus-mcp-hub.certManagerAvailable" .) -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+Secret name for `ingress.tls`. The cert-manager Certificate's Secret wins automatically, so an
+operator who enabled certManager does not have to restate the name in two places and cannot
+have the two disagree.
+*/}}
+{{- define "prometheus-mcp-hub.ingressTLSSecretName" -}}
+{{- if include "prometheus-mcp-hub.servingCertEnabled" . -}}
+{{- include "prometheus-mcp-hub.servingCertSecretName" . -}}
+{{- else -}}
+{{- .Values.ingress.tls.secretName -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Every host this Ingress publishes: ingress.host plus every extraHosts entry. */}}
+{{- define "prometheus-mcp-hub.ingressHosts" -}}
+{{- $hosts := list .Values.ingress.host -}}
+{{- range .Values.ingress.extraHosts -}}
+{{- $hosts = append $hosts .host -}}
+{{- end -}}
+{{- toYaml (compact $hosts) -}}
+{{- end -}}
+
+{{/*
 Fail-fast validation. Every one of these is a misconfiguration that would
 otherwise install cleanly and be wrong in production.
 */}}
@@ -231,28 +298,40 @@ otherwise install cleanly and be wrong in production.
 {{- if eq (int .Values.ports.mcp) (int .Values.ports.admin) -}}
 {{- fail "prometheus-mcp-hub: ports.mcp and ports.admin must differ." -}}
 {{- end -}}
-{{- if eq (int .Values.ports.tunnel) (int .Values.ports.admin) -}}
-{{- fail "prometheus-mcp-hub: ports.tunnel and ports.admin must differ." -}}
+
+{{/* ---- the tunnel path, which shares the MCP listener ---- */}}
+{{- if not (hasPrefix "/" .Values.tunnel.path) -}}
+{{- fail (printf "prometheus-mcp-hub: tunnel.path is %q and must start with /. It is the path on the MCP listener where spokes open the tunnel WebSocket (PMF_TUNNEL_PATH)." .Values.tunnel.path) -}}
 {{- end -}}
-{{- if eq (int .Values.ports.mcp) (int .Values.ports.tunnel) -}}
-{{- fail "prometheus-mcp-hub: ports.mcp and ports.tunnel must differ." -}}
+{{- if eq .Values.tunnel.path "/" -}}
+{{- fail "prometheus-mcp-hub: tunnel.path must not be \"/\". The tunnel shares a listener with the MCP endpoint, so mounting it at the root would swallow every MCP request; the binary refuses this too." -}}
+{{- end -}}
+{{- if regexMatch "[?# \t{}]" .Values.tunnel.path -}}
+{{- fail (printf "prometheus-mcp-hub: tunnel.path %q must be a plain path: no query, fragment, whitespace or { } wildcard." .Values.tunnel.path) -}}
 {{- end -}}
 
 {{- if .Values.ingress.enabled -}}
 {{- if ne .Values.ingress.servicePortName "mcp" -}}
-{{- fail (printf "prometheus-mcp-hub: ingress.servicePortName is %q. Only the %q port may be published through an Ingress; the admin port must never be routed and the tunnel port cannot survive an HTTP proxy (it is mutually authenticated TLS -- publish it with tunnel.service instead)." .Values.ingress.servicePortName "mcp") -}}
+{{- fail (printf "prometheus-mcp-hub: ingress.servicePortName is %q. Only the %q port may be published through an Ingress: it carries the agent-facing MCP endpoint AND the spoke tunnel WebSocket at tunnel.path, and the admin port must never be routed." .Values.ingress.servicePortName "mcp") -}}
 {{- end -}}
 {{- if not .Values.ingress.host -}}
 {{- fail "prometheus-mcp-hub: ingress.enabled is true but ingress.host is empty." -}}
 {{- end -}}
 {{- end -}}
 
-{{- if .Values.tunnel.service.enabled -}}
-{{- if eq (int .Values.tunnel.service.port) (int .Values.ports.admin) -}}
-{{- fail (printf "prometheus-mcp-hub: tunnel.service.port (%d) equals ports.admin (%d); a LoadBalancer would publish the admin listener." (int .Values.tunnel.service.port) (int .Values.ports.admin)) -}}
+{{/* ---- cert-manager ---- */}}
+{{- if .Values.certManager.enabled -}}
+{{- if not (include "prometheus-mcp-hub.certManagerAvailable" .) -}}
+{{- fail "prometheus-mcp-hub: certManager.enabled is true but the cert-manager.io/v1 API is not present on this cluster. Install cert-manager first, or set certManager.enabled=false and supply ingress.tls.secretName yourself. (If you are rendering offline, `helm template --api-versions cert-manager.io/v1` tells Helm the CRDs exist.)" -}}
 {{- end -}}
-{{- if not (has .Values.tunnel.service.type (list "LoadBalancer" "NodePort" "ClusterIP")) -}}
-{{- fail (printf "prometheus-mcp-hub: tunnel.service.type must be LoadBalancer, NodePort or ClusterIP, got %q." .Values.tunnel.service.type) -}}
+{{- if and .Values.certManager.serving.enabled (not .Values.certManager.issuerRef.name) -}}
+{{- fail "prometheus-mcp-hub: certManager.serving.enabled is true but certManager.issuerRef.name is empty. cert-manager cannot issue a certificate without an Issuer or ClusterIssuer to issue it." -}}
+{{- end -}}
+{{- if and .Values.certManager.serving.enabled (not (has .Values.certManager.issuerRef.kind (list "Issuer" "ClusterIssuer"))) -}}
+{{- fail (printf "prometheus-mcp-hub: certManager.issuerRef.kind must be Issuer or ClusterIssuer, got %q." .Values.certManager.issuerRef.kind) -}}
+{{- end -}}
+{{- if and .Values.certManager.serving.enabled (not .Values.certManager.serving.dnsNames) (not .Values.ingress.host) -}}
+{{- fail "prometheus-mcp-hub: certManager.serving.enabled is true but there is no name to put on the certificate: ingress.host is empty and certManager.serving.dnsNames is empty." -}}
 {{- end -}}
 {{- end -}}
 

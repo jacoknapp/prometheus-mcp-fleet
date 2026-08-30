@@ -4,6 +4,7 @@
 package hubapi
 
 import (
+	"crypto/x509"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/authn"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/ca"
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/certproof"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/fleet"
 )
 
@@ -32,7 +34,8 @@ const ProjectURL = "https://github.com/jacoknapp/prometheus-mcp-fleet"
 // Routes:
 //
 //	POST /enroll                                     single-use `pmf_enr_` bearer
-//	POST /renew                                      mutual TLS only, no bearer
+//	GET  /renew/challenge                            unauthenticated, see below
+//	POST /renew                                      certificate + proof, no bearer
 //	GET  /pki/bundle                                 CA bundle, unauthenticated
 //	GET  /pki/crl                                    DER CRL, unauthenticated
 //	GET  /.well-known/oauth-protected-resource/mcp   RFC 9728 metadata
@@ -41,6 +44,11 @@ const ProjectURL = "https://github.com/jacoknapp/prometheus-mcp-fleet"
 // revocation list are public by construction, and requiring a credential to
 // fetch the trust anchor you need in order to present a credential is a
 // bootstrap loop.
+//
+// /renew/challenge is unauthenticated for the same shape of reason: it is the
+// step that lets a caller authenticate at all, and what it returns is a nonce
+// with an expiry, which is neither a secret nor a capability. Everything that
+// decides anything happens at POST /renew.
 func NewPublicMux(opts Options) (http.Handler, error) {
 	s, err := newServer(opts)
 	if err != nil {
@@ -49,6 +57,7 @@ func NewPublicMux(opts Options) (http.Handler, error) {
 	mux := http.NewServeMux()
 	enroll := s.verifier.Middleware(fleet.ClassEnrollment)(http.HandlerFunc(s.handleEnroll))
 	mux.Handle("POST /enroll", s.enrollmentGate(enroll))
+	mux.HandleFunc("GET /renew/challenge", s.handleRenewChallenge)
 	mux.HandleFunc("POST /renew", s.handleRenew)
 	mux.HandleFunc("GET /pki/bundle", s.handlePKIBundle)
 	mux.HandleFunc("GET /pki/crl", s.handlePKICRL)
@@ -176,36 +185,92 @@ func (s *server) replay(w http.ResponseWriter, r *http.Request, kid, clusterID s
 		"this enrollment token has already been redeemed and cannot be redeemed again")
 }
 
+// handleRenewChallenge issues the nonce a renewal must sign.
+//
+// It is deliberately free of side effects: nothing is stored, no rate is
+// consumed and no credential is required, so it cannot be used to exhaust
+// anything a real spoke needs. It is answered even while the hub is draining,
+// because the challenge is stateless and remains valid at whichever replica
+// eventually serves the POST.
+func (s *server) handleRenewChallenge(w http.ResponseWriter, r *http.Request) {
+	nonce, expiresAt := s.issueRenewNonce(s.clock())
+	s.writeJSON(w, r, http.StatusOK, RenewChallengeResponse{Nonce: nonce, ExpiresAt: expiresAt})
+}
+
 // handleRenew issues a fresh certificate to a spoke that already holds one.
 //
-// Authentication is the client certificate and nothing else: there is no
-// bearer credential on this route, and the cluster identity comes from the
-// verified certificate's URI SAN by way of [ca.CA.IdentityFromCert]. Nothing
-// in the request body can influence which identity is issued, so a spoke
-// cannot renew its way into being a different cluster.
+// # Why this is not mutual TLS
 //
-// The listener must be configured with [ca.CA.ServerTLSConfig] (or an
-// equivalent that verifies the client chain against the hub CA); this handler
-// refuses any request whose TLS state carries no verified chain.
+// It was, once, and that is the bug this shape exists to fix. Under ADR-0014
+// the hub sits behind a standard Kubernetes Ingress that terminates TLS and
+// forwards plain HTTP, so r.TLS is nil on every request that arrives in
+// production and crypto/tls never sees a spoke's certificate. A handler that
+// read r.TLS.PeerCertificates therefore refused every renewal in the field
+// while passing every test that spoke TLS directly to it — and since spoke
+// certificates live 14 days and renew at half life, the whole fleet would have
+// disconnected on day 14 needing 100 fresh enrollment tokens to recover.
+//
+// Authentication is therefore the same construction the tunnel handshake
+// already uses, one layer up from TLS: a nonce this fleet issued, a certificate
+// chain, and a signature over a transcript binding the two to a cluster. The
+// order below is the security property.
+//
+//  1. The nonce must be one this fleet minted and still inside its window. It
+//     is checked first because it is the cheapest check and it is self-
+//     contained, so a caller with no challenge at all is turned away before the
+//     hub parses any certificate it supplied.
+//  2. The chain must verify against this CA. [ca.CA.VerifyChain] is the whole
+//     trust decision, and the cluster ID comes from the leaf's URI SAN.
+//  3. The serial must not be on the revocation denylist. Revocation changes far
+//     more often than the trust anchor, so it is a separate, live lookup.
+//  4. The signature must verify under the leaf's public key, over the cluster
+//     ID *the hub derived in step 2*. This is the step that makes the
+//     certificate a credential rather than a public document anyone could
+//     quote, and passing the derived cluster ID rather than a claimed one is
+//     what stops a caller re-scoping a proof to somebody else's cluster.
+//
+// Only then is a certificate issued, for the identity from step 2. Nothing in
+// the request body can influence which identity that is: [RenewRequest] has no
+// cluster field, and [ca.CA.IssueSpokeFromCSR] discards the CSR's subject, SANs
+// and extensions, so a request asking for "CN=admin" or for another cluster's
+// URI SAN receives a certificate for its own cluster and nothing else.
 func (s *server) handleRenew(w http.ResponseWriter, r *http.Request) {
 	if !s.guard(w, r) {
 		s.metrics.Enrollment(ResultDenied)
 		return
 	}
-	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 || len(r.TLS.VerifiedChains) == 0 {
-		s.metrics.Enrollment(ResultDenied)
-		s.log.LogAttrs(r.Context(), slog.LevelWarn, "renew without a verified client certificate",
-			slog.String("remoteAddr", authn.SourceAddr(r)))
-		s.fail(w, r, CodeUnauthenticated,
-			"renewal requires a verified client certificate; there is no bearer credential for this route")
+	var req RenewRequest
+	if !s.readBody(w, r, &req) {
+		s.metrics.Enrollment(ResultInvalid)
 		return
 	}
-	identity, err := s.ca.IdentityFromCert(r.TLS.PeerCertificates[0])
+
+	if err := s.verifyRenewNonce(req.Nonce, s.clock()); err != nil {
+		s.metrics.Enrollment(ResultDenied)
+		s.log.LogAttrs(r.Context(), slog.LevelWarn, "renewal challenge refused",
+			slog.String("remoteAddr", authn.SourceAddr(r)),
+			slog.String("error", err.Error()))
+		s.fail(w, r, CodeUnauthenticated,
+			"the renewal challenge is missing, expired or was not issued by this hub; "+
+				"fetch a fresh one from GET /renew/challenge")
+		return
+	}
+
+	chain, ok := s.readChain(w, r, req.Chain)
+	if !ok {
+		return
+	}
+	identity, err := s.ca.VerifyChain(chain)
 	if err != nil {
 		s.metrics.Enrollment(ResultDenied)
-		s.fail(w, r, CodeForbidden, "the client certificate carries no usable spoke identity")
+		s.log.LogAttrs(r.Context(), slog.LevelWarn, "renewal certificate refused",
+			slog.String("remoteAddr", authn.SourceAddr(r)),
+			slog.String("error", err.Error()))
+		s.fail(w, r, CodeForbidden,
+			"the presented certificate is not a spoke identity issued by this hub")
 		return
 	}
+
 	revoked, err := s.revokedSerials(r)
 	if err != nil {
 		s.metrics.Enrollment(ResultError)
@@ -218,10 +283,26 @@ func (s *server) handleRenew(w http.ResponseWriter, r *http.Request) {
 			slog.String("cluster", identity.ClusterID),
 			slog.String("serial", identity.CertSerial),
 			slog.String("note", "revoked certificate attempted renewal"))
-		s.fail(w, r, CodeForbidden, "the client certificate has been revoked")
+		s.fail(w, r, CodeForbidden, "the presented certificate has been revoked")
 		return
 	}
-	csrDER, ok := s.readCSR(w, r)
+
+	// The cluster ID passed here is the one derived from the certificate in
+	// step 2, never one the caller supplied: the transcript is what binds the
+	// proof to an identity, so verifying it against a claimed value would make
+	// the binding decorative.
+	if err := certproof.Verify(chain[0], req.Signature, req.Nonce,
+		certproof.RenewProtocolVersion, identity.ClusterID); err != nil {
+		s.metrics.Enrollment(ResultDenied)
+		s.security(r, EventRenewalUnproven,
+			slog.String("cluster", identity.ClusterID),
+			slog.String("serial", identity.CertSerial))
+		s.fail(w, r, CodeForbidden,
+			"the signature does not prove possession of the private key for the presented certificate")
+		return
+	}
+
+	csrDER, ok := s.decodeCSRField(w, r, req.CSR)
 	if !ok {
 		return
 	}
@@ -250,6 +331,37 @@ func (s *server) handleRenew(w http.ResponseWriter, r *http.Request) {
 		ClusterID:   identity.ClusterID,
 		Serial:      serial,
 	})
+}
+
+// readChain parses the DER certificates a renewal presented, leaf first.
+//
+// An absent chain is an authentication failure rather than a malformed request:
+// the caller offered no credential at all. An unparseable one is a malformed
+// request, because something was offered and it was not a certificate.
+func (s *server) readChain(w http.ResponseWriter, r *http.Request, der [][]byte) ([]*x509.Certificate, bool) {
+	if len(der) == 0 {
+		s.metrics.Enrollment(ResultDenied)
+		s.fail(w, r, CodeUnauthenticated,
+			"chain is required: the spoke's current certificate, DER encoded, leaf first")
+		return nil, false
+	}
+	if len(der) > MaxChainCerts {
+		s.metrics.Enrollment(ResultInvalid)
+		s.fail(w, r, CodeInvalidRequest, fmt.Sprintf("chain carries more than %d certificates", MaxChainCerts))
+		return nil, false
+	}
+	chain := make([]*x509.Certificate, 0, len(der))
+	for i, b := range der {
+		cert, err := x509.ParseCertificate(b)
+		if err != nil {
+			s.metrics.Enrollment(ResultInvalid)
+			s.fail(w, r, CodeInvalidRequest,
+				fmt.Sprintf("chain entry %d is not a parseable DER certificate", i))
+			return nil, false
+		}
+		chain = append(chain, cert)
+	}
+	return chain, true
 }
 
 // handlePKIBundle serves the CA certificate as PEM.
@@ -324,24 +436,34 @@ func (s *server) handleProtectedResourceMetadata(w http.ResponseWriter, r *http.
 	}
 }
 
-// readCSR decodes and bounds the base64 DER certificate signing request.
+// readCSR decodes the body of POST /enroll down to its certificate signing
+// request.
 func (s *server) readCSR(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 	var req EnrollRequest
 	if !s.readBody(w, r, &req) {
 		s.metrics.Enrollment(ResultInvalid)
 		return nil, false
 	}
-	if req.CSR == "" {
+	return s.decodeCSRField(w, r, req.CSR)
+}
+
+// decodeCSRField bounds and decodes one base64 DER certificate signing request.
+//
+// It is shared by /enroll and /renew so that the two routes cannot disagree
+// about what a CSR field may contain. On /renew it runs only after the caller
+// has proved possession, so an unauthenticated peer never reaches the decoder.
+func (s *server) decodeCSRField(w http.ResponseWriter, r *http.Request, csr string) ([]byte, bool) {
+	if csr == "" {
 		s.metrics.Enrollment(ResultInvalid)
 		s.fail(w, r, CodeInvalidRequest, "csr is required: a base64 DER certificate signing request")
 		return nil, false
 	}
-	if len(req.CSR) > MaxCSRBytes {
+	if len(csr) > MaxCSRBytes {
 		s.metrics.Enrollment(ResultInvalid)
 		s.fail(w, r, CodeInvalidRequest, fmt.Sprintf("csr exceeds %d base64 characters", MaxCSRBytes))
 		return nil, false
 	}
-	der, err := decodeCSR(req.CSR)
+	der, err := decodeCSR(csr)
 	if err != nil {
 		s.metrics.Enrollment(ResultInvalid)
 		s.fail(w, r, CodeInvalidRequest, "csr is not valid base64 DER")

@@ -12,9 +12,10 @@
 //
 // [NewPublicMux] serves the routes that must be reachable from a cluster that
 // has not been enrolled yet: /enroll (a single-use `pmf_enr_` credential),
-// /renew (mutual TLS and nothing else), the CA bundle, the CRL, and the RFC
-// 9728 protected-resource document. It is mounted alongside the MCP handler on
-// the public listener.
+// /renew/challenge and /renew (a certificate plus a signed challenge, and no
+// bearer credential at all), the CA bundle, the CRL, and the RFC 9728
+// protected-resource document. It is mounted alongside the MCP handler on the
+// public listener.
 //
 // Both are built on the standard library's [net/http.ServeMux] method+path
 // patterns. There is no router dependency, and there is no route whose path is
@@ -36,8 +37,15 @@
 //     issued certificate is the one the hub decided on when it minted the
 //     enrollment token, so a CSR asking for "CN=admin" gets a spoke
 //     certificate for its own cluster and nothing else.
-//   - /renew takes the cluster identity from the verified client certificate.
-//     Nothing in the request body can influence it.
+//   - /renew takes the cluster identity from the URI SAN of the certificate the
+//     caller proved possession of, and from nowhere else. [RenewRequest] has no
+//     cluster field, so nothing in the request body can influence it.
+//   - /renew reads no TLS state. Behind the Ingress of ADR-0014 there is none
+//     to read, so possession is proved at the application layer with the same
+//     construction the tunnel handshake uses
+//     ([github.com/jacoknapp/prometheus-mcp-fleet/internal/certproof]). A
+//     handler that consulted r.TLS here would work in a lab and refuse every
+//     renewal in production, which is exactly what it did once.
 //
 // # Importers and concurrency
 //

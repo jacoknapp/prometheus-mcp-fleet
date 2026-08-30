@@ -57,7 +57,8 @@ const (
 	// ResultReplay is a second redemption of an enrollment token.
 	ResultReplay = "replay"
 	// ResultDenied is a request refused before issuance: disabled, draining,
-	// unauthenticated, or a client certificate that is revoked.
+	// unauthenticated, a challenge that does not verify, an untrusted or
+	// revoked certificate, or a proof of possession that does not check out.
 	ResultDenied = "denied"
 	// ResultInvalid is a malformed CSR or request body.
 	ResultInvalid = "invalid"
@@ -87,8 +88,13 @@ const (
 	EventCertIssued = "cert.issued"
 	// EventCertRevoked is a certificate revocation.
 	EventCertRevoked = "cert.revoked"
-	// EventCertRenewed is a mutual-TLS renewal.
+	// EventCertRenewed is a successful certificate renewal.
 	EventCertRenewed = "cert.renewed"
+	// EventRenewalUnproven is a renewal that presented a trusted, unrevoked
+	// certificate but could not sign the challenge for it. It is a security
+	// event rather than a plain refusal: the certificate is public, so this is
+	// what somebody quoting one they do not hold the key for looks like.
+	EventRenewalUnproven = "renewal.unproven"
 )
 
 // ErrorEnvelope is the single error shape every route in this package returns.

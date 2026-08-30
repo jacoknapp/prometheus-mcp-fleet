@@ -41,6 +41,12 @@ const (
 	// MaxCSRBytes bounds the base64 CSR field. An 8192-bit RSA request is
 	// under 2 KiB of DER, so this is generous by an order of magnitude.
 	MaxCSRBytes = 32 << 10
+	// MaxChainCerts bounds how many certificates a renewal may present. This
+	// CA issues spoke certificates directly off the root, so a legitimate chain
+	// is one certificate; the allowance exists so an intermediate could be
+	// introduced without a wire change, not so a caller can hand the hub an
+	// arbitrary pile of DER to parse.
+	MaxChainCerts = 8
 )
 
 // labelKeyRE is the accepted label key grammar. It matches the Kubernetes

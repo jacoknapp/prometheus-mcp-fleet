@@ -4,7 +4,8 @@
 # Two replicas, which is the only configuration in which a PodDisruptionBudget
 # is rendered at all. Read the replicaCount comment in values.yaml first: a
 # tunnel is pinned to one replica, so real HA also needs every replica
-# individually addressable and every spoke listing all of them.
+# individually routable -- one hostname or path prefix per replica on the same
+# Ingress -- and every spoke listing all of them in hub.endpoints.
 replicaCount: 2
 podDisruptionBudget:
   enabled: true
@@ -17,7 +18,11 @@ topologySpreadConstraints:
     labelSelector:
       matchLabels:
         app.kubernetes.io/name: prometheus-mcp-hub
-tunnel:
-  serverNames:
-    - hub-0.example.com
-    - hub-1.example.com
+ingress:
+  enabled: true
+  className: nginx
+  host: hub-0.example.com
+  extraHosts:
+    - host: hub-1.example.com
+config:
+  publicURL: https://hub-0.example.com/mcp

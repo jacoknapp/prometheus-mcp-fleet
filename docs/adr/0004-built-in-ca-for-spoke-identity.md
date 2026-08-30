@@ -34,10 +34,20 @@ The hub runs a small internal certificate authority.
 * The enrollment token is burned atomically before the certificate is returned.
   A second redemption is refused and logged as a security event, because a
   replayed enrollment token means the install secret leaked.
-* Renewal happens over the existing mutually authenticated connection at half of
-  the certificate's lifetime with jitter, using no enrollment token at all.
-* Revocation is a hub-side denylist keyed on serial, consulted during the TLS
-  handshake. A CRL is published for external auditors but nothing depends on it.
+* Renewal happens at half of the certificate's lifetime with jitter, using no
+  enrollment token at all.
+* Revocation is a hub-side denylist keyed on serial, consulted on every
+  connection. A CRL is published for external auditors but nothing depends on it.
+
+> **Amended by [ADR-0014](0014-websocket-tunnel-through-standard-ingress.md).**
+> As first written, both of the last two points happened at the TLS layer: the
+> spoke presented its certificate to a mutually authenticated listener and the
+> denylist was consulted from `VerifyPeerCertificate`. ADR-0014 put the hub
+> behind an Ingress that terminates TLS, so the hub never sees a client
+> certificate. Renewal and the tunnel handshake now prove possession inside the
+> connection, over a hub-issued challenge, and the denylist is consulted there.
+> Nothing about the identity rules in this record changed: the cluster ID still
+> comes only from the URI SAN, and the hub still discards what the CSR asks for.
 
 `IdentityFromCert` derives the cluster ID **only** from the URI SAN, verifying
 the scheme, the trust domain and the path shape. The common name is ignored for

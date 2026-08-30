@@ -5,7 +5,6 @@ templates:
   - templates/deployment.yaml
   - templates/configmap.yaml
   - templates/service.yaml
-  - templates/service-tunnel.yaml
   - templates/serviceaccount.yaml
   - templates/rbac.yaml
   - templates/networkpolicy.yaml
@@ -126,8 +125,19 @@ tests:
           path: "data.PMF_MCP_ADDR"
           value: ":8080"
       - equal:
+          path: "data.PMF_TUNNEL_PATH"
+          value: "/tunnel"
+      # ADR-0014 deleted these from internal/config/hub.go. The binary IGNORES
+      # an unknown PMF_ key silently, so emitting one hands the operator a
+      # default they did not ask for.
+      - notExists:
           path: "data.PMF_TUNNEL_ADDR"
-          value: ":8443"
+      - notExists:
+          path: "data.PMF_TUNNEL_SERVER_NAMES"
+      - notExists:
+          path: "data.PMF_TUNNEL_TLS_CERT_FILE"
+      - notExists:
+          path: "data.PMF_TUNNEL_TLS_KEY_FILE"
       - equal:
           path: "data.PMF_ADMIN_ADDR"
           value: ":9090"

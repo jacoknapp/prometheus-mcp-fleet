@@ -11,9 +11,3 @@ podSecurityContext:
   fsGroup: null
   seccompProfile:
     type: RuntimeDefault
-tunnel:
-  serverNames:
-    - hub.apps.example.com
-  service:
-    type: NodePort
-    nodePort: 30443

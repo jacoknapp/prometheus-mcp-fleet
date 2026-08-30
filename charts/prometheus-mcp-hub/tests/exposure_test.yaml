@@ -97,30 +97,115 @@ tests:
           path: spec.ports[0].name
           value: mcp
 
-  - it: refuses a tunnel LoadBalancer that would publish the admin port
-    set:
-      tunnel:
-        service:
-          port: 9090
+  # ADR-0014: the tunnel is a WebSocket on the mcp port. There is no tunnel
+  # Service, no tunnel container port and nothing on 8443 anywhere.
+  - it: publishes no tunnel port on the Service
+    template: templates/service.yaml
     asserts:
-      - failedTemplate:
-          errorPattern: "a LoadBalancer would publish the admin listener"
-
-  - it: publishes only the tunnel port on the tunnel LoadBalancer
-    template: templates/service-tunnel.yaml
-    asserts:
-      - equal:
-          path: spec.type
-          value: LoadBalancer
       - lengthEqual:
           path: spec.ports
-          count: 1
+          count: 2
       - equal:
           path: spec.ports[0].name
-          value: tunnel
+          value: mcp
+      - notContains:
+          path: spec.ports
+          content:
+            name: tunnel
+            port: 8443
+            targetPort: tunnel
+            protocol: TCP
+
+  - it: declares no tunnel container port on the Deployment
+    template: templates/deployment.yaml
+    asserts:
+      - lengthEqual:
+          path: spec.template.spec.containers[0].ports
+          count: 2
       - equal:
-          path: spec.ports[0].targetPort
-          value: tunnel
+          path: spec.template.spec.containers[0].ports[0].name
+          value: mcp
+      - equal:
+          path: spec.template.spec.containers[0].ports[1].name
+          value: admin
+
+  # The Ingress is the ONLY way in, so it must carry the tunnel path. A hub
+  # whose Ingress misses /tunnel passes every probe and accepts zero spokes.
+  - it: routes the tunnel path when ingress.path already covers it
+    template: templates/ingress.yaml
+    set:
+      ingress:
+        enabled: true
+        host: mcp.example.com
+        path: /
+        pathType: Prefix
+    asserts:
+      - lengthEqual:
+          path: spec.rules[0].http.paths
+          count: 1
+      - equal:
+          path: spec.rules[0].http.paths[0].path
+          value: /
+
+  - it: renders a second path entry when ingress.path would exclude the tunnel
+    template: templates/ingress.yaml
+    set:
+      ingress:
+        enabled: true
+        host: mcp.example.com
+        path: /mcp
+        pathType: Prefix
+        extraHosts:
+          - host: alt.example.com
+            path: /mcp
+            pathType: Prefix
+    asserts:
+      - lengthEqual:
+          path: spec.rules[0].http.paths
+          count: 2
+      - equal:
+          path: spec.rules[0].http.paths[1].path
+          value: /tunnel
+      - equal:
+          path: spec.rules[0].http.paths[1].pathType
+          value: Prefix
+      - equal:
+          path: spec.rules[0].http.paths[1].backend.service.port.number
+          value: 8080
+      - lengthEqual:
+          path: spec.rules[1].http.paths
+          count: 2
+      - equal:
+          path: spec.rules[1].http.paths[1].path
+          value: /tunnel
+
+  - it: honours a custom tunnel.path in the Ingress rule it renders
+    template: templates/ingress.yaml
+    set:
+      ingress:
+        enabled: true
+        host: mcp.example.com
+        path: /mcp
+        pathType: Prefix
+      tunnel:
+        path: /pmf-tunnel
+    asserts:
+      - equal:
+          path: spec.rules[0].http.paths[1].path
+          value: /pmf-tunnel
+
+  - it: does not double up when ingress.path is exactly the tunnel path
+    template: templates/ingress.yaml
+    set:
+      ingress:
+        enabled: true
+        host: mcp.example.com
+        path: /tunnel
+        pathType: Exact
+    asserts:
+      - lengthEqual:
+          path: spec.rules[0].http.paths
+          count: 1
 
   - it: keeps the admin port on a ClusterIP Service so a ServiceMonitor can reach it
     template: templates/service.yaml

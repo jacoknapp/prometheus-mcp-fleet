@@ -6,8 +6,9 @@ Image: {{ include "prometheus-mcp-hub.image" . }}
 {{- end }}
 
 Listeners
-  MCP     {{ include "prometheus-mcp-hub.fullname" . }}.{{ include "prometheus-mcp-hub.namespace" . }}.svc:{{ int .Values.service.mcpPort }}  (agents and spoke enrollment)
-  Tunnel  {{ if .Values.tunnel.service.enabled }}{{ include "prometheus-mcp-hub.tunnelServiceName" . }}.{{ include "prometheus-mcp-hub.namespace" . }}.svc:{{ int .Values.tunnel.service.port }} ({{ .Values.tunnel.service.type }}){{ else }}NOT EXPOSED - tunnel.service.enabled=false, so no spoke can reach this hub{{ end }}
+  MCP     {{ include "prometheus-mcp-hub.fullname" . }}.{{ include "prometheus-mcp-hub.namespace" . }}.svc:{{ int .Values.service.mcpPort }}  (agents, spoke enrollment AND the spoke tunnel)
+  Tunnel  {{ .Values.tunnel.path }} on that same listener - a WebSocket, not a second port and not a
+          second Service. Spokes set hub.endpoints to wss://<your ingress host>{{ .Values.tunnel.path }}.
   Admin   in-cluster only, container port {{ int .Values.ports.admin }} ({{ if .Values.service.admin.enabled }}published on the ClusterIP Service as port {{ int .Values.service.admin.port }}{{ else }}not on any Service{{ end }})
 
 State
@@ -35,13 +36,42 @@ State
   ####################################################################
 {{- end }}
 
-{{- if and .Values.tunnel.service.enabled (not .Values.tunnel.serverNames) (not .Values.tunnel.tls.existingSecret) }}
+{{- if not .Values.ingress.enabled }}
 
-WARNING - tunnel.serverNames is empty and you supplied no tunnel.tls.existingSecret.
-  The internal CA self-issues the tunnel server certificate from that list, so with
-  it empty a spoke's TLS verification of the hub fails and NO TUNNEL EVER
-  ESTABLISHES. Set tunnel.serverNames to every host or IP your spokes will put in
-  their hub.endpoints.
+WARNING - ingress.enabled=false, so nothing outside this cluster can reach this hub.
+  Since ADR-0014 the spoke tunnel is a WebSocket on the MCP listener, published by
+  the SAME standard Ingress as the MCP endpoint. There is no tunnel Service, no
+  LoadBalancer and no passthrough annotation to arrange - but with no Ingress at all
+  there is also no path for a spoke to dial in on. Set ingress.enabled=true with
+  ingress.host, or publish {{ include "prometheus-mcp-hub.fullname" . }}:{{ int .Values.service.mcpPort }} some other way.
+{{- else if not (include "prometheus-mcp-hub.pathCoversTunnel" (list . .Values.ingress.path .Values.ingress.pathType)) }}
+
+NOTE - ingress.path ({{ .Values.ingress.path }}, {{ .Values.ingress.pathType }}) does not cover tunnel.path ({{ .Values.tunnel.path }}),
+  so a SECOND Ingress path entry was rendered for the tunnel. Nothing to do; this
+  note exists because an Ingress that silently misses {{ .Values.tunnel.path }} gives you a hub
+  that passes every probe and accepts zero spokes.
+{{- end }}
+
+{{- if include "prometheus-mcp-hub.servingCertEnabled" . }}
+
+Serving certificate
+  cert-manager issues it from {{ .Values.certManager.issuerRef.kind }}/{{ .Values.certManager.issuerRef.name }} into
+  Secret {{ include "prometheus-mcp-hub.servingCertSecretName" . }}, which the Ingress uses. Watch it with
+    kubectl -n {{ include "prometheus-mcp-hub.namespace" . }} get certificate {{ include "prometheus-mcp-hub.servingCertSecretName" . }}
+  The hub's INTERNAL CA is a different thing entirely and is NOT managed here: it signs
+  spoke identities, so the hub holds its private key and generates it on first boot into
+  {{ include "prometheus-mcp-hub.caSecretName" . }}. Do not try to replace it with a cert-manager Certificate.
+{{- end }}
+
+{{- if .Values.ingress.enabled }}
+
+IDLE TIMEOUTS
+  The tunnel is a long-lived WebSocket through your Ingress controller. Its HTTP/2
+  keepalive pings run every 10s, comfortably inside nginx's 60s proxy-read-timeout
+  default, so defaults are fine. A controller configured BELOW that will drop every
+  spoke in the fleet on a timer. On ingress-nginx, raise it with
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+  set through ingress.annotations.
 {{- end }}
 
 {{- if not (include "prometheus-mcp-hub.pdbEnabled" .) }}
@@ -58,10 +88,11 @@ automatically at replicaCount >= 2.
 replicaCount={{ .Values.replicaCount }}. Read this before relying on it:
   A spoke tunnel is pinned to ONE hub replica and there is deliberately no
   hub-to-hub forwarding. Credential state is shared (it is one Secret), but tunnels
-  are not. Every replica must be individually reachable from outside the cluster and
-  every spoke must list all {{ .Values.replicaCount }} addresses in hub.endpoints. Putting several
-  replicas behind one Service does NOT give you HA; it gives you a fleet where each
-  cluster is visible to exactly one replica.
+  are not. Every replica must be individually routable from outside the cluster and
+  every spoke must list all {{ .Values.replicaCount }} URLs in hub.endpoints. Putting several replicas
+  behind one Service does NOT give you HA; it gives you a fleet where each cluster
+  is visible to exactly one replica. Per-replica addressing is now ordinary HTTP
+  routing - a hostname or a path prefix per replica on the same Ingress.
 {{- end }}
 
 Next steps
@@ -72,7 +103,7 @@ Next steps
        curl -X POST localhost:{{ int .Values.ports.admin }}/admin/v1/enrollments -d '{"clusterId":"<cluster>"}'
      then install prometheus-mcp-spoke in that cluster with
        enrollment.token=<the pmf_enr_ token>   (or enrollment.existingSecret)
-       hub.endpoints[0]={{ if .Values.tunnel.service.enabled }}<external tunnel address>:{{ int .Values.tunnel.service.port }}{{ else }}<external tunnel address>{{ end }}
+       hub.endpoints[0]={{ if .Values.ingress.enabled }}wss://{{ .Values.ingress.host }}{{ .Values.tunnel.path }}{{ else }}wss://<external hub host>{{ .Values.tunnel.path }}{{ end }}
        hub.apiUrl={{ if .Values.config.publicURL }}{{ .Values.config.publicURL }}{{ else }}<external MCP URL>{{ end }}
   3. Watch spokes attach:
        kubectl -n {{ include "prometheus-mcp-hub.namespace" . }} logs deploy/{{ include "prometheus-mcp-hub.fullname" . }} -f

@@ -8,7 +8,7 @@ cluster:
   id: prod-tls
 hub:
   endpoints:
-    - hub.example.com:8443
+    - wss://hub.example.com/tunnel
   apiUrl: https://hub.example.com
   caBundle: |
     -----BEGIN CERTIFICATE-----

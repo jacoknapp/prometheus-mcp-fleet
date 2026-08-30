@@ -108,7 +108,8 @@ connection it dialed:
 - serve allow-listed Prometheus requests the hub sends down the tunnel;
 - re-validate each of those against its own copy of the allow-list;
 - recompute cluster facts on a slow timer and answer `Describe` from cache;
-- renew its client certificate at half its lifetime;
+- renew its client certificate at half its lifetime, by signing a challenge
+  from the hub rather than by presenting it at the TLS layer;
 - reconnect with full-jitter backoff when the connection drops.
 
 ## The tunnel
@@ -178,6 +179,12 @@ is still derived only from the certificate's URI SAN, and a spoke whose
 self-reported cluster ID disagrees with its certificate is refused rather than
 corrected. The trade-off — the Ingress is inside the trust boundary — is
 recorded in [ADR-0014](adr/0014-websocket-tunnel-through-standard-ingress.md).
+
+`POST /renew` authenticates the same way and shares the same code
+(`internal/certproof`): there is no peer certificate for it to read either, so a
+spoke fetches a challenge from `GET /renew/challenge` and signs it. The two
+exchanges bind different protocol version strings into the transcript, so a
+proof made for one cannot be redeemed at the other.
 
 The response body is **opaque to the spoke**. It never parses Prometheus JSON;
 it copies bytes into 64 KiB chunks. That keeps the spoke tiny, keeps it
@@ -281,8 +288,8 @@ flowchart LR
     BURN -->|already used| SEC["409 + security event"]
     BURN --> ISSUE["CA mints its OWN subject<br/>CSR subject/SANs discarded"]
     ISSUE --> CERT["cert · 14 days<br/>URI SAN pmf://domain/spoke/id"]
-    CERT --> TUN["mTLS tunnel"]
-    CERT -->|"at 50% life, over mTLS"| RENEW["renew, no token"]
+    CERT --> TUN["tunnel: in-band proof of possession"]
+    CERT -->|"at 50% life, signed challenge"| RENEW["renew, no token"]
 ```
 
 The cluster ID comes only from the certificate's URI SAN. Nothing a spoke reports

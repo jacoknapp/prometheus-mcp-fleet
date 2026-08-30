@@ -8,6 +8,7 @@ Image:      {{ include "prometheus-mcp-spoke.image" . }}
 
 This spoke DIALS OUT. It opens nothing inbound except the metrics port on {{ int .Values.ports.admin }}.
   Hub tunnel:     {{ join ", " .Values.hub.endpoints }}
+                  (a WebSocket on the hub's ordinary MCP listener, through its Ingress)
   Hub enrollment: {{ .Values.hub.apiUrl }}
   Prometheus:     {{ .Values.prometheus.url }}
 
@@ -91,18 +92,27 @@ If the spoke cannot reach the hub
   3. Egress. {{ if .Values.networkPolicy.enabled }}This release rendered a NetworkPolicy. Its hub rule is an ipBlock, because
      the hub is not in this cluster and cannot be selected by namespace. Confirm the
      hub's real address falls inside networkPolicy.egress.hub.cidrs
-     ({{ join ", " .Values.networkPolicy.egress.hub.cidrs }}), and that {{ range $i, $e := .Values.hub.endpoints }}{{ if $i }}, {{ end }}port {{ include "prometheus-mcp-spoke.endpointPort" $e }}{{ end }} is allowed.
+     ({{ join ", " .Values.networkPolicy.egress.hub.cidrs }}), and that {{ range $i, $p := (fromYamlArray (include "prometheus-mcp-spoke.hubEgressPorts" .)) }}{{ if $i }}, {{ end }}port {{ $p }}{{ end }} is allowed
+     (443 for a wss:// endpoint with no explicit port -- the tunnel arrives on the hub's
+     ordinary HTTPS Ingress, not on a dedicated 8443 listener).
      Also check any OTHER NetworkPolicy in this namespace: policies are additive only
      for allow, and a default-deny egress policy elsewhere still applies.{{ else }}networkPolicy.enabled=false here, so check for a cluster-wide default-deny
      egress policy, a service mesh sidecar, or an egress gateway in front of you.{{ end }}
-  4. Corporate proxy or egress NAT. The tunnel is raw mTLS over TCP, NOT HTTP, so an
-     HTTP forward proxy cannot carry it and HTTPS_PROXY is not consulted. It needs a
-     real TCP path to {{ join ", " .Values.hub.endpoints }}.
-  5. TLS. "certificate signed by unknown authority" means the trust bundle is wrong:
-     set hub.caBundle or hub.existingCASecret. "certificate is valid for X, not Y"
-     means the hub's tunnel.serverNames does not list the address you put in
-     hub.endpoints -- that is fixed on the hub, not here.
-  6. Enrollment 401/409. A single-use token that was already redeemed returns a replay
+  4. Corporate proxy or egress NAT. The tunnel is an HTTP Upgrade to a WebSocket over
+     ordinary HTTPS, so a forward proxy CAN carry it and HTTPS_PROXY is honoured. Two
+     things to check: the proxy must allow the Upgrade rather than stripping it, and it
+     must not close the connection while idle -- the tunnel pings every 10s, so any
+     idle timeout above ~30s is fine. It needs a path to {{ join ", " .Values.hub.endpoints }}.
+  5. TLS. "certificate signed by unknown authority" means the trust bundle for the HUB'S
+     SERVER certificate is wrong: set hub.caBundle or hub.existingCASecret, or use a hub
+     Ingress certificate your trust store already accepts. "certificate is valid for X,
+     not Y" means the hub's Ingress certificate does not cover the host in your
+     hub.endpoints -- fixed on the hub's ingress.host / certManager.serving.dnsNames,
+     not here.
+  6. Wrong URL. hub.endpoints must be the hub's Ingress host plus the hub's tunnel.path,
+     e.g. wss://hub.example.com/tunnel. A 404 on the upgrade means the hub's Ingress does
+     not route that path.
+  7. Enrollment 401/409. A single-use token that was already redeemed returns a replay
      error; mint a fresh one. In identity.backend=memory every restart redeems again,
      which is why that mode needs a multi-use token.
 

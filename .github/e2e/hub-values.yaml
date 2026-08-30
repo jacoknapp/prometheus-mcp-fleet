@@ -36,11 +36,11 @@ replicaCount: 1
 
 service:
   type: ClusterIP
-tunnel:
-  serverNames:
-    - pmf-hub-tunnel.prometheus-mcp-hub.svc
-  service:
-    type: ClusterIP
+
+# No tunnel Service and no tunnel serverNames since ADR-0014: the spoke tunnel is
+# a WebSocket on the MCP listener at tunnel.path, so the ClusterIP Service above
+# is the only thing the spoke needs to reach. tunnel.path keeps its /tunnel
+# default.
 
 # A PDB on a single-replica workload blocks node drains; off in CI as in the
 # production defaults.
@@ -54,9 +54,16 @@ networkPolicy:
   enabled: false
 
 # Standard Ingress only (BUILD_SPEC 1.12). Not exercised here: the suite reaches
-# MCP through `kubectl port-forward`, so an Ingress controller would be one more
-# moving part between the assertion and the thing being asserted.
+# MCP through `kubectl port-forward`, and the spoke dials the ClusterIP Service
+# directly, so an Ingress controller would be one more moving part between the
+# assertion and the thing being asserted. That also means no TLS in this cluster:
+# the spoke uses ws:// rather than wss://.
 ingress:
+  enabled: false
+
+# cert-manager is not installed in the e2e kind cluster. The chart fails loudly
+# rather than silently if this is turned on without the CRDs.
+certManager:
   enabled: false
 
 metrics:

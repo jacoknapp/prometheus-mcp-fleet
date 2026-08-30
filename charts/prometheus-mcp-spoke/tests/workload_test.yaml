@@ -13,7 +13,7 @@ set:
     id: prod-us-east-1
   hub:
     endpoints:
-      - hub.example.com:8443
+      - wss://hub.example.com/tunnel
     apiUrl: https://hub.example.com
 
 tests:
@@ -124,7 +124,7 @@ tests:
     asserts:
       - equal:
           path: "data.PMF_HUB_ENDPOINTS"
-          value: "hub.example.com:8443"
+          value: "wss://hub.example.com/tunnel"
       - equal:
           path: "data.PMF_HUB_API_URL"
           value: "https://hub.example.com"
@@ -161,12 +161,12 @@ tests:
     set:
       hub:
         endpoints:
-          - hub-0.example.com:8443
-          - hub-1.example.com:8443
+          - wss://hub-0.example.com/tunnel
+          - wss://hub-1.example.com/tunnel
     asserts:
       - equal:
           path: "data.PMF_HUB_ENDPOINTS"
-          value: "hub-0.example.com:8443,hub-1.example.com:8443"
+          value: "wss://hub-0.example.com/tunnel,wss://hub-1.example.com/tunnel"
 
   - it: renders cluster labels deterministically as k=v pairs
     template: templates/configmap.yaml

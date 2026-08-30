@@ -89,9 +89,6 @@ spec:
             - name: mcp
               containerPort: {{ .Values.ports.mcp }}
               protocol: TCP
-            - name: tunnel
-              containerPort: {{ .Values.ports.tunnel }}
-              protocol: TCP
             - name: admin
               containerPort: {{ .Values.ports.admin }}
               protocol: TCP
@@ -168,11 +165,6 @@ spec:
               mountPath: {{ .Values.bootstrap.mountPath }}
               readOnly: true
             {{- end }}
-            {{- if .Values.tunnel.tls.existingSecret }}
-            - name: tunnel-tls
-              mountPath: {{ .Values.tunnel.tls.mountPath }}
-              readOnly: true
-            {{- end }}
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -189,12 +181,6 @@ spec:
         - name: bootstrap
           secret:
             secretName: {{ .Values.bootstrap.existingSecret }}
-            defaultMode: 0400
-        {{- end }}
-        {{- if .Values.tunnel.tls.existingSecret }}
-        - name: tunnel-tls
-          secret:
-            secretName: {{ .Values.tunnel.tls.existingSecret }}
             defaultMode: 0400
         {{- end }}
         {{- with .Values.extraVolumes }}

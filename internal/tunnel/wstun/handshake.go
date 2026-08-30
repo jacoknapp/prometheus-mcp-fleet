@@ -4,18 +4,14 @@
 package wstun
 
 import (
-	"crypto"
-	"crypto/ecdsa"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/sha256"
-	"crypto/x509"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"time"
+
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/certproof"
 )
 
 // Handshake errors. Callers branch on these with errors.Is.
@@ -26,8 +22,11 @@ var (
 	// the configured authority.
 	ErrUntrustedCertificate = errors.New("wstun: certificate is not trusted")
 	// ErrBadSignature means the peer did not prove possession of the private
-	// key matching the certificate it presented.
-	ErrBadSignature = errors.New("wstun: signature does not verify")
+	// key matching the certificate it presented. It is the sentinel from
+	// internal/certproof rather than one of this package's own, so that a
+	// caller which has verified a proof through either path branches on one
+	// value.
+	ErrBadSignature = certproof.ErrBadSignature
 	// ErrRevoked means the certificate's serial is on the hub's denylist.
 	ErrRevoked = errors.New("wstun: certificate has been revoked")
 	// ErrProtocolVersion means the peer speaks an incompatible wire version.
@@ -90,55 +89,12 @@ type serverAccept struct {
 	ClusterID string `json:"clusterId,omitempty"`
 }
 
-// transcript is the byte string both sides sign and verify.
-//
-// Every field that could be attacker-influenced is length-prefixed, so no
-// combination of values can produce the same transcript as a different
-// combination. Concatenating without lengths is the classic way to make a
-// signature cover something other than what it appears to.
-func transcript(nonce []byte, protocolVersion, clusterID string) []byte {
-	var buf []byte
-	appendField := func(b []byte) {
-		var n [4]byte
-		binary.BigEndian.PutUint32(n[:], uint32(len(b)))
-		buf = append(buf, n[:]...)
-		buf = append(buf, b...)
-	}
-	buf = append(buf, "prometheus-mcp-fleet/tunnel-auth\x00"...)
-	appendField(nonce)
-	appendField([]byte(protocolVersion))
-	appendField([]byte(clusterID))
-	return buf
-}
-
-// signTranscript produces the spoke's proof of possession.
-func signTranscript(key crypto.Signer, nonce []byte, protocolVersion, clusterID string) ([]byte, error) {
-	digest := sha256.Sum256(transcript(nonce, protocolVersion, clusterID))
-	sig, err := key.Sign(rand.Reader, digest[:], crypto.SHA256)
-	if err != nil {
-		return nil, fmt.Errorf("sign the handshake transcript: %w", err)
-	}
-	return sig, nil
-}
-
-// verifyTranscript checks the spoke's proof against its certificate.
-func verifyTranscript(leaf *x509.Certificate, sig, nonce []byte, protocolVersion, clusterID string) error {
-	digest := sha256.Sum256(transcript(nonce, protocolVersion, clusterID))
-
-	switch pub := leaf.PublicKey.(type) {
-	case *ecdsa.PublicKey:
-		if !ecdsa.VerifyASN1(pub, digest[:], sig) {
-			return ErrBadSignature
-		}
-	case *rsa.PublicKey:
-		if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, digest[:], sig); err != nil {
-			return fmt.Errorf("%w: %s", ErrBadSignature, err)
-		}
-	default:
-		return fmt.Errorf("%w: unsupported key type %T", ErrBadSignature, leaf.PublicKey)
-	}
-	return nil
-}
+// The transcript, its signature and its verification live in
+// internal/certproof: the renewal endpoint in internal/hubapi proves possession
+// of the same certificates with the same construction, and a second
+// implementation that drifted from this one is exactly how a signature scheme
+// breaks. This package supplies the wire framing and the exchange; certproof
+// supplies the bytes that get signed.
 
 // writeMessage writes one length-prefixed JSON handshake message.
 func writeMessage(w io.Writer, v any) error {

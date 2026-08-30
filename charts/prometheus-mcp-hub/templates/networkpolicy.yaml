@@ -28,7 +28,11 @@ spec:
     - Egress
     {{- end }}
   ingress:
-    # MCP: agents reach this through the Ingress controller.
+    # MCP: agents reach this through the Ingress controller -- and so do SPOKE
+    # TUNNELS. Since ADR-0014 the tunnel is a WebSocket on this same port, so
+    # this one rule is the whole inbound story and there is no tunnel port to
+    # open. If you narrow it, narrow it to the Ingress controller, never to the
+    # agents alone, or every spoke in the fleet is cut off.
     - ports:
         - port: mcp
           protocol: TCP
@@ -44,18 +48,6 @@ spec:
         {{- end }}
         {{- with .Values.networkPolicy.mcp.extraFrom }}
         {{- toYaml . | nindent 8 }}
-        {{- end }}
-      {{- end }}
-    # Tunnel: spokes live in other clusters, so by default this is open. Narrow
-    # it with networkPolicy.tunnel.cidrs once you know your fleet's egress ranges.
-    - ports:
-        - port: tunnel
-          protocol: TCP
-      {{- if not .Values.networkPolicy.tunnel.allowAll }}
-      from:
-        {{- range .Values.networkPolicy.tunnel.cidrs }}
-        - ipBlock:
-            cidr: {{ . | quote }}
         {{- end }}
       {{- end }}
     # Admin/metrics: scrapers only. This port is never published outside.

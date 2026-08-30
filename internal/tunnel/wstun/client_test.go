@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/certproof"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel/grpctun"
 )
 
@@ -364,17 +365,17 @@ func TestVerifyTranscriptKeyTypes(t *testing.T) {
 			t.Fatalf("generate RSA key: %v", err)
 		}
 		leaf := selfSigned(t, key.Public(), key)
-		sig, err := signTranscript(key, nonce, ProtocolVersion, "prod")
+		sig, err := certproof.Sign(key, nonce, ProtocolVersion, "prod")
 		if err != nil {
-			t.Fatalf("signTranscript: %v", err)
+			t.Fatalf("certproof.Sign: %v", err)
 		}
-		if err := verifyTranscript(leaf, sig, nonce, ProtocolVersion, "prod"); err != nil {
-			t.Errorf("verifyTranscript() = %v, want nil", err)
+		if err := certproof.Verify(leaf, sig, nonce, ProtocolVersion, "prod"); err != nil {
+			t.Errorf("certproof.Verify() = %v, want nil", err)
 		}
 		// A signature over a different cluster id must not verify: that binding
 		// is the reason the transcript exists.
-		if err := verifyTranscript(leaf, sig, nonce, ProtocolVersion, "staging"); !errors.Is(err, ErrBadSignature) {
-			t.Errorf("verifyTranscript() over a rescoped transcript = %v, want ErrBadSignature", err)
+		if err := certproof.Verify(leaf, sig, nonce, ProtocolVersion, "staging"); !errors.Is(err, ErrBadSignature) {
+			t.Errorf("certproof.Verify() over a rescoped transcript = %v, want ErrBadSignature", err)
 		}
 	})
 
@@ -386,8 +387,8 @@ func TestVerifyTranscriptKeyTypes(t *testing.T) {
 			t.Fatalf("generate ed25519 key: %v", err)
 		}
 		leaf := selfSigned(t, pub, priv)
-		if err := verifyTranscript(leaf, []byte("sig"), nonce, ProtocolVersion, "prod"); !errors.Is(err, ErrBadSignature) {
-			t.Errorf("verifyTranscript() = %v, want ErrBadSignature", err)
+		if err := certproof.Verify(leaf, []byte("sig"), nonce, ProtocolVersion, "prod"); !errors.Is(err, ErrBadSignature) {
+			t.Errorf("certproof.Verify() = %v, want ErrBadSignature", err)
 		}
 	})
 }
@@ -455,7 +456,7 @@ func read(t *testing.T, conn net.Conn, v any) {
 	}
 }
 
-// selfSigned mints a certificate carrying pub, so verifyTranscript has a leaf
+// selfSigned mints a certificate carrying pub, so certproof.Verify has a leaf
 // of the right key type to work against.
 func selfSigned(t *testing.T, pub, signer any) *x509.Certificate {
 	t.Helper()

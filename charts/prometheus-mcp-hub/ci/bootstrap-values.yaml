@@ -3,17 +3,11 @@
 #
 # Adopting operator-supplied CA material and an HMAC pepper from a Secret the
 # chart does NOT create, so no key material ever passes through Helm values.
-# Also supplies the tunnel server certificate instead of self-issuing it.
 bootstrap:
   existingSecret: hub-bootstrap
   pepperKey: pepper.key
   caCertKey: ca.crt
   caKeyKey: ca.key
-tunnel:
-  tls:
-    existingSecret: hub-tunnel-tls
-    certKey: tls.crt
-    keyKey: tls.key
 state:
   secretName: fleet-state
   caSecretName: fleet-ca

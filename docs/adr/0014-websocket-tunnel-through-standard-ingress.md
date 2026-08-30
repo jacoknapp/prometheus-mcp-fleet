@@ -68,8 +68,26 @@ a different nonce or re-scoped to another cluster.
 
 This is deliberately the same construction as TLS's own `CertificateVerify`
 step, performed one layer up. The private key still never leaves the spoke, the
-certificate is still the sole source of identity, and the CA, issuance,
-renewal and revocation machinery is untouched.
+certificate is still the sole source of identity, and the CA, issuance and
+revocation machinery is untouched.
+
+**Certificate renewal uses the same construction, for the same reason.**
+`POST /renew` authenticated with mutual TLS until it was noticed that behind
+this Ingress `r.TLS` is nil on every request, so the route refused every renewal
+in the field. It now works exactly as the handshake above does: the spoke fetches
+a challenge from `GET /renew/challenge`, and posts its certificate chain, a
+signature over the transcript, and the challenge. The transcript, the signing and
+the verification are literally the same code — `internal/certproof` — because two
+implementations of a signature transcript that drift is how these break.
+
+The renewal challenge is **stateless**: `random ‖ expiry ‖ HMAC(pepper, …)`,
+authenticated with the pepper every replica already holds, so a nonce issued by
+one replica verifies at any other with no shared state. It is not single-use, and
+does not need to be: replaying a captured renewal yields a certificate for a
+public key the attacker does not hold the private half of. That is the opposite
+of `/enroll`, where the credential is a bearer token and single use is the whole
+security property. The two exchanges bind different protocol version strings into
+the transcript, so a signature captured from one cannot be redeemed at the other.
 
 ## Consequences
 
@@ -115,6 +133,18 @@ inside the tunnel keep it busy at a 10-second interval, which is well inside
 every default we found, and the deployment docs name the annotation to raise
 where a controller is stricter.
 
+**Certificates come from cert-manager, with one exception.** The hub's serving
+certificate is a cert-manager `Certificate` wired to the Ingress, which is the
+ordinary Kubernetes way to do it and removes a class of manual renewal error.
+
+The exception is the hub's **internal CA**, which is generated on first boot
+into a Secret the hub owns, and stays that way. It is not a cert-manager
+resource because the hub needs the CA *private key* in process in order to sign
+enrollments — and spoke identities cannot come from cert-manager either, since
+cert-manager in one of a hundred unrelated clusters has no access to that key.
+That asymmetry is the entire reason the enrollment flow exists
+([ADR-0004](0004-built-in-ca-for-spoke-identity.md)).
+
 **What we gave up.** Raw TLS was slightly cheaper: WebSocket framing adds a few
 bytes per message and one masking pass on the client side. At our message sizes
 this is not measurable next to a Prometheus query.
@@ -124,6 +154,16 @@ this is not measurable next to a Prometheus query.
 * **Keep raw mTLS on a LoadBalancer.** Rejected: it is the constraint we were
   given. It also asks every operator for a load balancer per hub, which is a
   real cost in some environments and impossible in others.
+* **Let the Ingress do the mTLS.** nginx can verify a client certificate
+  itself (`auth-tls-verify-client: on`) and forward it upstream as
+  `ssl-client-cert`, which would make the in-band handshake unnecessary: a bad
+  certificate would be rejected at the TLS layer before any application code
+  ran. This is genuinely the better design **where it is available**, and it is
+  the first thing to reconsider if the deployment constraints ever loosen.
+  Rejected here because the Ingress in this environment is a plain proxy: it
+  does no client-certificate verification and forwards no such header. Building
+  against a capability the target does not have would produce a hub that
+  authenticates nothing.
 * **`ssl-passthrough` on the Ingress.** Preserves true end-to-end mTLS, and we
   document it as an option for operators who have it. Rejected as the default:
   it is an nginx annotation, not part of the Ingress API, and several

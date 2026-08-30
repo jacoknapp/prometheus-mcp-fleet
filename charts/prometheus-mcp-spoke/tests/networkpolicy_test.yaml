@@ -2,7 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The hub is in another cluster, so its egress rule is an ipBlock and a port
-# taken from hub.endpoints. A namespaceSelector could never match it.
+# taken from the hub.endpoints URLs. A namespaceSelector could never match it.
+#
+# Since ADR-0014 those URLs are wss:// through the hub's ordinary Ingress, so the
+# default port is 443. An 8443 anywhere in here would mean the chart had gone
+# back to assuming a dedicated tunnel listener that no longer exists.
 suite: spoke NetworkPolicy egress reaches the configured hub
 templates:
   - templates/networkpolicy.yaml
@@ -11,11 +15,13 @@ set:
     id: prod-us-east-1
   hub:
     endpoints:
-      - hub.example.com:8443
+      - wss://hub.example.com/tunnel
     apiUrl: https://hub.example.com
 
 tests:
-  - it: opens egress on the port configured in hub.endpoints
+  # A wss:// URL with no explicit port is ordinary HTTPS. This is the whole
+  # point of ADR-0014 as far as this policy is concerned.
+  - it: opens 443 for a wss hub URL with no explicit port
     asserts:
       - isKind:
           of: NetworkPolicy
@@ -26,14 +32,30 @@ tests:
               - ipBlock:
                   cidr: "0.0.0.0/0"
             ports:
-              - port: 8443
+              - port: 443
                 protocol: TCP
 
-  - it: follows a non-default hub port
+  - it: opens 80 for a plaintext ws hub URL
     set:
       hub:
         endpoints:
-          - hub.example.com:9443
+          - ws://hub.example.com/tunnel
+    asserts:
+      - contains:
+          path: spec.egress
+          content:
+            to:
+              - ipBlock:
+                  cidr: "0.0.0.0/0"
+            ports:
+              - port: 80
+                protocol: TCP
+
+  - it: follows an explicit port in the hub URL
+    set:
+      hub:
+        endpoints:
+          - wss://hub.example.com:9443/tunnel
     asserts:
       - contains:
           path: spec.egress
@@ -49,7 +71,7 @@ tests:
     set:
       hub:
         endpoints:
-          - 198.51.100.10:8443
+          - wss://198.51.100.10/tunnel
     asserts:
       - contains:
           path: spec.egress
@@ -58,15 +80,31 @@ tests:
               - ipBlock:
                   cidr: "198.51.100.10/32"
             ports:
-              - port: 8443
+              - port: 443
+                protocol: TCP
+
+  - it: pins a bracketed IPv6 hub endpoint to an exact /128
+    set:
+      hub:
+        endpoints:
+          - wss://[2001:db8::1]:9443/tunnel
+    asserts:
+      - contains:
+          path: spec.egress
+          content:
+            to:
+              - ipBlock:
+                  cidr: "2001:db8::1/128"
+            ports:
+              - port: 9443
                 protocol: TCP
 
   - it: opens every port when several hub replicas are listed
     set:
       hub:
         endpoints:
-          - hub-0.example.com:8443
-          - hub-1.example.com:9443
+          - wss://hub-0.example.com/tunnel
+          - wss://hub-1.example.com:9443/tunnel
       networkPolicy:
         egress:
           hub:
@@ -80,9 +118,27 @@ tests:
               - ipBlock:
                   cidr: "203.0.113.0/24"
             ports:
-              - port: 8443
+              - port: 443
                 protocol: TCP
               - port: 9443
+                protocol: TCP
+
+  - it: lets networkPolicy.egress.hub.ports override the derived ports
+    set:
+      networkPolicy:
+        egress:
+          hub:
+            ports:
+              - 8443
+    asserts:
+      - contains:
+          path: spec.egress
+          content:
+            to:
+              - ipBlock:
+                  cidr: "0.0.0.0/0"
+            ports:
+              - port: 8443
                 protocol: TCP
 
   - it: allows DNS, the local Prometheus and the Kubernetes API

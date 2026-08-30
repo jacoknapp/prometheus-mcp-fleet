@@ -11,17 +11,19 @@ cluster, so there is no namespace to select. Any hub.endpoints entry that is
 already an IP literal is pinned to an exact /32 or /128; a DNS name cannot be
 resolved by a NetworkPolicy at all, so those fall back to
 networkPolicy.egress.hub.cidrs -- narrow that to your hub's real addresses.
+
+Ports come from the hub.endpoints URLs, which since ADR-0014 are ordinary
+wss:// URLs through the hub's Ingress -- so 443 by default, not 8443. There is
+no separate tunnel listener left to reach.
 */}}
 {{- if .Values.networkPolicy.enabled -}}
 {{- include "prometheus-mcp-spoke.validate" . -}}
-{{- $ports := list -}}
+{{- $ports := fromYamlArray (include "prometheus-mcp-spoke.hubEgressPorts" .) -}}
 {{- $literalCIDRs := list -}}
 {{- range .Values.hub.endpoints -}}
-{{- $ports = append $ports (include "prometheus-mcp-spoke.endpointPort" .) -}}
 {{- $c := include "prometheus-mcp-spoke.endpointCIDR" . -}}
 {{- if $c }}{{- $literalCIDRs = append $literalCIDRs $c -}}{{- end -}}
 {{- end -}}
-{{- $ports = $ports | uniq -}}
 {{- $literalCIDRs = $literalCIDRs | uniq -}}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -94,7 +96,8 @@ spec:
     {{- end }}
     {{- with .Values.networkPolicy.egress.hub.cidrs }}
     # The hub, reached over ordinary egress. It is in another cluster, so this
-    # is an ipBlock and never a namespaceSelector. Ports come from hub.endpoints.
+    # is an ipBlock and never a namespaceSelector. Ports come from the
+    # hub.endpoints URLs (443 for wss://), or networkPolicy.egress.hub.ports.
     - to:
         {{- range . }}
         - ipBlock:

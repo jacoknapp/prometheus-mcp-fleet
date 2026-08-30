@@ -1,0 +1,131 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# cert-manager supplies the hub's SERVING certificate and nothing else. It does
+# not and cannot supply the internal CA: that CA signs spoke identities, so the
+# hub must hold its private key.
+#
+# These live in helm-unittest rather than in ci/ because `helm lint` has no
+# --api-versions flag, so a ci/ values file with certManager.enabled=true could
+# not be linted. helm-unittest can declare the capability directly.
+#
+# The render-time FAILURES live in validation_test.yaml with the rest of them.
+suite: hub cert-manager integration
+templates:
+  - templates/certificate.yaml
+  - templates/ingress.yaml
+tests:
+  - it: renders nothing when certManager is disabled
+    template: templates/certificate.yaml
+    set:
+      ingress:
+        enabled: true
+        host: mcp.example.com
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: issues the serving certificate for every Ingress host
+    template: templates/certificate.yaml
+    capabilities:
+      apiVersions:
+        - cert-manager.io/v1
+    set:
+      ingress:
+        enabled: true
+        host: mcp.example.com
+        extraHosts:
+          - host: mcp-alt.example.com
+        tls:
+          enabled: true
+      certManager:
+        enabled: true
+        issuerRef:
+          name: letsencrypt
+          kind: ClusterIssuer
+    asserts:
+      - isKind:
+          of: Certificate
+      - isAPIVersion:
+          of: cert-manager.io/v1
+      - equal:
+          path: spec.secretName
+          value: RELEASE-NAME-prometheus-mcp-hub-serving-tls
+      - equal:
+          path: spec.dnsNames
+          value:
+            - mcp.example.com
+            - mcp-alt.example.com
+      - equal:
+          path: spec.issuerRef.name
+          value: letsencrypt
+      - equal:
+          path: spec.issuerRef.kind
+          value: ClusterIssuer
+      - equal:
+          path: spec.privateKey.rotationPolicy
+          value: Always
+      - contains:
+          path: spec.usages
+          content: server auth
+
+  # The point of the wiring: the operator names the issuer once, not the Secret
+  # twice, so ingress.tls and the Certificate cannot drift apart.
+  - it: wires ingress.tls.secretName to the cert-manager Secret automatically
+    template: templates/ingress.yaml
+    capabilities:
+      apiVersions:
+        - cert-manager.io/v1
+    set:
+      ingress:
+        enabled: true
+        host: mcp.example.com
+        tls:
+          enabled: true
+          secretName: stale-hand-written-tls
+      certManager:
+        enabled: true
+        issuerRef:
+          name: letsencrypt
+    asserts:
+      - equal:
+          path: spec.tls[0].secretName
+          value: RELEASE-NAME-prometheus-mcp-hub-serving-tls
+
+  - it: honours an explicit serving secretName and dnsNames
+    template: templates/certificate.yaml
+    capabilities:
+      apiVersions:
+        - cert-manager.io/v1
+    set:
+      ingress:
+        enabled: true
+        host: mcp.example.com
+      certManager:
+        enabled: true
+        issuerRef:
+          name: internal-ca
+          kind: Issuer
+        serving:
+          secretName: hub-tls
+          dnsNames:
+            - pmf.example.com
+          duration: 2160h
+          renewBefore: 360h
+    asserts:
+      - equal:
+          path: metadata.name
+          value: hub-tls
+      - equal:
+          path: spec.secretName
+          value: hub-tls
+      - equal:
+          path: spec.dnsNames
+          value:
+            - pmf.example.com
+      - equal:
+          path: spec.duration
+          value: 2160h
+      - equal:
+          path: spec.renewBefore
+          value: 360h

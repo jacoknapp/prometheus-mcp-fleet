@@ -20,6 +20,7 @@ import (
 
 	"github.com/coder/websocket"
 
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/certproof"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel/grpctun"
 )
@@ -150,7 +151,7 @@ func clientHandshake(conn net.Conn, cfg ClientConfig, signer crypto.Signer) (ser
 			ErrHandshakeFailed, len(hello.Nonce), nonceLen)
 	}
 
-	sig, err := signTranscript(signer, hello.Nonce, ProtocolVersion, cfg.ClusterID)
+	sig, err := certproof.Sign(signer, hello.Nonce, ProtocolVersion, cfg.ClusterID)
 	if err != nil {
 		return "", fmt.Errorf("%w: %w", ErrHandshakeFailed, err)
 	}

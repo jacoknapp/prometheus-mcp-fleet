@@ -4,14 +4,17 @@
 package hubapi
 
 import (
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -20,7 +23,10 @@ import (
 	"github.com/google/go-cmp/cmp"
 
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/ca"
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/certproof"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/fleet"
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/token"
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel/wstun"
 )
 
 // parseIssued decodes the PEM certificate an enrollment or renewal returned.
@@ -489,167 +495,503 @@ func TestEnrollStoreFailures(t *testing.T) {
 	}
 }
 
-// TestRenew drives the mutual-TLS renewal route.
-func TestRenew(t *testing.T) {
+// TestRenewChallenge covers the unauthenticated half of the renewal exchange.
+func TestRenewChallenge(t *testing.T) {
 	t.Parallel()
 
-	t.Run("identity comes from the certificate", func(t *testing.T) {
+	t.Run("issues a bounded, self-authenticating nonce", func(t *testing.T) {
 		t.Parallel()
 		h := newHarness(t, nil)
-		srv := h.mtlsServer(tls.RequireAndVerifyClientCert)
-		id := h.issueSpoke("prod-eu-1")
-		client := h.mtlsClient(id)
 
-		// The CSR asks to become another cluster, and the body carries no
-		// field that could name one: EnrollRequest has exactly one field and
-		// unknown fields are refused.
+		got := h.challenge()
+		if want := testNow.Add(RenewChallengeTTL); !got.ExpiresAt.Equal(want) {
+			t.Errorf("ExpiresAt = %s, want %s", got.ExpiresAt, want)
+		}
+		if len(got.Nonce) != renewNonceLen {
+			t.Errorf("nonce is %d bytes, want %d", len(got.Nonce), renewNonceLen)
+		}
+		if err := h.verifyNonce(got.Nonce); err != nil {
+			t.Errorf("the hub does not accept the challenge it just issued: %v", err)
+		}
+	})
+
+	t.Run("two challenges differ", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t, nil)
+		if bytes.Equal(h.challenge().Nonce, h.challenge().Nonce) {
+			t.Error("the hub issued the same challenge twice")
+		}
+	})
+
+	t.Run("a draining hub still issues one", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t, nil)
+		h.setDraining(true)
+
+		// The challenge is stateless, so one minted by a replica on its way out
+		// is still good at whichever replica serves the POST. Refusing here
+		// would make a rolling restart look like an outage to every spoke that
+		// happened to ask the wrong pod.
+		resp := h.do(h.public, http.MethodGet, "/renew/challenge", "", nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+		}
+		resp.Body.Close()
+	})
+
+	t.Run("a challenge minted under another pepper is refused", func(t *testing.T) {
+		t.Parallel()
+		// The pepper is what makes a nonce verifiable at a replica that never
+		// issued it: replicas of one hub share it, and nothing else has it. A
+		// challenge authenticated under a different pepper must not verify,
+		// which is what stops the nonce from being forgeable by anyone who has
+		// worked out its layout — the layout is not the secret.
+		issuer := newHarness(t, nil)
+		verifier := newHarness(t, func(o *Options) {
+			hasher, err := token.NewHasher([]byte("fedcba9876543210fedcba9876543210"))
+			if err != nil {
+				t.Fatalf("token.NewHasher: %v", err)
+			}
+			o.Hasher = hasher
+		})
+
+		id := verifier.issueSpoke("prod-eu-1")
+		nonce := issuer.challenge().Nonce
+		csr, _ := makeCSR(t, csrOptions{})
+
+		resp := verifier.renew(RenewRequest{
+			CSR:       csr,
+			Chain:     id.chain(),
+			Signature: signRenew(t, id.key, nonce, certproof.RenewProtocolVersion, id.clusterID),
+			Nonce:     nonce,
+		})
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want %d (%s)", resp.StatusCode, http.StatusUnauthorized, decode(t, resp, nil))
+		}
+	})
+}
+
+// TestRenewSucceedsWithoutAnyTLSClientCertificate is the regression test for
+// the bug this route was rewritten to fix.
+//
+// The hub sits behind an ingress that terminates TLS (ADR-0014), so in
+// production r.TLS is nil on every request and no client certificate ever
+// reaches the handler. The previous implementation authenticated from
+// r.TLS.PeerCertificates and therefore refused every renewal in the field while
+// passing a suite that spoke TLS directly to it. Spoke certificates live 14
+// days and renew at half life, so the fleet would have dropped off on day 14
+// needing a hundred fresh enrollment tokens to come back.
+//
+// h.public is a plain HTTP server: there is no TLS state here at all. If this
+// test ever needs a TLS listener in order to pass, the bug is back.
+func TestRenewSucceedsWithoutAnyTLSClientCertificate(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+	id := h.issueSpoke("prod-eu-1")
+
+	var got EnrollResponse
+	resp := h.renew(h.renewRequestFor(id))
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want %d (%s)", resp.StatusCode, http.StatusCreated, decode(t, resp, nil))
+	}
+	body := decode(t, resp, &got)
+	assertNoSecretMaterial(t, h, body)
+
+	if got.ClusterID != "prod-eu-1" {
+		t.Errorf("ClusterID = %q, want prod-eu-1", got.ClusterID)
+	}
+	if got.Serial == id.serial {
+		t.Error("renewal reused the previous serial")
+	}
+	if got.CABundle != string(h.ca.BundlePEM()) {
+		t.Error("the renewal did not return the current trust anchor")
+	}
+	if !got.NotAfter.After(h.clock.Now()) {
+		t.Errorf("NotAfter = %s, which is not in the future", got.NotAfter)
+	}
+	if h.metrics.securityEvents(EventCertRenewed) != 1 {
+		t.Error("no cert.renewed security event")
+	}
+	if h.metrics.enrollments(ResultIssued) != 1 {
+		t.Error("no issued enrollment metric was recorded")
+	}
+	if !strings.Contains(h.logs.String(), id.serial) {
+		t.Error("the renewal audit line does not name the previous serial")
+	}
+}
+
+// TestRenewIgnoresTheTLSLayerEntirely presents one spoke's certificate at the
+// TLS layer while the request body proves possession of another's.
+//
+// The answer must be the identity the body proved. Renewal reads r.TLS for
+// nothing, and pinning that down stops anybody reintroducing a "prefer the peer
+// certificate when there is one" branch that would work in a lab and fail
+// behind every real ingress.
+func TestRenewIgnoresTheTLSLayerEntirely(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+	proven := h.issueSpoke("prod-eu-1")
+	presented := h.issueSpoke("prod-us-9")
+
+	srv := h.tlsServer(tls.RequireAndVerifyClientCert)
+	var got EnrollResponse
+	resp := postJSON(t, h.tlsClient(presented), srv.URL+"/renew", h.renewRequestFor(proven))
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want %d (%s)", resp.StatusCode, http.StatusCreated, decode(t, resp, nil))
+	}
+	decode(t, resp, &got)
+	if got.ClusterID != "prod-eu-1" {
+		t.Errorf("ClusterID = %q, want the identity proved in the body, not the one at the TLS layer",
+			got.ClusterID)
+	}
+}
+
+// TestRenewIdentityComesFromTheCertificate proves that nothing a caller puts in
+// the request decides which cluster it renews as.
+func TestRenewIdentityComesFromTheCertificate(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a hostile csr buys nothing", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t, nil)
+		id := h.issueSpoke("prod-eu-1")
+
+		// The CSR asks to become another cluster and to be called admin. Both
+		// are discarded: only its public key survives.
 		hostile, err := url.Parse("pmf://" + h.ca.TrustDomain() + "/spoke/prod-us-9")
 		if err != nil {
 			t.Fatalf("parse uri: %v", err)
 		}
-		csr, _ := makeCSR(t, csrOptions{CommonName: "admin", URIs: []*url.URL{hostile}, Key: id.key})
+		csr, _ := makeCSR(t, csrOptions{CommonName: "admin", URIs: []*url.URL{hostile}})
+
+		req := h.renewRequestFor(id)
+		req.CSR = csr
 
 		var got EnrollResponse
-		resp := postJSON(t, client, srv.URL+"/renew", EnrollRequest{CSR: csr})
+		resp := h.renew(req)
 		if resp.StatusCode != http.StatusCreated {
 			t.Fatalf("status = %d, want %d (%s)", resp.StatusCode, http.StatusCreated, decode(t, resp, nil))
 		}
-		body := decode(t, resp, &got)
-		assertNoSecretMaterial(t, h, body)
+		decode(t, resp, &got)
 
 		if got.ClusterID != "prod-eu-1" {
-			t.Errorf("ClusterID = %q, want the identity from the client certificate", got.ClusterID)
+			t.Errorf("ClusterID = %q, want the identity from the presented certificate", got.ClusterID)
 		}
 		cert := parseIssued(t, got.Certificate)
 		if want := "spoke:prod-eu-1"; cert.Subject.CommonName != want {
 			t.Errorf("CommonName = %q, want %q", cert.Subject.CommonName, want)
 		}
-		if got.Serial == id.serial {
-			t.Error("renewal reused the previous serial")
-		}
-		if h.metrics.securityEvents(EventCertRenewed) != 1 {
-			t.Error("no cert.renewed security event")
-		}
-		if !strings.Contains(h.logs.String(), id.serial) {
-			t.Error("the renewal audit line does not name the previous serial")
+		if len(cert.URIs) != 1 || cert.URIs[0].Path != "/spoke/prod-eu-1" {
+			t.Errorf("URI SANs = %v, want exactly the spoke's own", cert.URIs)
 		}
 	})
 
 	t.Run("a body cannot name a cluster", func(t *testing.T) {
 		t.Parallel()
 		h := newHarness(t, nil)
-		srv := h.mtlsServer(tls.RequireAndVerifyClientCert)
 		id := h.issueSpoke("prod-eu-1")
-		csr, _ := makeCSR(t, csrOptions{Key: id.key})
 
-		status, body, err := postRaw(h.mtlsClient(id), srv.URL+"/renew", "",
-			`{"csr":"`+csr+`","clusterId":"prod-us-9"}`)
+		// RenewRequest has no cluster field and the hub decodes strictly, so an
+		// attempt to name one is a 400 rather than a value somebody has to
+		// remember to ignore.
+		raw, err := json.Marshal(h.renewRequestFor(id))
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		hostile := strings.Replace(string(raw), `{"csr":`, `{"clusterId":"prod-us-9","csr":`, 1)
+
+		status, body, err := postRaw(h.public.Client(), h.public.URL+"/renew", "", hostile)
 		if err != nil {
 			t.Fatalf("POST /renew: %v", err)
 		}
 		if status != http.StatusBadRequest {
 			t.Fatalf("status = %d, want %d (%s)", status, http.StatusBadRequest, body)
 		}
-	})
-
-	t.Run("no tls at all", func(t *testing.T) {
-		t.Parallel()
-		h := newHarness(t, nil)
-		csr, _ := makeCSR(t, csrOptions{})
-		resp := h.do(h.public, http.MethodPost, "/renew", "", EnrollRequest{CSR: csr})
-		if resp.StatusCode != http.StatusUnauthorized {
-			t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusUnauthorized)
-		}
-		if env := envelopeOf(t, resp); env.Error.Code != CodeUnauthenticated {
-			t.Errorf("code = %q, want %q", env.Error.Code, CodeUnauthenticated)
+		if h.metrics.enrollments(ResultIssued) != 0 {
+			t.Error("a certificate was issued for a body that named a cluster")
 		}
 	})
+}
 
-	t.Run("tls with no client certificate", func(t *testing.T) {
-		t.Parallel()
-		h := newHarness(t, nil)
-		srv := h.mtlsChainOnlyServer(tls.NoClientCert)
-		csr, _ := makeCSR(t, csrOptions{})
+// TestRenewRejections is the table of every way a renewal must fail.
+//
+// Each case starts from a request that would otherwise succeed and breaks
+// exactly one thing, so a case that stops failing names the specific check that
+// has stopped happening.
+func TestRenewRejections(t *testing.T) {
+	t.Parallel()
 
-		resp := postJSON(t, h.mtlsClient(spokeIdentity{}), srv.URL+"/renew", EnrollRequest{CSR: csr})
-		if resp.StatusCode != http.StatusUnauthorized {
-			t.Fatalf("status = %d, want %d (%s)", resp.StatusCode, http.StatusUnauthorized, decode(t, resp, nil))
-		}
-		if env := envelopeOf(t, resp); env.Error.Code != CodeUnauthenticated {
-			t.Errorf("code = %q, want %q", env.Error.Code, CodeUnauthenticated)
-		}
-		if h.metrics.enrollments(ResultDenied) == 0 {
-			t.Error("no denied enrollment metric was recorded")
-		}
-	})
+	const cluster = "prod-eu-1"
 
-	t.Run("bearer credentials do not work here", func(t *testing.T) {
-		t.Parallel()
-		h := newHarness(t, nil)
-		srv := h.mtlsChainOnlyServer(tls.NoClientCert)
-		csr, _ := makeCSR(t, csrOptions{})
+	tests := []struct {
+		name string
+		// prepare runs before the request is built, for store state.
+		prepare func(t *testing.T, h *harness, id spokeIdentity)
+		// build breaks one thing about an otherwise valid request.
+		build      func(t *testing.T, h *harness, id spokeIdentity, req *RenewRequest)
+		wantStatus int
+		wantCode   string
+		// wantEvent, when set, must have been recorded exactly once.
+		wantEvent string
+	}{
+		{
+			name: "no challenge at all",
+			build: func(_ *testing.T, _ *harness, _ spokeIdentity, req *RenewRequest) {
+				req.Nonce = nil
+			},
+			wantStatus: http.StatusUnauthorized,
+			wantCode:   CodeUnauthenticated,
+		},
+		{
+			name: "expired challenge",
+			build: func(_ *testing.T, h *harness, _ spokeIdentity, _ *RenewRequest) {
+				// The proof is perfect; only the window has closed.
+				h.clock.advance(RenewChallengeTTL + time.Second)
+			},
+			wantStatus: http.StatusUnauthorized,
+			wantCode:   CodeUnauthenticated,
+		},
+		{
+			name: "challenge with a corrupted authentication tag",
+			build: func(_ *testing.T, _ *harness, _ spokeIdentity, req *RenewRequest) {
+				// Flip a bit inside the HMAC. Everything else about the nonce,
+				// including its expiry, is untouched and still in date.
+				req.Nonce[len(req.Nonce)-1] ^= 0x01
+			},
+			wantStatus: http.StatusUnauthorized,
+			wantCode:   CodeUnauthenticated,
+		},
+		{
+			name: "challenge with a rewritten expiry",
+			build: func(_ *testing.T, _ *harness, _ spokeIdentity, req *RenewRequest) {
+				// Push the expiry into the far future. The tag covers it, so
+				// the whole nonce stops verifying rather than lasting longer.
+				req.Nonce[renewNonceRandomBytes] ^= 0x7f
+			},
+			wantStatus: http.StatusUnauthorized,
+			wantCode:   CodeUnauthenticated,
+		},
+		{
+			name: "challenge of the wrong length",
+			build: func(_ *testing.T, _ *harness, _ spokeIdentity, req *RenewRequest) {
+				req.Nonce = req.Nonce[:len(req.Nonce)-1]
+			},
+			wantStatus: http.StatusUnauthorized,
+			wantCode:   CodeUnauthenticated,
+		},
+		{
+			name: "no certificate chain",
+			build: func(_ *testing.T, _ *harness, _ spokeIdentity, req *RenewRequest) {
+				req.Chain = nil
+			},
+			wantStatus: http.StatusUnauthorized,
+			wantCode:   CodeUnauthenticated,
+		},
+		{
+			name: "unparseable certificate chain",
+			build: func(_ *testing.T, _ *harness, _ spokeIdentity, req *RenewRequest) {
+				req.Chain = [][]byte{[]byte("not a certificate")}
+			},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   CodeInvalidRequest,
+		},
+		{
+			name: "chain longer than the limit",
+			build: func(_ *testing.T, _ *harness, id spokeIdentity, req *RenewRequest) {
+				req.Chain = slices.Repeat(id.chain(), MaxChainCerts+1)
+			},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   CodeInvalidRequest,
+		},
+		{
+			name: "certificate from a different ca",
+			build: func(t *testing.T, h *harness, _ spokeIdentity, req *RenewRequest) {
+				// Same trust domain, same cluster ID, same shape, and the
+				// signature over the challenge is genuine. Only the issuer is
+				// wrong, which is the whole of the difference between a spoke
+				// and somebody with a certificate generator.
+				foreign := issueSpokeFrom(t, h.otherAuthority(), cluster)
+				req.Chain = foreign.chain()
+				req.Signature = signRenew(t, foreign.key, req.Nonce, certproof.RenewProtocolVersion, cluster)
+			},
+			wantStatus: http.StatusForbidden,
+			wantCode:   CodeForbidden,
+		},
+		{
+			name: "certificate carrying no spoke identity",
+			build: func(t *testing.T, h *harness, _ spokeIdentity, req *RenewRequest) {
+				// Signed by this CA, so genuinely trusted; it simply has no URI
+				// SAN. Being trusted is not the same as being a spoke.
+				rogue := h.rogueClientCert("admin")
+				req.Chain = rogue.chain()
+				req.Signature = signRenew(t, rogue.key, req.Nonce, certproof.RenewProtocolVersion, cluster)
+			},
+			wantStatus: http.StatusForbidden,
+			wantCode:   CodeForbidden,
+		},
+		{
+			name: "revoked certificate",
+			prepare: func(t *testing.T, h *harness, id spokeIdentity) {
+				if err := h.store.RevokeCert(t.Context(), RevokedCert{
+					Serial: id.serial, RevokedAt: testNow,
+					NotAfter: testNow.Add(time.Hour), Reason: "decommissioned",
+				}); err != nil {
+					t.Fatalf("RevokeCert: %v", err)
+				}
+			},
+			wantStatus: http.StatusForbidden,
+			wantCode:   CodeForbidden,
+			wantEvent:  EventCertRevoked,
+		},
+		{
+			name: "signature over a different nonce",
+			build: func(t *testing.T, h *harness, id spokeIdentity, req *RenewRequest) {
+				// Both nonces are ones this hub issued and both are in date.
+				// The signature simply does not cover the one that was sent.
+				other := h.challenge().Nonce
+				req.Signature = signRenew(t, id.key, other, certproof.RenewProtocolVersion, cluster)
+			},
+			wantStatus: http.StatusForbidden,
+			wantCode:   CodeForbidden,
+			wantEvent:  EventRenewalUnproven,
+		},
+		{
+			name: "signature scoped to a different cluster",
+			build: func(t *testing.T, _ *harness, id spokeIdentity, req *RenewRequest) {
+				req.Signature = signRenew(t, id.key, req.Nonce, certproof.RenewProtocolVersion, "prod-us-9")
+			},
+			wantStatus: http.StatusForbidden,
+			wantCode:   CodeForbidden,
+			wantEvent:  EventRenewalUnproven,
+		},
+		{
+			name: "signature made for the tunnel handshake",
+			build: func(t *testing.T, _ *harness, id spokeIdentity, req *RenewRequest) {
+				// Nonce, certificate and cluster are all right; only the
+				// protocol version in the transcript belongs to the other
+				// exchange. This is what stops a proof captured from a tunnel
+				// handshake being redeemed here for a certificate.
+				req.Signature = signRenew(t, id.key, req.Nonce, wstun.ProtocolVersion, cluster)
+			},
+			wantStatus: http.StatusForbidden,
+			wantCode:   CodeForbidden,
+			wantEvent:  EventRenewalUnproven,
+		},
+		{
+			name: "tampered signature",
+			build: func(_ *testing.T, _ *harness, _ spokeIdentity, req *RenewRequest) {
+				req.Signature[len(req.Signature)-1] ^= 0x01
+			},
+			wantStatus: http.StatusForbidden,
+			wantCode:   CodeForbidden,
+			wantEvent:  EventRenewalUnproven,
+		},
+		{
+			name: "signature by a key that is not the certificate's",
+			build: func(t *testing.T, _ *harness, _ spokeIdentity, req *RenewRequest) {
+				// Quoting somebody else's certificate is easy: it is public.
+				// Signing for it is the part that is not.
+				req.Signature = signRenew(t, newKeyPair(t), req.Nonce, certproof.RenewProtocolVersion, cluster)
+			},
+			wantStatus: http.StatusForbidden,
+			wantCode:   CodeForbidden,
+			wantEvent:  EventRenewalUnproven,
+		},
+		{
+			name: "no csr",
+			build: func(_ *testing.T, _ *harness, _ spokeIdentity, req *RenewRequest) {
+				req.CSR = ""
+			},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   CodeInvalidRequest,
+		},
+		{
+			name: "csr that is not base64",
+			build: func(_ *testing.T, _ *harness, _ spokeIdentity, req *RenewRequest) {
+				req.CSR = "!!! not base64 !!!"
+			},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   CodeInvalidRequest,
+		},
+		{
+			name: "csr that is not a certificate request",
+			build: func(_ *testing.T, _ *harness, _ spokeIdentity, req *RenewRequest) {
+				req.CSR = base64.StdEncoding.EncodeToString([]byte("not a csr"))
+			},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   CodeInvalidRequest,
+		},
+		{
+			name: "oversized csr",
+			build: func(_ *testing.T, _ *harness, _ spokeIdentity, req *RenewRequest) {
+				req.CSR = strings.Repeat("A", MaxCSRBytes+4)
+			},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   CodeInvalidRequest,
+		},
+	}
 
-		status, _, err := postRaw(h.mtlsClient(spokeIdentity{}), srv.URL+"/renew", h.adminToken,
-			`{"csr":"`+csr+`"}`)
-		if err != nil {
-			t.Fatalf("POST /renew: %v", err)
-		}
-		if status != http.StatusUnauthorized {
-			t.Fatalf("status = %d, want %d", status, http.StatusUnauthorized)
-		}
-	})
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t, nil)
+			id := h.issueSpoke(cluster)
+			if tc.prepare != nil {
+				tc.prepare(t, h, id)
+			}
+			req := h.renewRequestFor(id)
+			if tc.build != nil {
+				tc.build(t, h, id, &req)
+			}
 
-	t.Run("a revoked certificate cannot renew", func(t *testing.T) {
+			resp := h.renew(req)
+			if resp.StatusCode != tc.wantStatus {
+				t.Fatalf("status = %d, want %d (%s)", resp.StatusCode, tc.wantStatus, decode(t, resp, nil))
+			}
+			env := envelopeOf(t, resp)
+			if env.Error.Code != tc.wantCode {
+				t.Errorf("code = %q, want %q", env.Error.Code, tc.wantCode)
+			}
+			if tc.wantEvent != "" && h.metrics.securityEvents(tc.wantEvent) != 1 {
+				t.Errorf("security event %q recorded %d times, want 1",
+					tc.wantEvent, h.metrics.securityEvents(tc.wantEvent))
+			}
+			if h.metrics.enrollments(ResultIssued) != 0 {
+				t.Error("a certificate was issued for a request that had to be refused")
+			}
+			assertNoSecretMaterial(t, h, env.Error.Message)
+		})
+	}
+}
+
+// TestRenewOperationalRefusals covers the refusals that are about the hub's own
+// state rather than the caller's credentials.
+func TestRenewOperationalRefusals(t *testing.T) {
+	t.Parallel()
+
+	t.Run("draining", func(t *testing.T) {
 		t.Parallel()
 		h := newHarness(t, nil)
 		id := h.issueSpoke("prod-eu-1")
-		if err := h.store.RevokeCert(t.Context(), RevokedCert{
-			Serial: id.serial, RevokedAt: testNow, NotAfter: testNow.Add(time.Hour), Reason: "decommissioned",
-		}); err != nil {
-			t.Fatalf("RevokeCert: %v", err)
-		}
-		// The handler's own check is what is under test, so the listener is
-		// configured not to reject the certificate during the handshake.
-		srv := h.mtlsChainOnlyServer(tls.RequireAndVerifyClientCert)
-		csr, _ := makeCSR(t, csrOptions{Key: id.key})
-
-		resp := postJSON(t, h.mtlsClient(id), srv.URL+"/renew", EnrollRequest{CSR: csr})
-		if resp.StatusCode != http.StatusForbidden {
-			t.Fatalf("status = %d, want %d (%s)", resp.StatusCode, http.StatusForbidden, decode(t, resp, nil))
-		}
-		if env := envelopeOf(t, resp); env.Error.Code != CodeForbidden {
-			t.Errorf("code = %q, want %q", env.Error.Code, CodeForbidden)
-		}
-		if h.metrics.securityEvents(EventCertRevoked) != 1 {
-			t.Error("a revoked certificate's renewal attempt was not a security event")
-		}
-	})
-
-	t.Run("draining refuses renewal", func(t *testing.T) {
-		t.Parallel()
-		h := newHarness(t, nil)
-		srv := h.mtlsServer(tls.RequireAndVerifyClientCert)
-		id := h.issueSpoke("prod-eu-1")
-		csr, _ := makeCSR(t, csrOptions{Key: id.key})
+		req := h.renewRequestFor(id)
 		h.setDraining(true)
 
-		resp := postJSON(t, h.mtlsClient(id), srv.URL+"/renew", EnrollRequest{CSR: csr})
+		resp := h.renew(req)
 		if resp.StatusCode != http.StatusServiceUnavailable {
 			t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusServiceUnavailable)
 		}
 		resp.Body.Close()
 	})
 
-	t.Run("invalid csr", func(t *testing.T) {
+	t.Run("bearer credentials do not work here", func(t *testing.T) {
 		t.Parallel()
 		h := newHarness(t, nil)
-		srv := h.mtlsServer(tls.RequireAndVerifyClientCert)
-		id := h.issueSpoke("prod-eu-1")
-
-		resp := postJSON(t, h.mtlsClient(id), srv.URL+"/renew",
-			EnrollRequest{CSR: base64.StdEncoding.EncodeToString([]byte("not a csr"))})
-		if resp.StatusCode != http.StatusBadRequest {
-			t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+		// An admin token is the most authority this hub issues, and it buys
+		// exactly nothing here: renewal takes a certificate and a proof, and
+		// there is no bearer path to fall back to.
+		resp := h.do(h.public, http.MethodPost, "/renew", h.adminToken, RenewRequest{})
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusUnauthorized)
 		}
 		resp.Body.Close()
 	})
@@ -657,10 +999,7 @@ func TestRenew(t *testing.T) {
 	t.Run("body limit", func(t *testing.T) {
 		t.Parallel()
 		h := newHarness(t, nil)
-		srv := h.mtlsServer(tls.RequireAndVerifyClientCert)
-		id := h.issueSpoke("prod-eu-1")
-
-		status, _, err := postRaw(h.mtlsClient(id), srv.URL+"/renew", "", oversizeJSON("csr"))
+		status, _, err := postRaw(h.public.Client(), h.public.URL+"/renew", "", oversizeJSON("csr"))
 		if err != nil {
 			t.Fatalf("POST /renew: %v", err)
 		}
@@ -669,42 +1008,37 @@ func TestRenew(t *testing.T) {
 		}
 	})
 
+	t.Run("malformed json", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t, nil)
+		status, _, err := postRaw(h.public.Client(), h.public.URL+"/renew", "", `{"csr":`)
+		if err != nil {
+			t.Fatalf("POST /renew: %v", err)
+		}
+		if status != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d", status, http.StatusBadRequest)
+		}
+	})
+
 	t.Run("store failure listing revocations", func(t *testing.T) {
 		t.Parallel()
 		h := newHarness(t, nil)
 		id := h.issueSpoke("prod-eu-1")
-		srv := h.mtlsChainOnlyServer(tls.RequireAndVerifyClientCert)
+		req := h.renewRequestFor(id)
 		h.store.inject(t, func(f *fakeStore) { f.errListRevoked = errors.New("state secret unreadable") })
-		csr, _ := makeCSR(t, csrOptions{Key: id.key})
 
-		resp := postJSON(t, h.mtlsClient(id), srv.URL+"/renew", EnrollRequest{CSR: csr})
+		resp := h.renew(req)
 		if resp.StatusCode != http.StatusInternalServerError {
 			t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusInternalServerError)
 		}
-		resp.Body.Close()
+		body := decode(t, resp, nil)
+		if strings.Contains(body, "state secret") {
+			t.Errorf("the store error leaked into the response: %s", body)
+		}
+		if h.metrics.enrollments(ResultError) == 0 {
+			t.Error("no error enrollment metric was recorded")
+		}
 	})
-}
-
-// TestRenewRefusesACertificateWithoutASpokeIdentity covers a certificate this
-// CA signed that carries no spoke URI SAN. Being trusted is not the same as
-// being a spoke, and the handler must not conflate them.
-func TestRenewRefusesACertificateWithoutASpokeIdentity(t *testing.T) {
-	t.Parallel()
-	h := newHarness(t, nil)
-	srv := h.mtlsChainOnlyServer(tls.RequireAndVerifyClientCert)
-	csr, _ := makeCSR(t, csrOptions{})
-
-	resp := postJSON(t, h.mtlsClient(h.rogueClientCert("admin")), srv.URL+"/renew",
-		EnrollRequest{CSR: csr})
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("status = %d, want %d (%s)", resp.StatusCode, http.StatusForbidden, decode(t, resp, nil))
-	}
-	if env := envelopeOf(t, resp); env.Error.Code != CodeForbidden {
-		t.Errorf("code = %q, want %q", env.Error.Code, CodeForbidden)
-	}
-	if h.metrics.enrollments(ResultIssued) != 0 {
-		t.Error("an identity-less certificate was issued a renewal")
-	}
 }
 
 // TestPKIRoutesAreUnauthenticated proves the trust anchor and the revocation

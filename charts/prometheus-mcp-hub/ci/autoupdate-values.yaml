@@ -19,6 +19,3 @@ autoUpdate:
 metrics:
   prometheusRule:
     enabled: true
-tunnel:
-  serverNames:
-    - hub.example.com

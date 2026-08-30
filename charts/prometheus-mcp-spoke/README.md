@@ -2,11 +2,13 @@
 
 ![Version: 0.1.0](https://img.shields.io/badge/Version-0.1.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.1.0](https://img.shields.io/badge/AppVersion-0.1.0-informational?style=flat-square)
 
-Tiny outbound-only agent that dials the prometheus-mcp-hub over mTLS and proxies this cluster's Prometheus HTTP API. One namespaced Role over one Secret, or no RBAC at all in memory identity mode.
+Tiny outbound-only agent that dials the prometheus-mcp-hub over an authenticated WebSocket and proxies this cluster's Prometheus HTTP API. One namespaced Role over one Secret, or no RBAC at all in memory identity mode.
 
 The spoke is a tiny agent that runs in **one** Kubernetes cluster, dials **out** to a
-`prometheus-mcp-hub` over mutually authenticated TLS, and serves that cluster's Prometheus
-HTTP API back through the tunnel. It streams opaque bytes and never parses Prometheus JSON,
+`prometheus-mcp-hub` over ordinary HTTPS — a WebSocket on the hub's MCP listener at
+`wss://<hub>/tunnel`, mutually authenticated inside the connection
+([ADR-0014](../../docs/adr/0014-websocket-tunnel-through-standard-ingress.md)) — and serves
+that cluster's Prometheus HTTP API back through the tunnel. It streams opaque bytes and never parses Prometheus JSON,
 which is why it is this small and why it works unchanged against Thanos, Mimir and Cortex.
 
 **The hub is in a different cluster.** Every spoke is its own Helm release in its own
@@ -21,7 +23,7 @@ default that only works when the hub happens to be local is a trap that fails on
 helm install spoke oci://ghcr.io/jacoknapp/prometheus-mcp-fleet/charts/prometheus-mcp-spoke \
   --namespace prometheus-mcp --create-namespace \
   --set cluster.id=prod-us-east-1 \
-  --set hub.endpoints[0]=hub.example.com:8443 \
+  --set hub.endpoints[0]=wss://mcp.example.com/tunnel \
   --set hub.apiUrl=https://mcp.example.com \
   --set enrollment.existingSecret=spoke-enrollment
 ```
@@ -35,7 +37,7 @@ runs.
 | Value | Why it cannot be defaulted |
 |---|---|
 | `cluster.id` | Immutable identity the hub binds into this spoke's certificate URI SAN. Two clusters sharing one would fight over a single certificate identity, each deregistering the other. |
-| `hub.endpoints` | The hub is in another cluster. There is no `.svc` name to fall back to. |
+| `hub.endpoints` | The hub is in another cluster. There is no `.svc` name to fall back to. A `wss://` URL: the hub's Ingress host plus the hub's `tunnel.path`, e.g. `wss://mcp.example.com/tunnel`. |
 | `hub.apiUrl` | Same, for the enrollment listener. |
 | `prometheus.url` | Defaulted to `prometheus-operated.monitoring.svc:9090`, but wrong for most clusters. |
 
@@ -115,7 +117,7 @@ places, and the rendered NetworkPolicy says so:
 | Destination | Rule |
 |---|---|
 | DNS | `kube-system`, UDP+TCP 53 |
-| The hub | `ipBlock` from `networkPolicy.egress.hub.cidrs`, on the ports parsed out of `hub.endpoints` |
+| The hub | `ipBlock` from `networkPolicy.egress.hub.cidrs`, on the ports parsed out of the `hub.endpoints` URLs — **443** for a `wss://` URL with no explicit port |
 | Local Prometheus | `namespaceSelector` plus the port parsed out of `prometheus.url` |
 | Kubernetes API | TCP 443 (only needed by `identity.backend: secret`) |
 
@@ -124,6 +126,12 @@ cluster and there is no namespace to select. Any `hub.endpoints` entry that is a
 literal is additionally pinned to an exact `/32` (or `/128`). A DNS name cannot be resolved
 by a NetworkPolicy at all, so named hubs fall back to `networkPolicy.egress.hub.cidrs`,
 which defaults to the honest `0.0.0.0/0` — **narrow it to your hub's real addresses.**
+
+The port comes from the endpoint URL and is `443` by default, not `8443`. Since
+[ADR-0014](../../docs/adr/0014-websocket-tunnel-through-standard-ingress.md) the tunnel is a
+WebSocket on the hub's ordinary MCP listener behind a standard Ingress; there is no separate
+tunnel listener to open a separate port for. `networkPolicy.egress.hub.ports` overrides the
+derivation for the case where an egress gateway or a NAT moves the port.
 
 The only Service this chart renders is a ClusterIP for metrics. `service.type` must stay
 `ClusterIP` and an `Ingress` in `extraManifests` is rejected outright, because the spoke's
@@ -137,10 +145,14 @@ The token buys exactly one certificate and the hub burns it atomically on redemp
 the window is short — but it is not zero.
 
 `hub.caBundle` (inline PEM, rendered into a ConfigMap because a CA certificate is public)
-or `hub.existingCASecret` supplies the hub's trust bundle **out of band**. The hub is in a
-different cluster and a different trust domain, so nothing here vouches for it. With
-neither set the spoke accepts the bundle the hub returns at enrollment and caches it —
-trust on first use, which is fine on a trusted path and not fine on the open internet.
+or `hub.existingCASecret` supplies the trust bundle for the **hub's server certificate** —
+the one its Ingress terminates, on both `hub.endpoints` and `hub.apiUrl`. It is not
+client-certificate material and has nothing to do with this spoke's own identity, which
+comes from enrollment. If the hub's Ingress serves a publicly trusted certificate you do not
+need either value; they exist for a private CA. Supply it **out of band**: the hub is in a
+different cluster, so nothing here vouches for it on first enrollment. With neither set the
+spoke accepts the bundle the hub returns at enrollment and caches it — trust on first use,
+which is fine on a trusted path and not fine on the open internet.
 
 `hub.tlsInsecure` and `prometheus.tls.skipVerify` each require `hub.allowInsecure` as well.
 Two independent settings mean an insecure spoke cannot be reached by a single typo.
@@ -236,16 +248,23 @@ its firewall.
 2. **DNS.** Resolve the hub name from inside the cluster. The spoke image is distroless, so
    use a debug pod.
 3. **Egress.** Confirm the hub's real address falls inside `networkPolicy.egress.hub.cidrs`
-   and that the `hub.endpoints` port is allowed. Check for *other* policies too:
-   NetworkPolicies are additive for allow, and a default-deny egress policy elsewhere in the
-   namespace still applies.
-4. **Proxy / egress NAT.** The tunnel is raw mTLS over TCP, **not HTTP**. An HTTP forward
-   proxy cannot carry it and `HTTPS_PROXY` is not consulted. It needs a real TCP path.
-5. **TLS.** `certificate signed by unknown authority` means the trust bundle is wrong: set
-   `hub.caBundle` or `hub.existingCASecret`. `certificate is valid for X, not Y` means the
-   hub's `tunnel.serverNames` does not list the address in your `hub.endpoints` — fixed on
-   the hub, not here.
-6. **Enrollment 401/409.** A single-use token that was already redeemed returns a replay
+   and that the port derived from `hub.endpoints` — 443 for a plain `wss://` URL — is
+   allowed. Check for *other* policies too: NetworkPolicies are additive for allow, and a
+   default-deny egress policy elsewhere in the namespace still applies.
+4. **Proxy / egress NAT.** The tunnel is an HTTP `Upgrade` to a WebSocket over ordinary
+   HTTPS, so a forward proxy **can** carry it and `HTTPS_PROXY` **is** honoured. Two things
+   to check: the proxy must pass the `Upgrade` through rather than stripping it, and it must
+   not close the connection while idle. The tunnel pings every 10 seconds, so any idle
+   timeout above ~30 seconds is fine.
+5. **TLS.** `certificate signed by unknown authority` means the trust bundle for the hub's
+   **server** certificate is wrong: set `hub.caBundle` or `hub.existingCASecret`.
+   `certificate is valid for X, not Y` means the hub's Ingress certificate does not cover
+   the host in your `hub.endpoints` — fixed on the hub's `ingress.host` /
+   `certManager.serving.dnsNames`, not here.
+6. **Wrong URL.** `hub.endpoints` must be the hub's Ingress host plus the hub's
+   `tunnel.path`, e.g. `wss://mcp.example.com/tunnel`. A 404 on the upgrade means the hub's
+   Ingress does not route that path.
+7. **Enrollment 401/409.** A single-use token that was already redeemed returns a replay
    error; mint a fresh one. In `identity.backend: memory` every restart redeems again, which
    is why that mode needs a multi-use token.
 
@@ -345,13 +364,13 @@ Kubernetes: `>=1.28.0-0`
 | goRuntime.memLimitRatio | float | `0.9` | Fraction of the memory limit used for `GOMEMLIMIT`, as a downward API divisor. 0.9 leaves headroom for non-Go allocations before the kernel OOM killer. |
 | hostNetwork | bool | `false` | `spec.template.spec.hostNetwork`. |
 | hub.allowInsecure | bool | `false` | `PMF_ALLOW_INSECURE`. The second key that must be turned for any insecure option to take effect. Two independent settings mean an insecure spoke cannot be reached by a single typo. |
-| hub.apiUrl | string | `""` | `PMF_HUB_API_URL`. REQUIRED, no default. `https://host[:port]` base URL of the hub's enrollment listener, which the hub serves on its MCP port. External, like `hub.endpoints`. |
-| hub.caBundle | string | `""` | Inline PEM trust bundle for the hub's tunnel and enrollment server certificates, rendered into a ConfigMap and mounted as `PMF_HUB_CA_FILE`. The spoke needs this OUT OF BAND on first enrollment: the hub is in a different cluster and a different trust domain, so nothing in this cluster's trust store vouches for it. A CA certificate is public, so this is not secret material. Empty means the spoke trusts the bundle the hub returns at enrollment and caches it under `config.dataDir` — which is fine after the first successful enrollment, and is trust-on-first-use before it. |
+| hub.apiUrl | string | `""` | `PMF_HUB_API_URL`. REQUIRED, no default. `https://host[:port]` base URL of the hub's enrollment listener, which the hub serves on its MCP port — the same listener and the same Ingress host as `hub.endpoints`, so in practice this is the `https://` form of it without the tunnel path. External, like `hub.endpoints`. |
+| hub.caBundle | string | `""` | Trust bundle for the hub's SERVER certificate, rendered into a ConfigMap and mounted as `PMF_HUB_CA_FILE`. This is inline PEM. It verifies the certificate the hub's Ingress presents on `hub.endpoints` and `hub.apiUrl` — it is NOT client-certificate material and has nothing to do with the spoke's own identity, which comes from enrollment. If your hub's Ingress serves a publicly trusted certificate (Let's Encrypt, a corporate CA already in the image's trust store) you do not need this at all; it exists for a private CA. The spoke needs it OUT OF BAND on first enrollment, because the hub is in a different cluster and nothing here vouches for it yet. A CA certificate is public, so this is not secret material. Empty means the spoke trusts the bundle the hub returns at enrollment and caches it under `config.dataDir` — fine after the first successful enrollment, trust-on-first-use before it. |
 | hub.caMountPath | string | `"/etc/prometheus-mcp-fleet/hub-ca"` | Where the hub trust bundle is mounted. |
 | hub.caSecretKey | string | `"ca.crt"` | Key inside `hub.existingCASecret` holding the PEM bundle. |
-| hub.endpoints | list | `[]` | `PMF_HUB_ENDPOINTS`. REQUIRED, no default. Hub tunnel endpoints as `host:port`, joined with commas — an external address such as `hub.example.com:8443`, whatever the hub's tunnel LoadBalancer publishes. The spoke holds ONE TUNNEL PER ENDPOINT: that is how hub HA works, because a tunnel is pinned to one hub replica and there is no hub-to-hub forwarding. List every hub replica's external address. |
-| hub.existingCASecret | string | `""` | Name of an existing Secret holding the hub trust bundle, used instead of `hub.caBundle`. The chart never creates it. |
-| hub.tlsInsecure | bool | `false` | `PMF_HUB_TLS_INSECURE`. Skips verification of the hub's server certificate, which lets anything on the network impersonate the hub and collect this cluster's metrics. It does nothing unless `hub.allowInsecure` is also true, and the chart refuses to render that combination without it. |
+| hub.endpoints | list | `[]` | `PMF_HUB_ENDPOINTS`. REQUIRED, no default. Hub tunnel endpoints as `wss://` URLs, joined with commas — for example `wss://hub.example.com/tunnel`, which is the hub's Ingress host plus the hub's `tunnel.path`. Since ADR-0014 the tunnel is a WebSocket on the hub's ordinary MCP listener behind a standard Ingress, so this is a URL and the port is the ordinary HTTPS port unless you name another. A bare `host:port` is read by the binary as `wss://<host:port>/tunnel`, which for the old `:8443` default is simply the wrong port and never connects; the chart refuses it rather than let you find out in production. The spoke holds ONE TUNNEL PER ENDPOINT: that is how hub HA works, because a tunnel is pinned to one hub replica and there is no hub-to-hub forwarding. List every hub replica's external URL. |
+| hub.existingCASecret | string | `""` | Name of an existing Secret holding the hub's SERVER trust bundle, used instead of `hub.caBundle`. Same thing, out of a Secret you already have. The chart never creates it. |
+| hub.tlsInsecure | bool | `false` | `PMF_HUB_TLS_INSECURE`. Skips verification of the hub's server certificate — the one its Ingress terminates — which lets anything on the network impersonate the hub and collect this cluster's metrics. It does nothing unless `hub.allowInsecure` is also true, and the chart refuses to render that combination without it. |
 | identity.backend | string | `"secret"` | `PMF_IDENTITY_BACKEND`. Where the issued client key and certificate live. `secret` (default) writes them to a Secret in this namespace, so a pod restart reuses the existing certificate. It costs exactly one `Role` with `get,create,update` on that one Secret by name — see the "RBAC" section of the README. `memory` needs NO RBAC at all, but the key is lost on every restart, so the spoke re-enrolls each time and therefore needs a MULTI-USE enrollment token. That is strictly weaker: a multi-use token is a standing credential that mints cluster identities. `file` writes under `config.dataDir`, which is the `/tmp` emptyDir, so in a pod it behaves like `memory` while looking durable. It exists for running the binary outside Kubernetes. |
 | identity.secretName | string | `""` | `PMF_IDENTITY_SECRET_NAME`. Name of the Secret the spoke owns. Empty means `<fullname>-identity`. This exact name is what the rendered Role restricts by `resourceNames`. |
 | image.digest | string | `""` | Image digest (`sha256:...`). When set the image is pinned by digest and the tag is ignored. Recommended for production and set automatically by the release workflow. |
@@ -403,7 +422,8 @@ Kubernetes: `>=1.28.0-0`
 | networkPolicy.egress.enabled | bool | `true` | Restrict spoke egress to DNS, the hub, Prometheus and the Kubernetes API. |
 | networkPolicy.egress.extraRules | list | `[]` | Raw additional `egress` rules, appended verbatim. |
 | networkPolicy.egress.hub.cidrs | list | `["0.0.0.0/0"]` | CIDRs the hub may be reached at. `0.0.0.0/0` is the honest default: the hub lives outside this cluster and a NetworkPolicy cannot resolve a DNS name. Narrow it to your hub's addresses. Any `hub.endpoints` entry that is already an IP literal is added as an exact `/32` (or `/128`) rule automatically and does not need to appear here. |
-| networkPolicy.egress.hub.enabled | bool | `true` | Allow egress to every port named in `hub.endpoints`. Without this the tunnel never establishes. |
+| networkPolicy.egress.hub.enabled | bool | `true` | Allow egress to the hub. Without this the tunnel never establishes. |
+| networkPolicy.egress.hub.ports | list | `[]` | Ports the hub is reached on. Empty derives them from the `hub.endpoints` URLs, which is what you want: a `wss://` URL with no explicit port means 443, because the tunnel now arrives on the hub's ordinary HTTPS Ingress rather than a dedicated 8443 listener. Set this only when something between here and the hub — an egress gateway, a NAT — moves the port. |
 | networkPolicy.egress.kubeAPI.enabled | bool | `true` | Allow egress to the Kubernetes API server. Required whenever `identity.backend` is `secret`; pointless otherwise. |
 | networkPolicy.egress.kubeAPI.port | int | `443` | Port of the Kubernetes API server for the egress rule. |
 | networkPolicy.egress.prometheus.enabled | bool | `true` | Allow egress to the local Prometheus, on the port parsed from `prometheus.url`. |

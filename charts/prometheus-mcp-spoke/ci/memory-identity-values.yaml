@@ -10,7 +10,7 @@ cluster:
   id: airgap-dc1
 hub:
   endpoints:
-    - 198.51.100.10:8443
+    - wss://198.51.100.10/tunnel
   apiUrl: https://198.51.100.10
   existingCASecret: hub-ca
 identity:

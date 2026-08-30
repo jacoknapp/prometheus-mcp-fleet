@@ -2,12 +2,14 @@
 
 ![Version: 0.1.0](https://img.shields.io/badge/Version-0.1.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.1.0](https://img.shields.io/badge/AppVersion-0.1.0-informational?style=flat-square)
 
-MCP server that gives AI agents Prometheus capability across a fleet of Kubernetes clusters, terminating mTLS tunnels dialled by prometheus-mcp-spoke.
+MCP server that gives AI agents Prometheus capability across a fleet of Kubernetes clusters, terminating WebSocket tunnels dialled out by prometheus-mcp-spoke through a standard Ingress.
 
 The hub is the MCP (Model Context Protocol) server that gives AI agents Prometheus
 capability across a fleet of Kubernetes clusters. Spokes in each cluster dial **out** to
-it over mutually authenticated TLS; the hub terminates those tunnels, routes agent tool
-calls to the right cluster, and returns token-efficient results.
+it over ordinary HTTPS — a WebSocket on the hub's MCP listener, mutually authenticated
+inside the connection ([ADR-0014](../../docs/adr/0014-websocket-tunnel-through-standard-ingress.md)).
+The hub terminates those tunnels, routes agent tool calls to the right cluster, and
+returns token-efficient results.
 
 It is deployed **once**, in one cluster. The spoke chart
 (`prometheus-mcp-spoke`) is deployed separately in each of the other clusters.
@@ -17,7 +19,9 @@ It is deployed **once**, in one cluster. The spoke chart
 ```console
 helm install hub oci://ghcr.io/jacoknapp/prometheus-mcp-fleet/charts/prometheus-mcp-hub \
   --namespace prometheus-mcp --create-namespace \
-  --set tunnel.serverNames[0]=hub.example.com \
+  --set ingress.enabled=true \
+  --set ingress.className=nginx \
+  --set ingress.host=hub.example.com \
   --set ingress.enabled=true \
   --set ingress.host=mcp.example.com \
   --set config.publicURL=https://mcp.example.com
@@ -76,31 +80,52 @@ namespace", not "may read Secrets". Pre-create the two Secrets yourself and set
 
 ## Exposure
 
-Three listeners, three very different exposure rules.
+**Two** container ports, and only one of them is ever published.
 
-| Listener | Port | How it is published |
-|---|---|---|
-| MCP | 8080 | Standard `networking.k8s.io/v1` **Ingress** (`ingress.*`) |
-| Tunnel | 8443 | Its **own Service**, LoadBalancer by default (`tunnel.service.*`) |
-| Admin / metrics / health / pprof | 9090 | ClusterIP only. Never anything else. |
+| Listener | Port | Carries | How it is published |
+|---|---|---|---|
+| MCP | 8080 | Agent MCP requests, spoke enrollment **and the spoke tunnel WebSocket** at `tunnel.path` | Standard `networking.k8s.io/v1` **Ingress** (`ingress.*`) |
+| Admin / metrics / health / pprof | 9090 | Credential-issuing REST API, `/metrics`, probes, pprof | ClusterIP only. Never anything else. |
 
-The tunnel cannot go behind an HTTP Ingress. It is mutually authenticated TLS and the hub
-must see the spoke's client certificate; an Ingress terminates TLS and cannot pass one
-through. Hence the separate Service — `LoadBalancer` by default because the spokes are in
-other clusters, with `NodePort` and `ClusterIP` also selectable.
+There is no tunnel port, no tunnel Service and no `tunnel.service.*` values. Since
+[ADR-0014](../../docs/adr/0014-websocket-tunnel-through-standard-ingress.md) the tunnel is
+a WebSocket on the MCP listener at `tunnel.path` (`/tunnel` by default), so one Ingress
+rule and one certificate publish the whole product. Mutual authentication moved inside the
+connection as a signed-nonce exchange over the spoke's certificate, which means the hub
+presents no tunnel server certificate and asks for none at the TLS layer — the Ingress is
+a plain proxy and verifies nothing on its own. A spoke's
+`hub.endpoints` entry is therefore a URL: `wss://hub.example.com/tunnel`.
 
-An **ssl-passthrough Ingress also works** (for example
-`nginx.ingress.kubernetes.io/ssl-passthrough: "true"`, or a Traefik `TCPRoute` with
-`tls.passthrough`), because it hands the raw TCP stream to the backend without terminating
-TLS. It is deliberately not shipped: the annotation, the required controller flag
-(`--enable-ssl-passthrough`) and the SNI requirements are all controller-specific, and a
-default that silently does not pass client certificates would be worse than no default.
-Configure it yourself with `extraManifests` if you prefer it to a LoadBalancer.
+The Ingress **must** route `tunnel.path`. `ingress.path: /` (the default) covers it. If
+you narrow `ingress.path` to something that does not — `/mcp`, say — the chart renders a
+**second path entry** for `tunnel.path` on that host automatically, and `NOTES.txt` says
+it did. This is not politeness: a hub whose Ingress misses `/tunnel` serves MCP perfectly,
+passes every probe and accepts zero spokes.
 
-`tunnel.serverNames` **must** list every host or IP a spoke will put in its
-`hub.endpoints`. The internal CA self-issues the tunnel server certificate from that list;
-if a name is missing, the spoke's TLS verification of the hub fails and no tunnel ever
-establishes. `NOTES.txt` warns when it is empty.
+### Idle timeouts
+
+The tunnel is a long-lived upgraded connection through your Ingress controller, and
+controllers close idle ones. The tunnel's HTTP/2 keepalive pings run every **10 seconds**,
+comfortably inside ingress-nginx's 60-second `proxy-read-timeout` default, so **the
+defaults are fine**. A controller tuned below that will disconnect every spoke in the
+fleet on a timer while the hub keeps reporting healthy. Raise it through
+`ingress.annotations`:
+
+```yaml
+ingress:
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+```
+
+HAProxy uses `haproxy.org/timeout-tunnel`; Traefik uses the entrypoint's
+`respondingTimeouts`. See `ci/ingress-values.yaml`.
+
+An **ssl-passthrough Ingress still works** if you have it (for example
+`nginx.ingress.kubernetes.io/ssl-passthrough: "true"`), and restores end-to-end TLS
+between spoke and hub. It is deliberately not the default: it is an nginx annotation
+rather than part of the Ingress API, several controllers do not implement it, and the
+deployment constraint this chart is built for is standard Ingress only.
 
 There is no Gateway API `HTTPRoute` and no OpenShift `Route` in this chart.
 
@@ -110,11 +135,58 @@ The admin listener carries the credential-issuing REST API, `/metrics`, health a
 optionally pprof. Four render-time guards enforce that it stays inside:
 
 * `service.type` must be `ClusterIP` while `service.admin.enabled` is true.
-* `ingress.servicePortName` must be `mcp`.
-* `tunnel.service.port` may not equal `ports.admin`.
-* `ports.mcp`, `ports.tunnel` and `ports.admin` must all differ.
+* `ingress.servicePortName` must be `mcp` — the only port that may ever be routed.
+* `service.mcpPort` may not equal `ports.admin`.
+* `ports.mcp` and `ports.admin` must differ.
+* `tunnel.path` must start with `/` and may not be `/`, which would swallow the MCP
+  endpoint it shares a listener with.
 
 Each is a `fail` in `_helpers.tpl` with an explanation, not a silent default.
+
+### NetworkPolicy
+
+`networkPolicy.mcp` is the hub's whole inbound story, because spoke tunnels arrive on the
+MCP port from the Ingress controller exactly as agent requests do. There is no tunnel rule
+to open. It defaults to the Ingress controller's namespace rather than `allowAll`, which is
+defence in depth — the hub authenticates every spoke itself, inside the connection — but it
+is still right. If you narrow it further, narrow it to the **controller**; narrowing it to
+the agents alone cuts off every spoke in the fleet.
+
+## Certificates
+
+`certManager.enabled` renders a cert-manager `Certificate` for the hub's **serving**
+certificate against an issuer you already have, and wires `ingress.tls.secretName` to the
+Secret cert-manager writes — so the name is stated once and the two cannot drift apart:
+
+```yaml
+ingress:
+  enabled: true
+  host: pmf.example.com
+  tls:
+    enabled: true
+certManager:
+  enabled: true
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+```
+
+Every cert-manager resource is guarded by `.Capabilities.APIVersions.Has "cert-manager.io/v1"`,
+so the chart still renders on a cluster without the CRDs. `certManager.enabled` on such a
+cluster is a render-time `fail` with a named cause rather than a silent no-op that would
+leave the Ingress with no certificate at all. When rendering offline, tell Helm the CRDs
+exist: `helm template --api-versions cert-manager.io/v1`.
+
+**cert-manager does not, and cannot, supply the hub's internal CA.** That CA signs spoke
+identities, so the hub must hold its *private key* to sign an enrollment; it is generated
+on first boot into the CA Secret the hub owns (`state.caSecretName`) and read back from
+there. A cert-manager `Certificate` hands you a certificate, not a signing service, and
+replacing the internal CA with one would break enrollment entirely.
+
+**Spoke certificates do not come from cert-manager either.** They come from the hub's
+enrollment API, because cert-manager in one of a hundred unrelated clusters has no access
+to the hub's CA key — which is the entire reason the enrollment flow exists. Do not try to
+wire it up.
 
 ## Security context
 
@@ -138,7 +210,7 @@ see `ci/openshift-values.yaml`.
 ## Resources and probes
 
 Requests `250m` / `256Mi`; the memory limit is `1Gi`. There is **no default CPU limit**:
-CFS-throttling a process that terminates ~100 long-lived mTLS tunnels turns a CPU spike
+CFS-throttling a process that terminates ~100 long-lived spoke tunnels turns a CPU spike
 into fleet-wide latency. `GOMEMLIMIT` is derived from the memory limit through the
 downward API (at `goRuntime.memLimitRatio`, 0.9 by default), so it tracks the cgroup and
 not node allocatable.
@@ -157,7 +229,7 @@ tests assert both halves: absent at `replicaCount: 1`, present at `replicaCount:
 
 Before raising `replicaCount`, read this: a spoke tunnel is pinned to exactly one replica
 and there is deliberately no hub-to-hub forwarding. Credential state is shared because it
-is one Secret, but tunnels are not. Real HA needs every replica individually addressable
+is one Secret, but tunnels are not. Real HA needs every replica individually routable
 from outside the cluster and every spoke configured with all N addresses.
 
 ## Metrics and alerts
@@ -288,6 +360,17 @@ Kubernetes: `>=1.28.0-0`
 | bootstrap.existingSecret | string | `""` | Name of an existing Secret holding operator-supplied bootstrap material (HMAC pepper and/or CA keypair) to adopt instead of letting the hub self-generate. Mounted read-only; the chart never creates this Secret, so no key material is ever stored in Helm release values. |
 | bootstrap.mountPath | string | `"/etc/prometheus-mcp-fleet/bootstrap"` | Where `bootstrap.existingSecret` is mounted. |
 | bootstrap.pepperKey | string | `""` | Key inside `bootstrap.existingSecret` holding the HMAC pepper. Empty leaves `PMF_PEPPER_FILE` unset. |
+| certManager.enabled | bool | `false` | Render cert-manager resources. Requires the `cert-manager.io/v1` CRDs. |
+| certManager.issuerRef.group | string | `"cert-manager.io"` | API group of the issuer. |
+| certManager.issuerRef.kind | string | `"ClusterIssuer"` | `Issuer` or `ClusterIssuer`. |
+| certManager.issuerRef.name | string | `""` | Name of the existing Issuer or ClusterIssuer that signs the hub's serving certificate. Required when `certManager.enabled`. |
+| certManager.serving.dnsNames | list | `[]` | DNS names on the certificate. Empty means `ingress.host` plus every `ingress.extraHosts` entry. |
+| certManager.serving.duration | string | `""` | `spec.duration`. Empty leaves the issuer's default. |
+| certManager.serving.enabled | bool | `true` | Render a `Certificate` for the hub's serving certificate and wire `ingress.tls.secretName` to it. |
+| certManager.serving.privateKey | object | `{"algorithm":"ECDSA","rotationPolicy":"Always","size":256}` | `spec.privateKey`. `rotationPolicy: Always` means a renewal issues a fresh key rather than re-signing the old one. |
+| certManager.serving.renewBefore | string | `""` | `spec.renewBefore`. Empty leaves the issuer's default. |
+| certManager.serving.secretAnnotations | object | `{}` | `spec.secretTemplate.annotations` on the generated Secret. |
+| certManager.serving.secretName | string | `""` | Secret cert-manager writes the serving certificate to. Empty means `<fullname>-serving-tls`. |
 | commonAnnotations | object | `{}` | Extra annotations added to every object this chart renders. |
 | commonLabels | object | `{}` | Extra labels added to every object this chart renders. |
 | config.agentKeyTTL | string | `"720h"` | `PMF_AGENT_KEY_TTL`. Default lifetime of a minted `pmf_agt_` agent key. |
@@ -331,17 +414,17 @@ Kubernetes: `>=1.28.0-0`
 | image.repository | string | `"jacoknapp/prometheus-mcp-fleet/hub"` | Image repository, without the registry. |
 | image.tag | string | `""` | Image tag. Empty means `.Chart.AppVersion`. Ignored when `image.digest` is set. |
 | imagePullSecrets | list | `[]` | Image pull secrets for a private registry. |
-| ingress.annotations | object | `{}` | Annotations for the Ingress. |
+| ingress.annotations | object | `{}` | Annotations for the Ingress. IDLE TIMEOUTS: an Ingress controller closes an idle upgraded connection, and the tunnel is a long-lived WebSocket. nginx defaults to 60s while the tunnel's HTTP/2 keepalive pings run every 10s, so the defaults are fine — but a controller tuned BELOW ~30s disconnects every spoke in the fleet, repeatedly, and the hub still looks healthy. Raise it there: nginx.ingress.kubernetes.io/proxy-read-timeout: "3600" nginx.ingress.kubernetes.io/proxy-send-timeout: "3600" (HAProxy: `haproxy.org/timeout-tunnel`. Traefik: the entrypoint's respondingTimeouts.) |
 | ingress.className | string | `""` | `spec.ingressClassName`. |
-| ingress.enabled | bool | `false` | Render a standard `networking.k8s.io/v1` Ingress for the MCP port. The tunnel port cannot use this — an HTTP Ingress cannot pass a client certificate through to the hub — see `tunnel.service`. |
-| ingress.extraHosts | list | `[]` | Additional hosts, each an object with `host`, and optionally `path` and `pathType`. |
+| ingress.enabled | bool | `false` | Render a standard `networking.k8s.io/v1` Ingress for the MCP port. This carries EVERYTHING: the agent-facing MCP endpoint and the spoke tunnel WebSocket at `tunnel.path` share the one listener, so one rule and one certificate publish the whole product. There is no second Service, no LoadBalancer and no `ssl-passthrough` to arrange. The controller only has to proxy `Connection: Upgrade`, which every Ingress controller does natively. |
+| ingress.extraHosts | list | `[]` | Additional hosts, each an object with `host`, and optionally `path` and `pathType`. Each one gets the same tunnel-path treatment as `ingress.host`. |
 | ingress.host | string | `""` | Hostname. Required when `ingress.enabled` is true. |
-| ingress.path | string | `"/"` | Path exposed. The MCP endpoint is served at the root of the MCP listener. |
+| ingress.path | string | `"/"` | Path exposed. `/` publishes both the MCP endpoint and the tunnel at `tunnel.path`. A narrower path that does not cover `tunnel.path` gets a SECOND path entry rendered for the tunnel automatically — an Ingress that does not route `tunnel.path` accepts zero spokes while looking perfectly healthy. |
 | ingress.pathType | string | `"Prefix"` | `pathType`. |
 | ingress.servicePortName | string | `"mcp"` | Name of the Service port to route to. Must be `mcp`; the chart refuses to route the admin port through an Ingress. |
-| ingress.tls.enabled | bool | `false` | Terminate TLS at the Ingress. |
+| ingress.tls.enabled | bool | `false` | Terminate TLS at the Ingress. Spokes dial `wss://`, so in practice this is on. |
 | ingress.tls.hosts | list | `[]` | Override the hosts listed in the TLS block. Empty means `ingress.host` plus every `ingress.extraHosts` entry. |
-| ingress.tls.secretName | string | `""` | Secret holding the certificate. Empty with `enabled: true` means the controller's default certificate. |
+| ingress.tls.secretName | string | `""` | Secret holding the serving certificate. Empty with `enabled: true` means the controller's default certificate — unless `certManager.enabled` is true, in which case this is wired automatically to the Secret cert-manager writes. |
 | initContainers | list | `[]` | Init containers for the hub pod. |
 | livenessProbe.enabled | bool | `true` | Enable the liveness probe. It targets `/healthz`, which never checks a dependency — a dead upstream must not restart the hub. |
 | livenessProbe.failureThreshold | int | `6` | Failure threshold. |
@@ -392,12 +475,10 @@ Kubernetes: `>=1.28.0-0`
 | networkPolicy.egress.kubeAPIPort | int | `443` | Port of the Kubernetes API server for the egress rule. |
 | networkPolicy.enabled | bool | `true` | Render a NetworkPolicy. On by default: the hub terminates connections from outside the cluster and holds a CA. |
 | networkPolicy.labels | object | `{}` | Extra labels for the NetworkPolicy. |
-| networkPolicy.mcp.allowAll | bool | `false` | Allow ingress to the MCP port from any source. Use when your Ingress controller's identity cannot be expressed as a selector. |
+| networkPolicy.mcp.allowAll | bool | `false` | Allow ingress to the MCP port from any source. Use when your Ingress controller's identity cannot be expressed as a selector. Leave it false. This one rule is the hub's whole inbound story: SPOKE TUNNELS arrive here too, on the same port, from the same Ingress controller, so there is no separate tunnel rule to open. Restricting the port to the controller is defence in depth — the hub authenticates every spoke itself, inside the connection — but it is still right, and if you narrow it, narrow it to the CONTROLLER and never to the agents alone or you cut off every spoke in the fleet. |
 | networkPolicy.mcp.extraFrom | list | `[]` | Additional raw `ingress.from` entries for the MCP port. |
 | networkPolicy.mcp.namespaceSelector | object | `{"matchLabels":{"kubernetes.io/metadata.name":"ingress-nginx"}}` | `namespaceSelector` for clients allowed to reach the MCP port. |
 | networkPolicy.mcp.podSelector | object | `{}` | `podSelector` for clients allowed to reach the MCP port. Empty selects every pod in the selected namespaces. |
-| networkPolicy.tunnel.allowAll | bool | `true` | Allow ingress to the tunnel port from anywhere. On by default because spokes live in other clusters; narrow it with `networkPolicy.tunnel.cidrs` where you know your fleet's egress ranges. |
-| networkPolicy.tunnel.cidrs | list | `[]` | CIDRs allowed to reach the tunnel port when `allowAll` is false. |
 | nodeSelector | object | `{}` | `spec.template.spec.nodeSelector`. |
 | podAnnotations | object | `{}` | Annotations for the hub pods. |
 | podDisruptionBudget.enabled | bool | `true` | Render a PodDisruptionBudget. It is force-disabled whenever `replicaCount < 2`: `minAvailable: 1` on a single-replica workload blocks every node drain forever. |
@@ -412,7 +493,6 @@ Kubernetes: `>=1.28.0-0`
 | podSecurityContext.seccompProfile | object | `{"type":"RuntimeDefault"}` | Seccomp profile for every container in the pod. |
 | ports.admin | int | `9090` | Container port of the admin REST + metrics + health + pprof listener (`PMF_ADMIN_ADDR`). Never routed through an Ingress and never carried by a LoadBalancer or NodePort Service; the chart fails to render if you try. |
 | ports.mcp | int | `8080` | Container port of the agent-facing MCP listener (`PMF_MCP_ADDR`). |
-| ports.tunnel | int | `8443` | Container port of the mTLS tunnel listener spokes dial (`PMF_TUNNEL_ADDR`). |
 | priorityClassName | string | `""` | `spec.template.spec.priorityClassName`. |
 | rbac.allowCreate | bool | `true` | Grant the unrestricted `create` verb on Secrets in this namespace. Kubernetes cannot restrict `create` by `resourceNames` (the object has no name at authorization time), so this one verb cannot be name-scoped. It permits creating a Secret, never reading one. Pre-create the state Secret and set this to false to leave the hub with nothing but name-restricted `get,update`. |
 | rbac.create | bool | `true` | Render the namespaced Role and RoleBinding that let the hub read and write its own state Secret. Nothing cluster-scoped is ever rendered by this chart. |
@@ -423,7 +503,7 @@ Kubernetes: `>=1.28.0-0`
 | readinessProbe.periodSeconds | int | `10` | Probe period. |
 | readinessProbe.successThreshold | int | `1` | Success threshold. |
 | readinessProbe.timeoutSeconds | int | `3` | Probe timeout. |
-| replicaCount | int | `1` | Number of hub replicas. Read before raising above 1: a spoke tunnel is pinned to exactly one replica and there is deliberately no hub-to-hub forwarding (BUILD_SPEC 1.11). Credential state is shared because it lives in one Secret, but tunnels are not. Real HA needs every replica individually addressable from outside the cluster and every spoke configured with all N addresses in `hub.endpoints`. |
+| replicaCount | int | `1` | Number of hub replicas. Read before raising above 1: a spoke tunnel is pinned to exactly one replica and there is deliberately no hub-to-hub forwarding (BUILD_SPEC 1.11). Credential state is shared because it lives in one Secret, but tunnels are not. Real HA needs every replica individually routable from outside the cluster and every spoke configured with all N URLs in `hub.endpoints`. |
 | resources.limits.memory | string | `"1Gi"` | Memory limit. Also the source of `GOMEMLIMIT` via the downward API. |
 | resources.requests.cpu | string | `"250m"` | CPU request. |
 | resources.requests.memory | string | `"256Mi"` | Memory request. |
@@ -463,21 +543,7 @@ Kubernetes: `>=1.28.0-0`
 | tracing.enabled | bool | `false` | Enable OTLP trace export. |
 | tracing.endpoint | string | `""` | `PMF_OTEL_EXPORTER_OTLP_ENDPOINT`. OTLP/gRPC collector endpoint. |
 | tracing.sampleRatio | string | `"0.05"` | `PMF_TRACE_SAMPLE_RATIO`. Head sampling ratio between 0 and 1, as a string so YAML never reformats it. |
-| tunnel.serverNames | list | `[]` | `PMF_TUNNEL_SERVER_NAMES`. SANs placed on the tunnel server certificate when the internal CA self-issues it. This MUST contain every host or IP a spoke will put in its `hub.endpoints`, or the spoke's TLS verification of the hub fails and no tunnel ever establishes. Leave empty only when you supply your own certificate through `tunnel.tls`. |
-| tunnel.service.annotations | object | `{}` | Annotations for the tunnel Service. Cloud load balancer configuration goes here. |
-| tunnel.service.enabled | bool | `true` | Render a dedicated Service for the spoke tunnel port, separate from `service` so the tunnel can be published without ever exposing MCP or admin. |
-| tunnel.service.externalTrafficPolicy | string | `""` | `spec.externalTrafficPolicy`. `Local` preserves the spoke source IP. |
-| tunnel.service.labels | object | `{}` | Extra labels for the tunnel Service. |
-| tunnel.service.loadBalancerClass | string | `""` | `spec.loadBalancerClass`. |
-| tunnel.service.loadBalancerIP | string | `""` | `spec.loadBalancerIP`. |
-| tunnel.service.loadBalancerSourceRanges | list | `[]` | `spec.loadBalancerSourceRanges`. Narrow this to your fleet's egress ranges wherever you can. |
-| tunnel.service.nodePort | string | `""` | NodePort to request when `tunnel.service.type` is `NodePort`. Empty means allocated. |
-| tunnel.service.port | int | `8443` | Service port for the tunnel. |
-| tunnel.service.type | string | `"LoadBalancer"` | Service type. `LoadBalancer` is the default because spokes live in other clusters. `NodePort` and `ClusterIP` are also accepted; `ClusterIP` is only useful for in-cluster testing. |
-| tunnel.tls.certKey | string | `"tls.crt"` | Key inside `tunnel.tls.existingSecret` holding the PEM certificate (`PMF_TUNNEL_TLS_CERT_FILE`). |
-| tunnel.tls.existingSecret | string | `""` | Name of an existing Secret holding an operator-supplied tunnel server certificate, used instead of one self-issued by the internal CA. Mounted read-only; the chart never creates it. |
-| tunnel.tls.keyKey | string | `"tls.key"` | Key inside `tunnel.tls.existingSecret` holding the PEM private key (`PMF_TUNNEL_TLS_KEY_FILE`). |
-| tunnel.tls.mountPath | string | `"/etc/prometheus-mcp-fleet/tunnel-tls"` | Where `tunnel.tls.existingSecret` is mounted. |
+| tunnel.path | string | `"/tunnel"` | `PMF_TUNNEL_PATH`. Path on the MCP listener where spokes open the tunnel WebSocket. There is no separate tunnel port and no tunnel Service: an Ingress terminates TLS and cannot pass a client certificate through, so the tunnel arrives as ordinary HTTP on the MCP listener and mutual authentication happens INSIDE the connection, over the spoke's certificate, before any gRPC byte (ADR-0014). The Ingress is a plain proxy and verifies nothing. A spoke's `hub.endpoints` entry is `wss://<ingress host><tunnel.path>`. It may not be `/`, which would collide with the MCP endpoint. |
 | updateStrategy.rollingUpdate | object | `{}` | `spec.strategy.rollingUpdate`. Empty means the Kubernetes defaults. |
 | updateStrategy.type | string | `"RollingUpdate"` | Deployment strategy type, `RollingUpdate` or `Recreate`. |
 

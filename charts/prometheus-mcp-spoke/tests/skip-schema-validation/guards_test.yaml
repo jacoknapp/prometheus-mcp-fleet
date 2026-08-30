@@ -23,7 +23,7 @@ tests:
         id: ""
       hub:
         endpoints:
-          - hub.example.com:8443
+          - wss://hub.example.com/tunnel
         apiUrl: https://hub.example.com
     asserts:
       - failedTemplate:
@@ -35,7 +35,7 @@ tests:
         id: Prod_US_East
       hub:
         endpoints:
-          - hub.example.com:8443
+          - wss://hub.example.com/tunnel
         apiUrl: https://hub.example.com
     asserts:
       - failedTemplate:
@@ -52,7 +52,22 @@ tests:
       - failedTemplate:
           errorPattern: "hub.endpoints is required and has no default"
 
-  - it: refuses a hub endpoint without a port
+  # The regression this guards: a host:port endpoint left over from before
+  # ADR-0014 normalises to wss://<host:port>/tunnel inside the binary, which for
+  # the old :8443 default is the WRONG PORT and never connects. Silently.
+  - it: refuses a bare host:port hub endpoint
+    set:
+      cluster:
+        id: prod-us-east-1
+      hub:
+        endpoints:
+          - hub.example.com:8443
+        apiUrl: https://hub.example.com
+    asserts:
+      - failedTemplate:
+          errorPattern: "must be a wss:// \\(or ws://\\) URL"
+
+  - it: refuses a bare hostname hub endpoint
     set:
       cluster:
         id: prod-us-east-1
@@ -62,7 +77,31 @@ tests:
         apiUrl: https://hub.example.com
     asserts:
       - failedTemplate:
-          errorPattern: "is not host:port"
+          errorPattern: "must be a wss:// \\(or ws://\\) URL"
+
+  - it: refuses an https hub endpoint, which is the enrollment URL not the tunnel URL
+    set:
+      cluster:
+        id: prod-us-east-1
+      hub:
+        endpoints:
+          - https://hub.example.com/tunnel
+        apiUrl: https://hub.example.com
+    asserts:
+      - failedTemplate:
+          errorPattern: "must be a wss:// \\(or ws://\\) URL"
+
+  - it: refuses a hub endpoint carrying a query string
+    set:
+      cluster:
+        id: prod-us-east-1
+      hub:
+        endpoints:
+          - wss://hub.example.com/tunnel?token=x
+        apiUrl: https://hub.example.com
+    asserts:
+      - failedTemplate:
+          errorPattern: "carries a query or fragment"
 
   - it: refuses an empty hub.apiUrl
     set:
@@ -70,7 +109,7 @@ tests:
         id: prod-us-east-1
       hub:
         endpoints:
-          - hub.example.com:8443
+          - wss://hub.example.com/tunnel
         apiUrl: ""
     asserts:
       - failedTemplate:
@@ -83,7 +122,7 @@ tests:
         id: prod-us-east-1
       hub:
         endpoints:
-          - hub.example.com:8443
+          - wss://hub.example.com/tunnel
         apiUrl: https://hub.example.com
     asserts:
       - failedTemplate:

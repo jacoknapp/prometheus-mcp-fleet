@@ -4,5 +4,4 @@
 # The shipped defaults, stated explicitly so a change to them shows up as a
 # diff in this file's render rather than silently.
 tunnel:
-  serverNames:
-    - hub.example.com
+  path: /tunnel

@@ -150,12 +150,28 @@ helm-lint: ## Lint both charts against every ci/ values file.
 	done
 
 .PHONY: helm-template
-helm-template: ## Render both charts with default values.
-	@for chart in charts/*/; do helm template test "$$chart" >/dev/null && echo "ok $$chart"; done
+helm-template: ## Render both charts against every ci/ values file.
+	# NOT `helm template <chart>` with no values: cluster.id, hub.endpoints and
+	# hub.apiUrl are `required` in the spoke's values.schema.json and deliberately
+	# have no default, so a bare render can only ever fail. ci/*-values.yaml is
+	# where the renderable shapes live, and chart-testing lints the same files.
+	@set -e; for chart in charts/*/; do \
+		for values in "$$chart"ci/*.yaml; do \
+			helm template test "$$chart" -f "$$values" >/dev/null; \
+			echo "ok $$values"; \
+		done; \
+	done
 
 .PHONY: helm-unittest
 helm-unittest: ## Run helm-unittest suites.
 	helm unittest charts/prometheus-mcp-hub charts/prometheus-mcp-spoke
+	# Guards that sit BEHIND values.schema.json: the schema rejects these inputs
+	# first, so the `fail` in _helpers.tpl is only reachable with
+	# --skip-schema-validation -- which is a real flag operators pass.
+	@for chart in charts/prometheus-mcp-hub charts/prometheus-mcp-spoke; do \
+		helm unittest --skip-schema-validation \
+			-f 'tests/skip-schema-validation/*_test.yaml' "$$chart"; \
+	done
 
 .PHONY: helm-docs
 helm-docs: ## Regenerate chart READMEs from values.yaml.

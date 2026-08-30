@@ -54,7 +54,7 @@ a query.
 | Admin | `pmf_adm_` | Operator, IaC | 90 days | Mint and revoke keys, mint enrollments, CA operations | Admin listener only |
 | Agent | `pmf_agt_` | AI agent runtime | 30 days | Call the MCP tools its scope permits | MCP listener only |
 | Enrollment | `pmf_enr_` | Spoke install | 15 minutes, **single use** | Exchange one CSR for one certificate | Public listener |
-| Spoke identity | X.509 | Spoke pod | 14 days, auto-renewed | Serve one cluster | Tunnel listener |
+| Spoke identity | X.509 | Spoke pod | 14 days, auto-renewed | Serve one cluster | Tunnel handshake and `POST /renew` |
 
 ### Token format
 
@@ -142,6 +142,12 @@ performed one layer up, and it preserves the properties that matter: the private
 key never transits, and a captured response cannot be replayed against a fresh
 nonce or re-scoped to another cluster.
 
+The Ingress is a plain proxy here: it does not verify client certificates and
+forwards none upstream, so there is no transport-layer identity for the hub to
+inherit. Where an Ingress *can* do that verification, it is the better design
+and the in-band handshake becomes unnecessary — see
+[ADR-0014](adr/0014-websocket-tunnel-through-standard-ingress.md).
+
 **What this costs, stated plainly.** The terminating Ingress is inside the trust
 boundary. It sees the frames, and a compromised Ingress could relay a live
 connection. It cannot *impersonate* a spoke — it never holds a spoke's private
@@ -157,13 +163,30 @@ exactly `/spoke/<id>` with `<id>` matching
 `^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`. The common name is ignored for identity
 purposes — it is decoration.
 
-**Renewal** happens over the existing mutually authenticated connection at half
-of the certificate's lifetime with ±10% jitter, so 100 spokes do not stampede.
-No enrollment token is involved. Below 10% remaining the spoke alarms; on expiry
-it needs a fresh enrollment token, which is intentional.
+**Renewal** happens at half of the certificate's lifetime with ±10% jitter, so
+100 spokes do not stampede. No enrollment token is involved. Below 10% remaining
+the spoke alarms; on expiry it needs a fresh enrollment token, which is
+intentional.
 
-**Revocation** is a hub-side denylist keyed on certificate serial, consulted in
-`VerifyPeerCertificate` during the handshake. A CRL is published at `/pki/crl`
+Renewal is **not** mutual TLS. It cannot be: the Ingress terminates TLS, so the
+hub sees no client certificate on any request, and a route that read
+`r.TLS.PeerCertificates` would refuse every renewal in production while passing
+in a lab. `POST /renew` instead takes the certificate chain and a signature over
+a challenge from `GET /renew/challenge`, verified with the same code as the
+tunnel handshake (`internal/certproof`). The hub checks the challenge, the chain
+against its CA, the revocation denylist and the signature, in that order, and
+takes the cluster ID from the verified certificate — the request body has no
+field that could name one.
+
+The challenge is unauthenticated and stateless: `random ‖ expiry ‖
+HMAC(pepper, …)`, valid for 60 seconds, verifiable at any replica. It is not
+single-use, because replaying a renewal returns a certificate for a public key
+the replayer holds no private half of. That reasoning does *not* transfer to
+enrollment, whose token is a bearer credential and is burned atomically.
+
+**Revocation** is a hub-side denylist keyed on certificate serial, consulted on
+every tunnel handshake and on every renewal, against live state rather than a
+cached list. A CRL is published at `/pki/crl`
 for external auditors, but nothing in this system depends on it — a CRL adds
 latency, a distribution problem and a `nextUpdate` gap for no benefit when the
 hub is the only verifier. The 14-day lifetime is the backstop.
@@ -316,6 +339,26 @@ successful injection worthless than pretend to detect one.
 | **Network attacker** | — | HTTPS only; the spoke verifies the hub's server certificate, and the hub verifies the spoke's certificate and a signature over a nonce it chose. Observing traffic is not enough to impersonate either side |
 | **Compromised Ingress** | Observe tunnel traffic; relay a live connection | Cannot impersonate a spoke — it holds no spoke private key, and the signature covers a fresh hub-chosen nonce. This is the accepted cost of Ingress-only exposure; see ADR-0014 |
 | **Malicious CSR** | — | Subject and SANs discarded; only the public key is used; key type and size are checked |
+
+## Certificates and cert-manager
+
+The hub's **serving** certificate — what the Ingress presents to agents and
+spokes — is a cert-manager `Certificate`. That is the ordinary Kubernetes way to
+manage it, and it removes a class of manual renewal error.
+
+The hub's **internal CA** is deliberately not a cert-manager resource. The hub
+needs the CA private key in process to sign enrollments, so it generates one on
+first boot into a Secret it owns. Spoke identities cannot come from cert-manager
+either: cert-manager in one of a hundred unrelated clusters has no access to
+that key, and giving it one would mean distributing the CA private key to every
+monitored cluster — which is the opposite of what a CA is for. That asymmetry is
+why the enrollment flow exists at all.
+
+If you already run an external PKI and would rather it issued spoke
+certificates, that is the `external` mode sketched in
+[ADR-0004](adr/0004-built-in-ca-for-spoke-identity.md): supply a trust bundle and
+an explicit SAN-to-cluster-ID binding table. Trust-domain membership alone must
+never confer a cluster ID.
 
 ## Secrets in Kubernetes
 

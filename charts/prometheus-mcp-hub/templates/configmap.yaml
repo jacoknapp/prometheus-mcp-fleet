@@ -26,7 +26,13 @@ metadata:
   {{- end }}
 data:
   PMF_MCP_ADDR: {{ printf ":%d" (int .Values.ports.mcp) | quote }}
-  PMF_TUNNEL_ADDR: {{ printf ":%d" (int .Values.ports.tunnel) | quote }}
+  {{/*
+    The tunnel is a WebSocket on the MCP listener, not a listener of its own
+    (ADR-0014). PMF_TUNNEL_ADDR, PMF_TUNNEL_SERVER_NAMES, PMF_TUNNEL_TLS_CERT_FILE
+    and PMF_TUNNEL_TLS_KEY_FILE no longer exist in internal/config/hub.go and are
+    SILENTLY IGNORED by the binary; do not reintroduce them.
+  */}}
+  PMF_TUNNEL_PATH: {{ .Values.tunnel.path | quote }}
   {{/*
     The binary defaults PMF_ADMIN_ADDR to 127.0.0.1:9090. In a pod that would
     make the port unreachable by the kubelet's probes and by any scraper, so
@@ -60,13 +66,6 @@ data:
   {{- end }}
   {{- end }}
   PMF_TRUST_DOMAIN: {{ .Values.config.trustDomain | quote }}
-  {{- with .Values.tunnel.serverNames }}
-  PMF_TUNNEL_SERVER_NAMES: {{ join "," . | quote }}
-  {{- end }}
-  {{- if .Values.tunnel.tls.existingSecret }}
-  PMF_TUNNEL_TLS_CERT_FILE: {{ printf "%s/%s" (trimSuffix "/" .Values.tunnel.tls.mountPath) .Values.tunnel.tls.certKey | quote }}
-  PMF_TUNNEL_TLS_KEY_FILE: {{ printf "%s/%s" (trimSuffix "/" .Values.tunnel.tls.mountPath) .Values.tunnel.tls.keyKey | quote }}
-  {{- end }}
   PMF_SPOKE_CERT_TTL: {{ .Values.config.spokeCertTTL | quote }}
   PMF_ENROLLMENT_TOKEN_TTL: {{ .Values.config.enrollmentTokenTTL | quote }}
   PMF_AGENT_KEY_TTL: {{ .Values.config.agentKeyTTL | quote }}

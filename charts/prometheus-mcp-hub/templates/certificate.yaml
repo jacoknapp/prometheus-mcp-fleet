@@ -1,0 +1,63 @@
+{{/*
+Copyright The prometheus-mcp-fleet Authors.
+SPDX-License-Identifier: Apache-2.0
+
+The hub's SERVING certificate, issued by cert-manager and consumed by the
+Ingress. That is the whole of cert-manager's job in this chart.
+
+It does NOT issue the hub's internal CA. That CA signs spoke identities, which
+means the hub must hold its private key to sign an enrollment; it is generated
+on first boot into the CA Secret the hub owns and reads back. Nor does it issue
+spoke certificates: those come from the hub's enrollment API, because
+cert-manager in one of a hundred unrelated clusters has no access to that key.
+See "Certificates" in README.md.
+
+Guarded by the cert-manager.io/v1 capability so the chart still renders on a
+cluster without the CRDs; `prometheus-mcp-hub.validate` turns
+certManager.enabled on such a cluster into a named failure instead.
+*/}}
+{{- if include "prometheus-mcp-hub.servingCertEnabled" . -}}
+{{- include "prometheus-mcp-hub.validate" . -}}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "prometheus-mcp-hub.servingCertSecretName" . }}
+  namespace: {{ include "prometheus-mcp-hub.namespace" . }}
+  labels:
+    {{- include "prometheus-mcp-hub.labels" . | nindent 4 }}
+  {{- with (include "prometheus-mcp-hub.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  secretName: {{ include "prometheus-mcp-hub.servingCertSecretName" . }}
+  {{- with .Values.certManager.serving.secretAnnotations }}
+  secretTemplate:
+    annotations:
+      {{- toYaml . | nindent 6 }}
+  {{- end }}
+  {{- with .Values.certManager.serving.duration }}
+  duration: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.certManager.serving.renewBefore }}
+  renewBefore: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.certManager.serving.privateKey }}
+  privateKey:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  usages:
+    - digital signature
+    - key encipherment
+    - server auth
+  dnsNames:
+    {{- if .Values.certManager.serving.dnsNames }}
+    {{- toYaml .Values.certManager.serving.dnsNames | nindent 4 }}
+    {{- else }}
+    {{- include "prometheus-mcp-hub.ingressHosts" . | nindent 4 }}
+    {{- end }}
+  issuerRef:
+    name: {{ .Values.certManager.issuerRef.name }}
+    kind: {{ .Values.certManager.issuerRef.kind }}
+    group: {{ .Values.certManager.issuerRef.group }}
+{{- end }}

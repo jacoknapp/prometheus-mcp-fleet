@@ -20,6 +20,7 @@ import (
 
 	"github.com/coder/websocket"
 
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/certproof"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel/grpctun"
 )
@@ -332,7 +333,7 @@ func (s *Server) authenticate(conn net.Conn, remote string) (tunnel.Identity, er
 	// Possession of the private key, over a nonce this hub chose for this
 	// connection. Everything before this proves only that the peer holds a
 	// copy of a certificate, which is public.
-	if err := verifyTranscript(leaf, auth.Signature, nonce, auth.ProtocolVersion, auth.ClusterID); err != nil {
+	if err := certproof.Verify(leaf, auth.Signature, nonce, auth.ProtocolVersion, auth.ClusterID); err != nil {
 		return tunnel.Identity{}, err
 	}
 

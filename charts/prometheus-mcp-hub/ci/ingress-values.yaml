@@ -1,9 +1,12 @@
 # Copyright The prometheus-mcp-fleet Authors.
 # SPDX-License-Identifier: Apache-2.0
 #
-# MCP published through a standard networking.k8s.io/v1 Ingress, with the tunnel
-# on its own LoadBalancer because an HTTP Ingress cannot pass a client
-# certificate through. This is the intended production shape.
+# The intended production shape: ONE standard networking.k8s.io/v1 Ingress
+# carrying both the agent-facing MCP endpoint and the spoke tunnel WebSocket at
+# tunnel.path. No LoadBalancer, no NodePort, no ssl-passthrough (ADR-0014).
+#
+# proxy-read-timeout is set well above the tunnel's 10s keepalive interval: an
+# Ingress controller that closes idle upgraded connections drops every spoke.
 ingress:
   enabled: true
   className: nginx
@@ -11,10 +14,14 @@ ingress:
   path: /
   pathType: Prefix
   annotations:
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
   extraHosts:
+    # A deliberately NARROW path: it does not cover tunnel.path, so the chart
+    # renders a second path entry for /tunnel on this host. Without that the
+    # hub would serve MCP here and accept no spokes.
     - host: mcp-alt.example.com
-      path: /
+      path: /mcp
       pathType: Prefix
   tls:
     enabled: true
@@ -22,13 +29,4 @@ ingress:
 config:
   publicURL: https://mcp.example.com
 tunnel:
-  serverNames:
-    - tunnel.example.com
-  service:
-    enabled: true
-    type: LoadBalancer
-    annotations:
-      service.beta.kubernetes.io/aws-load-balancer-type: nlb
-    loadBalancerSourceRanges:
-      - 203.0.113.0/24
-    externalTrafficPolicy: Local
+  path: /tunnel

@@ -38,6 +38,7 @@ import (
 
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/authn"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/ca"
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/certproof"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/fleet"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/token"
 )
@@ -401,7 +402,7 @@ type harness struct {
 	admin  *httptest.Server
 	public *httptest.Server
 	// publicMux is the same handler h.public serves, kept so a test can mount
-	// it a second time behind mutual TLS.
+	// it a second time behind a TLS listener.
 	publicMux http.Handler
 
 	adminToken string
@@ -761,8 +762,9 @@ func makeCSR(t *testing.T, opts csrOptions) (b64 string, key *ecdsa.PrivateKey) 
 	return base64.StdEncoding.EncodeToString(der), key
 }
 
-// spokeIdentity is a client certificate the harness CA has issued, ready to
-// present to the mutual-TLS /renew route.
+// spokeIdentity is a client certificate an authority has issued, in the shape a
+// spoke holds it: the DER chain it sends to /renew and the key that signs the
+// challenge.
 type spokeIdentity struct {
 	clusterID string
 	serial    string
@@ -770,22 +772,32 @@ type spokeIdentity struct {
 	key       *ecdsa.PrivateKey
 }
 
+// chain is the DER certificate chain as [RenewRequest.Chain] carries it.
+func (s spokeIdentity) chain() [][]byte { return s.tlsCert.Certificate }
+
 // issueSpoke issues a client certificate for clusterID the way a successful
 // enrollment would.
 func (h *harness) issueSpoke(clusterID string) spokeIdentity {
 	h.t.Helper()
-	b64, key := makeCSR(h.t, csrOptions{CommonName: "spoke"})
+	return issueSpokeFrom(h.t, h.ca, clusterID)
+}
+
+// issueSpokeFrom issues a spoke certificate from an arbitrary authority, so a
+// test can present one that is perfectly formed and signed by the wrong CA.
+func issueSpokeFrom(t *testing.T, authority *ca.CA, clusterID string) spokeIdentity {
+	t.Helper()
+	b64, key := makeCSR(t, csrOptions{CommonName: "spoke"})
 	der, err := base64.StdEncoding.DecodeString(b64)
 	if err != nil {
-		h.t.Fatalf("decode csr: %v", err)
+		t.Fatalf("decode csr: %v", err)
 	}
-	certPEM, cert, err := h.ca.IssueSpokeFromCSR(der, clusterID)
+	certPEM, cert, err := authority.IssueSpokeFromCSR(der, clusterID)
 	if err != nil {
-		h.t.Fatalf("IssueSpokeFromCSR: %v", err)
+		t.Fatalf("IssueSpokeFromCSR: %v", err)
 	}
 	block, _ := pem.Decode(certPEM)
 	if block == nil {
-		h.t.Fatal("issued certificate is not PEM")
+		t.Fatal("issued certificate is not PEM")
 	}
 	return spokeIdentity{
 		clusterID: clusterID,
@@ -795,37 +807,91 @@ func (h *harness) issueSpoke(clusterID string) spokeIdentity {
 	}
 }
 
-// mtlsServer starts the public mux behind the hub's own mutual-TLS
-// configuration.
-//
-// It is [ca.CA.ServerTLSConfig] with the "h2" ALPN pin cleared, because
-// httptest speaks HTTP/1.1 and pinning h2 would break the handshake for a
-// reason that has nothing to do with what is under test. Everything that
-// decides identity -- RequireAndVerifyClientCert, the CA pool, and the
-// VerifyPeerCertificate hook that rejects an identity-less or revoked leaf --
-// is the production configuration.
-func (h *harness) mtlsServer(clientAuth tls.ClientAuthType) *httptest.Server {
+// otherAuthority builds a second CA with the same trust domain as the harness
+// one. A certificate it issues is perfect in every observable way except its
+// signature, which is exactly the case chain verification exists to catch.
+func (h *harness) otherAuthority() *ca.CA {
 	h.t.Helper()
-	conf := h.ca.ServerTLSConfig(h.serverCert(), func(serial string) bool {
-		entries, err := h.store.ListRevokedCerts(context.Background())
-		if err != nil {
-			return false
-		}
-		return slices.ContainsFunc(entries, func(rc RevokedCert) bool { return rc.Serial == serial })
-	})
-	conf.NextProtos = nil
-	conf.ClientAuth = clientAuth
-	return h.startTLS(conf)
+	dir := h.t.TempDir()
+	authority, err := ca.LoadOrCreate(
+		filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key"),
+		ca.Options{Clock: h.clock.Now, TrustDomain: h.ca.TrustDomain()})
+	if err != nil {
+		h.t.Fatalf("ca.LoadOrCreate: %v", err)
+	}
+	return authority
 }
 
-// mtlsChainOnlyServer starts the public mux behind a listener that verifies
-// the client chain against the hub CA and does nothing else.
+// challenge fetches one renewal challenge from the public mux.
+func (h *harness) challenge() RenewChallengeResponse {
+	h.t.Helper()
+	resp := h.do(h.public, http.MethodGet, "/renew/challenge", "", nil)
+	if resp.StatusCode != http.StatusOK {
+		h.t.Fatalf("GET /renew/challenge: status = %d", resp.StatusCode)
+	}
+	var out RenewChallengeResponse
+	decode(h.t, resp, &out)
+	if len(out.Nonce) == 0 {
+		h.t.Fatal("the hub issued an empty renewal challenge")
+	}
+	return out
+}
+
+// verifyNonce runs the hub's own challenge check, so a test can assert that
+// what the hub issued is what the hub accepts without going through a route.
+func (h *harness) verifyNonce(nonce []byte) error {
+	h.t.Helper()
+	srv, err := newServer(Options{
+		Store: h.store, Hasher: h.hasher, CA: h.ca, Verifier: h.verifier, Clock: h.clock.Now,
+	})
+	if err != nil {
+		h.t.Fatalf("newServer: %v", err)
+	}
+	return srv.verifyRenewNonce(nonce, h.clock.Now())
+}
+
+// signRenew produces the proof of possession a renewal carries. Every argument
+// is explicit so a test can sign the wrong thing on purpose.
+func signRenew(t *testing.T, key *ecdsa.PrivateKey, nonce []byte, protocolVersion, clusterID string) []byte {
+	t.Helper()
+	sig, err := certproof.Sign(key, nonce, protocolVersion, clusterID)
+	if err != nil {
+		t.Fatalf("certproof.Sign: %v", err)
+	}
+	return sig
+}
+
+// renewRequestFor builds a well-formed renewal for id against a fresh
+// challenge, reusing id's key for the CSR the way a real spoke would not (it
+// generates a new one) but which keeps the fixture small where the key under
+// test is the one that signs.
+func (h *harness) renewRequestFor(id spokeIdentity) RenewRequest {
+	h.t.Helper()
+	nonce := h.challenge().Nonce
+	csr, _ := makeCSR(h.t, csrOptions{CommonName: "spoke"})
+	return RenewRequest{
+		CSR:       csr,
+		Chain:     id.chain(),
+		Signature: signRenew(h.t, id.key, nonce, certproof.RenewProtocolVersion, id.clusterID),
+		Nonce:     nonce,
+	}
+}
+
+// renew posts a renewal to the plain-HTTP public mux, which is the production
+// shape: the hub is behind an ingress that terminates TLS, so r.TLS is nil.
+func (h *harness) renew(body any) *http.Response {
+	h.t.Helper()
+	return h.do(h.public, http.MethodPost, "/renew", "", body)
+}
+
+// tlsServer starts the public mux behind a TLS listener that will accept a
+// client certificate but decides nothing on the strength of one.
 //
-// It exists because the production hook rejects an identity-less or revoked
-// certificate during the handshake, so with it installed the handler's own
-// checks for exactly those two cases could never run and would be untested.
-// Defence in depth is only depth if each layer is separately proven.
-func (h *harness) mtlsChainOnlyServer(clientAuth tls.ClientAuthType) *httptest.Server {
+// No route needs it any more: renewal proves possession inside the request
+// body, because behind the ingress of ADR-0014 there is no TLS state to read.
+// It survives so that one test can present a client certificate at the TLS
+// layer and prove the handler pays it no attention at all.
+func (h *harness) tlsServer(clientAuth tls.ClientAuthType) *httptest.Server {
 	h.t.Helper()
 	return h.startTLS(&tls.Config{
 		Certificates: []tls.Certificate{h.serverCert()},
@@ -856,9 +922,9 @@ func (h *harness) startTLS(conf *tls.Config) *httptest.Server {
 	return srv
 }
 
-// mtlsClient returns an HTTP client that trusts the harness CA and presents
-// the given identity. A zero identity presents no client certificate.
-func (h *harness) mtlsClient(id spokeIdentity) *http.Client {
+// tlsClient returns an HTTP client that trusts the harness CA and presents the
+// given identity. A zero identity presents no client certificate.
+func (h *harness) tlsClient(id spokeIdentity) *http.Client {
 	h.t.Helper()
 	conf := &tls.Config{RootCAs: h.ca.Pool(), MinVersion: tls.VersionTLS13}
 	if len(id.tlsCert.Certificate) > 0 {
@@ -867,7 +933,8 @@ func (h *harness) mtlsClient(id spokeIdentity) *http.Client {
 	return &http.Client{Transport: &http.Transport{TLSClientConfig: conf}}
 }
 
-// postJSON issues a POST with an explicit client, for the mutual-TLS routes.
+// postJSON issues a POST with an explicit client, for the tests that need a
+// TLS connection of their own rather than the harness's plain-HTTP server.
 func postJSON(t *testing.T, client *http.Client, url string, body any) *http.Response {
 	t.Helper()
 	raw, err := json.Marshal(body)

@@ -47,12 +47,15 @@ sequenceDiagram
     Hub-->>Spoke: {certificate, caBundle, notAfter}
     Spoke->>Spoke: write key + cert to its identity Secret
 
-    Spoke->>Hub: dial tunnel with mTLS
+    Spoke->>Hub: dial tunnel, prove possession in-band (ADR-0014)
     Hub->>Hub: identity from the URI SAN, never from the payload
     Hub-->>Spoke: connected
 
     loop at 50% of certificate life, ±10% jitter
-        Spoke->>Hub: POST /renew over the existing mTLS (no token)
+        Spoke->>Hub: GET /renew/challenge (no credential)
+        Hub-->>Spoke: {nonce, expiresAt}
+        Spoke->>Hub: POST /renew {csr, chain, signature, nonce} (no token)
+        Hub->>Hub: verify nonce, chain, revocation, signature
         Hub-->>Spoke: fresh certificate
     end
 ```
@@ -174,12 +177,49 @@ certificate value.
 
 The spoke renews at **half its certificate's lifetime**, with ±10% jitter so
 that a hundred spokes installed on the same afternoon do not all renew in the
-same minute a week later. Renewal runs over the existing mutually authenticated
-tunnel and needs **no enrollment token** — a spoke that renews on schedule never
-needs an operator again.
+same minute a week later. Renewal needs **no enrollment token** — a spoke that
+renews on schedule never needs an operator again.
 
-The cluster ID for a renewal comes from the presented client certificate, never
-from the request body.
+Renewal is **not** mutual TLS, and this is worth being explicit about because it
+used to be. The hub sits behind an Ingress that terminates TLS
+([ADR-0014](adr/0014-websocket-tunnel-through-standard-ingress.md)), so a client
+certificate presented at the TLS layer reaches the Ingress and stops there; the
+hub sees no peer certificate on any request. A renewal route that read one
+therefore refused every renewal in production while passing every test that
+spoke TLS to it directly, and since certificates live 14 days and renew at half
+life, the whole fleet would have disconnected on day 14.
+
+Possession is proved in the request body instead, with the same construction the
+tunnel handshake uses:
+
+```
+GET  /renew/challenge  ->  {"nonce": "<base64>", "expiresAt": "<RFC3339>"}
+POST /renew  {csr, chain, signature, nonce}
+                       ->  {certificate, caBundle, clusterId, notAfter, serial}
+```
+
+The hub verifies, in this order: that the nonce is one it issued and has not
+expired; that the chain verifies against its CA; that the serial is not on the
+revocation denylist; and that the signature over
+`transcript(nonce, "renew-v1", clusterID)` checks out under the leaf's public
+key. Only then does it issue.
+
+`GET /renew/challenge` needs no credential — it is the step that lets a spoke
+authenticate at all — and it stores nothing. The nonce carries its own proof
+(`random ‖ expiry ‖ HMAC(pepper, …)`), so a challenge issued by one hub replica
+is accepted by any other without shared state, and a hub restart does not
+invalidate one in flight. It expires after 60 seconds.
+
+The nonce is deliberately **not** single-use. Replaying a captured renewal
+request returns a certificate for the public key in the captured CSR — a key
+whose private half belongs to the spoke that built it — so a replay gains an
+attacker nothing it can use. Enrollment is the opposite case: its token is a
+bearer credential, so it is burned atomically and a second redemption is a
+security event.
+
+The cluster ID for a renewal comes from the verified certificate, never from the
+request body. `RenewRequest` has no cluster field at all, and the hub decodes
+strictly, so a body that tries to name one is rejected outright.
 
 When a renewal fails, the spoke logs at `warn` and retries. Inside the last 24
 hours before expiry it escalates to `error`. Alert on

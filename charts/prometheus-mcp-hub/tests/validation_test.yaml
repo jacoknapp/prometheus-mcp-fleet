@@ -96,3 +96,43 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: "state.backend is \"file\" but state.file is empty"
+
+  # cert-manager. `certManager.enabled` on a cluster without the CRDs must be a
+  # named failure, not a silent no-op that leaves the Ingress with no
+  # certificate at all.
+  - it: refuses certManager.enabled where the cert-manager CRDs are absent
+    set:
+      certManager:
+        enabled: true
+        issuerRef:
+          name: letsencrypt
+    asserts:
+      - failedTemplate:
+          errorPattern: "the cert-manager.io/v1 API is not present on this cluster"
+
+  - it: refuses a cert-manager Certificate with no issuer to issue it
+    capabilities:
+      apiVersions:
+        - cert-manager.io/v1
+    set:
+      ingress:
+        enabled: true
+        host: mcp.example.com
+      certManager:
+        enabled: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "certManager.issuerRef.name is empty"
+
+  - it: refuses a cert-manager Certificate with no name to put on it
+    capabilities:
+      apiVersions:
+        - cert-manager.io/v1
+    set:
+      certManager:
+        enabled: true
+        issuerRef:
+          name: letsencrypt
+    asserts:
+      - failedTemplate:
+          errorPattern: "there is no name to put on the certificate"

@@ -37,10 +37,12 @@ var layer = map[string]int{
 	"config":  0,
 	"tunnel":  0,
 	"promapi": 0,
-	// mtls builds the client side of the tunnel's TLS config. It sits at L0 so
-	// the spoke can present a certificate without linking internal/ca, which is
-	// the code that issues identities for the whole fleet.
-	"mtls": 0,
+	// certproof is the proof-of-possession transcript the tunnel handshake and
+	// certificate renewal both sign. It is pure crypto over the standard
+	// library, and it sits at L0 because the two packages that must share it —
+	// tunnel/wstun at L1 and hubapi at L2 — are on different layers and neither
+	// may import the other.
+	"certproof": 0,
 
 	// L1 — infrastructure. May touch the network, the filesystem and the clock.
 	"obs":               1,

@@ -174,17 +174,54 @@ exactly one place.
 {{- end -}}
 
 {{/*
-Host part of a `host:port` endpoint, tolerating a bracketed IPv6 literal.
+Hub endpoint parsing. Since ADR-0014 a hub endpoint is a URL --
+wss://hub.example.com/tunnel -- not host:port. The tunnel is a WebSocket on the
+hub's ordinary MCP listener behind a standard Ingress, so the port that matters
+for egress is the ordinary HTTPS port unless the URL names another.
+
 Argument is the endpoint string, not the root context.
 */}}
-{{- define "prometheus-mcp-spoke.endpointHost" -}}
-{{- $parts := splitList ":" . -}}
-{{- join ":" (initial $parts) | trimPrefix "[" | trimSuffix "]" -}}
+
+{{/* Authority of an endpoint URL, e.g. "hub.example.com:8443" or "[2001:db8::1]". */}}
+{{- define "prometheus-mcp-spoke.endpointAuthority" -}}
+{{- $u := urlParse . -}}
+{{- $u.host | default "" -}}
 {{- end -}}
 
-{{/* Port part of a `host:port` endpoint. Argument is the endpoint string. */}}
+{{/* Host of an endpoint URL, with any port and any IPv6 brackets removed. */}}
+{{- define "prometheus-mcp-spoke.endpointHost" -}}
+{{- $auth := include "prometheus-mcp-spoke.endpointAuthority" . -}}
+{{- if hasPrefix "[" $auth -}}
+{{- regexFind "^\\[[^]]*\\]" $auth | trimPrefix "[" | trimSuffix "]" -}}
+{{- else if regexMatch ":[0-9]+$" $auth -}}
+{{- join ":" (initial (splitList ":" $auth)) -}}
+{{- else -}}
+{{- $auth -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Port of an endpoint URL: the explicit one, else the scheme default. wss and
+https are 443, ws and http are 80. This is why the NetworkPolicy no longer
+assumes 8443 -- there is no separate tunnel listener to assume it for.
+*/}}
 {{- define "prometheus-mcp-spoke.endpointPort" -}}
-{{- last (splitList ":" .) -}}
+{{- $u := urlParse . -}}
+{{- $auth := $u.host | default "" -}}
+{{- $port := "" -}}
+{{- if hasPrefix "[" $auth -}}
+{{- $rest := regexReplaceAll "^\\[[^]]*\\]" $auth "" -}}
+{{- if hasPrefix ":" $rest -}}{{- $port = trimPrefix ":" $rest -}}{{- end -}}
+{{- else if regexMatch ":[0-9]+$" $auth -}}
+{{- $port = last (splitList ":" $auth) -}}
+{{- end -}}
+{{- if $port -}}
+{{- $port -}}
+{{- else if or (eq $u.scheme "ws") (eq $u.scheme "http") -}}
+80
+{{- else -}}
+443
+{{- end -}}
 {{- end -}}
 
 {{/*
@@ -198,6 +235,22 @@ networkPolicy.egress.hub.cidrs. Argument is the endpoint string.
 {{- printf "%s/32" $host -}}
 {{- else if contains ":" $host -}}
 {{- printf "%s/128" $host -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Ports the NetworkPolicy opens towards the hub: the explicit override when given,
+otherwise one per distinct hub endpoint URL.
+*/}}
+{{- define "prometheus-mcp-spoke.hubEgressPorts" -}}
+{{- if .Values.networkPolicy.egress.hub.ports -}}
+{{- toYaml .Values.networkPolicy.egress.hub.ports -}}
+{{- else -}}
+{{- $ports := list -}}
+{{- range .Values.hub.endpoints -}}
+{{- $ports = append $ports (include "prometheus-mcp-spoke.endpointPort" . | int) -}}
+{{- end -}}
+{{- toYaml ($ports | uniq) -}}
 {{- end -}}
 {{- end -}}
 
@@ -280,12 +333,17 @@ watching.
 
 {{/* ---- the hub is in another cluster ---- */}}
 {{- if not .Values.hub.endpoints -}}
-{{- fail "prometheus-mcp-spoke: hub.endpoints is required and has no default. The hub runs in a DIFFERENT cluster, so there is no in-cluster address to fall back to: set it to the external host:port your hub's tunnel Service publishes, one entry per hub replica." -}}
+{{- fail "prometheus-mcp-spoke: hub.endpoints is required and has no default. The hub runs in a DIFFERENT cluster, so there is no in-cluster address to fall back to: set it to the tunnel URL your hub's Ingress publishes, such as wss://hub.example.com/tunnel, one entry per hub replica." -}}
 {{- end -}}
 {{- range .Values.hub.endpoints -}}
-{{- $port := include "prometheus-mcp-spoke.endpointPort" . -}}
-{{- if or (not (contains ":" .)) (not (regexMatch "^[0-9]+$" $port)) -}}
-{{- fail (printf "prometheus-mcp-spoke: hub.endpoints entry %q is not host:port. The spoke dials a raw mTLS socket, not a URL, so a scheme or a missing port cannot be guessed." .) -}}
+{{- if not (regexMatch "^wss?://" .) -}}
+{{- fail (printf "prometheus-mcp-spoke: hub.endpoints entry %q must be a wss:// (or ws://) URL such as wss://hub.example.com/tunnel. Since ADR-0014 the tunnel is a WebSocket on the hub's ordinary MCP listener behind a standard Ingress, not a raw socket on its own port. A bare host:port is read by the binary as wss://<host:port>/tunnel, which for the old :8443 default is simply the wrong port and never connects." .) -}}
+{{- end -}}
+{{- if not (include "prometheus-mcp-spoke.endpointHost" .) -}}
+{{- fail (printf "prometheus-mcp-spoke: hub.endpoints entry %q has no host." .) -}}
+{{- end -}}
+{{- if regexMatch "[?#]" . -}}
+{{- fail (printf "prometheus-mcp-spoke: hub.endpoints entry %q carries a query or fragment; the tunnel URL is a plain path such as wss://hub.example.com/tunnel." .) -}}
 {{- end -}}
 {{- end -}}
 {{- if not .Values.hub.apiUrl -}}
