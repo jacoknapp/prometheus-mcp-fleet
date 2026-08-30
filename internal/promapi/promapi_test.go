@@ -381,6 +381,14 @@ func TestValidateLabelName(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsInvalidLabelParameter(t *testing.T) {
+	t.Parallel()
+	err := Validate(EndpointTargets, url.Values{"scrapePool": {"bad-label"}}, false)
+	if !errors.Is(err, ErrInvalidParam) || !strings.Contains(err.Error(), "valid label name") {
+		t.Errorf("Validate(targets, invalid scrapePool) = %v, want an invalid label error", err)
+	}
+}
+
 func TestValidateDuration(t *testing.T) {
 	t.Parallel()
 

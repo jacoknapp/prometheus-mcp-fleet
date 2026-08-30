@@ -22,9 +22,6 @@ import (
 
 // Defaults applied when the corresponding Config field is zero.
 const (
-	// DefaultRefreshInterval matches the spoke's PMF_FACTS_REFRESH_INTERVAL
-	// default.
-	DefaultRefreshInterval = 10 * time.Minute
 	// DefaultTopN caps every sampled list (jobs, namespaces, metric
 	// prefixes). Twenty-five is enough to characterise a cluster and small
 	// enough that a hundred of them still fit in an agent's context.
@@ -37,6 +34,12 @@ const (
 	// be shortened to fit MaxFactsBytes.
 	truncationNote = "[facts note: sampled lists were shortened to fit the facts size cap]"
 )
+
+// defaultRefreshInterval returns the spoke's PMF_FACTS_REFRESH_INTERVAL
+// default. It is evaluated in executable code so mutation testing can prove
+// that the ten-minute value is asserted rather than treating const
+// initialisation as permanently uncovered.
+func defaultRefreshInterval() time.Duration { return 10 * time.Minute }
 
 // clusterIDRE is the cluster identity grammar from BUILD_SPEC section 5. The
 // value is advisory here — the hub overwrites it from the client certificate —
@@ -66,7 +69,7 @@ type Config struct {
 	// Client is the spoke's Prometheus client.
 	Client *promclient.Client
 	// RefreshInterval is how often [Collector.Run] recollects. Defaults to
-	// [DefaultRefreshInterval].
+	// ten minutes.
 	RefreshInterval time.Duration
 	// TopN caps the jobs, namespaces and metric-prefix lists. Defaults to
 	// [DefaultTopN].
@@ -138,7 +141,7 @@ func New(cfg Config) (*Collector, error) {
 
 	c := &Collector{
 		client:        cfg.Client,
-		refreshEvery:  orDefault(cfg.RefreshInterval, DefaultRefreshInterval),
+		refreshEvery:  orDefault(cfg.RefreshInterval, defaultRefreshInterval()),
 		topN:          orDefault(cfg.TopN, DefaultTopN),
 		maxFactsBytes: orDefault(cfg.MaxFactsBytes, DefaultMaxFactsBytes),
 		k8sVersion:    cfg.KubernetesVersion,
@@ -318,16 +321,7 @@ capping:
 		if err != nil || len(b) <= c.maxFactsBytes {
 			break
 		}
-		switch {
-		case len(cluster.Prometheus.Namespaces) > 0:
-			cluster.Prometheus.Namespaces = halve(cluster.Prometheus.Namespaces)
-		case len(cluster.Prometheus.Jobs) > 0:
-			cluster.Prometheus.Jobs = halve(cluster.Prometheus.Jobs)
-		case len(cluster.Prometheus.MetricPrefixes) > 0:
-			cluster.Prometheus.MetricPrefixes = halve(cluster.Prometheus.MetricPrefixes)
-		case len(cluster.Prometheus.ExternalLabels) > 0:
-			cluster.Prometheus.ExternalLabels = nil
-		default:
+		if !shrinkSampled(cluster) {
 			// Nothing sampled is left; the remainder is operator-supplied text
 			// and is not ours to silently discard.
 			break capping
@@ -340,6 +334,28 @@ capping:
 	if truncated {
 		cluster.Description = appendNote(cluster.Description, truncationNote)
 	}
+}
+
+// shrinkSampled removes half of the least valuable remaining sampled field.
+// Its ordered ifs make the precedence explicit and independently testable.
+func shrinkSampled(cluster *fleet.Cluster) bool {
+	if len(cluster.Prometheus.Namespaces) > 0 {
+		cluster.Prometheus.Namespaces = halve(cluster.Prometheus.Namespaces)
+		return true
+	}
+	if len(cluster.Prometheus.Jobs) > 0 {
+		cluster.Prometheus.Jobs = halve(cluster.Prometheus.Jobs)
+		return true
+	}
+	if len(cluster.Prometheus.MetricPrefixes) > 0 {
+		cluster.Prometheus.MetricPrefixes = halve(cluster.Prometheus.MetricPrefixes)
+		return true
+	}
+	if len(cluster.Prometheus.ExternalLabels) > 0 {
+		cluster.Prometheus.ExternalLabels = nil
+		return true
+	}
+	return false
 }
 
 // halve returns the first half of s, or nil once a single element is left.

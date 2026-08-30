@@ -1241,3 +1241,16 @@ func TestNopMetricsIsInert(t *testing.T) {
 		t.Errorf("default metrics = %T, want NopMetrics", r.metrics)
 	}
 }
+
+func TestPollFactsStopsWhenRegistryCloses(t *testing.T) {
+	t.Parallel()
+	r := mustNew(t, Options{FactsPollInterval: time.Hour})
+	close(r.done)
+	s := newFakeSession("prod", 1)
+	r.wg.Add(1)
+	r.pollFacts(context.Background(), "prod", &entry{}, s)
+	r.wg.Wait()
+	if got := s.describes(); len(got) != 0 {
+		t.Errorf("pollFacts called Describe after registry close: %v", got)
+	}
+}

@@ -33,6 +33,14 @@ func TestTokenSource(t *testing.T) {
 		}
 	})
 
+	t.Run("read failure before first token", func(t *testing.T) {
+		t.Parallel()
+		ts := newTokenSource("/proc/self/mem", 0, time.Now, slog.New(slog.DiscardHandler))
+		if _, err := ts.get(); err == nil || !strings.Contains(err.Error(), "token file") {
+			t.Errorf("get() = %v, want a read failure", err)
+		}
+	})
+
 	t.Run("empty file", func(t *testing.T) {
 		t.Parallel()
 		path := filepath.Join(t.TempDir(), "token")
@@ -156,6 +164,22 @@ func TestTokenSource(t *testing.T) {
 		got, err := ts.get()
 		if err != nil || got != "v1" {
 			t.Errorf("get() = %q, %v; want the cached v1", got, err)
+		}
+	})
+
+	t.Run("keeps cached token after a post-stat read failure", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "token")
+		writeTokenFile(t, path, "v1", 1000)
+		now := time.Unix(0, 0)
+		ts := newTokenSource(path, DefaultTokenTTL, func() time.Time { return now }, slog.New(slog.DiscardHandler))
+		if got, err := ts.get(); err != nil || got != "v1" {
+			t.Fatalf("initial get() = %q, %v", got, err)
+		}
+		ts.path = "/proc/self/mem"
+		now = now.Add(time.Hour)
+		if got, err := ts.get(); err != nil || got != "v1" {
+			t.Errorf("get() after read failure = %q, %v; want cached v1", got, err)
 		}
 	})
 

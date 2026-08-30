@@ -11,6 +11,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"errors"
+	"io"
 	"log/slog"
 	"math/big"
 	"net/http"
@@ -143,6 +144,23 @@ func TestDoRequestFailure(t *testing.T) {
 		}
 	})
 
+	t.Run("response body read failure", func(t *testing.T) {
+		t.Parallel()
+		c, err := New(Config{
+			APIServerURL: "https://api:443",
+			Namespace:    testNamespace,
+			HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusOK, Body: errReadCloser{}}, nil
+			})},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.GetSecret(t.Context(), "state"); err == nil || !strings.Contains(err.Error(), "read response") {
+			t.Errorf("GetSecret error = %v, want a response read failure", err)
+		}
+	})
+
 	t.Run("malformed json", func(t *testing.T) {
 		t.Parallel()
 		c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
@@ -205,6 +223,15 @@ func TestDoRequestFailure(t *testing.T) {
 		}
 	})
 }
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+type errReadCloser struct{}
+
+func (errReadCloser) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+func (errReadCloser) Close() error             { return nil }
 
 func TestRequestHeaders(t *testing.T) {
 	t.Parallel()
@@ -418,6 +445,26 @@ func TestInCluster(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestInClusterReportsNonMissingProjectedFileError(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("KUBERNETES_SERVICE_HOST", "10.96.0.1")
+	t.Setenv("KUBERNETES_SERVICE_PORT", "443")
+	if err := os.WriteFile(filepath.Join(dir, "namespace"), []byte("monitoring"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A self-referential symlink makes Stat fail with ELOOP, not ErrNotExist.
+	if err := os.Symlink("token", filepath.Join(dir, "token")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ca.crt"), pemCert(selfSignedDER(t)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := inCluster(dir)
+	if err == nil || errors.Is(err, ErrNotInCluster) || !strings.Contains(err.Error(), "stat") {
+		t.Errorf("inCluster error = %v, want a non-missing stat failure", err)
 	}
 }
 

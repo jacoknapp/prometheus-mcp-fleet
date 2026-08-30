@@ -147,8 +147,8 @@ func TestNewAppliesDefaults(t *testing.T) {
 		cfg.RefreshInterval = 0
 		cfg.TopN = 0
 	})
-	if got := c.RefreshInterval(); got != clusterfacts.DefaultRefreshInterval {
-		t.Fatalf("RefreshInterval = %s, want %s", got, clusterfacts.DefaultRefreshInterval)
+	if got := c.RefreshInterval(); got != 10*time.Minute {
+		t.Fatalf("RefreshInterval = %s, want %s", got, 10*time.Minute)
 	}
 	if got, want := c.Generation(), fixedNow.Add(-time.Hour).UnixNano(); got != want {
 		t.Fatalf("Generation = %d, want the StartedAt nanos %d", got, want)

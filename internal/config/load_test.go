@@ -40,6 +40,24 @@ func TestEnvKey(t *testing.T) {
 	}
 }
 
+func TestHelpErrorMessageIsUsage(t *testing.T) {
+	t.Parallel()
+	err := &HelpError{Usage: "usage text"}
+	if got := err.Error(); got != err.Usage {
+		t.Errorf("Error() = %q, want %q", got, err.Usage)
+	}
+}
+
+func TestSplitListDropsOnlyEmptyItems(t *testing.T) {
+	t.Parallel()
+	if got := splitList(" \t\n "); got != nil {
+		t.Errorf("splitList of whitespace = %#v, want nil", got)
+	}
+	if got := splitList(" , , "); got != nil {
+		t.Errorf("splitList of delimiters = %#v, want nil", got)
+	}
+}
+
 func TestLoadHubDefaults(t *testing.T) {
 	t.Parallel()
 

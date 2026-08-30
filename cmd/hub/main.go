@@ -14,6 +14,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"syscall"
@@ -24,24 +25,40 @@ import (
 )
 
 func main() {
-	if err := run(os.Args[1:]); err != nil {
+	mainWithExit(os.Args[1:], os.Stderr, os.Exit)
+}
+
+func mainWithExit(args []string, stderr io.Writer, exit func(int)) {
+	if err := run(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
-			os.Exit(0)
+			exit(0)
+			return
 		}
-		fmt.Fprintf(os.Stderr, "hub: %v\n", err)
-		os.Exit(1)
+		fmt.Fprintf(stderr, "hub: %v\n", err)
+		exit(1)
 	}
 }
 
 // run is separated from main so that the exit path is the only thing main
 // does, which keeps error handling testable.
 func run(args []string) error {
+	return runWith(args, os.Getenv, os.Stdout, hub.Run)
+}
+
+// runWith contains the command wiring while allowing tests to exercise the
+// successful lifecycle without starting listeners or sending process signals.
+func runWith(
+	args []string,
+	getenv func(string) string,
+	stdout io.Writer,
+	runHub func(context.Context, *config.Hub) error,
+) error {
 	if len(args) > 0 && args[0] == "version" {
-		fmt.Println(version.Get())
+		fmt.Fprintln(stdout, version.Get())
 		return nil
 	}
 
-	cfg, err := config.LoadHub(args, os.Getenv)
+	cfg, err := config.LoadHub(args, getenv)
 	if err != nil {
 		return err
 	}
@@ -54,5 +71,5 @@ func run(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
 
-	return hub.Run(ctx, cfg)
+	return runHub(ctx, cfg)
 }

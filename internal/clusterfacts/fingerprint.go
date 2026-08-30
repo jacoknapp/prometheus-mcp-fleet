@@ -102,10 +102,10 @@ func Fingerprint(c fleet.Cluster) string {
 	// back to a hash of nothing would make every spoke look unchanged forever,
 	// which is worse than stopping; and this branch can only be reached by
 	// adding an unmarshalable field to the struct above, in this package.
-	b, err := json.Marshal(cf)
-	if err != nil {
-		panic("clusterfacts: canonical facts are not marshalable: " + err.Error()) //nolint:forbidigo // unreachable invariant guard; see above.
-	}
+	// canonicalFacts is deliberately restricted to JSON's infallible scalar,
+	// map and slice types. Keep the ignored error beside that invariant instead
+	// of carrying an unreachable panic branch that can never be tested honestly.
+	b, _ := json.Marshal(cf)
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
 }

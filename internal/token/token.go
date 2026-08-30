@@ -12,7 +12,6 @@ import (
 	"hash/crc32"
 	"log/slog"
 	"math/big"
-	"strings"
 
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/fleet"
 )
@@ -144,6 +143,9 @@ func Mint(class fleet.KeyClass) (Minted, error) {
 //
 // kid must be exactly [KIDLen] base62 characters.
 func MintWithKID(class fleet.KeyClass, kid string) (Minted, error) {
+	if len(kid) != KIDLen || !isBase62(kid) {
+		return Minted{}, fmt.Errorf("mint kid %q: %w", kid, ErrMalformed)
+	}
 	return mintWith(class, kid, randRead)
 }
 
@@ -160,18 +162,13 @@ func mintWith(class fleet.KeyClass, kid string, read func([]byte) (int, error)) 
 		if kid, err = randomBase62(KIDLen, read); err != nil {
 			return Minted{}, fmt.Errorf("mint kid: %w", err)
 		}
-	} else if len(kid) != KIDLen || !isBase62(kid) {
-		return Minted{}, fmt.Errorf("mint kid %q: %w", kid, ErrMalformed)
 	}
 	secret := make([]byte, SecretBytes)
 	if _, err := read(secret); err != nil {
 		return Minted{}, fmt.Errorf("mint secret: %w", err)
 	}
-	enc, ok := encodeBase62(secret, SecretLen)
-	if !ok {
-		// Unreachable: 62^43 > 2^256, so 32 bytes always fit in 43 digits.
-		return Minted{}, fmt.Errorf("mint secret: %w", ErrMalformed)
-	}
+	// 62^43 > 2^256, so every 32-byte secret fits by construction.
+	enc, _ := encodeBase62(secret, SecretLen)
 
 	buf := make([]byte, 0, Len)
 	buf = append(buf, Prefix...)
@@ -182,7 +179,7 @@ func mintWith(class fleet.KeyClass, kid string, read func([]byte) (int, error)) 
 	buf = append(buf, '_')
 	buf = append(buf, encodeCRC(crc32.Checksum(buf[:bodyLen], castagnoli))...)
 
-	return Minted{Raw: RawToken(buf), KID: kid, Secret: secret}, nil
+	return Minted{Raw: newRawToken(string(buf)), KID: kid, Secret: secret}, nil
 }
 
 // Parse decodes a raw token into its class, its public KID and its secret
@@ -244,22 +241,6 @@ func Parse(raw string) (class fleet.KeyClass, kid string, secret []byte, err err
 		return "", "", nil, fmt.Errorf("secret out of range: %w", ErrMalformed)
 	}
 	return class, raw[headLen:kidEnd], secret, nil
-}
-
-// Pattern returns the regular expression that matches any well-formed token,
-// for publication to GitHub secret scanning and for log scrubbers of last
-// resort. It matches shape only: a string can match and still fail [Parse] on
-// its checksum.
-//
-// The expression uses RE2 syntax with no backtracking and is safe to run over
-// untrusted text.
-func Pattern() string {
-	classes := make([]string, 0, 3)
-	for _, c := range []fleet.KeyClass{fleet.ClassAdmin, fleet.ClassAgent, fleet.ClassEnrollment} {
-		classes = append(classes, string(c))
-	}
-	return fmt.Sprintf(`\b%s(?:%s)_[0-9A-Za-z]{%d}_[0-9A-Za-z]{%d}\b`,
-		Prefix, strings.Join(classes, "|"), KIDLen+SecretLen, CRCLen)
 }
 
 // encodeCRC renders a CRC-32C value as exactly [CRCLen] base62 digits,

@@ -155,8 +155,5 @@ func sharedVectorLabels(samples []VectorSample) map[string]string {
 			return nil
 		}
 	}
-	if len(shared) == 0 {
-		return nil
-	}
 	return shared
 }

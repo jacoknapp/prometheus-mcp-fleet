@@ -143,9 +143,6 @@ func (c *lruCache[K, V]) moveToFront(n *lruNode[K, V]) {
 // evictTail drops the least recently used entry. The caller holds c.mu.
 func (c *lruCache[K, V]) evictTail() {
 	n := c.tail
-	if n == nil {
-		return
-	}
 	c.unlink(n)
 	delete(c.m, n.key)
 }

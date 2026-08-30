@@ -57,9 +57,6 @@ func FitTokens[T any](items []T, ceiling int, build func([]T) any) ([]T, bool) {
 			return items[:n], true
 		}
 		next := n * ceiling / max(size, 1)
-		if next >= n {
-			next = n - 1
-		}
 		n = next
 	}
 	return items[:0], true

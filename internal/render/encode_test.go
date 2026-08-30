@@ -167,6 +167,51 @@ func TestEncodeRangeAllNonFiniteSeriesSortLast(t *testing.T) {
 	}
 }
 
+func TestRankByMaxCoversBothFiniteBoundariesAndTies(t *testing.T) {
+	t.Parallel()
+	real := SeriesStream{Metric: map[string]string{"id": "real"}, Values: []Point{{V: 1}}}
+	nan := SeriesStream{Metric: map[string]string{"id": "nan"}, Values: []Point{{V: math.NaN()}}}
+	for _, in := range []Matrix{{nan, real}, {real, nan}} {
+		got := rankByMax(in)
+		if !got[0].ok || got[0].s.Metric["id"] != "real" {
+			t.Errorf("rankByMax(%v) = %+v, want finite series first", in, got)
+		}
+	}
+	tied := rankByMax(Matrix{
+		{Metric: map[string]string{"id": "z"}, Values: []Point{{V: 2}}},
+		{Metric: map[string]string{"id": "a"}, Values: []Point{{V: 2}}},
+	})
+	if got := tied[0].s.Metric["id"]; got != "a" {
+		t.Errorf("equal maxima sorted first %q, want stable label key a", got)
+	}
+}
+
+func TestEncodingHelpersHandleEmptyLabelsAndWarnings(t *testing.T) {
+	t.Parallel()
+	rows := vectorRows([]VectorSample{{Value: Point{V: 1}}}, nil)
+	if rows[0][1] == nil {
+		t.Error("vectorRows emitted a nil labels object; the compact row schema requires an object")
+	}
+	shared, unchanged := factorShared([]RangeSeries{})
+	if shared != nil || unchanged == nil || len(unchanged) != 0 {
+		t.Errorf("factorShared(empty) = %v, %#v; want nil and a non-nil empty slice", shared, unchanged)
+	}
+	if got := sanitizeAll([]string{"\x00", "\x7f"}); got != nil {
+		t.Errorf("sanitizeAll(forbidden-only) = %q, want nil", got)
+	}
+}
+
+func TestEncodeInstantBreaksValueTiesByLabels(t *testing.T) {
+	t.Parallel()
+	got := EncodeInstant(InstantInput{ResultType: "vector", Vector: Vector{
+		{Metric: map[string]string{"id": "z"}, Value: Point{V: 1}},
+		{Metric: map[string]string{"id": "a"}, Value: Point{V: 1}},
+	}}, Options{})
+	if got.Rows[0][1].(map[string]string)["id"] != "a" {
+		t.Errorf("equal-valued rows were not ordered by labels: %+v", got.Rows)
+	}
+}
+
 // TestEncodeRangeEmpty covers the no-data case.
 func TestEncodeRangeEmpty(t *testing.T) {
 	t.Parallel()

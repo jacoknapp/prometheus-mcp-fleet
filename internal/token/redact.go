@@ -15,15 +15,22 @@ import (
 const Redacted = "[REDACTED]"
 
 // RawToken is a complete `pmf_` credential as handed to an operator exactly
-// once. It is a string underneath, but every path fmt, log/slog and
-// encoding/json use to turn a value into text is overridden to emit
+// once. Its representation is deliberately opaque, and every path fmt,
+// log/slog and encoding/json use to turn a value into text is overridden to emit
 // [Redacted], so it cannot leak through %v, %+v, %s, %q, a structured log
 // field, a JSON response body, or a panic trace that formats a struct
 // containing one.
 //
 // Reveal is the only way out. Call it at the single point where the secret is
 // delivered to its owner, never on a path that logs, serialises or errors.
-type RawToken string
+type RawToken struct {
+	raw string
+}
+
+// newRawToken wraps freshly minted credential text. Keeping construction
+// private prevents callers from converting RawToken back to string or []byte
+// without the greppable Reveal call.
+func newRawToken(raw string) RawToken { return RawToken{raw: raw} }
 
 // String implements fmt.Stringer and returns [Redacted].
 func (RawToken) String() string { return Redacted }
@@ -39,19 +46,24 @@ func (RawToken) LogValue() slog.Value { return slog.StringValue(Redacted) }
 // round-trip through a serialised document.
 func (RawToken) MarshalJSON() ([]byte, error) { return []byte(`"` + Redacted + `"`), nil }
 
+// MarshalText implements encoding.TextMarshaler. RawToken is a struct rather
+// than a string alias so encoding/json must use this method for map keys instead
+// of serialising the underlying credential.
+func (RawToken) MarshalText() ([]byte, error) { return []byte(Redacted), nil }
+
 // Reveal returns the underlying token text. Every call site is a place a
 // secret can escape, so each one should be individually justifiable.
-func (r RawToken) Reveal() string { return string(r) }
+func (r RawToken) Reveal() string { return r.raw }
 
 // IsZero reports whether the token is empty. It is safe to call on a value
 // that must not be revealed.
-func (r RawToken) IsZero() bool { return len(r) == 0 }
+func (r RawToken) IsZero() bool { return r.raw == "" }
 
 // Compile-time proof that the redacting interfaces are actually satisfied by
 // the value type (not just the pointer), because fmt and slog will only use
 // them if the method set of the value has them.
 var (
-	_ fmt.Stringer   = RawToken("")
-	_ fmt.GoStringer = RawToken("")
-	_ slog.LogValuer = RawToken("")
+	_ fmt.Stringer   = RawToken{}
+	_ fmt.GoStringer = RawToken{}
+	_ slog.LogValuer = RawToken{}
 )

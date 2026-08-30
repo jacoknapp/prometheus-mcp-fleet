@@ -19,6 +19,8 @@ to, see [CONTRIBUTING.md](../CONTRIBUTING.md).
 | `helm` | 3.19+ | Chart work |
 | `kubectl`, `kind` | recent | End-to-end tests |
 | `helm-unittest`, `helm-docs` | — | Chart tests and README generation |
+| `deadcode` | x/tools v0.49.0 | Production reachability gate |
+| `gremlins` | v0.6.0 | Mutation coverage and test-efficacy gate |
 
 `make help` lists every target.
 
@@ -28,6 +30,8 @@ to, see [CONTRIBUTING.md](../CONTRIBUTING.md).
 make check     # what CI runs on a pull request: fmt, vet, lint, test -race
 make test      # go test -race -covermode=atomic ./...
 make cover     # per-package coverage summary
+make deadcode  # fail review on production functions neither binary can reach
+make mutation  # 100% mutant coverage and efficacy; intentionally slow
 make build     # both binaries into ./bin
 ```
 
@@ -36,7 +40,15 @@ A single package while you work on it:
 ```bash
 go test -race -cover ./internal/promproxy/
 go test -race -run TestGenerationCAS -v ./internal/registry/
+make mutation MUTATION_PACKAGES=./internal/registry MUTATION_WORKERS=4
 ```
+
+`make test` rejects any uncovered statement block in handwritten code. Generated
+protobuf is excluded from that number because `buf breaking` and the regenerate
+diff are its executable contract; commands and reusable test-support packages
+are included. `make mutation` uses a 99.99 threshold because Gremlins treats a
+score *equal* to the configured threshold as a failure—99.99 therefore means an
+actual 100% for both mutant coverage and killed-mutant efficacy.
 
 ## Running it locally, without Kubernetes
 

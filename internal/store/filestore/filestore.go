@@ -43,6 +43,19 @@ type Options struct {
 	// refused locally. Zero means [store.MaxStateBytes]; negative is
 	// unbounded.
 	MaxBytes int
+
+	// The remaining fields are package-private fault boundaries used to verify
+	// durable-write failures without changing the exported storage contract.
+	stat       func(string) (fs.FileInfo, error)
+	createTemp func(string, string) (tempFile, error)
+	rename     func(string, string) error
+}
+
+type tempFile interface {
+	Write([]byte) (int, error)
+	Sync() error
+	Close() error
+	Name() string
 }
 
 // Store is a store.Store backed by one JSON file.
@@ -54,6 +67,9 @@ type Store struct {
 	mu     sync.Mutex
 	data   []byte
 	closed bool
+
+	createTemp func(string, string) (tempFile, error)
+	rename     func(string, string) error
 }
 
 // Ensure the backend satisfies the interface it claims.
@@ -73,7 +89,22 @@ func Open(opts Options) (*Store, error) {
 	if maxBytes == 0 {
 		maxBytes = store.MaxStateBytes
 	}
-	s := &Store{path: opts.Path, now: store.Clock(opts.Clock), maxBytes: maxBytes}
+	createTemp := opts.createTemp
+	if createTemp == nil {
+		createTemp = func(dir, pattern string) (tempFile, error) { return os.CreateTemp(dir, pattern) }
+	}
+	rename := opts.rename
+	if rename == nil {
+		rename = os.Rename
+	}
+	stat := opts.stat
+	if stat == nil {
+		stat = os.Stat
+	}
+	s := &Store{
+		path: opts.Path, now: store.Clock(opts.Clock), maxBytes: maxBytes,
+		createTemp: createTemp, rename: rename,
+	}
 
 	if dir := filepath.Dir(opts.Path); dir != "" {
 		if err := os.MkdirAll(dir, DirMode); err != nil {
@@ -83,10 +114,7 @@ func Open(opts Options) (*Store, error) {
 	raw, err := os.ReadFile(opts.Path)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
-		fresh, encErr := store.NewState().Encode()
-		if encErr != nil {
-			return nil, fmt.Errorf("filestore: %w", encErr)
-		}
+		fresh, _ := store.NewState().Encode()
 		if err := s.write(fresh); err != nil {
 			return nil, err
 		}
@@ -94,7 +122,7 @@ func Open(opts Options) (*Store, error) {
 	case err != nil:
 		return nil, fmt.Errorf("filestore: read %s: %w", opts.Path, err)
 	}
-	fi, err := os.Stat(opts.Path)
+	fi, err := stat(opts.Path)
 	if err != nil {
 		return nil, fmt.Errorf("filestore: stat %s: %w", opts.Path, err)
 	}
@@ -172,7 +200,7 @@ func (s *Store) mutate(ctx context.Context, fn func(*store.State) (bool, error))
 // that the rename itself is durable rather than merely the data.
 func (s *Store) write(b []byte) error {
 	dir := filepath.Dir(s.path)
-	tmp, err := os.CreateTemp(dir, ".state-*.tmp")
+	tmp, err := s.createTemp(dir, ".state-*.tmp")
 	if err != nil {
 		return fmt.Errorf("filestore: temp file in %s: %w", dir, err)
 	}
@@ -192,7 +220,7 @@ func (s *Store) write(b []byte) error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("filestore: close %s: %w", tmpName, err)
 	}
-	if err := os.Rename(tmpName, s.path); err != nil {
+	if err := s.rename(tmpName, s.path); err != nil {
 		return fmt.Errorf("filestore: rename onto %s: %w", s.path, err)
 	}
 	if d, err := os.Open(dir); err == nil {

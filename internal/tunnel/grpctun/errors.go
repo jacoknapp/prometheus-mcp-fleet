@@ -65,9 +65,6 @@ const (
 	// ReasonContextCancelled means the spoke itself gave up, normally because
 	// the process is shutting down.
 	ReasonContextCancelled Reason = "context-cancelled"
-	// ReasonServerShutdown means the local gRPC server was stopped while the
-	// connection was still healthy.
-	ReasonServerShutdown Reason = "server-shutdown"
 )
 
 // DialError is what a spoke-side Dial always returns. Dial never returns a bare

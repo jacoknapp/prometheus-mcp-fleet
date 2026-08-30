@@ -46,9 +46,6 @@ func ParseFormat(s string) (Format, error) {
 	}
 }
 
-// String implements fmt.Stringer.
-func (f Format) String() string { return string(f) }
-
 // Defaults applied by [Options.WithDefaults].
 const (
 	// DefaultMaxSeries is how many series a single-cluster range result keeps

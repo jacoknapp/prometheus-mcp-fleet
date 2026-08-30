@@ -62,6 +62,8 @@ func TestHubValidate(t *testing.T) {
 		{"log format", func(c *Hub) { c.LogFormat = "xml" }, "--log-format"},
 		{"data dir", func(c *Hub) { c.DataDir = "" }, "--data-dir"},
 		{"pepper file", func(c *Hub) { c.PepperFile = "" }, "--pepper-file"},
+		{"state secret required", func(c *Hub) { c.StateBackend, c.StateSecretName = StateBackendSecret, "" }, "--state-secret-name"},
+		{"state file required", func(c *Hub) { c.StateBackend, c.StateFile = StateBackendFile, "" }, "--state-file"},
 		{"ca cert without key", func(c *Hub) { c.CACertFile, c.CAKeyFile = "/ca.pem", "" }, "--ca-key-file"},
 		{"ca key without cert", func(c *Hub) { c.CACertFile, c.CAKeyFile = "", "/ca.key" }, "--ca-cert-file"},
 		{"trust domain empty", func(c *Hub) { c.TrustDomain = "" }, "--trust-domain"},
@@ -157,6 +159,8 @@ func TestSpokeValidate(t *testing.T) {
 	}{
 		{"no endpoints", func(c *Spoke) { c.HubEndpoints = nil }, "--hub-endpoints"},
 		{"endpoint neither url nor host:port", func(c *Spoke) { c.HubEndpoints = []string{"hub.example.com"} }, "--hub-endpoints"},
+		{"endpoint empty", func(c *Spoke) { c.HubEndpoints = []string{""} }, "is empty"},
+		{"endpoint unparseable URL", func(c *Spoke) { c.HubEndpoints = []string{"wss://%zz"} }, "not a URL"},
 		{"endpoint without host", func(c *Spoke) { c.HubEndpoints = []string{":8443"} }, "has no host"},
 		{"endpoint port zero", func(c *Spoke) { c.HubEndpoints = []string{"hub:0"} }, "invalid port"},
 		{"endpoint port not numeric", func(c *Spoke) { c.HubEndpoints = []string{"hub:https"} }, "invalid port"},
@@ -218,6 +222,7 @@ func TestSpokeValidate(t *testing.T) {
 			"--cluster-description",
 		},
 		{"data dir", func(c *Spoke) { c.DataDir = "" }, "--data-dir"},
+		{"identity secret required", func(c *Spoke) { c.IdentityBackend, c.IdentitySecretName = IdentityBackendSecret, "" }, "--identity-secret-name"},
 		{"prometheus url missing", func(c *Spoke) { c.PrometheusURL = "" }, "--prometheus-url"},
 		{"prometheus url scheme", func(c *Spoke) { c.PrometheusURL = "tcp://prom:9090" }, "--prometheus-url"},
 		{"prometheus timeout", func(c *Spoke) { c.PrometheusTimeout = 0 }, "--prometheus-timeout"},
@@ -263,6 +268,22 @@ func TestSpokeValidateInsecureIsAllowedWhenAcknowledged(t *testing.T) {
 	c.AllowInsecure = true
 	if err := c.Validate(); err != nil {
 		t.Errorf("Validate() = %v, want nil once PMF_ALLOW_INSECURE is set", err)
+	}
+}
+
+func TestSpokeValidateAcceptsLegacyHostPortEndpoint(t *testing.T) {
+	t.Parallel()
+	c := validSpoke(t)
+	c.HubEndpoints = []string{"hub.example.com:8443"}
+	if err := c.Validate(); err != nil {
+		t.Errorf("Validate() rejected the documented legacy host:port endpoint: %v", err)
+	}
+}
+
+func TestCheckPairAcceptsBothPathsEmpty(t *testing.T) {
+	t.Parallel()
+	if err := checkPair("cert", "", "key", ""); err != nil {
+		t.Errorf("checkPair(empty, empty) = %v, want nil", err)
 	}
 }
 

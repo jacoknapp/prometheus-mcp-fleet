@@ -40,6 +40,13 @@ type TracingConfig struct {
 	Build version.Build
 }
 
+// newTraceExporter is the network boundary of tracing initialisation. Keeping
+// it narrow lets tests exercise exporter and shutdown failures deterministically
+// without depending on a collector or a particular gRPC dial schedule.
+var newTraceExporter = func(ctx context.Context, endpoint string) (sdktrace.SpanExporter, error) {
+	return otlptracegrpc.New(ctx, endpointOption(endpoint))
+}
+
 // InitTracing installs the global tracer provider and text-map propagator, and
 // returns a shutdown function that flushes pending spans.
 //
@@ -60,7 +67,7 @@ func InitTracing(ctx context.Context, cfg TracingConfig) (func(context.Context) 
 		return func(context.Context) error { return nil }, nil
 	}
 
-	exporter, err := otlptracegrpc.New(ctx, endpointOption(cfg.Endpoint))
+	exporter, err := newTraceExporter(ctx, cfg.Endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("otlp trace exporter %q: %w", cfg.Endpoint, err)
 	}

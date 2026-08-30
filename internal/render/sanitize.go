@@ -136,14 +136,8 @@ func ClipRunes(s string, max int) string {
 	if utf8.RuneCountInString(s) <= max {
 		return s
 	}
-	n := 0
-	for i := range s {
-		if n == max {
-			return s[:i] + ClipMarker
-		}
-		n++
-	}
-	return s
+	runes := []rune(s)
+	return string(runes[:max]) + ClipMarker
 }
 
 // ClipBytes sanitises s and limits it to max bytes without splitting a rune,

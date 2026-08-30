@@ -5,6 +5,7 @@ package filestore
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -76,4 +77,91 @@ func TestOpenUnreadableFile(t *testing.T) {
 	if _, err := Open(Options{Path: path}); err == nil || !strings.Contains(err.Error(), "read") {
 		t.Errorf("Open error = %v, want a read failure", err)
 	}
+}
+
+func TestOpenReportsStatFailure(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(path, []byte(`{"schemaVersion":1}`), FileMode); err != nil {
+		t.Fatal(err)
+	}
+	want := errors.New("injected stat failure")
+	_, err := Open(Options{
+		Path: path,
+		stat: func(string) (fs.FileInfo, error) { return nil, want },
+	})
+	if !errors.Is(err, want) || !strings.Contains(err.Error(), "stat") {
+		t.Errorf("Open error = %v, want named stat failure", err)
+	}
+}
+
+func TestOpenReportsInitialWriteFailure(t *testing.T) {
+	t.Parallel()
+	want := errors.New("injected create-temp failure")
+	_, err := Open(Options{
+		Path: filepath.Join(t.TempDir(), "state.json"),
+		createTemp: func(string, string) (tempFile, error) {
+			return nil, want
+		},
+	})
+	if !errors.Is(err, want) || !strings.Contains(err.Error(), "temp file") {
+		t.Errorf("Open error = %v, want initial temp-file failure", err)
+	}
+}
+
+func TestWriteReportsEveryTemporaryFileFailure(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		configure func(*fakeTempFile)
+		want      string
+		wantClose bool
+	}{
+		{"write", func(f *fakeTempFile) { f.writeErr = errors.New("write failed") }, "write", true},
+		{"sync", func(f *fakeTempFile) { f.syncErr = errors.New("sync failed") }, "sync", true},
+		{"close", func(f *fakeTempFile) { f.closeErr = errors.New("close failed") }, "close", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "state.json")
+			s, err := Open(Options{Path: path})
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := append([]byte(nil), s.data...)
+			f := &fakeTempFile{name: filepath.Join(filepath.Dir(path), "fake.tmp")}
+			tc.configure(f)
+			s.createTemp = func(string, string) (tempFile, error) { return f, nil }
+			err = s.write([]byte(`{"schemaVersion":1,"epoch":9}`))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("write error = %v, want %q failure", err, tc.want)
+			}
+			if tc.wantClose && f.closes == 0 {
+				t.Error("temporary file was not closed after failure")
+			}
+			if string(s.data) != string(before) {
+				t.Error("failed write changed the in-memory committed document")
+			}
+		})
+	}
+}
+
+type fakeTempFile struct {
+	name                        string
+	writeErr, syncErr, closeErr error
+	closes                      int
+}
+
+func (f *fakeTempFile) Name() string { return f.name }
+func (f *fakeTempFile) Write(p []byte) (int, error) {
+	if f.writeErr != nil {
+		return 0, f.writeErr
+	}
+	return len(p), nil
+}
+func (f *fakeTempFile) Sync() error { return f.syncErr }
+func (f *fakeTempFile) Close() error {
+	f.closes++
+	return f.closeErr
 }

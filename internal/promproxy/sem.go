@@ -52,14 +52,6 @@ func (s *inflightSem) release(clusterID string) {
 	s.inflight[clusterID] = n
 }
 
-// held reports the current in-flight count for a cluster. Test and diagnostic
-// use only.
-func (s *inflightSem) held(clusterID string) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.inflight[clusterID]
-}
-
 // byteSem is a weighted semaphore over the hub's global response-byte budget.
 // It is acquired for a call's worst case before the call is made, which is the
 // only way to bound the hub's memory: by the time a body is arriving it is too
@@ -162,12 +154,4 @@ func (s *byteSem) grantLocked() {
 		s.free -= w.n
 		close(w.ready)
 	}
-}
-
-// available reports the currently unreserved byte budget. Test and diagnostic
-// use only.
-func (s *byteSem) available() int64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.free
 }

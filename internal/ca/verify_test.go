@@ -26,7 +26,7 @@ func TestVerifyChain(t *testing.T) {
 		{
 			name: "issued by this authority",
 			chain: func(t *testing.T) []*x509.Certificate {
-				return []*x509.Certificate{spokeCert(t, authority, "prod").Leaf}
+				return []*x509.Certificate{issuedSpokeCert(t, authority, "prod")}
 			},
 			wantCluster: "prod",
 		},
@@ -38,33 +38,23 @@ func TestVerifyChain(t *testing.T) {
 		{
 			name: "issued by a different authority",
 			chain: func(t *testing.T) []*x509.Certificate {
-				return []*x509.Certificate{spokeCert(t, other, "prod").Leaf}
+				return []*x509.Certificate{issuedSpokeCert(t, other, "prod")}
 			},
 			wantErr: ErrUntrustedChain,
 		},
 		{
 			name: "a peer cannot promote its own issuer by appending it",
 			chain: func(t *testing.T) []*x509.Certificate {
-				return []*x509.Certificate{spokeCert(t, other, "prod").Leaf, other.Certificate()}
+				return []*x509.Certificate{issuedSpokeCert(t, other, "prod"), other.Certificate()}
 			},
 			wantErr: ErrUntrustedChain,
 		},
 		{
 			name: "valid signature but no spoke identity",
 			chain: func(t *testing.T) []*x509.Certificate {
-				// A server certificate from the same CA: it chains, but it
-				// carries no URI SAN, so it names no cluster.
-				cert, err := authority.IssueServer([]string{"hub.test"}, nil)
-				if err != nil {
-					t.Fatalf("IssueServer: %v", err)
-				}
-				leaf, err := x509.ParseCertificate(cert.Certificate[0])
-				if err != nil {
-					t.Fatalf("ParseCertificate: %v", err)
-				}
-				return []*x509.Certificate{leaf}
+				return []*x509.Certificate{certWithoutIdentity(t, authority)}
 			},
-			wantErr: ErrUntrustedChain,
+			wantErr: ErrNoIdentity,
 		},
 	}
 

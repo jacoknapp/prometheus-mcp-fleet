@@ -24,8 +24,7 @@ import (
 // validity of anything the tests mint.
 var testTime = time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC)
 
-// fakeClock is a manually advanced clock. It is safe for concurrent use
-// because ServerTLSConfig reads it from the handshake goroutine.
+// fakeClock is a manually advanced clock safe for concurrent use.
 type fakeClock struct {
 	mu sync.Mutex
 	t  time.Time
@@ -71,6 +70,34 @@ func newKey(t *testing.T) *ecdsa.PrivateKey {
 		t.Fatalf("generate key: %v", err)
 	}
 	return k
+}
+
+// certWithoutIdentity returns a valid client certificate from c that carries
+// no URI SAN. It is useful for proving chain validity alone cannot establish a
+// fleet identity.
+func certWithoutIdentity(t *testing.T, c *CA) *x509.Certificate {
+	t.Helper()
+	_, leaf, err := c.sign(&x509.Certificate{
+		Subject:               pkix.Name{CommonName: "identity-less client"},
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		BasicConstraintsValid: true,
+	}, newKey(t).Public(), DefaultSpokeCertTTL)
+	if err != nil {
+		t.Fatalf("sign identity-less certificate: %v", err)
+	}
+	return leaf
+}
+
+func issuedSpokeCert(t *testing.T, c *CA, clusterID string) *x509.Certificate {
+	t.Helper()
+	key := newKey(t)
+	csrDER := newCSR(t, key, csrOptions{})
+	_, cert, err := c.IssueSpokeFromCSR(csrDER, clusterID)
+	if err != nil {
+		t.Fatalf("IssueSpokeFromCSR: %v", err)
+	}
+	return cert
 }
 
 // csrOptions describes what a test CSR should claim. Every field here is

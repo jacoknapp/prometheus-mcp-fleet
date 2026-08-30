@@ -240,10 +240,7 @@ func (s *Store) load(ctx context.Context, fresh bool) (*kube.Secret, error) {
 	}
 
 	// First use. Create the Secret with an empty document.
-	empty, err := store.NewState().Encode()
-	if err != nil {
-		return nil, fmt.Errorf("secretstore: %w", err)
-	}
+	empty, _ := store.NewState().Encode()
 	created, err := s.kc.CreateSecret(ctx, &kube.Secret{
 		Name:   s.name,
 		Data:   map[string][]byte{s.key: empty},
@@ -330,9 +327,6 @@ func (s *Store) mutate(ctx context.Context, fn func(*store.State) (bool, error))
 		// Copy the Secret's other keys forward: the CA material may share
 		// this object, and a blind replace would delete it.
 		data := maps.Clone(sec.Data)
-		if data == nil {
-			data = map[string][]byte{}
-		}
 		data[s.key] = encoded
 
 		updated, err := s.kc.UpdateSecret(ctx, &kube.Secret{

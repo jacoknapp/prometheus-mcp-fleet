@@ -13,6 +13,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"math/big"
 	"os"
@@ -34,6 +35,34 @@ const (
 	pemTypeCertificate = "CERTIFICATE"
 	pemTypePrivateKey  = "PRIVATE KEY"
 	pemTypeECKeyLegacy = "EC PRIVATE KEY"
+)
+
+type durableFile interface {
+	io.Writer
+	Name() string
+	Sync() error
+	Chmod(fs.FileMode) error
+	Close() error
+}
+
+type syncCloser interface {
+	Sync() error
+	Close() error
+}
+
+// These are the narrow process and filesystem boundaries whose failures must
+// be handled safely. Tests replace one at a time to exercise error paths that
+// otherwise depend on root privileges, filesystem type, or CSPRNG failure.
+var (
+	caGenerateKey       = ecdsa.GenerateKey
+	caRandomInt         = rand.Int
+	caCreateCertificate = x509.CreateCertificate
+	caReadFile          = os.ReadFile
+	caStat              = os.Stat
+	caRemove            = os.Remove
+	caCreateTemp        = func(dir, pattern string) (durableFile, error) { return os.CreateTemp(dir, pattern) }
+	caLink              = os.Link
+	caOpenDir           = func(path string) (syncCloser, error) { return os.Open(path) }
 )
 
 // CA is the hub's certificate authority. It is immutable after construction
@@ -58,6 +87,8 @@ const (
 	initPollAttempts = 20
 	initPollInterval = 10 * time.Millisecond
 )
+
+var loadOrCreateCreate = Create
 
 // LoadOrCreate loads the CA at certPath and keyPath, creating a new one
 // atomically if neither file exists.
@@ -97,7 +128,7 @@ func LoadOrCreate(certPath, keyPath string, opts Options) (*CA, error) {
 			lastIncomplete = fmt.Errorf("%w: %s present but %s missing", ErrCAIncomplete, present, missing)
 			continue
 		}
-		c, err := Create(certPath, keyPath, opts)
+		c, err := loadOrCreateCreate(certPath, keyPath, opts)
 		if errors.Is(err, ErrCAExists) {
 			// Another process won the creation race. Its material is
 			// authoritative; loop round and load it once both files land.
@@ -122,7 +153,7 @@ func Load(certPath, keyPath string, opts Options) (*CA, error) {
 		return nil, err
 	}
 
-	certPEM, err := os.ReadFile(certPath)
+	certPEM, err := caReadFile(certPath)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, fmt.Errorf("%w: %s", ErrCANotFound, certPath)
@@ -130,7 +161,7 @@ func Load(certPath, keyPath string, opts Options) (*CA, error) {
 		return nil, fmt.Errorf("read ca certificate %s: %w", certPath, err)
 	}
 
-	info, err := os.Stat(keyPath)
+	info, err := caStat(keyPath)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, fmt.Errorf("%w: %s", ErrCANotFound, keyPath)
@@ -140,7 +171,7 @@ func Load(certPath, keyPath string, opts Options) (*CA, error) {
 	if mode := info.Mode().Perm(); mode&0o077 != 0 {
 		return nil, fmt.Errorf("%w: %s has mode %04o", ErrInsecureKeyMode, keyPath, mode)
 	}
-	keyPEM, err := os.ReadFile(keyPath)
+	keyPEM, err := caReadFile(keyPath)
 	if err != nil {
 		return nil, fmt.Errorf("read ca key %s: %w", keyPath, err)
 	}
@@ -190,7 +221,7 @@ func Create(certPath, keyPath string, opts Options) (*CA, error) {
 		}
 	}
 
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	key, err := caGenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("generate ca key: %w", err)
 	}
@@ -216,18 +247,14 @@ func Create(certPath, keyPath string, opts Options) (*CA, error) {
 		MaxPathLen:     0,
 		MaxPathLenZero: true,
 	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	der, err := caCreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
 		return nil, fmt.Errorf("self-sign ca certificate: %w", err)
 	}
-	cert, err := x509.ParseCertificate(der)
-	if err != nil {
-		return nil, fmt.Errorf("parse new ca certificate: %w", err)
-	}
-	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
-	if err != nil {
-		return nil, fmt.Errorf("marshal ca key: %w", err)
-	}
+	// x509.CreateCertificate's successful output and this supported key type
+	// are valid by construction; neither standard-library conversion can fail.
+	cert, _ := x509.ParseCertificate(der)
+	keyDER, _ := x509.MarshalPKCS8PrivateKey(key)
 
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: pemTypeCertificate, Bytes: der})
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: pemTypePrivateKey, Bytes: keyDER})
@@ -237,7 +264,7 @@ func Create(certPath, keyPath string, opts Options) (*CA, error) {
 	}
 	if err := linkFileExclusive(certPath, certPEM, 0o644); err != nil {
 		// Do not leave a key behind with no certificate.
-		_ = os.Remove(keyPath)
+		_ = caRemove(keyPath)
 		return nil, err
 	}
 	return newCA(opts, cert, key), nil
@@ -295,7 +322,7 @@ func SerialHex(n *big.Int) string {
 // never be exercised.
 func newSerial() (*big.Int, error) {
 	limit := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), serialBits), big.NewInt(1))
-	n, err := rand.Int(rand.Reader, limit)
+	n, err := caRandomInt(rand.Reader, limit)
 	if err != nil {
 		return nil, fmt.Errorf("generate serial: %w", err)
 	}
@@ -376,7 +403,7 @@ func checkCAUsable(cert *x509.Certificate, key *ecdsa.PrivateKey) error {
 // exists but is not a regular file is an error, because renaming over a
 // directory or a device node is not something to paper over.
 func regularFileExists(path string) (bool, error) {
-	info, err := os.Stat(path)
+	info, err := caStat(path)
 	switch {
 	case err == nil && info.Mode().IsRegular():
 		return true, nil
@@ -400,12 +427,12 @@ func regularFileExists(path string) (bool, error) {
 // the new name itself is durable.
 func linkFileExclusive(path string, data []byte, mode fs.FileMode) error {
 	dir := filepath.Dir(path)
-	f, err := os.CreateTemp(dir, ".ca-*.tmp")
+	f, err := caCreateTemp(dir, ".ca-*.tmp")
 	if err != nil {
 		return fmt.Errorf("create temp in %s: %w", dir, err)
 	}
 	tmp := f.Name()
-	defer func() { _ = os.Remove(tmp) }()
+	defer func() { _ = caRemove(tmp) }()
 
 	if _, err := f.Write(data); err != nil {
 		_ = f.Close()
@@ -422,13 +449,13 @@ func linkFileExclusive(path string, data []byte, mode fs.FileMode) error {
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("close %s: %w", tmp, err)
 	}
-	if err := os.Link(tmp, path); err != nil {
+	if err := caLink(tmp, path); err != nil {
 		if errors.Is(err, fs.ErrExist) {
 			return fmt.Errorf("%w: %s", ErrCAExists, path)
 		}
 		return fmt.Errorf("link %s to %s: %w", tmp, path, err)
 	}
-	d, err := os.Open(dir)
+	d, err := caOpenDir(dir)
 	if err != nil {
 		return fmt.Errorf("open %s: %w", dir, err)
 	}

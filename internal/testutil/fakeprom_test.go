@@ -24,6 +24,9 @@ func get(t *testing.T, f *testutil.FakePrometheus, path string) (int, []byte) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Keep wire-size and slow-body assertions deterministic. Tests that need
+	// gzip opt in explicitly rather than inheriting net/http's transparent gzip.
+	req.Header.Set("Accept-Encoding", "identity")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("GET %s: %v", path, err)

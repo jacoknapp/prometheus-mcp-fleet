@@ -34,7 +34,7 @@ func TestHubLogValueRedactsURLCredentials(t *testing.T) {
 	if !strings.Contains(line, "redacted@") {
 		t.Errorf("log line does not mark the redaction:\n%s", line)
 	}
-	for _, want := range []string{"mcpAddr", "dataDir", "pepperFile", "trustDomain", "enableStatusConfig"} {
+	for _, want := range []string{"mcp_addr", "data_dir", "pepper_file", "trust_domain", "enable_status_config"} {
 		if !strings.Contains(line, want) {
 			t.Errorf("log line is missing %q:\n%s", want, line)
 		}
@@ -55,7 +55,7 @@ func TestSpokeLogValueRedactsURLCredentials(t *testing.T) {
 			t.Errorf("log line leaks %q:\n%s", secret, line)
 		}
 	}
-	for _, want := range []string{"clusterID", "env=prod", "hubEndpoints", "prometheusBearerTokenFile"} {
+	for _, want := range []string{"cluster_id", "env=prod", "hub_endpoints", "prometheus_bearer_token_file"} {
 		if !strings.Contains(line, want) {
 			t.Errorf("log line is missing %q:\n%s", want, line)
 		}

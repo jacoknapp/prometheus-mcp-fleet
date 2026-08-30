@@ -76,8 +76,10 @@ jobs:
         with:
           version: ${{ env.HELM_VERSION }}
 
-      # `make helm-lint` runs `helm lint --strict` on each chart and then again
-      # once per file in that chart's ci/ directory.
+      # `make helm-lint` runs `helm lint --strict` once per file in each chart's
+      # ci/ directory, and never on defaults alone: the spoke's schema marks
+      # cluster.id, hub.endpoints and hub.apiUrl required with no defaults, so a
+      # defaults-only lint can only ever fail.
       - name: helm lint --strict (all ci/ values files)
         run: make helm-lint
 

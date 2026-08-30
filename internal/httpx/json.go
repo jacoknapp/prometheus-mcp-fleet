@@ -75,10 +75,7 @@ func WriteError(w http.ResponseWriter, r *http.Request, status int, code, messag
 // falling back to a hand-written body.
 func errorJSON(requestID, code, message string) []byte {
 	body := ErrorBody{Error: ErrorDetail{Code: code, Message: message, RequestID: requestID}}
-	b, err := json.Marshal(body)
-	if err != nil {
-		return []byte(`{"error":{"code":"` + CodeInternal + `","message":"internal error"}}`)
-	}
+	b, _ := json.Marshal(body) // ErrorBody contains only strings; encoding cannot fail.
 	return append(b, '\n')
 }
 

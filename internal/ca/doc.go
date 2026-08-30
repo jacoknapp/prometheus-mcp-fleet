@@ -6,12 +6,11 @@
 // # Responsibility
 //
 // The hub is its own root of trust. This package owns a single, offline-shaped
-// root keypair that signs exactly two kinds of leaf certificate:
+// root keypair whose production responsibility is signing spoke client
+// certificates:
 //
 //   - spoke client certificates, minted during enrollment, which are the only
-//     thing that establishes a spoke's identity to the hub; and
-//   - the hub tunnel listener's server certificate, unless the operator
-//     supplies one from an external PKI.
+//     thing that establishes a spoke's identity to the hub.
 //
 // # Trust model
 //
@@ -54,12 +53,10 @@
 //     by re-enrolling or by renewing well before expiry. Because the identity
 //     lives in the SAN and not in the key, a renewed certificate is
 //     indistinguishable from the old one to the registry.
-//   - The hub server certificate is regenerated whenever the hub starts without
-//     an operator-supplied one, so it rotates for free.
-//   - Revocation is not CRL-driven at the transport: [CA.ServerTLSConfig]
-//     consults an in-process predicate on every handshake, which is immediate
-//     and cannot be stale. [CA.CRL] exists to publish the same information to
-//     anything outside the hub that wants it.
+//   - Revocation is not CRL-driven in the WebSocket tunnel. Its application
+//     handshake consults the live revocation store, which is immediate and
+//     cannot be stale. [CA.CRL] exists to publish the same information to
+//     consumers outside the hub.
 //   - The root itself has a 10 year default lifetime and no automated rotation.
 //     Rotating it is a fleet-wide re-enrollment and must be planned; the hub
 //     reports readiness as false once the root is within 24h of expiry so the

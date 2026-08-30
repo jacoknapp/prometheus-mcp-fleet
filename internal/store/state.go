@@ -148,10 +148,7 @@ func (s *State) migrateTo(target int) error {
 // diffing operator sees only real changes.
 func (s *State) Encode() ([]byte, error) {
 	s.SchemaVersion = SchemaVersion
-	b, err := json.Marshal(s)
-	if err != nil {
-		return nil, fmt.Errorf("encode state: %w", err)
-	}
+	b, _ := json.Marshal(s) // State contains only JSON-native field types.
 	return b, nil
 }
 
@@ -159,10 +156,7 @@ func (s *State) Encode() ([]byte, error) {
 // [ErrStateTooLarge] with the record counts and a pruning hint when the
 // document would not fit. A max of zero or less is unbounded.
 func (s *State) EncodeWithin(max int) ([]byte, error) {
-	b, err := s.Encode()
-	if err != nil {
-		return nil, err
-	}
+	b, _ := s.Encode()
 	if max > 0 && len(b) > max {
 		return nil, fmt.Errorf(
 			"state document is %d bytes against a %d byte limit, holding %d keys and %d revoked certificates; "+

@@ -14,7 +14,6 @@ import (
 	"encoding/pem"
 	"errors"
 	"math/big"
-	"net"
 	"net/url"
 	"strings"
 	"testing"
@@ -277,10 +276,9 @@ func TestIssueClampsToCAExpiryAndRefusesAfterIt(t *testing.T) {
 
 	clock := newFakeClock(testTime)
 	c := mustCA(t, Options{
-		CATTL:         time.Hour,
-		SpokeCertTTL:  14 * 24 * time.Hour,
-		ServerCertTTL: 14 * 24 * time.Hour,
-		Clock:         clock.Now,
+		CATTL:        time.Hour,
+		SpokeCertTTL: 14 * 24 * time.Hour,
+		Clock:        clock.Now,
 	})
 	caExpiry := testTime.Add(time.Hour)
 
@@ -292,14 +290,6 @@ func TestIssueClampsToCAExpiryAndRefusesAfterIt(t *testing.T) {
 	if got := cert.NotAfter.UTC(); !got.Equal(caExpiry) {
 		t.Errorf("leaf NotAfter = %s, want it clamped to the CA's %s", got, caExpiry)
 	}
-	srv, err := c.IssueServer([]string{"hub.test"}, nil)
-	if err != nil {
-		t.Fatalf("IssueServer: %v", err)
-	}
-	if got := srv.Leaf.NotAfter.UTC(); !got.Equal(caExpiry) {
-		t.Errorf("server NotAfter = %s, want it clamped to the CA's %s", got, caExpiry)
-	}
-
 	// One nanosecond before expiry issuance still works.
 	clock.Advance(time.Hour - time.Nanosecond)
 	if _, _, err := c.IssueSpokeFromCSR(csrDER, "prod"); err != nil {
@@ -311,77 +301,8 @@ func TestIssueClampsToCAExpiryAndRefusesAfterIt(t *testing.T) {
 	if _, _, err := c.IssueSpokeFromCSR(csrDER, "prod"); !errors.Is(err, ErrCAExpired) {
 		t.Errorf("issuance at CA expiry: got %v, want ErrCAExpired", err)
 	}
-	if _, err := c.IssueServer([]string{"hub.test"}, nil); !errors.Is(err, ErrCAExpired) {
-		t.Errorf("server issuance at CA expiry: got %v, want ErrCAExpired", err)
-	}
 	clock.Advance(24 * time.Hour)
 	if _, _, err := c.IssueSpokeFromCSR(csrDER, "prod"); !errors.Is(err, ErrCAExpired) {
 		t.Errorf("issuance after CA expiry: got %v, want ErrCAExpired", err)
-	}
-}
-
-func TestIssueServer(t *testing.T) {
-	t.Parallel()
-
-	clock := newFakeClock(testTime)
-	c := mustCA(t, Options{ServerCertTTL: 90 * 24 * time.Hour, Clock: clock.Now})
-
-	tests := []struct {
-		name    string
-		dns     []string
-		ips     []net.IP
-		wantCN  string
-		wantErr error
-	}{
-		{name: "dns only", dns: []string{"hub.fleet.local", "hub"}, wantCN: "hub.fleet.local"},
-		{name: "ip only", ips: []net.IP{net.ParseIP("10.0.0.7")}, wantCN: "prometheus-mcp-fleet hub"},
-		{name: "both", dns: []string{"hub.fleet.local"}, ips: []net.IP{net.ParseIP("::1")}, wantCN: "hub.fleet.local"},
-		{name: "neither", wantErr: ErrInvalidOptions},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			got, err := c.IssueServer(tc.dns, tc.ips)
-			if tc.wantErr != nil {
-				if !errors.Is(err, tc.wantErr) {
-					t.Fatalf("got %v, want %v", err, tc.wantErr)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("IssueServer: %v", err)
-			}
-			if got.Leaf == nil {
-				t.Fatal("Leaf is nil; crypto/tls would have to re-parse on every handshake")
-			}
-			if got.Leaf.Subject.CommonName != tc.wantCN {
-				t.Errorf("CommonName = %q, want %q", got.Leaf.Subject.CommonName, tc.wantCN)
-			}
-			if diff := cmp.Diff(tc.dns, got.Leaf.DNSNames); diff != "" {
-				t.Errorf("DNSNames (-want +got):\n%s", diff)
-			}
-			if len(got.Leaf.IPAddresses) != len(tc.ips) {
-				t.Errorf("IPAddresses = %v, want %v", got.Leaf.IPAddresses, tc.ips)
-			}
-			if diff := cmp.Diff([]x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, got.Leaf.ExtKeyUsage); diff != "" {
-				t.Errorf("ExtKeyUsage (-want +got):\n%s", diff)
-			}
-			if got.Leaf.IsCA {
-				t.Error("server certificate is a CA")
-			}
-			if len(got.Leaf.URIs) != 0 {
-				t.Errorf("server certificate carries URI SANs %v", got.Leaf.URIs)
-			}
-			if _, ok := got.PrivateKey.(*ecdsa.PrivateKey); !ok {
-				t.Errorf("private key is %T, want *ecdsa.PrivateKey", got.PrivateKey)
-			}
-			if want := testTime.Add(90 * 24 * time.Hour); !got.Leaf.NotAfter.UTC().Equal(want) {
-				t.Errorf("NotAfter = %s, want %s", got.Leaf.NotAfter.UTC(), want)
-			}
-			// A server certificate has no spoke identity.
-			if _, err := c.IdentityFromCert(got.Leaf); !errors.Is(err, ErrNoIdentity) {
-				t.Errorf("IdentityFromCert on a server certificate: got %v, want ErrNoIdentity", err)
-			}
-		})
 	}
 }

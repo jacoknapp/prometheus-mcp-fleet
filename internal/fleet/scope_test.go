@@ -101,6 +101,13 @@ func TestScopeAllowsCluster(t *testing.T) {
 	}
 }
 
+func TestDurationString(t *testing.T) {
+	t.Parallel()
+	if got := Duration(90 * time.Second).String(); got != "1m30s" {
+		t.Errorf("Duration.String() = %q, want 1m30s", got)
+	}
+}
+
 func TestScopeAllowsTool(t *testing.T) {
 	t.Parallel()
 

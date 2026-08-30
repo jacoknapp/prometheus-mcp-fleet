@@ -358,7 +358,6 @@ type bodyReader struct {
 	term      error
 	delivered int64
 	trail     tunnel.Trailer
-	published bool
 	closed    bool
 	doneOnce  sync.Once
 }
@@ -384,11 +383,7 @@ func (b *bodyReader) Read(p []byte) (int, error) {
 	if err != nil {
 		b.finished = true
 		if b.term == nil {
-			if b.closed && !b.published {
-				b.term = ErrBodyClosed
-			} else {
-				b.term = err
-			}
+			b.term = err
 		}
 		err = b.term
 	}
@@ -436,7 +431,6 @@ func (b *bodyReader) publish(t tunnel.Trailer) {
 		return
 	}
 	b.trail = t
-	b.published = true
 }
 
 func (b *bodyReader) finishOnce() {

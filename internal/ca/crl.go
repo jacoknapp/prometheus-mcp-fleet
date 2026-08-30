@@ -11,6 +11,8 @@ import (
 	"time"
 )
 
+var caCreateRevocationList = x509.CreateRevocationList
+
 // RevokedEntry is one revoked certificate.
 type RevokedEntry struct {
 	// Serial is the certificate serial in lowercase hexadecimal, exactly as
@@ -28,9 +30,9 @@ type RevokedEntry struct {
 // sane issuance sequence and therefore satisfies RFC 5280's requirement that
 // numbers increase.
 //
-// This CRL is a publication mechanism for consumers outside the hub. The hub's
-// own tunnel listener does not use it: ServerTLSConfig consults a live
-// predicate instead, which cannot be stale.
+// This CRL is a publication mechanism for consumers outside the hub. The
+// WebSocket tunnel authenticates certificates at the application layer and
+// consults the live revocation store directly, so it does not consume a CRL.
 func (c *CA) CRL(revoked []RevokedEntry, thisUpdate time.Time, validity time.Duration) ([]byte, error) {
 	if validity <= 0 {
 		return nil, fmt.Errorf("%w: crl validity %s must be positive", ErrInvalidOptions, validity)
@@ -60,7 +62,7 @@ func (c *CA) CRL(revoked []RevokedEntry, thisUpdate time.Time, validity time.Dur
 		ThisUpdate:                thisUpdate.UTC(),
 		NextUpdate:                thisUpdate.Add(validity).UTC(),
 	}
-	der, err := x509.CreateRevocationList(rand.Reader, tmpl, c.cert, c.key)
+	der, err := caCreateRevocationList(rand.Reader, tmpl, c.cert, c.key)
 	if err != nil {
 		return nil, fmt.Errorf("sign crl: %w", err)
 	}

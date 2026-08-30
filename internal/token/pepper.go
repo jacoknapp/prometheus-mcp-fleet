@@ -6,6 +6,7 @@ package token
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -19,6 +20,21 @@ const PepperFileMode fs.FileMode = 0o600
 // other than its owner. The hub refuses to start rather than key every stored
 // digest with a secret the whole machine can read.
 var ErrInsecurePepperFile = errors.New("pepper file has insecure permissions")
+
+// Filesystem operations are indirected at the narrow boundaries that can
+// legitimately fail after exclusive creation. Production uses the os package;
+// tests replace one operation at a time to verify cleanup and error wrapping
+// without relying on a particular filesystem or running as an unprivileged
+// user.
+var (
+	makePepperDirs = os.MkdirAll
+	openPepperFile = func(path string, flag int, perm fs.FileMode) (io.WriteCloser, error) {
+		return os.OpenFile(path, flag, perm)
+	}
+	statPepperFile   = os.Stat
+	readPepperFile   = os.ReadFile
+	removePepperFile = os.Remove
+)
 
 // GeneratePepper returns [MinPepperBytes] fresh bytes from the system CSPRNG.
 func GeneratePepper() ([]byte, error) {
@@ -63,7 +79,7 @@ func LoadOrCreatePepper(path string) ([]byte, error) {
 // rather than each keying its digests differently.
 func createPepper(path string) ([]byte, error) {
 	if dir := filepath.Dir(path); dir != "" {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
+		if err := makePepperDirs(dir, 0o700); err != nil {
 			return nil, fmt.Errorf("pepper directory %s: %w", dir, err)
 		}
 	}
@@ -71,7 +87,7 @@ func createPepper(path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, PepperFileMode)
+	f, err := openPepperFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, PepperFileMode)
 	if err != nil {
 		if errors.Is(err, fs.ErrExist) {
 			return readPepper(path)
@@ -80,9 +96,11 @@ func createPepper(path string) ([]byte, error) {
 	}
 	if _, err := f.Write(fresh); err != nil {
 		_ = f.Close()
+		_ = removePepperFile(path)
 		return nil, fmt.Errorf("write pepper %s: %w", path, err)
 	}
 	if err := f.Close(); err != nil {
+		_ = removePepperFile(path)
 		return nil, fmt.Errorf("close pepper %s: %w", path, err)
 	}
 	return fresh, nil
@@ -90,7 +108,7 @@ func createPepper(path string) ([]byte, error) {
 
 // readPepper loads and validates an existing pepper file.
 func readPepper(path string) ([]byte, error) {
-	info, err := os.Stat(path)
+	info, err := statPepperFile(path)
 	if err != nil {
 		return nil, err
 	}
@@ -101,7 +119,7 @@ func readPepper(path string) ([]byte, error) {
 		return nil, fmt.Errorf("pepper %s is mode %04o, want %04o: %w",
 			path, perm, PepperFileMode, ErrInsecurePepperFile)
 	}
-	p, err := os.ReadFile(path)
+	p, err := readPepperFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read pepper %s: %w", path, err)
 	}

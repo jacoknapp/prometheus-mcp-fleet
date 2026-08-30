@@ -357,10 +357,6 @@ func (v *Verifier) fromCache(
 			v.pos.Remove(sum)
 			v.metrics.AuthFailure(ReasonExpired)
 			return nil, time.Time{}, true, fmt.Errorf("credential %s: %w", e.principal.KID, ErrExpired)
-		case e.principal.Class != want:
-			v.metrics.AuthFailure(ReasonWrongClass)
-			return nil, time.Time{}, true, fmt.Errorf("credential is class %q, listener requires %q: %w",
-				e.principal.Class, want, ErrWrongClass)
 		default:
 			v.metrics.CacheHit()
 			v.metrics.AuthSuccess(want)

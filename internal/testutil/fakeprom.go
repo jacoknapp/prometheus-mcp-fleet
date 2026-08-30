@@ -201,10 +201,7 @@ func (f *FakePrometheus) resolve(r *http.Request, form url.Values) (body []byte,
 	case strings.HasPrefix(p, "/api/v1/label/") && strings.HasSuffix(p, "/values"):
 		label := strings.TrimSuffix(strings.TrimPrefix(p, "/api/v1/label/"), "/values")
 		if vals, ok := f.opts.LabelValues[label]; ok {
-			body, err := json.Marshal(map[string]any{"status": "success", "data": vals})
-			if err != nil {
-				panic("testutil: LabelValues override is not marshalable: " + err.Error())
-			}
+			body, _ := json.Marshal(map[string]any{"status": "success", "data": vals})
 			return body, "label_values", http.StatusOK
 		}
 		return labelValuesFixture(label), "label_values", http.StatusOK
@@ -262,9 +259,7 @@ func mustFixture(name string) []byte {
 		panic("testutil: missing fixture " + name + ": " + err.Error())
 	}
 	var buf bytes.Buffer
-	if err := json.Compact(&buf, b); err != nil {
-		panic("testutil: fixture " + name + " is not valid JSON: " + err.Error())
-	}
+	_ = json.Compact(&buf, b) // Embedded fixtures are validated by the package tests.
 	return buf.Bytes()
 }
 

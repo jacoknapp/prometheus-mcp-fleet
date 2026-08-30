@@ -4,14 +4,19 @@
 package wstun
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
 
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel"
 )
@@ -123,6 +128,17 @@ func TestReserveSession(t *testing.T) {
 			t.Error("reserveSession() = false after a slot was released")
 		}
 	})
+}
+
+func TestNewServerUsesDefaultLogger(t *testing.T) {
+	t.Parallel()
+	s, err := NewServer(ServerConfig{Verify: newTestCA(t).verify})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	if s.log == nil {
+		t.Error("NewServer left the logger nil")
+	}
 }
 
 // TestConnSourceAccept covers the seam's own lifecycle, which the HTTP handler
@@ -278,6 +294,41 @@ func TestAuthenticateOverAPipe(t *testing.T) {
 		}
 	})
 
+	t.Run("connection refuses the hello", func(t *testing.T) {
+		t.Parallel()
+		hub, peer := net.Pipe()
+		defer hub.Close()
+		defer peer.Close()
+		if _, err := srv.authenticate(writeFailConn{Conn: hub}, "10.0.0.1:1"); !errors.Is(err, ErrHandshakeFailed) || !errors.Is(err, errHandshakeFixture) {
+			t.Errorf("authenticate() = %v, want hello-write failure", err)
+		}
+	})
+
+	t.Run("connection refuses the handshake deadline", func(t *testing.T) {
+		t.Parallel()
+		hub, peer := net.Pipe()
+		defer hub.Close()
+		defer peer.Close()
+		if _, err := srv.authenticate(deadlineConn{Conn: hub, failAll: true}, "10.0.0.1:1"); !errors.Is(err, ErrHandshakeFailed) || !errors.Is(err, errHandshakeFixture) {
+			t.Errorf("authenticate() = %v, want handshake/deadline failure", err)
+		}
+	})
+
+	t.Run("entropy source fails", func(t *testing.T) {
+		t.Parallel()
+		broken, err := NewServer(ServerConfig{Verify: ca.verify, Logger: quiet()})
+		if err != nil {
+			t.Fatalf("NewServer: %v", err)
+		}
+		broken.rand = fixtureErrorReader{}
+		hub, peer := net.Pipe()
+		defer hub.Close()
+		defer peer.Close()
+		if _, err := broken.authenticate(hub, "10.0.0.1:1"); !errors.Is(err, ErrHandshakeFailed) || !errors.Is(err, errHandshakeFixture) {
+			t.Errorf("authenticate() = %v, want entropy failure", err)
+		}
+	})
+
 	t.Run("peer stalls after the hello", func(t *testing.T) {
 		t.Parallel()
 		short, err := NewServer(ServerConfig{
@@ -365,4 +416,127 @@ func TestAuthenticateOverAPipe(t *testing.T) {
 			t.Errorf("identity = %+v, want the serial and expiry filled in from the leaf", id)
 		}
 	})
+}
+
+// TestServeHTTPRareRefusals covers the upgrade and atomic-cap failures that do
+// not require a complete gRPC session.
+func TestServeHTTPRareRefusals(t *testing.T) {
+	ca := newTestCA(t)
+
+	t.Run("malformed upgrade", func(t *testing.T) {
+		srv, err := NewServer(ServerConfig{Verify: ca.verify, Logger: quiet()})
+		if err != nil {
+			t.Fatalf("NewServer: %v", err)
+		}
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, DefaultPath, nil)
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		req.Header.Set("Sec-WebSocket-Protocol", Subprotocol)
+		rw := &recordingResponseWriter{header: make(http.Header)}
+		srv.serveHTTP(rw, req)
+		if rw.status == 0 || rw.status == http.StatusSwitchingProtocols {
+			t.Errorf("status = %d, want an upgrade refusal", rw.status)
+		}
+	})
+
+	t.Run("session fills while peer authenticates", func(t *testing.T) {
+		var srv *Server
+		verify := func(chain []*x509.Certificate) (tunnel.Identity, error) {
+			id, err := ca.verify(chain)
+			if err == nil {
+				srv.sessions.Store(1)
+			}
+			return id, err
+		}
+		var err error
+		srv, err = NewServer(ServerConfig{Verify: verify, Logger: quiet(), MaxSessions: 1})
+		if err != nil {
+			t.Fatalf("NewServer: %v", err)
+		}
+		ts := httptest.NewServer(srv.Handler())
+		defer ts.Close()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		ws, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(ts.URL, "http"), &websocket.DialOptions{Subprotocols: []string{Subprotocol}})
+		if err != nil {
+			t.Fatalf("websocket dial: %v", err)
+		}
+		conn := websocket.NetConn(ctx, ws, websocket.MessageBinary)
+		defer conn.Close()
+		hello := readHello(t, conn)
+		cert := ca.issue(t, "prod")
+		if err := writeMessage(conn, signedAuth(t, cert, hello.Nonce, "prod")); err != nil {
+			t.Fatalf("write ClientAuth: %v", err)
+		}
+		accept := readAccept(t, conn)
+		if accept.Accepted || !strings.Contains(accept.Reason, "session limit") {
+			t.Errorf("ServerAccept = %+v, want session-limit refusal", accept)
+		}
+	})
+
+	t.Run("peer closes before accepted verdict", func(t *testing.T) {
+		verified := make(chan struct{})
+		release := make(chan struct{})
+		verify := func(chain []*x509.Certificate) (tunnel.Identity, error) {
+			id, err := ca.verify(chain)
+			close(verified)
+			<-release
+			return id, err
+		}
+		srv, err := NewServer(ServerConfig{Verify: verify, Logger: quiet()})
+		if err != nil {
+			t.Fatalf("NewServer: %v", err)
+		}
+		ts := httptest.NewServer(srv.Handler())
+		defer ts.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		ws, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(ts.URL, "http"), &websocket.DialOptions{Subprotocols: []string{Subprotocol}})
+		if err != nil {
+			t.Fatalf("websocket dial: %v", err)
+		}
+		conn := websocket.NetConn(ctx, ws, websocket.MessageBinary)
+		hello := readHello(t, conn)
+		cert := ca.issue(t, "prod")
+		if err := writeMessage(conn, signedAuth(t, cert, hello.Nonce, "prod")); err != nil {
+			t.Fatalf("write ClientAuth: %v", err)
+		}
+		<-verified
+		ws.CloseNow()
+		close(release)
+		deadline := time.Now().Add(time.Second)
+		for srv.sessions.Load() != 0 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if got := srv.sessions.Load(); got != 0 {
+			t.Errorf("live session count = %d after failed verdict write, want 0", got)
+		}
+	})
+}
+
+// recordingResponseWriter intentionally lacks http.Hijacker, making a
+// WebSocket upgrade fail after the handler's own preflight checks pass.
+type recordingResponseWriter struct {
+	header http.Header
+	status int
+	body   bytes.Buffer
+}
+
+type fixtureErrorReader struct{}
+
+func (fixtureErrorReader) Read([]byte) (int, error) { return 0, errHandshakeFixture }
+
+type writeFailConn struct{ net.Conn }
+
+func (writeFailConn) Write([]byte) (int, error) { return 0, errHandshakeFixture }
+
+func (w *recordingResponseWriter) Header() http.Header    { return w.header }
+func (w *recordingResponseWriter) WriteHeader(status int) { w.status = status }
+func (w *recordingResponseWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.body.Write(p)
 }

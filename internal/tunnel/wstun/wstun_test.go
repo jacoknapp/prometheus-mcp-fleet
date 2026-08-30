@@ -165,8 +165,8 @@ func TestHandshakeRejections(t *testing.T) {
 			if !contains(accept.Reason, tc.wantReason) {
 				t.Errorf("refusal reason = %q, want it to mention %q", accept.Reason, tc.wantReason)
 			}
-			if hub.server.Sessions() != 0 {
-				t.Errorf("Sessions() = %d after a refused handshake, want 0", hub.server.Sessions())
+			if got := hub.server.sessions.Load(); got != 0 {
+				t.Errorf("live session count = %d after a refused handshake, want 0", got)
 			}
 		})
 	}
@@ -226,8 +226,8 @@ func TestStalledHandshakeConsumesOnlyAHandshakeSlot(t *testing.T) {
 	stalled := hub.rawConn(t)
 	readHello(t, stalled)
 
-	if got := hub.server.Sessions(); got != 0 {
-		t.Errorf("Sessions() = %d during an unauthenticated handshake, want 0", got)
+	if got := hub.server.sessions.Load(); got != 0 {
+		t.Errorf("live session count = %d during an unauthenticated handshake, want 0", got)
 	}
 	resp := upgradeRequest(t, hub.http.URL+DefaultPath, hub.http.Client(),
 		http.Header{"Sec-WebSocket-Protocol": []string{Subprotocol}})
@@ -539,8 +539,8 @@ func TestSessionIdentityComesFromTheCertificate(t *testing.T) {
 		if id.RemoteAddr == "" {
 			t.Error("RemoteAddr is empty")
 		}
-		if hub.server.Sessions() != 1 {
-			t.Errorf("Sessions() = %d, want 1", hub.server.Sessions())
+		if got := hub.server.sessions.Load(); got != 1 {
+			t.Errorf("live session count = %d, want 1", got)
 		}
 	case err := <-errCh:
 		t.Fatalf("Dial returned before a session: %v", err)

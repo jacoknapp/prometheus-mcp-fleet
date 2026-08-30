@@ -87,11 +87,10 @@ func ServeConn(ctx context.Context, conn net.Conn, cfg DialerConfig, h tunnel.Ha
 	go func() { serveErr <- srv.Serve(lis) }()
 
 	var (
-		err       error
 		cancelled bool
 	)
 	select {
-	case err = <-serveErr:
+	case <-serveErr:
 	case <-ctx.Done():
 		cancelled = true
 		// Stop, not GracefulStop: the hub has already been told to go away by
@@ -107,15 +106,10 @@ func ServeConn(ctx context.Context, conn net.Conn, cfg DialerConfig, h tunnel.Ha
 	switch {
 	case cancelled:
 		return dialErr(cfg.Endpoint, ReasonContextCancelled, ctx.Err())
-	case errors.Is(err, grpc.ErrServerStopped):
-		return dialErr(cfg.Endpoint, ReasonServerShutdown, err)
 	default:
 		// Serve returned because the one-shot listener's second Accept woke up,
-		// which only happens when the connection died.
-		cause := err
-		if reason := nc.DeathReason(); reason != "" {
-			cause = errors.New(reason)
-		}
-		return dialErr(cfg.Endpoint, ReasonConnClosed, cause)
+		// which only happens when the connection died. The notify wrapper always
+		// records that failure before waking Accept.
+		return dialErr(cfg.Endpoint, ReasonConnClosed, errors.New(nc.DeathReason()))
 	}
 }

@@ -364,11 +364,6 @@ func (b *bodyReader) Close() error {
 	b.pending = nil
 	if !b.finished {
 		b.finish(ErrBodyClosed)
-	} else {
-		b.doneOnce.Do(func() {
-			b.cleanup()
-			b.release()
-		})
 	}
 	return nil
 }

@@ -91,6 +91,7 @@ type Server struct {
 	cfg  ServerConfig
 	log  *slog.Logger
 	hsTO time.Duration
+	rand io.Reader
 
 	src *connSource
 	lis tunnel.Listener
@@ -136,19 +137,19 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	// answer 503 before an upgrade, which is here; counting the same sessions
 	// again below would only create a second, racier answer to the same
 	// question.
-	lis, err := grpctun.NewSourceListener(src, grpctun.ListenerConfig{
+	// src is non-nil and MaxSessions is deliberately left at its valid zero
+	// value, so NewSourceListener has no error path for these arguments.
+	lis, _ := grpctun.NewSourceListener(src, grpctun.ListenerConfig{
 		Logger:    log,
 		Keepalive: cfg.Keepalive,
 	})
-	if err != nil {
-		return nil, fmt.Errorf("wstun: build the tunnel listener: %w", err)
-	}
 
 	cfg.Path = path
 	return &Server{
 		cfg:     cfg,
 		log:     log,
 		hsTO:    hsTO,
+		rand:    rand.Reader,
 		src:     src,
 		lis:     lis,
 		pending: make(chan struct{}, pendingN),
@@ -164,10 +165,6 @@ func (s *Server) Handler() http.Handler { return http.HandlerFunc(s.serveHTTP) }
 // Hand it to the registry exactly as the previous TLS listener was handed over;
 // nothing above the transport can tell the difference.
 func (s *Server) Listener() tunnel.Listener { return s.lis }
-
-// Sessions reports how many spokes are currently attached. It exists for
-// readiness reporting and tests.
-func (s *Server) Sessions() int { return int(s.sessions.Load()) }
 
 func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	remote := remoteAddr(r)
@@ -285,7 +282,7 @@ func (s *Server) authenticate(conn net.Conn, remote string) (tunnel.Identity, er
 	}
 
 	nonce := make([]byte, nonceLen)
-	if _, err := rand.Read(nonce); err != nil {
+	if _, err := io.ReadFull(s.rand, nonce); err != nil {
 		return tunnel.Identity{}, fmt.Errorf("%w: generate nonce: %w", ErrHandshakeFailed, err)
 	}
 	hello := serverHello{Nonce: nonce, ProtocolVersion: ProtocolVersion, ServerID: s.cfg.ServerID}

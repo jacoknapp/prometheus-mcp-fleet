@@ -5,6 +5,7 @@ package wstun
 
 import (
 	"context"
+	"crypto"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
@@ -17,13 +18,48 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/certproof"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel/grpctun"
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel/tunneltest"
 )
+
+var errHandshakeFixture = errors.New("handshake fixture failure")
+
+type failingSigner struct{}
+
+func (failingSigner) Public() crypto.PublicKey { return nil }
+func (failingSigner) Sign(io.Reader, []byte, crypto.SignerOpts) ([]byte, error) {
+	return nil, errHandshakeFixture
+}
+
+type deadlineConn struct {
+	net.Conn
+	failAll  bool
+	failZero bool
+}
+
+func (c deadlineConn) SetDeadline(d time.Time) error {
+	if c.failAll || (c.failZero && d.IsZero()) {
+		return errHandshakeFixture
+	}
+	return c.Conn.SetDeadline(d)
+}
+
+type secondWriteFails struct{ writes int }
+
+func (w *secondWriteFails) Write(p []byte) (int, error) {
+	w.writes++
+	if w.writes == 2 {
+		return 0, errHandshakeFixture
+	}
+	return len(p), nil
+}
 
 // TestNormalizeEndpoint pins the grammar an operator's PMF_HUB_ENDPOINTS value
 // is read with, including the host:port form kept for spokes upgrading from
@@ -194,6 +230,155 @@ func TestClientHandshake(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestClientHandshakeLocalFailures covers failures originating on the spoke,
+// rather than malformed messages sent by the scripted hubs above.
+func TestClientHandshakeLocalFailures(t *testing.T) {
+	t.Parallel()
+
+	ca := newTestCA(t)
+	cert := ca.issue(t, "prod")
+	signer, err := signerFor(cert)
+	if err != nil {
+		t.Fatalf("signerFor: %v", err)
+	}
+
+	t.Run("cannot install handshake deadline", func(t *testing.T) {
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+		_, err := clientHandshake(deadlineConn{Conn: client, failAll: true}, ClientConfig{ClusterID: "prod", Certificate: cert}, signer)
+		if !errors.Is(err, ErrHandshakeFailed) || !errors.Is(err, errHandshakeFixture) {
+			t.Errorf("clientHandshake() = %v, want handshake/deadline failure", err)
+		}
+	})
+
+	t.Run("signer fails", func(t *testing.T) {
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+		go func() {
+			_ = writeMessage(server, serverHello{Nonce: make([]byte, nonceLen), ProtocolVersion: ProtocolVersion})
+		}()
+		_, err := clientHandshake(client, ClientConfig{ClusterID: "prod", Certificate: cert}, failingSigner{})
+		if !errors.Is(err, ErrHandshakeFailed) || !errors.Is(err, errHandshakeFixture) {
+			t.Errorf("clientHandshake() = %v, want signer failure", err)
+		}
+	})
+
+	t.Run("auth write fails", func(t *testing.T) {
+		client, server := net.Pipe()
+		defer client.Close()
+		go func() {
+			_ = writeMessage(server, serverHello{Nonce: make([]byte, nonceLen), ProtocolVersion: ProtocolVersion})
+			_ = server.Close()
+		}()
+		_, err := clientHandshake(client, ClientConfig{ClusterID: "prod", Certificate: cert}, signer)
+		if !errors.Is(err, ErrHandshakeFailed) {
+			t.Errorf("clientHandshake() = %v, want handshake write failure", err)
+		}
+	})
+
+	t.Run("hub closes before verdict", func(t *testing.T) {
+		client, server := net.Pipe()
+		defer client.Close()
+		go func() {
+			_ = writeMessage(server, serverHello{Nonce: make([]byte, nonceLen), ProtocolVersion: ProtocolVersion})
+			var auth clientAuth
+			_ = readMessage(server, &auth)
+			_ = server.Close()
+		}()
+		_, err := clientHandshake(client, ClientConfig{ClusterID: "prod", Certificate: cert}, signer)
+		if !errors.Is(err, ErrHandshakeFailed) {
+			t.Errorf("clientHandshake() = %v, want missing-verdict failure", err)
+		}
+	})
+
+	t.Run("cannot clear deadline", func(t *testing.T) {
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+		go func() {
+			_ = writeMessage(server, serverHello{Nonce: make([]byte, nonceLen), ProtocolVersion: ProtocolVersion})
+			var auth clientAuth
+			_ = readMessage(server, &auth)
+			_ = writeMessage(server, serverAccept{Accepted: true, ClusterID: "prod"})
+		}()
+		_, err := clientHandshake(deadlineConn{Conn: client, failZero: true}, ClientConfig{ClusterID: "prod", Certificate: cert}, signer)
+		if !errors.Is(err, ErrHandshakeFailed) || !errors.Is(err, errHandshakeFixture) {
+			t.Errorf("clientHandshake() = %v, want clear-deadline failure", err)
+		}
+	})
+}
+
+// TestDialHandshakeClassification covers failures that occur after a valid
+// HTTP upgrade, where Dial must distinguish protocol negotiation and caller
+// cancellation from an identity rejection.
+func TestDialHandshakeClassification(t *testing.T) {
+	t.Parallel()
+
+	ca := newTestCA(t)
+	cert := ca.issue(t, "prod")
+
+	t.Run("server omits the subprotocol", func(t *testing.T) {
+		t.Parallel()
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ws, err := websocket.Accept(w, r, nil)
+			if err == nil {
+				defer ws.CloseNow()
+			}
+		}))
+		defer ts.Close()
+		err := Dial(context.Background(), ClientConfig{
+			URL: "ws" + strings.TrimPrefix(ts.URL, "http"), Certificate: cert,
+			ClusterID: "prod", HTTPClient: ts.Client(),
+		}, &tunneltest.EchoHandler{})
+		var de *grpctun.DialError
+		if !errors.As(err, &de) || de.Reason != grpctun.ReasonUpgradeRejected || !errors.Is(err, ErrSubprotocol) {
+			t.Errorf("Dial() = %v, want subprotocol upgrade rejection", err)
+		}
+	})
+
+	t.Run("caller cancels during handshake", func(t *testing.T) {
+		t.Parallel()
+		upgraded := make(chan struct{})
+		release := make(chan struct{})
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{Subprotocol}})
+			if err != nil {
+				return
+			}
+			conn := websocket.NetConn(context.Background(), ws, websocket.MessageBinary)
+			if err := writeMessage(conn, serverHello{Nonce: make([]byte, nonceLen), ProtocolVersion: ProtocolVersion}); err != nil {
+				return
+			}
+			var auth clientAuth
+			if err := readMessage(conn, &auth); err != nil {
+				return
+			}
+			close(upgraded)
+			<-release
+			ws.CloseNow()
+		}))
+		defer ts.Close()
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			done <- Dial(ctx, ClientConfig{
+				URL: "ws" + strings.TrimPrefix(ts.URL, "http"), Certificate: cert,
+				ClusterID: "prod", HTTPClient: ts.Client(), Logger: quiet(),
+			}, &tunneltest.EchoHandler{})
+		}()
+		<-upgraded
+		cancel()
+		close(release)
+		err := <-done
+		var de *grpctun.DialError
+		if !errors.As(err, &de) || de.Reason != grpctun.ReasonContextCancelled || !errors.Is(err, context.Canceled) {
+			t.Errorf("Dial() = %v, want context-cancelled classification", err)
+		}
+	})
 }
 
 // TestSignerFor covers the two ways a spoke can have no usable key.
@@ -432,6 +617,21 @@ func TestHandshakeMessageFraming(t *testing.T) {
 		t.Parallel()
 		if err := writeMessage(errWriter{}, serverHello{}); err == nil {
 			t.Error("writeMessage() = nil on a dead writer")
+		}
+	})
+
+	t.Run("write reports an encoding failure", func(t *testing.T) {
+		t.Parallel()
+		if err := writeMessage(io.Discard, func() {}); err == nil || !strings.Contains(err.Error(), "encode") {
+			t.Errorf("writeMessage() = %v, want encoding failure", err)
+		}
+	})
+
+	t.Run("write reports a broken body write", func(t *testing.T) {
+		t.Parallel()
+		w := &secondWriteFails{}
+		if err := writeMessage(w, serverHello{}); !errors.Is(err, errHandshakeFixture) || w.writes != 2 {
+			t.Errorf("writeMessage() = %v after %d writes, want body-write failure", err, w.writes)
 		}
 	})
 }

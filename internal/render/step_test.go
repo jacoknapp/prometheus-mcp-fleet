@@ -6,6 +6,7 @@ package render
 import (
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -183,6 +184,7 @@ func TestParsePromDuration(t *testing.T) {
 		{in: "5m5", wantErr: true},
 		{in: "NaN", wantErr: true},
 		{in: "Inf", wantErr: true},
+		{in: strings.Repeat("9", 100) + "s", wantErr: true},
 	}
 	for _, tc := range tests {
 		got, err := ParsePromDuration(tc.in)
@@ -249,9 +251,6 @@ func TestParseFormat(t *testing.T) {
 		}
 		if got != tc.want {
 			t.Errorf("ParseFormat(%q) = %q, want %q", tc.in, got, tc.want)
-		}
-		if got.String() != string(got) {
-			t.Errorf("String() = %q", got.String())
 		}
 	}
 }

@@ -74,7 +74,7 @@ func TestRawTokenRedactsUnderFmt(t *testing.T) {
 	if m.Raw.IsZero() {
 		t.Error("IsZero reported true for a minted token")
 	}
-	if !RawToken("").IsZero() {
+	if !(RawToken{}).IsZero() {
 		t.Error("IsZero reported false for an empty token")
 	}
 }
@@ -96,6 +96,7 @@ func TestRawTokenRedactsUnderJSON(t *testing.T) {
 		{"struct field", payload{Token: m.Raw}},
 		{"slice", []RawToken{m.Raw}},
 		{"map value", map[string]RawToken{"k": m.Raw}},
+		{"map key", map[RawToken]string{m.Raw: "value"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

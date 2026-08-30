@@ -4,11 +4,47 @@
 package clusterfacts
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
+
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/promclient"
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/testutil"
 )
+
+func TestQueryFallbacksReturnEmptyResultsHonestly(t *testing.T) {
+	t.Parallel()
+
+	emptyVector := `{"status":"success","data":{"resultType":"vector","result":[]}}`
+	fake := testutil.NewFakePrometheus(t, testutil.FakeOptions{QueryResults: map[string]string{
+		`prometheus_target_interval_length_seconds{quantile="0.99"}`: emptyVector,
+		"prometheus_build_info": emptyVector,
+	}})
+	client, err := promclient.New(promclient.Config{BaseURL: fake.URL, Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("promclient.New: %v", err)
+	}
+	c := &Collector{client: client}
+
+	interval, err := c.scrapeIntervalByQuery(context.Background())
+	if err != nil {
+		t.Fatalf("scrapeIntervalByQuery: %v", err)
+	}
+	if interval != "" {
+		t.Fatalf("scrape interval = %q, want empty", interval)
+	}
+
+	labels, err := c.externalLabelsByQuery(context.Background())
+	if err != nil {
+		t.Fatalf("externalLabelsByQuery: %v", err)
+	}
+	if labels != nil {
+		t.Fatalf("external labels = %v, want nil", labels)
+	}
+}
 
 func TestDetectFlavor(t *testing.T) {
 	t.Parallel()
@@ -245,6 +281,11 @@ func TestParseGlobalSection(t *testing.T) {
 			name:       "value-less lines are skipped",
 			doc:        "global:\n  external_labels:\n    justakey\n    cluster: eu\n",
 			wantLabels: map[string]string{"cluster": "eu"},
+		},
+		{
+			name:         "value-less global line is skipped",
+			doc:          "global:\n  justakey\n  scrape_interval: 20s\n",
+			wantInterval: "20s",
 		},
 	}
 	for _, tc := range tests {

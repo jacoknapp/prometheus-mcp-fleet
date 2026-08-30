@@ -282,3 +282,16 @@ func TestHealthIsConcurrencySafe(t *testing.T) {
 		t.Error("Ready() = true after draining started")
 	}
 }
+
+func TestWriteHealthJSONMarshalFailure(t *testing.T) {
+	t.Parallel()
+	rec := httptest.NewRecorder()
+	writeHealthJSON(rec, http.StatusOK, func() {})
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
+	}
+	if got := rec.Body.String(); got != "{\"status\":\"error\"}\n" {
+		t.Fatalf("body = %q", got)
+	}
+}

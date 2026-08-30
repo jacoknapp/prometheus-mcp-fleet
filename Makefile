@@ -88,6 +88,7 @@ lint: ## Run golangci-lint.
 .PHONY: test
 test: ## Run unit tests with the race detector.
 	go test -race -covermode=atomic -coverprofile=$(COVER_FILE) ./...
+	./hack/check-coverage.sh $(COVER_FILE)
 
 .PHONY: test-short
 test-short: ## Run fast unit tests only.
@@ -109,6 +110,20 @@ fuzz: ## Run every fuzz target briefly.
 		done; \
 	done
 
+.PHONY: deadcode
+deadcode: ## Report production functions unreachable from either binary.
+	go run golang.org/x/tools/cmd/deadcode@v0.49.0 ./cmd/...
+
+MUTATION_PACKAGES ?= ./...
+MUTATION_WORKERS  ?= 4
+
+.PHONY: mutation
+mutation: ## Mutation-test all handwritten Go code; override MUTATION_PACKAGES to shard.
+	go run github.com/go-gremlins/gremlins/cmd/gremlins@v0.6.0 unleash \
+		$(MUTATION_PACKAGES) --integration --workers $(MUTATION_WORKERS) \
+		--exclude-files '^internal/gen/' \
+		--threshold-efficacy 99.99 --threshold-mcover 99.99
+
 .PHONY: vuln
 vuln: ## Check dependencies for known vulnerabilities.
 	go run golang.org/x/vuln/cmd/govulncheck@latest ./...
@@ -119,7 +134,7 @@ tidy: ## Tidy and verify go.mod.
 	go mod verify
 
 .PHONY: check
-check: fmt-check vet lint test ## Everything CI runs on a pull request.
+check: fmt-check vet lint deadcode test ## Everything CI runs on a pull request.
 
 ##@ Container images
 
@@ -139,14 +154,25 @@ images: $(addprefix image-,$(COMPONENTS)) ## Build every component image locally
 
 .PHONY: helm-lint
 helm-lint: ## Lint both charts against every ci/ values file.
-	@for chart in charts/*/; do \
+	# Deliberately no bare `helm lint --strict <chart>`. The spoke's
+	# values.schema.json marks cluster.id, hub.endpoints and hub.apiUrl as
+	# required with no defaults -- that is the guard stopping a hundred clusters
+	# from silently sharing one identity -- so a defaults-only lint can only
+	# ever fail. ci/*.yaml holds the renderable shapes, and `ct lint` uses the
+	# same files.
+	@set -e; for chart in charts/*/; do \
 		echo "==> $$chart"; \
-		helm lint --strict "$$chart"; \
+		found=0; \
 		for values in "$$chart"ci/*.yaml; do \
 			[ -e "$$values" ] || continue; \
+			found=1; \
 			echo "    values: $$values"; \
 			helm lint --strict "$$chart" -f "$$values"; \
 		done; \
+		if [ "$$found" -eq 0 ]; then \
+			echo "$$chart has no ci/*.yaml; every chart must ship at least one"; \
+			exit 1; \
+		fi; \
 	done
 
 .PHONY: helm-template

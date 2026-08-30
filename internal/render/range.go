@@ -104,9 +104,6 @@ func EncodeRange(in RangeInput, opts Options) *RangeResult {
 	if span := in.End.Sub(in.Start); span >= 0 && in.Step > 0 {
 		points = int(span/in.Step) + 1
 	}
-	if points < 0 {
-		points = 0
-	}
 
 	total := in.SeriesTotalHint
 	if total < len(in.Matrix) {
@@ -290,10 +287,7 @@ func round(v float64) float64 {
 		return v
 	}
 	s := strconv.FormatFloat(v, 'g', ValueSignificantDigits, 64)
-	out, err := strconv.ParseFloat(s, 64)
-	if err != nil {
-		return v
-	}
+	out, _ := strconv.ParseFloat(s, 64)
 	return out
 }
 

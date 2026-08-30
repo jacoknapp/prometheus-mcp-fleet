@@ -6,6 +6,8 @@ package token
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -13,6 +15,20 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 )
+
+type pepperWriteCloser struct {
+	writeErr error
+	closeErr error
+}
+
+func (f *pepperWriteCloser) Write(p []byte) (int, error) {
+	if f.writeErr != nil {
+		return 0, f.writeErr
+	}
+	return len(p), nil
+}
+
+func (f *pepperWriteCloser) Close() error { return f.closeErr }
 
 func TestGeneratePepper(t *testing.T) {
 	t.Parallel()
@@ -222,6 +238,75 @@ func TestReadPepperUnreadableFile(t *testing.T) {
 	if _, err := readPepper(path); !errors.Is(err, fs.ErrPermission) {
 		t.Fatalf("readPepper error = %v, want a permission error", err)
 	}
+}
+
+// TestPepperFilesystemFailures exercises failures that real filesystems can
+// produce but that cannot be triggered portably (especially when tests run as
+// root). Each case asserts both the wrapped cause and the absence of returned
+// secret material.
+func TestPepperFilesystemFailures(t *testing.T) {
+	boom := errors.New("filesystem fault")
+	origMkdir, origOpen := makePepperDirs, openPepperFile
+	origRead, origRemove := readPepperFile, removePepperFile
+	t.Cleanup(func() {
+		makePepperDirs, openPepperFile = origMkdir, origOpen
+		readPepperFile, removePepperFile = origRead, origRemove
+	})
+
+	t.Run("mkdir", func(t *testing.T) {
+		makePepperDirs = func(string, fs.FileMode) error { return boom }
+		got, err := createPepper(filepath.Join(t.TempDir(), "nested", "pepper.key"))
+		if !errors.Is(err, boom) || got != nil {
+			t.Fatalf("createPepper = (%v, %v), want (nil, wrapped fault)", got, err)
+		}
+		makePepperDirs = origMkdir
+	})
+
+	t.Run("open", func(t *testing.T) {
+		openPepperFile = func(string, int, fs.FileMode) (io.WriteCloser, error) { return nil, boom }
+		got, err := createPepper(filepath.Join(t.TempDir(), "pepper.key"))
+		if !errors.Is(err, boom) || got != nil {
+			t.Fatalf("createPepper = (%v, %v), want (nil, wrapped fault)", got, err)
+		}
+		openPepperFile = origOpen
+	})
+
+	for _, tc := range []struct {
+		name string
+		file *pepperWriteCloser
+	}{
+		{name: "write", file: &pepperWriteCloser{writeErr: boom}},
+		{name: "close", file: &pepperWriteCloser{closeErr: boom}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "pepper.key")
+			removed := ""
+			openPepperFile = func(string, int, fs.FileMode) (io.WriteCloser, error) { return tc.file, nil }
+			removePepperFile = func(path string) error { removed = path; return nil }
+			got, err := createPepper(path)
+			if !errors.Is(err, boom) || got != nil {
+				t.Fatalf("createPepper = (%v, %v), want (nil, wrapped fault)", got, err)
+			}
+			if removed != path {
+				t.Errorf("failed create removed %q, want %q", removed, path)
+			}
+			openPepperFile, removePepperFile = origOpen, origRemove
+		})
+	}
+
+	t.Run("read", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "pepper.key")
+		writeFile(t, path, bytes.Repeat([]byte{1}, MinPepperBytes), 0o600)
+		readPepperFile = func(string) ([]byte, error) { return nil, boom }
+		got, err := readPepper(path)
+		if !errors.Is(err, boom) || got != nil {
+			t.Fatalf("readPepper = (%v, %v), want (nil, wrapped fault)", got, err)
+		}
+		if strings := fmt.Sprint(err); strings == boom.Error() {
+			t.Errorf("readPepper did not add operation context: %v", err)
+		}
+		readPepperFile = origRead
+	})
 }
 
 func writeFile(t *testing.T, path string, data []byte, mode fs.FileMode) {

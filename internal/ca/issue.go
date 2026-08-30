@@ -8,12 +8,10 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
-	"net"
 	"net/url"
 	"time"
 )
@@ -90,45 +88,6 @@ func (c *CA) IssueSpokeFromCSR(csrDER []byte, clusterID string) (certPEM []byte,
 	return pem.EncodeToMemory(&pem.Block{Type: pemTypeCertificate, Bytes: der}), leaf, nil
 }
 
-// IssueServer issues the hub tunnel listener's server certificate with a
-// freshly generated P-256 key, and returns it ready to hand to crypto/tls. At
-// least one DNS name or IP address is required: a certificate with no SAN
-// cannot be verified by any modern client.
-//
-// The private key exists only inside the returned tls.Certificate and is never
-// written to disk by this package.
-func (c *CA) IssueServer(dnsNames []string, ipAddrs []net.IP) (tls.Certificate, error) {
-	if len(dnsNames) == 0 && len(ipAddrs) == 0 {
-		return tls.Certificate{}, fmt.Errorf("%w: server certificate needs at least one dns name or ip", ErrInvalidOptions)
-	}
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("generate server key: %w", err)
-	}
-	cn := "prometheus-mcp-fleet hub"
-	if len(dnsNames) > 0 {
-		cn = dnsNames[0]
-	}
-	tmpl := &x509.Certificate{
-		Subject:               pkix.Name{CommonName: cn},
-		DNSNames:              dnsNames,
-		IPAddresses:           ipAddrs,
-		KeyUsage:              x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-		IsCA:                  false,
-	}
-	der, leaf, err := c.sign(tmpl, key.Public(), c.opts.ServerCertTTL)
-	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("issue server certificate: %w", err)
-	}
-	return tls.Certificate{
-		Certificate: [][]byte{der},
-		PrivateKey:  key,
-		Leaf:        leaf,
-	}, nil
-}
-
 // sign fills in the parts of tmpl that are never the caller's business
 // (serial, validity window, issuer) and signs it.
 func (c *CA) sign(tmpl *x509.Certificate, pub any, ttl time.Duration) ([]byte, *x509.Certificate, error) {
@@ -151,14 +110,12 @@ func (c *CA) sign(tmpl *x509.Certificate, pub any, ttl time.Duration) ([]byte, *
 	tmpl.NotBefore = notBefore
 	tmpl.NotAfter = notAfter
 
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, c.cert, pub, c.key)
+	der, err := caCreateCertificate(rand.Reader, tmpl, c.cert, pub, c.key)
 	if err != nil {
 		return nil, nil, fmt.Errorf("sign certificate: %w", err)
 	}
-	leaf, err := x509.ParseCertificate(der)
-	if err != nil {
-		return nil, nil, fmt.Errorf("parse issued certificate: %w", err)
-	}
+	// Successful x509.CreateCertificate output is valid DER by construction.
+	leaf, _ := x509.ParseCertificate(der)
 	return der, leaf, nil
 }
 

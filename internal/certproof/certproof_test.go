@@ -300,3 +300,23 @@ func TestTranscriptRejectsAnOversizedField(t *testing.T) {
 		})
 	}
 }
+
+// TestSignAndVerifyRejectOversizedTranscriptFields proves both convenience
+// operations preserve Transcript's structural bound instead of signing or
+// accepting a truncated length prefix.
+func TestSignAndVerifyRejectOversizedTranscriptFields(t *testing.T) {
+	t.Parallel()
+
+	oversized := strings.Repeat("x", certproof.MaxFieldBytes+1)
+	key := newECDSA(t)
+	leaf := selfSigned(t, key)
+
+	if sig, err := certproof.Sign(key, []byte("nonce"), "v1", oversized);
+		!errors.Is(err, certproof.ErrFieldTooLarge) || sig != nil {
+		t.Errorf("Sign() = (%x, %v), want nil and ErrFieldTooLarge", sig, err)
+	}
+	if err := certproof.Verify(leaf, []byte("signature"), []byte("nonce"), "v1", oversized);
+		!errors.Is(err, certproof.ErrFieldTooLarge) {
+		t.Errorf("Verify() = %v, want ErrFieldTooLarge", err)
+	}
+}

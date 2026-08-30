@@ -58,14 +58,6 @@ var (
 	// ^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$.
 	ErrInvalidClusterID = errors.New("ca: invalid cluster id")
 
-	// ErrCertRevoked is returned by the ServerTLSConfig verification hook when
-	// an otherwise valid peer certificate's serial is revoked.
-	ErrCertRevoked = errors.New("ca: certificate is revoked")
-
-	// ErrInvalidBundle is returned by ClientTLSConfig when the supplied PEM
-	// trust bundle contains no certificates.
-	ErrInvalidBundle = errors.New("ca: trust bundle contains no certificates")
-
 	// ErrInvalidOptions is returned when Options are internally inconsistent,
 	// for example a malformed trust domain or a negative lifetime.
 	ErrInvalidOptions = errors.New("ca: invalid options")

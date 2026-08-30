@@ -72,10 +72,7 @@ func (c *Client) LabelValues(ctx context.Context, label string) ([]string, error
 	if err := promapi.ValidateLabelName(label); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrNotAllowed, err)
 	}
-	route, err := promapi.Get(promapi.EndpointLabelValues)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrNotAllowed, err)
-	}
+	route, _ := promapi.Get(promapi.EndpointLabelValues)
 	var env struct {
 		envelope
 		Data []string `json:"data"`

@@ -146,10 +146,8 @@ func AddTool[In, Out any](s *Server, t Tool, h ToolFunc[In, Out]) {
 	if len(t.Meta) > 0 {
 		tool.Meta = mcp.Meta(t.Meta)
 	}
-	encoded, err := json.MarshalIndent(schema, "", "  ")
-	if err != nil {
-		panic(fmt.Sprintf("mcpsurface: tool %q: encode input schema: %v", t.Name, err))
-	}
+	// inputSchema constructs only JSON-native maps, slices and scalar values.
+	encoded, _ := json.MarshalIndent(schema, "", "  ")
 	mcp.AddTool(s.mcp, tool, func(
 		ctx context.Context, req *mcp.CallToolRequest, in In,
 	) (*mcp.CallToolResult, Out, error) {

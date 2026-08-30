@@ -10,7 +10,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"testing"
 
@@ -125,6 +124,50 @@ func TestMintRejectsUnknownClass(t *testing.T) {
 	}
 }
 
+func TestMintWithKID(t *testing.T) {
+	t.Parallel()
+
+	const kid = "AdminKey01"
+	m, err := MintWithKID(fleet.ClassAdmin, kid)
+	if err != nil {
+		t.Fatalf("MintWithKID: %v", err)
+	}
+	if m.KID != kid {
+		t.Fatalf("KID = %q, want %q", m.KID, kid)
+	}
+	class, parsedKID, secret, err := Parse(m.Raw.Reveal())
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if class != fleet.ClassAdmin || parsedKID != kid || !bytes.Equal(secret, m.Secret) {
+		t.Fatalf("Parse = (%q, %q, %x), want (%q, %q, %x)", class, parsedKID, secret, fleet.ClassAdmin, kid, m.Secret)
+	}
+
+	for _, bad := range []string{"short", "toolongkid1", "contains-_", ""} {
+		got, err := MintWithKID(fleet.ClassAdmin, bad)
+		if !errors.Is(err, ErrMalformed) {
+			t.Errorf("MintWithKID(%q) error = %v, want ErrMalformed", bad, err)
+		}
+		if !got.Raw.IsZero() || got.KID != "" || got.Secret != nil {
+			t.Errorf("MintWithKID(%q) returned secret material with error", bad)
+		}
+	}
+}
+
+func TestIsBase62(t *testing.T) {
+	t.Parallel()
+	for _, s := range []string{"0", "09", "AZ", "az", "0Az9"} {
+		if !isBase62(s) {
+			t.Errorf("isBase62(%q) = false, want true", s)
+		}
+	}
+	for _, s := range []string{"", "-", "a_", "é"} {
+		if isBase62(s) {
+			t.Errorf("isBase62(%q) = true, want false", s)
+		}
+	}
+}
+
 func TestParseErrors(t *testing.T) {
 	t.Parallel()
 
@@ -224,41 +267,6 @@ func TestParseIsCanonical(t *testing.T) {
 		}
 		if got := assemble(string(class), kid, enc); got != m.Raw.Reveal() {
 			t.Fatalf("re-encoded token = %q, want the original", got)
-		}
-	}
-}
-
-func TestPattern(t *testing.T) {
-	t.Parallel()
-	re, err := regexp.Compile(Pattern())
-	if err != nil {
-		t.Fatalf("Pattern is not valid RE2: %v", err)
-	}
-	for _, class := range []fleet.KeyClass{fleet.ClassAdmin, fleet.ClassAgent, fleet.ClassEnrollment} {
-		m, err := Mint(class)
-		if err != nil {
-			t.Fatalf("Mint(%q): %v", class, err)
-		}
-		raw := m.Raw.Reveal()
-		if !re.MatchString(raw) {
-			t.Errorf("Pattern does not match a minted %q token", class)
-		}
-		embedded := "Authorization: Bearer " + raw + "\n"
-		if got := re.FindString(embedded); got != raw {
-			t.Errorf("Pattern extracted %q from a log line, want the whole token", got)
-		}
-	}
-	negatives := []string{
-		"",
-		"pmf_",
-		"pmf_xyz_" + strings.Repeat("a", 53) + "_" + strings.Repeat("a", 6),
-		"pmf_agt_" + strings.Repeat("a", 52) + "_" + strings.Repeat("a", 6),
-		"pmf_agt_" + strings.Repeat("a", 53) + "_" + strings.Repeat("a", 5),
-		"pmf_agt_" + strings.Repeat("-", 53) + "_" + strings.Repeat("a", 6),
-	}
-	for _, n := range negatives {
-		if re.MatchString(n) {
-			t.Errorf("Pattern matched non-token %q", n)
 		}
 	}
 }

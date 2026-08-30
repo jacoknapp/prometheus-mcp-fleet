@@ -22,11 +22,6 @@ const (
 	// re-enrollment, so it is set long enough that it is a planned event and
 	// not an incident.
 	DefaultCATTL = 10 * 365 * 24 * time.Hour
-	// DefaultServerCertTTL is 90 days. The hub regenerates its own listener
-	// certificate on start when the operator has not supplied one, so this
-	// only bounds a very long-running process.
-	DefaultServerCertTTL = 90 * 24 * time.Hour
-
 	// clockSkew is how far every certificate's NotBefore is backdated so that
 	// a freshly issued certificate is usable on a peer whose clock is a little
 	// behind the hub's.
@@ -61,9 +56,6 @@ type Options struct {
 	// consulted by Create; loading an existing CA uses whatever is on disk.
 	// Defaults to DefaultCATTL.
 	CATTL time.Duration
-	// ServerCertTTL is the lifetime of a certificate issued by IssueServer.
-	// Defaults to DefaultServerCertTTL.
-	ServerCertTTL time.Duration
 	// Clock supplies the current time. It exists so tests can drive expiry
 	// boundaries deterministically. Defaults to time.Now.
 	Clock func() time.Time
@@ -79,9 +71,6 @@ func (o Options) withDefaults() Options {
 	}
 	if o.CATTL == 0 {
 		o.CATTL = DefaultCATTL
-	}
-	if o.ServerCertTTL == 0 {
-		o.ServerCertTTL = DefaultServerCertTTL
 	}
 	if o.Clock == nil {
 		o.Clock = time.Now
@@ -99,9 +88,6 @@ func (o Options) validate() error {
 	}
 	if o.CATTL <= 0 {
 		return fmt.Errorf("%w: ca ttl %s", ErrInvalidOptions, o.CATTL)
-	}
-	if o.ServerCertTTL <= 0 {
-		return fmt.Errorf("%w: server cert ttl %s", ErrInvalidOptions, o.ServerCertTTL)
 	}
 	return nil
 }

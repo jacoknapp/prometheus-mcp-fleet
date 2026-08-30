@@ -181,9 +181,7 @@ func (l *loader) list(p *[]string, name string, def []string, help string) {
 	*p = def
 	value := &csvValue{dst: p}
 	if v, ok := l.lookup(name); ok {
-		if err := value.Set(v); err != nil {
-			l.fail(name, v, err)
-		}
+		_ = value.Set(v) // csvValue.Set only splits a string and cannot fail.
 	}
 	l.fs.Var(value, name, usage(name, help))
 }

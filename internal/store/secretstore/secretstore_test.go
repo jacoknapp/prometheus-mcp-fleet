@@ -350,6 +350,38 @@ func TestConflictThenSuccess(t *testing.T) {
 	}
 }
 
+func TestMutationInitializesANilSecretDataMap(t *testing.T) {
+	t.Parallel()
+	api, s := newStore(t, secretstore.Options{})
+	api.seed(secretstore.DefaultSecretName, nil)
+	if err := s.PutKey(t.Context(), agentKey("agent0001")); err != nil {
+		t.Fatalf("PutKey into Secret with nil data: %v", err)
+	}
+	if _, err := s.GetKey(t.Context(), "agent0001"); err != nil {
+		t.Errorf("GetKey after initializing nil data: %v", err)
+	}
+}
+
+func TestConflictBackoffHonorsContextCancellation(t *testing.T) {
+	t.Parallel()
+	api, s := newStore(t, secretstore.Options{MaxAttempts: 3, Backoff: time.Hour})
+	api.seed(secretstore.DefaultSecretName, map[string][]byte{
+		secretstore.DefaultKey: []byte(`{"schemaVersion":1}`),
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	var once sync.Once
+	api.beforeWrite = func() {
+		api.seed(secretstore.DefaultSecretName, map[string][]byte{
+			secretstore.DefaultKey: []byte(`{"schemaVersion":1}`),
+		})
+		once.Do(func() { time.AfterFunc(20*time.Millisecond, cancel) })
+	}
+	err := s.PutKey(ctx, agentKey("agent0001"))
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("PutKey = %v, want context.Canceled during conflict backoff", err)
+	}
+}
+
 func TestCacheServesReads(t *testing.T) {
 	t.Parallel()
 	now := tBase

@@ -4,6 +4,7 @@
 package ca
 
 import (
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -11,6 +12,8 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"errors"
+	"io"
+	"io/fs"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -21,6 +24,43 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 )
+
+type faultDurableFile struct {
+	name string
+	fail string
+	err  error
+}
+
+func (f *faultDurableFile) Name() string { return f.name }
+func (f *faultDurableFile) Write(p []byte) (int, error) {
+	if f.fail == "write" {
+		return 0, f.err
+	}
+	return len(p), nil
+}
+func (f *faultDurableFile) Sync() error {
+	if f.fail == "sync" {
+		return f.err
+	}
+	return nil
+}
+func (f *faultDurableFile) Chmod(fs.FileMode) error {
+	if f.fail == "chmod" {
+		return f.err
+	}
+	return nil
+}
+func (f *faultDurableFile) Close() error {
+	if f.fail == "close" {
+		return f.err
+	}
+	return nil
+}
+
+type faultSyncCloser struct{ err error }
+
+func (f *faultSyncCloser) Sync() error  { return f.err }
+func (f *faultSyncCloser) Close() error { return nil }
 
 func TestOptionsDefaults(t *testing.T) {
 	t.Parallel()
@@ -35,9 +75,6 @@ func TestOptionsDefaults(t *testing.T) {
 	if got.CATTL != DefaultCATTL {
 		t.Errorf("CATTL = %s, want %s", got.CATTL, DefaultCATTL)
 	}
-	if got.ServerCertTTL != DefaultServerCertTTL {
-		t.Errorf("ServerCertTTL = %s, want %s", got.ServerCertTTL, DefaultServerCertTTL)
-	}
 	if got.Clock == nil {
 		t.Fatal("Clock is nil after defaulting")
 	}
@@ -46,16 +83,15 @@ func TestOptionsDefaults(t *testing.T) {
 	}
 
 	explicit := Options{
-		TrustDomain:   "other.test",
-		SpokeCertTTL:  time.Hour,
-		CATTL:         2 * time.Hour,
-		ServerCertTTL: 3 * time.Hour,
-		Clock:         func() time.Time { return testTime },
+		TrustDomain:  "other.test",
+		SpokeCertTTL: time.Hour,
+		CATTL:        2 * time.Hour,
+		Clock:        func() time.Time { return testTime },
 	}.withDefaults()
 	if diff := cmp.Diff("other.test", explicit.TrustDomain); diff != "" {
 		t.Errorf("TrustDomain (-want +got):\n%s", diff)
 	}
-	if explicit.SpokeCertTTL != time.Hour || explicit.CATTL != 2*time.Hour || explicit.ServerCertTTL != 3*time.Hour {
+	if explicit.SpokeCertTTL != time.Hour || explicit.CATTL != 2*time.Hour {
 		t.Errorf("explicit TTLs were overwritten: %+v", explicit)
 	}
 	if !explicit.Clock().Equal(testTime) {
@@ -81,7 +117,6 @@ func TestOptionsValidate(t *testing.T) {
 		{name: "trust domain leading dash", opts: Options{TrustDomain: "-fleet.local"}},
 		{name: "negative spoke ttl", opts: Options{SpokeCertTTL: -time.Hour}},
 		{name: "negative ca ttl", opts: Options{CATTL: -time.Hour}},
-		{name: "negative server ttl", opts: Options{ServerCertTTL: -time.Hour}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -842,4 +877,213 @@ func TestLinkFileExclusive(t *testing.T) {
 	if err := linkFileExclusive(sub, []byte("x"), 0o600); !errors.Is(err, ErrCAExists) {
 		t.Errorf("linkFileExclusive over a directory: got %v, want ErrCAExists", err)
 	}
+}
+
+// TestCAOperationalFailures drives the process boundaries that fail only under
+// unusual kernel, filesystem, or entropy conditions. It is deliberately
+// non-parallel because each case temporarily replaces one package operation.
+func TestCAOperationalFailures(t *testing.T) {
+	boom := errors.New("injected operational failure")
+	origGenerateKey, origRandomInt := caGenerateKey, caRandomInt
+	origCreateCert, origCreateCRL := caCreateCertificate, caCreateRevocationList
+	origRead, origStat, origRemove := caReadFile, caStat, caRemove
+	origCreateTemp, origLink, origOpenDir := caCreateTemp, caLink, caOpenDir
+	origLoadOrCreateCreate := loadOrCreateCreate
+	t.Cleanup(func() {
+		caGenerateKey, caRandomInt = origGenerateKey, origRandomInt
+		caCreateCertificate, caCreateRevocationList = origCreateCert, origCreateCRL
+		caReadFile, caStat, caRemove = origRead, origStat, origRemove
+		caCreateTemp, caLink, caOpenDir = origCreateTemp, origLink, origOpenDir
+		loadOrCreateCreate = origLoadOrCreateCreate
+	})
+
+	assertBoom := func(t *testing.T, got *CA, err error) {
+		t.Helper()
+		if got != nil || !errors.Is(err, boom) {
+			t.Fatalf("result = (%v, %v), want (nil, wrapped injected error)", got, err)
+		}
+	}
+
+	t.Run("load certificate read", func(t *testing.T) {
+		caReadFile = func(string) ([]byte, error) { return nil, boom }
+		got, err := Load("certificate", "key", Options{})
+		assertBoom(t, got, err)
+		caReadFile = origRead
+	})
+
+	t.Run("load key stat", func(t *testing.T) {
+		certPath, keyPath := paths(t)
+		if _, err := Create(certPath, keyPath, Options{}); err != nil {
+			t.Fatal(err)
+		}
+		caStat = func(string) (fs.FileInfo, error) { return nil, boom }
+		got, err := Load(certPath, keyPath, Options{})
+		assertBoom(t, got, err)
+		caStat = origStat
+	})
+
+	t.Run("load key read", func(t *testing.T) {
+		certPath, keyPath := paths(t)
+		if _, err := Create(certPath, keyPath, Options{}); err != nil {
+			t.Fatal(err)
+		}
+		caReadFile = func(path string) ([]byte, error) {
+			if path == keyPath {
+				return nil, boom
+			}
+			return origRead(path)
+		}
+		got, err := Load(certPath, keyPath, Options{})
+		assertBoom(t, got, err)
+		caReadFile = origRead
+	})
+
+	t.Run("invalid create options", func(t *testing.T) {
+		got, err := Create("certificate", "key", Options{CATTL: -1})
+		if got != nil || !errors.Is(err, ErrInvalidOptions) {
+			t.Fatalf("Create = (%v, %v), want nil ErrInvalidOptions", got, err)
+		}
+	})
+
+	t.Run("create path stat", func(t *testing.T) {
+		dir := t.TempDir()
+		got, err := Create(dir, filepath.Join(dir, "key"), Options{})
+		if got != nil || !errors.Is(err, ErrInvalidCA) {
+			t.Fatalf("Create = (%v, %v), want nil ErrInvalidCA", got, err)
+		}
+	})
+
+	t.Run("key generation", func(t *testing.T) {
+		caGenerateKey = func(elliptic.Curve, io.Reader) (*ecdsa.PrivateKey, error) { return nil, boom }
+		certPath, keyPath := paths(t)
+		got, err := Create(certPath, keyPath, Options{})
+		assertBoom(t, got, err)
+		caGenerateKey = origGenerateKey
+	})
+
+	t.Run("serial generation", func(t *testing.T) {
+		caRandomInt = func(io.Reader, *big.Int) (*big.Int, error) { return nil, boom }
+		if serial, err := newSerial(); serial != nil || !errors.Is(err, boom) {
+			t.Fatalf("newSerial = (%v, %v), want nil wrapped error", serial, err)
+		}
+		certPath, keyPath := paths(t)
+		got, err := Create(certPath, keyPath, Options{})
+		assertBoom(t, got, err)
+		caRandomInt = origRandomInt
+	})
+
+	t.Run("certificate signing", func(t *testing.T) {
+		c := mustCA(t, Options{})
+		caCreateCertificate = func(io.Reader, *x509.Certificate, *x509.Certificate, any, any) ([]byte, error) {
+			return nil, boom
+		}
+		certPath, keyPath := paths(t)
+		got, err := Create(certPath, keyPath, Options{})
+		assertBoom(t, got, err)
+		csrDER, _ := simpleCSR(t)
+		pemBytes, leaf, err := c.IssueSpokeFromCSR(csrDER, "prod")
+		if pemBytes != nil || leaf != nil || !errors.Is(err, boom) {
+			t.Fatalf("IssueSpokeFromCSR = (%x, %v, %v), want nils and wrapped error", pemBytes, leaf, err)
+		}
+		caCreateCertificate = origCreateCert
+	})
+
+	t.Run("crl signing", func(t *testing.T) {
+		c := mustCA(t, Options{})
+		caCreateRevocationList = func(io.Reader, *x509.RevocationList, *x509.Certificate, crypto.Signer) ([]byte, error) {
+			return nil, boom
+		}
+		der, err := c.CRL(nil, testTime, time.Hour)
+		if der != nil || !errors.Is(err, boom) {
+			t.Fatalf("CRL = (%x, %v), want nil wrapped error", der, err)
+		}
+		caCreateRevocationList = origCreateCRL
+	})
+
+	t.Run("creation race never settles", func(t *testing.T) {
+		loadOrCreateCreate = func(string, string, Options) (*CA, error) { return nil, ErrCAExists }
+		certPath, keyPath := paths(t)
+		got, err := LoadOrCreate(certPath, keyPath, Options{})
+		if got != nil || !errors.Is(err, ErrCAExists) || !strings.Contains(err.Error(), "did not settle") {
+			t.Fatalf("LoadOrCreate = (%v, %v), want nil unsettled ErrCAExists", got, err)
+		}
+		loadOrCreateCreate = origLoadOrCreateCreate
+	})
+
+	t.Run("certificate commit cleans key", func(t *testing.T) {
+		certPath, keyPath := paths(t)
+		caLink = func(old, new string) error {
+			if new == certPath {
+				return boom
+			}
+			return origLink(old, new)
+		}
+		got, err := Create(certPath, keyPath, Options{})
+		assertBoom(t, got, err)
+		if _, err := os.Stat(keyPath); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("failed certificate commit left key behind: %v", err)
+		}
+		caLink = origLink
+	})
+}
+
+func TestLinkFileExclusiveOperationalFailures(t *testing.T) {
+	boom := errors.New("injected filesystem failure")
+	origCreateTemp, origLink, origOpenDir := caCreateTemp, caLink, caOpenDir
+	t.Cleanup(func() { caCreateTemp, caLink, caOpenDir = origCreateTemp, origLink, origOpenDir })
+
+	t.Run("create temp", func(t *testing.T) {
+		caCreateTemp = func(string, string) (durableFile, error) { return nil, boom }
+		if err := linkFileExclusive("target", []byte("data"), 0o600); !errors.Is(err, boom) {
+			t.Fatalf("error = %v, want wrapped injected error", err)
+		}
+		caCreateTemp = origCreateTemp
+	})
+
+	for _, stage := range []string{"write", "sync", "chmod", "close"} {
+		t.Run(stage, func(t *testing.T) {
+			caCreateTemp = func(string, string) (durableFile, error) {
+				return &faultDurableFile{name: filepath.Join(t.TempDir(), "temp"), fail: stage, err: boom}, nil
+			}
+			if err := linkFileExclusive("target", []byte("data"), 0o600); !errors.Is(err, boom) {
+				t.Fatalf("error = %v, want wrapped injected error", err)
+			}
+			caCreateTemp = origCreateTemp
+		})
+	}
+
+	t.Run("link", func(t *testing.T) {
+		caCreateTemp = func(string, string) (durableFile, error) {
+			return &faultDurableFile{name: filepath.Join(t.TempDir(), "temp")}, nil
+		}
+		caLink = func(string, string) error { return boom }
+		if err := linkFileExclusive("target", []byte("data"), 0o600); !errors.Is(err, boom) {
+			t.Fatalf("error = %v, want wrapped injected error", err)
+		}
+		caCreateTemp, caLink = origCreateTemp, origLink
+	})
+
+	t.Run("open directory", func(t *testing.T) {
+		caCreateTemp = func(string, string) (durableFile, error) {
+			return &faultDurableFile{name: filepath.Join(t.TempDir(), "temp")}, nil
+		}
+		caLink = func(string, string) error { return nil }
+		caOpenDir = func(string) (syncCloser, error) { return nil, boom }
+		if err := linkFileExclusive("target", []byte("data"), 0o600); !errors.Is(err, boom) {
+			t.Fatalf("error = %v, want wrapped injected error", err)
+		}
+		caCreateTemp, caLink, caOpenDir = origCreateTemp, origLink, origOpenDir
+	})
+
+	t.Run("sync directory", func(t *testing.T) {
+		caCreateTemp = func(string, string) (durableFile, error) {
+			return &faultDurableFile{name: filepath.Join(t.TempDir(), "temp")}, nil
+		}
+		caLink = func(string, string) error { return nil }
+		caOpenDir = func(string) (syncCloser, error) { return &faultSyncCloser{err: boom}, nil }
+		if err := linkFileExclusive("target", []byte("data"), 0o600); !errors.Is(err, boom) {
+			t.Fatalf("error = %v, want wrapped injected error", err)
+		}
+		caCreateTemp, caLink, caOpenDir = origCreateTemp, origLink, origOpenDir
+	})
 }
