@@ -326,6 +326,11 @@ func checkPath(flagName, path string) error {
 		return problem(flagName, "must not be %q: it shares a listener with the MCP endpoint", path)
 	case strings.ContainsAny(path, "?# \t"):
 		return problem(flagName, "%q must be a plain path with no query or fragment", path)
+	case strings.ContainsAny(path, "{}"):
+		// The path is handed to http.ServeMux, whose patterns treat braces as
+		// wildcards and which panics on a malformed one. A configuration typo
+		// must not be able to crash the process at startup.
+		return problem(flagName, "%q must not contain { or }: it is a literal mount path, not a route pattern", path)
 	default:
 		return nil
 	}

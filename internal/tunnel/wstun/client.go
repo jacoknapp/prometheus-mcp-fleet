@@ -270,6 +270,9 @@ func (cfg ClientConfig) httpClient() (*http.Client, error) {
 		}
 		tlsCfg.RootCAs = pool
 	}
+	// Client.Timeout is deliberately left at zero. It is an absolute deadline on
+	// the whole exchange, and the "exchange" here is a tunnel that lives for
+	// days; the upgrade is bounded by dialTimeout instead.
 	return &http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig: tlsCfg,

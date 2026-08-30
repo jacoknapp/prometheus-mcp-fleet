@@ -54,6 +54,8 @@ func TestHubValidate(t *testing.T) {
 		{"tunnel path relative", func(c *Hub) { c.TunnelPath = "tunnel" }, "--tunnel-path"},
 		{"tunnel path root", func(c *Hub) { c.TunnelPath = "/" }, "--tunnel-path"},
 		{"tunnel path empty", func(c *Hub) { c.TunnelPath = "" }, "--tunnel-path"},
+		{"tunnel path with a query", func(c *Hub) { c.TunnelPath = "/tunnel?x=1" }, "--tunnel-path"},
+		{"tunnel path with a mux wildcard", func(c *Hub) { c.TunnelPath = "/tunnel/{id}" }, "--tunnel-path"},
 		{"admin addr", func(c *Hub) { c.AdminAddr = "nope" }, "--admin-addr"},
 		{"admin addr host with space", func(c *Hub) { c.AdminAddr = "bad host:9090" }, "--admin-addr"},
 		{"log level", func(c *Hub) { c.LogLevel = "verbose" }, "--log-level"},
