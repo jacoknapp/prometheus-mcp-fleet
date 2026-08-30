@@ -13,7 +13,6 @@ import (
 	"crypto/x509/pkix"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"math/big"
 	"net"
@@ -36,7 +35,7 @@ import (
 const trustDomain = "fleet.test"
 
 // quiet keeps test output readable; the transport logs every refusal.
-func quiet() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+func quiet() *slog.Logger { return slog.New(slog.DiscardHandler) }
 
 // testCA is a throwaway certificate authority, generated per test.
 //

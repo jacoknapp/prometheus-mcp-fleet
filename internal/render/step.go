@@ -4,6 +4,7 @@
 package render
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -142,9 +143,10 @@ func snapUp(d time.Duration) time.Duration {
 			return rung
 		}
 	}
-	day := 24 * time.Hour
-	n := (d + day - 1) / day
-	return n * day
+	const day = 24 * time.Hour
+	// n is a count of days, not a duration: divide first, then scale the unit.
+	n := int64(d+day-1) / int64(day)
+	return time.Duration(n) * day
 }
 
 // FormatDuration renders d in Prometheus duration syntax ("15s", "5m", "1h",
@@ -180,7 +182,7 @@ func FormatDuration(d time.Duration) string {
 func ParsePromDuration(s string) (time.Duration, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
-		return 0, fmt.Errorf("render: empty duration")
+		return 0, errors.New("render: empty duration")
 	}
 	if secs, err := strconv.ParseFloat(s, 64); err == nil {
 		if math.IsNaN(secs) || math.IsInf(secs, 0) {

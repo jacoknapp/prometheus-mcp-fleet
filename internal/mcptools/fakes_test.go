@@ -86,6 +86,8 @@ func newFakeProm(t *testing.T) *fakeProm {
 		case fleet.StateDegraded:
 			f.unreachable[c.ID] = fmt.Errorf("cluster %s: %w: %s",
 				c.ID, promproxy.ErrUpstream, c.Prometheus.UnreachableReason)
+		case fleet.StateConnected:
+			// Reachable: no injected failure.
 		}
 	}
 	for endpoint, file := range map[promapi.Endpoint]string{
@@ -191,17 +193,6 @@ func (f *fakeProm) lookupLocked(call promproxy.Call) (fakeResponse, bool) {
 		}
 	}
 	return fakeResponse{}, false
-}
-
-// endpoints returns the endpoints the fake was asked for, in order.
-func (f *fakeProm) endpoints() []string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	out := make([]string, 0, len(f.calls))
-	for _, c := range f.calls {
-		out = append(out, string(c.Endpoint))
-	}
-	return out
 }
 
 // lastForm returns the form of the last call to an endpoint.

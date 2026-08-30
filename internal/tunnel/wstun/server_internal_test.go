@@ -107,7 +107,9 @@ func TestReserveSession(t *testing.T) {
 	t.Run("capped", func(t *testing.T) {
 		t.Parallel()
 		s := &Server{cfg: ServerConfig{MaxSessions: 2}}
-		if !s.reserveSession() || !s.reserveSession() {
+		// Both calls must run: || would short-circuit and reserve only one.
+		first, second := s.reserveSession(), s.reserveSession()
+		if !first || !second {
 			t.Fatal("reserveSession() refused inside the cap")
 		}
 		if !s.atSessionLimit() {

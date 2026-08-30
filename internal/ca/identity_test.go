@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel"
 )
 

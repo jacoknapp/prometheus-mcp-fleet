@@ -126,16 +126,6 @@ func (f *fakeSession) describes() []string {
 	return append([]string(nil), f.describeArgs...)
 }
 
-// waitDescribe blocks until one more Describe completes.
-func (f *fakeSession) waitDescribe(t *testing.T) {
-	t.Helper()
-	select {
-	case <-f.describeCh:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for a Describe")
-	}
-}
-
 // testClock is a manually advanced clock. internal/testutil has one, but the
 // registry sits below it in the layering and importing upward from a test would
 // hide a real dependency cycle from the architecture test.

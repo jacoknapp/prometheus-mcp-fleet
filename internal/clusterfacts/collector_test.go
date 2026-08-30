@@ -1016,10 +1016,7 @@ func TestRun(t *testing.T) {
 		go func() { defer close(done); c.Run(ctx) }()
 
 		deadline := time.After(5 * time.Second)
-		for {
-			if c.Facts().Cluster.Prometheus.Reachable {
-				break
-			}
+		for !c.Facts().Cluster.Prometheus.Reachable {
 			select {
 			case <-deadline:
 				t.Fatal("Run did not publish collected facts")

@@ -29,6 +29,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/clusterfacts"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/config"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/httpx"
@@ -37,7 +39,6 @@ import (
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel/wstun"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/version"
-	"golang.org/x/sync/errgroup"
 )
 
 // protocolVersion is the hub<->spoke wire contract this build speaks. The hub
@@ -117,10 +118,11 @@ type spoke struct {
 }
 
 func (s *spoke) run(ctx context.Context, registry prometheusRegistry) error {
-	admin, err := s.startAdmin(registry)
+	admin, err := s.startAdmin(ctx, registry)
 	if err != nil {
 		return err
 	}
+	//nolint:contextcheck // deliberate: the parent context is already cancelled by the time this runs.
 	defer s.stopAdmin(admin)
 
 	if s.prom, err = promclient.New(promclient.Config{
@@ -488,7 +490,7 @@ func (s *spoke) Describe(ctx context.Context, knownFingerprint string) (tunnel.F
 }
 
 // startAdmin brings up the metrics, health and pprof listener.
-func (s *spoke) startAdmin(registry prometheusRegistry) (*httpx.Server, error) {
+func (s *spoke) startAdmin(ctx context.Context, registry prometheusRegistry) (*httpx.Server, error) {
 	mux := http.NewServeMux()
 	mux.Handle("GET /healthz", s.health.LiveHandler())
 	mux.Handle("GET /readyz", s.health.ReadyHandler())
@@ -504,7 +506,7 @@ func (s *spoke) startAdmin(registry prometheusRegistry) (*httpx.Server, error) {
 		Logger:  s.logger,
 		Handler: httpx.Chain(mux, httpx.RequestID, httpx.SecurityHeaders, httpx.Recover(s.logger, nil)),
 	})
-	if err := srv.Start(); err != nil {
+	if err := srv.Start(ctx); err != nil {
 		return nil, fmt.Errorf("start the admin listener: %w", err)
 	}
 	s.logger.Info("admin listener ready", "addr", srv.Addr())

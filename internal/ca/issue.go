@@ -66,10 +66,10 @@ func (c *CA) IssueSpokeFromCSR(csrDER []byte, clusterID string) (certPEM []byte,
 	}
 	csr, err := x509.ParseCertificateRequest(csrDER)
 	if err != nil {
-		return nil, nil, fmt.Errorf("%w: parse: %s", ErrCSRInvalid, err)
+		return nil, nil, fmt.Errorf("%w: parse: %w", ErrCSRInvalid, err)
 	}
 	if err := csr.CheckSignature(); err != nil {
-		return nil, nil, fmt.Errorf("%w: signature: %s", ErrCSRInvalid, err)
+		return nil, nil, fmt.Errorf("%w: signature: %w", ErrCSRInvalid, err)
 	}
 	if err := checkCSRPublicKey(csr.PublicKey); err != nil {
 		return nil, nil, err

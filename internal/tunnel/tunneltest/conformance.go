@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"runtime"
 	"strings"
 	"sync"
@@ -143,7 +144,7 @@ func testSimpleRequestResponse(t *testing.T, newSession Factory) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != 206 {
+	if resp.StatusCode != http.StatusPartialContent {
 		t.Errorf("StatusCode = %d, want 206", resp.StatusCode)
 	}
 	if resp.ContentType != h.ContentType {
@@ -471,7 +472,7 @@ func testTrailerError(t *testing.T, newSession Factory) {
 		t.Errorf("body = %q, want %q", got, body)
 	}
 	// An incomplete response must not be indistinguishable from a complete one.
-	if errors.Is(err, io.EOF) || err == nil {
+	if errors.Is(err, io.EOF) {
 		t.Fatalf("terminal read error = %v, want the upstream failure", err)
 	}
 	if !strings.Contains(err.Error(), msg) {
@@ -689,7 +690,11 @@ func testInvalidRequests(t *testing.T, newSession Factory) {
 			}
 		})
 	}
-	if n := len(s.(interface{ Identity() tunnel.Identity }).Identity().ClusterID); n == 0 {
+	ident, ok := s.(interface{ Identity() tunnel.Identity })
+	if !ok {
+		t.Fatalf("session %T does not expose Identity()", s)
+	}
+	if ident.Identity().ClusterID == "" {
 		t.Error("Identity().ClusterID is empty")
 	}
 	if calls := len(newEchoCalls(s)); calls != 0 {
@@ -844,6 +849,6 @@ func isZeroCluster(c fleet.Cluster) bool {
 	return c.ID == "" && c.DisplayName == "" && c.Description == "" &&
 		len(c.Labels) == 0 && c.AgentVersion == "" && c.ProtocolVersion == "" &&
 		c.Kubernetes == (fleet.KubernetesInfo{}) &&
-		c.Prometheus.Reachable == false && c.Prometheus.Version == "" &&
+		!c.Prometheus.Reachable && c.Prometheus.Version == "" &&
 		len(c.Prometheus.Jobs) == 0
 }

@@ -40,16 +40,16 @@ func newClient(t *testing.T, baseURL string, opt func(*promclient.Config)) *prom
 	return c
 }
 
-// drain reads a response body to completion and returns the bytes, the read
-// error and the trailer.
-func drain(t *testing.T, resp *tunnel.Response) ([]byte, error, tunnel.Trailer) {
+// drain reads a response body to completion and returns the bytes, the
+// trailer and the read error.
+func drain(t *testing.T, resp *tunnel.Response) ([]byte, tunnel.Trailer, error) {
 	t.Helper()
 	b, err := io.ReadAll(resp.Body)
 	trailer := resp.Trailer()
 	if cerr := resp.Body.Close(); cerr != nil {
 		t.Fatalf("Close: %v", cerr)
 	}
-	return b, err, trailer
+	return b, trailer, err
 }
 
 func TestNewValidatesConfig(t *testing.T) {
@@ -238,7 +238,7 @@ func TestDoSendsFormOnTheRightSideOfTheRequest(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Do: %v", err)
 			}
-			body, readErr, trailer := drain(t, resp)
+			body, trailer, readErr := drain(t, resp)
 			if readErr != nil {
 				t.Fatalf("read body: %v", readErr)
 			}
@@ -320,7 +320,7 @@ func TestDoGzipPassthrough(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Do: %v", err)
 	}
-	body, readErr, trailer := drain(t, resp)
+	body, trailer, readErr := drain(t, resp)
 	if readErr != nil {
 		t.Fatalf("read: %v", readErr)
 	}
@@ -392,7 +392,7 @@ func TestDoEnforcesByteCapDuringRead(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Do: %v", err)
 			}
-			body, readErr, trailer := drain(t, resp)
+			body, trailer, readErr := drain(t, resp)
 
 			if !tc.wantTruncated {
 				if readErr != nil {
@@ -481,7 +481,7 @@ func TestDoDoesNotTrustContentLength(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Do: %v", err)
 			}
-			body, readErr, trailer := drain(t, resp)
+			body, trailer, readErr := drain(t, resp)
 			if !errors.Is(readErr, promclient.ErrTooLarge) {
 				t.Fatalf("read error = %v, want ErrTooLarge", readErr)
 			}
@@ -510,7 +510,7 @@ func TestDoClientCapWinsOverRequestCap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Do: %v", err)
 	}
-	body, readErr, _ := drain(t, resp)
+	body, _, readErr := drain(t, resp)
 	if !errors.Is(readErr, promclient.ErrTooLarge) {
 		t.Fatalf("read error = %v, want ErrTooLarge", readErr)
 	}
@@ -552,7 +552,7 @@ func TestDoReportsWarnings(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Do: %v", err)
 			}
-			_, readErr, trailer := drain(t, resp)
+			_, trailer, readErr := drain(t, resp)
 			if readErr != nil {
 				t.Fatalf("read: %v", readErr)
 			}
@@ -581,7 +581,7 @@ func TestDoPassesUpstreamErrorsThrough(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Do: %v", err)
 			}
-			body, readErr, _ := drain(t, resp)
+			body, _, readErr := drain(t, resp)
 			if readErr != nil {
 				t.Fatalf("read: %v", readErr)
 			}

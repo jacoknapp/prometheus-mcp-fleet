@@ -51,8 +51,10 @@ func ToolNames() []string { return slices.Clone(toolNames) }
 // cluster without parsing the JSON-RPC body.
 var clusterHeaderMeta = map[string]any{"x-mcp-header": []any{"cluster"}}
 
-// formatConstraint is the shared shape of the format argument.
-func formatConstraint(allowJSON bool, def string) mcpsurface.Constraint {
+// formatConstraint is the shared shape of the format argument. Every tool
+// defaults to the compact renderer; format:"json" is opt-in per call.
+func formatConstraint(allowJSON bool) mcpsurface.Constraint {
+	def := string(render.FormatCompact)
 	enum := []string{string(render.FormatCompact), string(render.FormatTable)}
 	if allowJSON {
 		enum = []string{
@@ -122,7 +124,7 @@ func (t *Tools) registerDiscovery(s *mcpsurface.Server) {
 				Default: StatusAll,
 			},
 			"limit":  intRange(1, 500, 100),
-			"format": formatConstraint(false, string(render.FormatCompact)),
+			"format": formatConstraint(false),
 			"filter": {Examples: []any{"prod", "eu-west"}},
 			"labelSelector": {
 				Examples: []any{map[string]string{"env": "prod", "region": "eu-west"}},
@@ -170,7 +172,7 @@ func (t *Tools) registerQuery(s *mcpsurface.Server) {
 		Meta:       clusterHeaderMeta,
 		Constraints: map[string]mcpsurface.Constraint{
 			"limit":   intRange(1, 1000, 100),
-			"format":  formatConstraint(true, string(render.FormatCompact)),
+			"format":  formatConstraint(true),
 			"time":    {Examples: []any{"now", "now-15m", "2026-08-29T12:00:00Z"}},
 			"timeout": {Default: "30s", Examples: []any{"30s", "2m"}},
 			"query":   {Examples: []any{"sum by(job) (up == 0)", "rate(http_requests_total[5m])"}},
@@ -194,7 +196,7 @@ func (t *Tools) registerQuery(s *mcpsurface.Server) {
 		Constraints: map[string]mcpsurface.Constraint{
 			"maxPoints": intRange(10, 500, render.DefaultMaxPoints),
 			"maxSeries": intRange(1, 200, render.DefaultMaxSeries),
-			"format":    formatConstraint(true, string(render.FormatCompact)),
+			"format":    formatConstraint(true),
 			"start":     {Default: "now-1h", Examples: []any{"now-6h", "-15m"}},
 			"end":       {Default: "now", Examples: []any{"now"}},
 			"step":      {Examples: []any{"1m", "5m"}},
@@ -275,7 +277,7 @@ func (t *Tools) registerMetadata(s *mcpsurface.Server) {
 		Meta:       clusterHeaderMeta,
 		Constraints: map[string]mcpsurface.Constraint{
 			"limit":    intRange(1, 1000, 100),
-			"format":   formatConstraint(true, string(render.FormatCompact)),
+			"format":   formatConstraint(true),
 			"start":    {Default: "now-1h"},
 			"end":      {Default: "now"},
 			"matchers": {MinItems: mcpsurface.Ptr(1), Examples: []any{[]string{`up{job="api"}`}}},
@@ -339,7 +341,7 @@ func (t *Tools) registerOperational(s *mcpsurface.Server) {
 				Default: HealthAny,
 			},
 			"limit":  intRange(1, 500, 50),
-			"format": formatConstraint(false, string(render.FormatCompact)),
+			"format": formatConstraint(false),
 			"job":    {Examples: []any{"kubelet"}},
 		},
 	}, run(t, ToolTargets, func() *TargetsOut { return &TargetsOut{} }, t.targets))
@@ -356,7 +358,7 @@ func (t *Tools) registerOperational(s *mcpsurface.Server) {
 		Constraints: map[string]mcpsurface.Constraint{
 			"type":   {Enum: []string{RuleTypeAll, RuleTypeAlert, RuleTypeRecord}, Default: RuleTypeAll},
 			"limit":  intRange(1, 500, 50),
-			"format": formatConstraint(false, string(render.FormatCompact)),
+			"format": formatConstraint(false),
 		},
 	}, run(t, ToolRules, func() *RulesOut { return &RulesOut{} }, t.rules))
 
@@ -373,7 +375,7 @@ func (t *Tools) registerOperational(s *mcpsurface.Server) {
 		Constraints: map[string]mcpsurface.Constraint{
 			"state":              {Enum: []string{AlertAll, AlertFiring, AlertPending}, Default: AlertFiring},
 			"limit":              intRange(1, 300, 50),
-			"format":             formatConstraint(false, string(render.FormatCompact)),
+			"format":             formatConstraint(false),
 			"includeAnnotations": {Default: true},
 			"severity":           {Examples: []any{"critical", "warning"}},
 		},

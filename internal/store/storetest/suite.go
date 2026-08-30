@@ -109,7 +109,8 @@ func adminKey(kid string, createdAt time.Time) *fleet.Key {
 }
 
 // enrollmentKey builds a single-use enrollment token record.
-func enrollmentKey(kid, clusterID string, createdAt time.Time) *fleet.Key {
+func enrollmentKey(kid string, createdAt time.Time) *fleet.Key {
+	const clusterID = "prod-eu-1"
 	return &fleet.Key{
 		KID:        kid,
 		Class:      fleet.ClassEnrollment,
@@ -158,7 +159,7 @@ func testKeyRoundTrip(t *testing.T, s store.Store) {
 	}{
 		{"agent with scope", agentKey("agent0001", tBase)},
 		{"admin without scope", adminKey("admin0001", tBase)},
-		{"enrollment with grant", enrollmentKey("enrol0001", "prod-eu-1", tBase)},
+		{"enrollment with grant", enrollmentKey("enrol0001", tBase)},
 	}
 	for _, tc := range tests {
 		mustPut(t, s, tc.key)
@@ -303,7 +304,7 @@ func testListKeysOrdering(t *testing.T, s store.Store) {
 	mustPut(t, s, agentKey("agentAAAA", tBase))
 	mustPut(t, s, adminKey("adminCCCC", tBase.Add(time.Hour)))
 	mustPut(t, s, adminKey("adminAAAA", tBase.Add(3*time.Hour)))
-	mustPut(t, s, enrollmentKey("enrolAAAA", "prod-eu-1", tBase.Add(4*time.Hour)))
+	mustPut(t, s, enrollmentKey("enrolAAAA", tBase.Add(4*time.Hour)))
 
 	tests := []struct {
 		name  string
@@ -570,7 +571,7 @@ func testTouchKeyNotFound(t *testing.T, s store.Store) {
 
 func testBurnEnrollment(t *testing.T, s store.Store) {
 	ctx := t.Context()
-	k := enrollmentKey("enrol0002", "prod-eu-1", tBase)
+	k := enrollmentKey("enrol0002", tBase)
 	mustPut(t, s, k)
 	before := mustEpoch(t, s)
 
@@ -610,7 +611,7 @@ func testBurnEnrollment(t *testing.T, s store.Store) {
 
 func testBurnEnrollmentTwice(t *testing.T, s store.Store) {
 	ctx := t.Context()
-	k := enrollmentKey("enrol0003", "prod-eu-1", tBase)
+	k := enrollmentKey("enrol0003", tBase)
 	mustPut(t, s, k)
 
 	first, err := s.BurnEnrollment(ctx, k.KID, "serial-01", tBase.Add(time.Minute))
@@ -653,16 +654,16 @@ func testBurnEnrollmentRejects(t *testing.T, s store.Store) {
 	}
 	mustPut(t, s, noGrant)
 
-	revoked := enrollmentKey("enrol0005", "prod-eu-1", tBase)
+	revoked := enrollmentKey("enrol0005", tBase)
 	mustPut(t, s, revoked)
 	if err := s.RevokeKey(ctx, revoked.KID, "operator error", tBase.Add(time.Minute)); err != nil {
 		t.Fatalf("RevokeKey: %v", err)
 	}
 
-	expired := enrollmentKey("enrol0006", "prod-eu-1", tBase)
+	expired := enrollmentKey("enrol0006", tBase)
 	mustPut(t, s, expired)
 
-	valid := enrollmentKey("enrol0007", "prod-eu-1", tBase)
+	valid := enrollmentKey("enrol0007", tBase)
 	mustPut(t, s, valid)
 
 	tests := []struct {
@@ -701,7 +702,7 @@ func testBurnEnrollmentRejects(t *testing.T, s store.Store) {
 
 func testBurnEnrollmentConcurrent(t *testing.T, s store.Store) {
 	ctx := t.Context()
-	k := enrollmentKey("enrol0008", "prod-eu-1", tBase)
+	k := enrollmentKey("enrol0008", tBase)
 	mustPut(t, s, k)
 
 	const racers = 24
@@ -872,7 +873,7 @@ func testRevokedCertValidates(t *testing.T, s store.Store) {
 
 func testEpochMonotonic(t *testing.T, s store.Store) {
 	ctx := t.Context()
-	k := enrollmentKey("enrol0009", "prod-eu-1", tBase)
+	k := enrollmentKey("enrol0009", tBase)
 	agent := agentKey("agent0014", tBase)
 
 	steps := []struct {

@@ -5,6 +5,7 @@ package promapi
 
 import (
 	"errors"
+	"net/http"
 	"net/url"
 	"strings"
 	"testing"
@@ -21,7 +22,7 @@ func TestGetKnownAndUnknown(t *testing.T) {
 		if r.Endpoint != e {
 			t.Errorf("Get(%q).Endpoint = %q", e, r.Endpoint)
 		}
-		if r.Method != "GET" && r.Method != "POST" {
+		if r.Method != http.MethodGet && r.Method != http.MethodPost {
 			t.Errorf("Get(%q).Method = %q, want GET or POST", e, r.Method)
 		}
 		if !strings.HasPrefix(r.PathTemplate, "/api/v1/") {

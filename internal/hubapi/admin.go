@@ -120,6 +120,8 @@ func (s *server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 				"an admin key carries no scope: its authority is the admin listener, not a scope document")
 			return
 		}
+	case fleet.ClassEnrollment:
+		// Unreachable: the maxTTL switch above already refused this class.
 	}
 	ttl, err := resolveTTL(req.TTL, maxTTL)
 	if err != nil {

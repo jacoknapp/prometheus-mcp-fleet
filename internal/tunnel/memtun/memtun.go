@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -123,9 +124,12 @@ func (s *session) Describe(ctx context.Context, knownFingerprint string) (tunnel
 	default:
 	}
 
+	// The caller's context is inherited by callCtx. s.ctx is the session
+	// lifetime, a second cancellation edge rather than a second parent, which
+	// a context tree cannot express.
 	callCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	stop := context.AfterFunc(s.ctx, cancel)
+	stop := context.AfterFunc(s.ctx, cancel) //nolint:contextcheck // s.ctx is a cancellation edge, not a replacement parent; ctx is inherited above.
 	defer stop()
 
 	facts, err := s.h.Describe(callCtx, knownFingerprint)
@@ -155,7 +159,7 @@ func (s *session) Do(ctx context.Context, req *tunnel.Request) (*tunnel.Response
 	}
 
 	reqCtx, cancel := context.WithCancel(ctx)
-	stop := context.AfterFunc(s.ctx, cancel)
+	stop := context.AfterFunc(s.ctx, cancel) //nolint:contextcheck // s.ctx is a cancellation edge, not a replacement parent; ctx is inherited above.
 	cleanup := func() {
 		stop()
 		cancel()
@@ -224,7 +228,7 @@ func (s *session) mapErr(callerCtx context.Context, err error) error {
 	}
 	select {
 	case <-s.done:
-		return fmt.Errorf("%w: %v", tunnel.ErrSessionClosed, err)
+		return fmt.Errorf("%w: %w", tunnel.ErrSessionClosed, err)
 	default:
 	}
 	return err
@@ -236,7 +240,7 @@ func validateRequest(req *tunnel.Request) error {
 	switch {
 	case req == nil:
 		return fmt.Errorf("%w: nil request", ErrInvalidRequest)
-	case req.Method != "GET" && req.Method != "POST":
+	case req.Method != http.MethodGet && req.Method != http.MethodPost:
 		return fmt.Errorf("%w: method %q is not GET or POST", ErrInvalidRequest, req.Method)
 	case !strings.HasPrefix(req.Path, "/"):
 		return fmt.Errorf("%w: path %q is not absolute", ErrInvalidRequest, req.Path)
@@ -287,7 +291,7 @@ func pump(ctx context.Context, pw *io.PipeWriter, resp *tunnel.Response, budget 
 		}
 	}
 
-	term := error(io.EOF)
+	term := io.EOF
 	switch {
 	case ctx.Err() != nil:
 		term = ctx.Err()
@@ -328,7 +332,7 @@ func copyBudgeted(w io.Writer, r io.Reader, budget int64) (sent int64, truncated
 		if n > 0 {
 			if _, werr := w.Write(buf[:n]); werr != nil {
 				// The reader went away; it already knows why.
-				return sent, truncated, nil
+				return sent, truncated, nil //nolint:nilerr // deliberate; see above.
 			}
 			sent += int64(n)
 		}

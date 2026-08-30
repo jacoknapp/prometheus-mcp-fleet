@@ -32,7 +32,7 @@ import (
 const trustDomain = "fleet.test"
 
 // quiet keeps test output readable.
-func quiet() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+func quiet() *slog.Logger { return slog.New(slog.DiscardHandler) }
 
 // testCA is a throwaway authority standing in for the hub's.
 //

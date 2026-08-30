@@ -5,6 +5,7 @@ package mcpsurface
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/google/jsonschema-go/jsonschema"
@@ -112,7 +113,7 @@ func applyConstraint(s *jsonschema.Schema, c Constraint) error {
 	}
 	if c.Items != nil {
 		if s.Items == nil {
-			return fmt.Errorf("item constraint on a property that is not an array")
+			return errors.New("item constraint on a property that is not an array")
 		}
 		if err := applyConstraint(s.Items, *c.Items); err != nil {
 			return fmt.Errorf("items: %w", err)

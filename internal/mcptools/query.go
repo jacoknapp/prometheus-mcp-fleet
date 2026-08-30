@@ -192,8 +192,8 @@ func (t *Tools) passthroughInstant(
 		out.Truncated = tokenCeilingTruncation(est, t.tokenCeiling)
 		return out, nil
 	}
-	out.Raw = json.RawMessage(env.Data)
-	out.Warnings = append(env.Warnings, env.Infos...)
+	out.Raw = env.Data
+	out.Warnings = slices.Concat(env.Warnings, env.Infos)
 	return out, nil
 }
 
@@ -279,7 +279,7 @@ func (t *Tools) queryRange(
 	}
 
 	now := t.now()
-	start, end, terr := t.resolveRange(in.Start, in.End, now, time.Hour, map[string]any{
+	start, end, terr := t.resolveRange(in.Start, in.End, now, map[string]any{
 		"cluster": in.Cluster,
 		"query":   render.ClipRunes(in.Query, 512),
 		"start":   in.Start,
@@ -344,8 +344,8 @@ func (t *Tools) queryRange(
 			out.Truncated = tokenCeilingTruncation(est, t.tokenCeiling)
 			return out, nil
 		}
-		out.Raw = json.RawMessage(env.Data)
-		out.Warnings = append(env.Warnings, env.Infos...)
+		out.Raw = env.Data
+		out.Warnings = slices.Concat(env.Warnings, env.Infos)
 		return out, nil
 	}
 
@@ -396,9 +396,14 @@ func (t *Tools) queryRange(
 // too-large range is exactly the case where the agent needs a corrected
 // argument object it can copy, and Prometheus would simply answer with far too
 // much data instead of refusing.
+// defaultRangeSpan is the window a range query covers when the caller gives
+// neither a start nor an end.
+const defaultRangeSpan = time.Hour
+
 func (t *Tools) resolveRange(
-	startArg, endArg string, now time.Time, defaultSpan time.Duration, echo map[string]any,
+	startArg, endArg string, now time.Time, echo map[string]any,
 ) (time.Time, time.Time, *ToolError) {
+	defaultSpan := defaultRangeSpan
 	end, err := ParseTime(endArg, now)
 	if err != nil {
 		return time.Time{}, time.Time{}, invalidTime("end", endArg, str(echo["cluster"]), err)

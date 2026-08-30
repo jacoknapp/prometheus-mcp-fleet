@@ -11,9 +11,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/store"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel/wstun"
-	"github.com/prometheus/client_golang/prometheus"
 )
 
 // prometheusRegistry names the concrete registry type the composition root
@@ -31,8 +32,8 @@ type prometheusRegistry = prometheus.Registry
 //
 // What survives from the old listener is the part that was never about TLS:
 // the revocation predicate, consulted on every connection.
-func (h *hub) newTunnelServer() (*wstun.Server, error) {
-	revoked, err := h.revokedSerials()
+func (h *hub) newTunnelServer(ctx context.Context) (*wstun.Server, error) {
+	revoked, err := h.revokedSerials(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -66,9 +67,9 @@ func (h *hub) newTunnelServer() (*wstun.Server, error) {
 // is least welcome. The cache is refreshed on a short timer and immediately
 // whenever the revocation epoch moves, so a revocation takes effect within one
 // refresh interval at worst.
-func (h *hub) revokedSerials() (func(serial string) bool, error) {
+func (h *hub) revokedSerials(ctx context.Context) (func(serial string) bool, error) {
 	d := &revocationCache{store: h.store, ttl: 30 * time.Second}
-	if err := d.refresh(context.Background()); err != nil {
+	if err := d.refresh(ctx); err != nil {
 		return nil, fmt.Errorf("load the revocation list: %w", err)
 	}
 	return d.isRevoked, nil
@@ -99,6 +100,10 @@ func (c *revocationCache) isRevoked(serial string) bool {
 		return revoked
 	}
 
+	// The predicate signature the tunnel server accepts carries no context --
+	// it is consulted from inside the TLS handshake, which has none to give --
+	// so this refresh is bounded by its own deadline rather than a caller's.
+	//nolint:contextcheck // no inheritable context exists at this call site; see above.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := c.refresh(ctx); err != nil {

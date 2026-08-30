@@ -16,6 +16,7 @@ import (
 	"errors"
 	"io"
 	"math/big"
+	"strings"
 	"testing"
 	"time"
 
@@ -66,8 +67,14 @@ func TestTranscriptIsUnambiguous(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			a := certproof.Transcript(tc.aNonce, tc.aVersion, tc.aCluster)
-			b := certproof.Transcript(tc.bNonce, tc.bVersion, tc.bCluster)
+			a, err := certproof.Transcript(tc.aNonce, tc.aVersion, tc.aCluster)
+			if err != nil {
+				t.Fatalf("Transcript(a): %v", err)
+			}
+			b, err := certproof.Transcript(tc.bNonce, tc.bVersion, tc.bCluster)
+			if err != nil {
+				t.Fatalf("Transcript(b): %v", err)
+			}
 			if bytes.Equal(a, b) {
 				t.Errorf("two different inputs produced the same transcript:\n%q", a)
 			}
@@ -80,7 +87,10 @@ func TestTranscriptIsUnambiguous(t *testing.T) {
 func TestTranscriptIsDomainSeparated(t *testing.T) {
 	t.Parallel()
 
-	got := certproof.Transcript([]byte("nonce"), "v1", "prod")
+	got, err := certproof.Transcript([]byte("nonce"), "v1", "prod")
+	if err != nil {
+		t.Fatalf("Transcript: %v", err)
+	}
 	if !bytes.HasPrefix(got, []byte("prometheus-mcp-fleet/tunnel-auth\x00")) {
 		t.Errorf("transcript does not begin with the domain tag: %q", got)
 	}
@@ -255,4 +265,38 @@ func selfSigned(t *testing.T, key crypto.Signer) *x509.Certificate {
 		t.Fatalf("ParseCertificate: %v", err)
 	}
 	return cert
+}
+
+// TestTranscriptRejectsAnOversizedField proves the uniqueness guarantee is
+// structural rather than a consequence of callers happening to pass small
+// values. A field at or beyond 4 GiB would truncate the 32-bit length prefix
+// and let two different inputs collide; the cap is what makes that
+// unrepresentable.
+func TestTranscriptRejectsAnOversizedField(t *testing.T) {
+	t.Parallel()
+
+	big := strings.Repeat("a", certproof.MaxFieldBytes+1)
+
+	tests := []struct {
+		name                       string
+		nonce                      []byte
+		protocolVersion, clusterID string
+	}{
+		{name: "nonce", nonce: []byte(big), protocolVersion: "v1", clusterID: "prod"},
+		{name: "protocol version", nonce: []byte("n"), protocolVersion: big, clusterID: "prod"},
+		{name: "cluster id", nonce: []byte("n"), protocolVersion: "v1", clusterID: big},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := certproof.Transcript(tc.nonce, tc.protocolVersion, tc.clusterID)
+			if !errors.Is(err, certproof.ErrFieldTooLarge) {
+				t.Fatalf("error = %v, want ErrFieldTooLarge", err)
+			}
+			if got != nil {
+				t.Error("a transcript was returned alongside an error")
+			}
+		})
+	}
 }

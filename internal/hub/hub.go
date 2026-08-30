@@ -32,6 +32,8 @@ import (
 	"os"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/authn"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/ca"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/config"
@@ -49,7 +51,6 @@ import (
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel/wstun"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/version"
-	"golang.org/x/sync/errgroup"
 )
 
 // Run starts the hub and blocks until ctx is cancelled or a fatal error occurs.
@@ -142,22 +143,26 @@ func (h *hub) run(ctx context.Context) error {
 		return err
 	}
 
-	admin, err := h.startAdmin()
+	admin, err := h.startAdmin(ctx)
 	if err != nil {
 		return err
 	}
+	// The shutdown helpers run after this context is cancelled, so they build
+	// their own deadline from ShutdownGrace rather than inheriting a dead one.
+	//nolint:contextcheck // deliberate: the parent context is already cancelled by the time this runs.
 	defer h.shutdown(admin, "admin")
 
 	// The tunnel is a route on the MCP listener now, so it has to exist before
 	// that listener is built rather than after it.
-	if h.tunnel, err = h.newTunnelServer(); err != nil {
+	if h.tunnel, err = h.newTunnelServer(ctx); err != nil {
 		return err
 	}
 
-	public, err := h.startPublic()
+	public, err := h.startPublic(ctx)
 	if err != nil {
 		return err
 	}
+	//nolint:contextcheck // deliberate: the parent context is already cancelled by the time this runs.
 	defer h.shutdown(public, "mcp")
 
 	listener := h.tunnel.Listener()
@@ -171,6 +176,8 @@ func (h *hub) run(ctx context.Context) error {
 	group.Go(func() error { h.watchCertExpiry(gctx); return nil })
 
 	<-gctx.Done()
+	// gctx is cancelled by definition on the line above; drain must not inherit it.
+	//nolint:contextcheck // deliberate: draining needs a live deadline, not a cancelled parent.
 	h.drain(listener)
 
 	if err := group.Wait(); err != nil && !errors.Is(err, context.Canceled) {
@@ -340,7 +347,7 @@ func (h *hub) resourceMetadataURL() string {
 
 // startAdmin brings up the admin API, metrics, health and pprof listener. It is
 // bound to loopback by default and must never be exposed.
-func (h *hub) startAdmin() (*httpx.Server, error) {
+func (h *hub) startAdmin(ctx context.Context) (*httpx.Server, error) {
 	adminMux, err := hubapi.NewAdminMux(h.apiOptions())
 	if err != nil {
 		return nil, fmt.Errorf("build the admin API: %w", err)
@@ -364,7 +371,7 @@ func (h *hub) startAdmin() (*httpx.Server, error) {
 			httpx.RequestID, httpx.SecurityHeaders,
 			httpx.Recover(h.logger, nil), httpx.AccessLog(h.logger)),
 	})
-	if err := srv.Start(); err != nil {
+	if err := srv.Start(ctx); err != nil {
 		return nil, fmt.Errorf("start the admin listener: %w", err)
 	}
 	h.logger.Info("admin listener ready", "addr", srv.Addr())
@@ -373,7 +380,7 @@ func (h *hub) startAdmin() (*httpx.Server, error) {
 
 // startPublic brings up the agent-facing listener: the MCP endpoint, plus the
 // unauthenticated enrollment and PKI routes.
-func (h *hub) startPublic() (*httpx.Server, error) {
+func (h *hub) startPublic(ctx context.Context) (*httpx.Server, error) {
 	publicMux, err := hubapi.NewPublicMux(h.apiOptions())
 	if err != nil {
 		return nil, fmt.Errorf("build the public API: %w", err)
@@ -400,7 +407,7 @@ func (h *hub) startPublic() (*httpx.Server, error) {
 			httpx.RequestID, httpx.SecurityHeaders,
 			httpx.Recover(h.logger, nil), httpx.AccessLog(h.logger)),
 	})
-	if err := srv.Start(); err != nil {
+	if err := srv.Start(ctx); err != nil {
 		return nil, fmt.Errorf("start the MCP listener: %w", err)
 	}
 	h.logger.Info("mcp listener ready", "addr", srv.Addr())

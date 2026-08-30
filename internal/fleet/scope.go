@@ -4,6 +4,7 @@
 package fleet
 
 import (
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -148,7 +149,7 @@ func matchToolPattern(pattern, name string) bool {
 // Validate reports whether the scope is internally consistent.
 func (s *Scope) Validate() error {
 	if s == nil {
-		return fmt.Errorf("scope is required")
+		return errors.New("scope is required")
 	}
 	if !s.Role.Valid() {
 		return fmt.Errorf("invalid role %q", s.Role)
@@ -157,16 +158,16 @@ func (s *Scope) Validate() error {
 		return fmt.Errorf("role %q cannot be granted to an agent key", RoleAdmin)
 	}
 	if len(s.Clusters.Allow) == 0 && len(s.Clusters.MatchLabels) == 0 {
-		return fmt.Errorf("clusters: one of allow or matchLabels is required")
+		return errors.New("clusters: one of allow or matchLabels is required")
 	}
 	if len(s.Tools.Allow) == 0 {
-		return fmt.Errorf("tools.allow is required (deny-by-default)")
+		return errors.New("tools.allow is required (deny-by-default)")
 	}
 	if slices.Contains(s.Clusters.Deny, "*") {
 		return fmt.Errorf("clusters.deny does not accept the wildcard %q", "*")
 	}
 	if s.Limits.MaxPoints < 0 || s.Limits.MaxSeries < 0 || s.Limits.MaxResponseBytes < 0 {
-		return fmt.Errorf("limits must not be negative")
+		return errors.New("limits must not be negative")
 	}
 	return nil
 }

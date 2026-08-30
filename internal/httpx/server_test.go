@@ -27,7 +27,7 @@ func startTestServer(t *testing.T, cfg ServerConfig) *Server {
 		cfg.Logger, _ = newTestLogger()
 	}
 	s := NewServer(cfg)
-	if err := s.Start(); err != nil {
+	if err := s.Start(t.Context()); err != nil {
 		t.Fatalf("start: %v", err)
 	}
 	t.Cleanup(func() {
@@ -168,7 +168,7 @@ func TestServerStartBindError(t *testing.T) {
 	logger, _ := newTestLogger()
 	s := NewServer(ServerConfig{Name: "conflicted", Addr: ln.Addr().String(), Logger: logger})
 
-	startErr := s.Start()
+	startErr := s.Start(t.Context())
 	if startErr == nil {
 		t.Fatal("Start on a busy port returned nil")
 	}
@@ -188,7 +188,7 @@ func TestServerStartTwice(t *testing.T) {
 	t.Parallel()
 
 	s := startTestServer(t, ServerConfig{})
-	if err := s.Start(); !errors.Is(err, ErrAlreadyStarted) {
+	if err := s.Start(t.Context()); !errors.Is(err, ErrAlreadyStarted) {
 		t.Errorf("second Start = %v, want ErrAlreadyStarted", err)
 	}
 }

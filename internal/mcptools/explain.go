@@ -125,14 +125,14 @@ func (t *Tools) explainPromQL(
 		out.CheckSkipped = fmt.Sprintf(
 			"Metric existence was not checked: %s. The structural answer above still holds.",
 			terr.Message)
-		return out, nil
+		return out, nil //nolint:nilerr // deliberate: the structural answer stands, the enrichment is best-effort.
 	}
 	names, terr := t.labelValuesOf(ctx, p, c.ID, MetadataName, nil, time.Time{}, time.Time{})
 	if terr != nil {
 		out.CheckSkipped = fmt.Sprintf(
 			"Metric existence was not checked: %s. The structural answer above still holds.",
 			terr.Message)
-		return out, nil
+		return out, nil //nolint:nilerr // deliberate: the structural answer stands, the enrichment is best-effort.
 	}
 	out.ClusterChecked = c.ID
 	known := make(map[string]bool, len(names))

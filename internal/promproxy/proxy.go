@@ -101,13 +101,13 @@ func New(opts Options) (*Proxy, error) {
 		return nil, errors.New("promproxy: registry is required")
 	}
 	if opts.DefaultTimeout < 0 || opts.MaxTimeout < 0 {
-		return nil, fmt.Errorf("promproxy: timeouts must not be negative")
+		return nil, errors.New("promproxy: timeouts must not be negative")
 	}
 	if opts.MaxResponseBytes < 0 || opts.GlobalResponseBudget < 0 {
-		return nil, fmt.Errorf("promproxy: byte budgets must not be negative")
+		return nil, errors.New("promproxy: byte budgets must not be negative")
 	}
 	if opts.MaxInflightPerCluster < 0 {
-		return nil, fmt.Errorf("promproxy: max in-flight per cluster must not be negative")
+		return nil, errors.New("promproxy: max in-flight per cluster must not be negative")
 	}
 	p := &Proxy{
 		reg:              opts.Registry,
@@ -302,7 +302,7 @@ func (p *Proxy) Do(ctx context.Context, principal *fleet.Principal, call Call) (
 		return nil, wrapped
 	}
 	if resp.Body != nil {
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 	}
 
 	body, truncated, rerr := readCapped(resp, maxBytes)
@@ -544,7 +544,7 @@ func readCapped(resp *tunnel.Response, maxBytes int64) (body []byte, truncated b
 			}
 			return nil, false, fmt.Errorf("gzip: %w", zerr)
 		}
-		defer zr.Close()
+		defer func() { _ = zr.Close() }()
 		r = io.LimitReader(zr, maxBytes+1)
 	}
 	b, rerr := io.ReadAll(r)

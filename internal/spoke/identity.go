@@ -121,10 +121,13 @@ type secretIdentityStore struct {
 	name   string
 }
 
+// Describe names the Secret the identity lives in.
 func (s *secretIdentityStore) Describe() string {
 	return fmt.Sprintf("secret %s/%s", s.client.Namespace(), s.name)
 }
 
+// Load reads the identity from the Secret, returning [ErrNoIdentity] when the
+// Secret is absent or carries no key and certificate yet.
 func (s *secretIdentityStore) Load(ctx context.Context) (key, cert, ca []byte, err error) {
 	sec, err := s.client.GetSecret(ctx, s.name)
 	if errors.Is(err, kube.ErrNotFound) {
@@ -140,6 +143,8 @@ func (s *secretIdentityStore) Load(ctx context.Context) (key, cert, ca []byte, e
 	return key, cert, ca, nil
 }
 
+// Save writes the identity to the Secret, creating it if another replica has
+// not already done so.
 func (s *secretIdentityStore) Save(ctx context.Context, key, cert, ca []byte) error {
 	data := map[string][]byte{keyClientKey: key, keyClientCert: cert, keyCABundle: ca}
 
@@ -172,8 +177,11 @@ func (s *secretIdentityStore) Save(ctx context.Context, key, cert, ca []byte) er
 // running outside Kubernetes.
 type fileIdentityStore struct{ dir string }
 
+// Describe names the directory the identity files live in.
 func (f *fileIdentityStore) Describe() string { return "files in " + f.dir }
 
+// Load reads the identity files, returning [ErrNoIdentity] when the key or the
+// certificate is missing.
 func (f *fileIdentityStore) Load(context.Context) (key, cert, ca []byte, err error) {
 	read := func(name string) ([]byte, error) {
 		b, err := os.ReadFile(filepath.Join(f.dir, name))
@@ -197,6 +205,8 @@ func (f *fileIdentityStore) Load(context.Context) (key, cert, ca []byte, err err
 	return key, cert, ca, nil
 }
 
+// Save writes each file through a temporary name and renames it into place, so
+// a crash mid-write cannot leave a half file that looks loadable.
 func (f *fileIdentityStore) Save(_ context.Context, key, cert, ca []byte) error {
 	if err := os.MkdirAll(f.dir, 0o700); err != nil {
 		return fmt.Errorf("create data dir: %w", err)
@@ -224,8 +234,11 @@ func (f *fileIdentityStore) Save(_ context.Context, key, cert, ca []byte) error 
 // who will grant no RBAC at all.
 type memoryIdentityStore struct{ key, cert, ca []byte }
 
+// Describe reports that nothing is persisted.
 func (m *memoryIdentityStore) Describe() string { return "memory (not persisted)" }
 
+// Load returns the identity held in memory, or [ErrNoIdentity] before the first
+// enrollment of this process.
 func (m *memoryIdentityStore) Load(context.Context) (key, cert, ca []byte, err error) {
 	if len(m.key) == 0 {
 		return nil, nil, nil, ErrNoIdentity
@@ -233,6 +246,7 @@ func (m *memoryIdentityStore) Load(context.Context) (key, cert, ca []byte, err e
 	return m.key, m.cert, m.ca, nil
 }
 
+// Save holds the identity for the lifetime of the process only.
 func (m *memoryIdentityStore) Save(_ context.Context, key, cert, ca []byte) error {
 	m.key, m.cert, m.ca = key, cert, ca
 	return nil

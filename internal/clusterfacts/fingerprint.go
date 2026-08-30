@@ -97,10 +97,14 @@ func Fingerprint(c fleet.Cluster) string {
 		PromHasAlertmanager: c.Prometheus.HasAlertmanager,
 	}
 	// canonicalFacts contains only strings, numbers, bools, []string and
-	// map[string]string, so marshalling cannot fail.
+	// map[string]string -- no floats, no channels, no custom marshaler -- so
+	// encoding/json has no failure mode here. A fingerprint that quietly fell
+	// back to a hash of nothing would make every spoke look unchanged forever,
+	// which is worse than stopping; and this branch can only be reached by
+	// adding an unmarshalable field to the struct above, in this package.
 	b, err := json.Marshal(cf)
 	if err != nil {
-		panic("clusterfacts: canonical facts are not marshalable: " + err.Error())
+		panic("clusterfacts: canonical facts are not marshalable: " + err.Error()) //nolint:forbidigo // unreachable invariant guard; see above.
 	}
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])

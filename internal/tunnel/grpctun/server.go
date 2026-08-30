@@ -69,7 +69,7 @@ func (s *spokeServer) Proxy(in *fleetv1.ProxyRequest, stream fleetv1.SpokeServic
 	defer func() { _ = resp.Body.Close() }()
 
 	if err := stream.Send(&fleetv1.ProxyChunk{Kind: &fleetv1.ProxyChunk_Head{Head: &fleetv1.ResponseHead{
-		StatusCode:      int32(resp.StatusCode),
+		StatusCode:      int32(resp.StatusCode), //nolint:gosec // G115: an HTTP status is three digits; net/http will not produce anything outside int32.
 		ContentType:     resp.ContentType,
 		ContentEncoding: resp.ContentEncoding,
 	}}}); err != nil {
@@ -84,7 +84,7 @@ func (s *spokeServer) Proxy(in *fleetv1.ProxyRequest, stream fleetv1.SpokeServic
 	}
 
 	trail := &fleetv1.ResponseTrail{
-		BytesTotal:         uint64(sent),
+		BytesTotal:         uint64(sent), //nolint:gosec // G115: streamBody only ever adds a non-negative Read count to sent, capped at req.MaxResponseBytes.
 		UpstreamDurationMs: time.Since(started).Milliseconds(),
 		Truncated:          truncated,
 	}

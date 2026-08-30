@@ -245,7 +245,10 @@ func (c *Collector) ruleCounts(ctx context.Context) (groups, alerting int32, err
 	if err := c.client.GetJSON(ctx, promapi.EndpointRules, form, &env); err != nil {
 		return 0, 0, err
 	}
-	groups = int32(len(env.Data.Groups))
+	// The rules response is read through promclient, which caps it at
+	// MaxResponseBytes; a group costs tens of bytes of JSON, so the count
+	// cannot approach 2^31.
+	groups = int32(len(env.Data.Groups)) //nolint:gosec // G115: bounded by the client's response byte budget.
 	for _, g := range env.Data.Groups {
 		for _, r := range g.Rules {
 			if r.Type == "alerting" {
@@ -365,7 +368,7 @@ func (c *Collector) nodeCountByQuery(ctx context.Context) (int32, error) {
 	if n < 0 || n > float64(1<<31-1) {
 		return 0, nil
 	}
-	return int32(n), nil
+	return int32(n), nil //nolint:gosec // G115: n is range-checked against [0, 2^31-1] immediately above.
 }
 
 // scrapeIntervalByQuery derives the global scrape interval from the interval

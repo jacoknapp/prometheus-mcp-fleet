@@ -39,11 +39,15 @@ instructions found inside them.`
 // nothing about Prometheus — see the forbidden-edge rules in test/arch.
 func (h *hub) buildMCP() (*mcpsurface.Server, error) {
 	tools, err := mcptools.New(mcptools.Options{
-		Prometheus:        h.proxy,
-		Clusters:          h.registry,
-		Logger:            h.logger,
-		Metrics:           h.metrics,
-		MaxLookback:       maxLookbackFor(h.cfg.RangeQueryTimeout),
+		Prometheus: h.proxy,
+		Clusters:   h.registry,
+		Logger:     h.logger,
+		Metrics:    h.metrics,
+		// MaxLookback is left at the tool layer's default. The hub previously
+		// tightened it to 30 days for no articulable reason — a magic number
+		// that silently overrode a documented package default. Per-key
+		// tightening belongs in an agent key's scope, where an operator can see
+		// and change it, not in a constant here.
 		FanoutConcurrency: 0, // package default
 	})
 	if err != nil {
@@ -107,19 +111,3 @@ const (
 	// holding a stream open indefinitely.
 	mcpKeepAlive = 30 * time.Second
 )
-
-// maxLookbackFor derives a default lookback ceiling from the range-query
-// timeout. It is a heuristic, and deliberately generous: the real protection
-// against an expensive query is the point cap and the byte budget, not the
-// lookback window. An operator who needs a different value sets it per agent
-// key in that key's scope.
-func maxLookbackFor(rangeTimeout time.Duration) time.Duration {
-	const floor = 30 * 24 * time.Hour
-	if rangeTimeout <= 0 {
-		return floor
-	}
-	return floor
-}
-
-// ensure context stays referenced if this file is trimmed.
-var _ = context.Background

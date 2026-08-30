@@ -186,7 +186,7 @@ func (c *Client) fetch(ctx context.Context, route promapi.Route, labelName strin
 		return nil, err
 	}
 	defer cancel()
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	limit := int64(maxJSONHelperBytes)
 	if c.maxResponseBytes < limit {

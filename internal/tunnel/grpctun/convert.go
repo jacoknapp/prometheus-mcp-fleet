@@ -6,6 +6,7 @@ package grpctun
 import (
 	"fmt"
 	"maps"
+	"net/http"
 	"strings"
 
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/fleet"
@@ -20,7 +21,7 @@ func validateRequest(req *tunnel.Request) error {
 	switch {
 	case req == nil:
 		return fmt.Errorf("%w: nil request", ErrInvalidRequest)
-	case req.Method != "GET" && req.Method != "POST":
+	case req.Method != http.MethodGet && req.Method != http.MethodPost:
 		return fmt.Errorf("%w: method %q is not GET or POST", ErrInvalidRequest, req.Method)
 	case !strings.HasPrefix(req.Path, "/"):
 		return fmt.Errorf("%w: path %q is not absolute", ErrInvalidRequest, req.Path)
@@ -37,7 +38,7 @@ func requestToProto(req *tunnel.Request) *fleetv1.ProxyRequest {
 		Method:           req.Method,
 		Path:             req.Path,
 		Body:             req.Form,
-		MaxResponseBytes: uint64(req.MaxResponseBytes),
+		MaxResponseBytes: uint64(req.MaxResponseBytes), //nolint:gosec // G115: validateRequest rejects MaxResponseBytes <= 0 before any request is sent.
 		AcceptGzip:       req.AcceptGzip,
 		RequestId:        req.RequestID,
 	}
@@ -46,16 +47,18 @@ func requestToProto(req *tunnel.Request) *fleetv1.ProxyRequest {
 // requestFromProto converts a wire request into its tunnel form. It is used on
 // the spoke, which must treat every field as untrusted input.
 func requestFromProto(in *fleetv1.ProxyRequest) (*tunnel.Request, error) {
+	// Range-check before converting, not after: the wire field is a uint64 and
+	// anything above 2^63 would wrap to a negative budget.
+	if in.GetMaxResponseBytes() > 1<<62 {
+		return nil, fmt.Errorf("%w: max_response_bytes %d overflows int64", ErrInvalidRequest, in.GetMaxResponseBytes())
+	}
 	req := &tunnel.Request{
 		Method:           in.GetMethod(),
 		Path:             in.GetPath(),
 		Form:             in.GetBody(),
 		AcceptGzip:       in.GetAcceptGzip(),
 		RequestID:        in.GetRequestId(),
-		MaxResponseBytes: int64(in.GetMaxResponseBytes()),
-	}
-	if in.GetMaxResponseBytes() > 1<<62 {
-		return nil, fmt.Errorf("%w: max_response_bytes %d overflows int64", ErrInvalidRequest, in.GetMaxResponseBytes())
+		MaxResponseBytes: int64(in.GetMaxResponseBytes()), //nolint:gosec // G115: bounded by the 1<<62 check immediately above.
 	}
 	if err := validateRequest(req); err != nil {
 		return nil, err

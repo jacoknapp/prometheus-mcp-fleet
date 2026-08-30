@@ -76,19 +76,44 @@ const domainTag = "prometheus-mcp-fleet/tunnel-auth\x00"
 // signature cover something other than what it appears to.
 //
 // The returned slice is freshly allocated and owned by the caller.
-func Transcript(nonce []byte, protocolVersion, clusterID string) []byte {
-	var buf []byte
-	appendField := func(b []byte) {
-		var n [4]byte
-		binary.BigEndian.PutUint32(n[:], uint32(len(b)))
-		buf = append(buf, n[:]...)
-		buf = append(buf, b...)
+// MaxFieldBytes bounds a single transcript field.
+//
+// The length prefix is 32 bits, so a field of 4 GiB or more would truncate it
+// and let two different inputs produce the same transcript — defeating the one
+// property this function exists to provide. Every real field is orders of
+// magnitude below this cap, so the bound is not a limitation; it is what makes
+// the uniqueness guarantee structural rather than a consequence of callers
+// happening to pass small values today.
+const MaxFieldBytes = 64 << 10
+
+// ErrFieldTooLarge means a transcript field exceeded [MaxFieldBytes].
+var ErrFieldTooLarge = errors.New("certproof: transcript field is too large")
+
+// Transcript builds the byte string both sides sign and verify.
+//
+// Every field is length-prefixed and the whole is domain-separated, so no
+// combination of values can produce the same transcript as a different
+// combination. Concatenating without lengths is the classic way to make a
+// signature cover something other than what it appears to.
+func Transcript(nonce []byte, protocolVersion, clusterID string) ([]byte, error) {
+	fields := [][]byte{nonce, []byte(protocolVersion), []byte(clusterID)}
+	for _, f := range fields {
+		if len(f) > MaxFieldBytes {
+			return nil, fmt.Errorf("%w: %d bytes, limit %d",
+				ErrFieldTooLarge, len(f), MaxFieldBytes)
+		}
 	}
+
+	buf := make([]byte, 0, len(domainTag)+len(fields)*4+
+		len(nonce)+len(protocolVersion)+len(clusterID))
 	buf = append(buf, domainTag...)
-	appendField(nonce)
-	appendField([]byte(protocolVersion))
-	appendField([]byte(clusterID))
-	return buf
+	for _, f := range fields {
+		var n [4]byte
+		binary.BigEndian.PutUint32(n[:], uint32(len(f)))
+		buf = append(buf, n[:]...)
+		buf = append(buf, f...)
+	}
+	return buf, nil
 }
 
 // Sign produces a proof of possession over
@@ -98,7 +123,11 @@ func Transcript(nonce []byte, protocolVersion, clusterID string) []byte {
 // crypto.Signer rather than a concrete type so the key may stay behind an
 // interface; crypto/tls hands one back for every key type it parses.
 func Sign(key crypto.Signer, nonce []byte, protocolVersion, clusterID string) ([]byte, error) {
-	digest := sha256.Sum256(Transcript(nonce, protocolVersion, clusterID))
+	t, err := Transcript(nonce, protocolVersion, clusterID)
+	if err != nil {
+		return nil, err
+	}
+	digest := sha256.Sum256(t)
 	sig, err := key.Sign(rand.Reader, digest[:], crypto.SHA256)
 	if err != nil {
 		return nil, fmt.Errorf("sign the proof-of-possession transcript: %w", err)
@@ -116,7 +145,11 @@ func Verify(leaf *x509.Certificate, sig, nonce []byte, protocolVersion, clusterI
 	if leaf == nil {
 		return fmt.Errorf("%w: no certificate presented", ErrBadSignature)
 	}
-	digest := sha256.Sum256(Transcript(nonce, protocolVersion, clusterID))
+	t, err := Transcript(nonce, protocolVersion, clusterID)
+	if err != nil {
+		return err
+	}
+	digest := sha256.Sum256(t)
 
 	switch pub := leaf.PublicKey.(type) {
 	case *ecdsa.PublicKey:
@@ -125,7 +158,7 @@ func Verify(leaf *x509.Certificate, sig, nonce []byte, protocolVersion, clusterI
 		}
 	case *rsa.PublicKey:
 		if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, digest[:], sig); err != nil {
-			return fmt.Errorf("%w: %s", ErrBadSignature, err)
+			return fmt.Errorf("%w: %w", ErrBadSignature, err)
 		}
 	default:
 		return fmt.Errorf("%w: unsupported key type %T", ErrBadSignature, leaf.PublicKey)

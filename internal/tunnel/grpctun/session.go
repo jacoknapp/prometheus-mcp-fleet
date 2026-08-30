@@ -91,7 +91,9 @@ func (s *session) Close(reason string) error {
 	s.closeOnce.Do(func() {
 		s.reason.Store(&reason)
 		s.cancel()
-		if err := s.cc.Close(); err != nil && !errors.Is(err, grpc.ErrClientConnClosing) {
+		// grpc.ErrClientConnClosing is deprecated; a second Close reports the
+		// Canceled status code instead.
+		if err := s.cc.Close(); err != nil && status.Code(err) != codes.Canceled {
 			s.closeErr = err
 		}
 		// The ClientConn owns the transport and normally closes the socket for
@@ -114,9 +116,12 @@ func (s *session) Describe(ctx context.Context, knownFingerprint string) (tunnel
 	default:
 	}
 
+	// The caller's context is inherited by callCtx. s.ctx is the session
+	// lifetime, a second cancellation edge rather than a second parent, which
+	// a context tree cannot express.
 	callCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	stopWatch := context.AfterFunc(s.ctx, cancel)
+	stopWatch := context.AfterFunc(s.ctx, cancel) //nolint:contextcheck // s.ctx is a cancellation edge, not a replacement parent; ctx is inherited above.
 	defer stopWatch()
 
 	resp, err := s.client.Describe(callCtx, &fleetv1.DescribeRequest{KnownFingerprint: knownFingerprint})
@@ -152,7 +157,7 @@ func (s *session) Do(ctx context.Context, req *tunnel.Request) (*tunnel.Response
 	// Cancelling the session must abort the stream, but a context tree cannot
 	// have two parents. AfterFunc gives us the second edge without a goroutine
 	// per request.
-	stopWatch := context.AfterFunc(s.ctx, cancel)
+	stopWatch := context.AfterFunc(s.ctx, cancel) //nolint:contextcheck // s.ctx is a cancellation edge, not a replacement parent; ctx is inherited above.
 	cleanup := func() {
 		stopWatch()
 		cancel()
@@ -204,7 +209,7 @@ func (s *session) mapErr(callerCtx context.Context, err error) error {
 	}
 	select {
 	case <-s.done:
-		return fmt.Errorf("%w: %v", tunnel.ErrSessionClosed, err)
+		return fmt.Errorf("%w: %w", tunnel.ErrSessionClosed, err)
 	default:
 	}
 	if st, ok := status.FromError(err); ok {
@@ -215,6 +220,9 @@ func (s *session) mapErr(callerCtx context.Context, err error) error {
 			return context.DeadlineExceeded
 		case codes.Unavailable:
 			return fmt.Errorf("%w: %s", tunnel.ErrSessionClosed, st.Message())
+		default:
+			// Every other code keeps its own meaning; the caller sees the
+			// status error unchanged.
 		}
 	}
 	return err
@@ -314,7 +322,7 @@ func (b *bodyReader) absorbTrail(t *fleetv1.ResponseTrail) {
 		Truncated:       t.GetTruncated(),
 		Warnings:        t.GetWarnings(),
 	}
-	term := error(io.EOF)
+	term := io.EOF
 	switch {
 	case t.GetError() != "":
 		// The spoke could not finish the upstream call, so the body the caller
@@ -327,7 +335,7 @@ func (b *bodyReader) absorbTrail(t *fleetv1.ResponseTrail) {
 	}
 	// Drain the final status so the RPC ends cleanly instead of with a
 	// cancellation the spoke would log as an error.
-	if _, err := b.stream.Recv(); err != nil && !errors.Is(err, io.EOF) && term == io.EOF {
+	if _, err := b.stream.Recv(); err != nil && !errors.Is(err, io.EOF) && errors.Is(term, io.EOF) {
 		term = b.mapErr(err)
 	}
 	b.finish(term)

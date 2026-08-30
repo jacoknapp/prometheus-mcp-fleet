@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -179,7 +180,7 @@ func (f *FakePrometheus) serve(w http.ResponseWriter, r *http.Request) {
 		body = buf.Bytes()
 		w.Header().Set("Content-Encoding", "gzip")
 	}
-	w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(status)
 	f.writeBody(w, body)
 }
@@ -270,14 +271,14 @@ func mustFixture(name string) []byte {
 // errorBody renders the JSON error envelope Prometheus returns for a status.
 func errorBody(code int) []byte {
 	kind := "internal"
-	switch {
-	case code == http.StatusBadRequest:
+	switch code {
+	case http.StatusBadRequest:
 		kind = "bad_data"
-	case code == http.StatusUnprocessableEntity:
+	case http.StatusUnprocessableEntity:
 		kind = "execution"
-	case code == http.StatusServiceUnavailable:
+	case http.StatusServiceUnavailable:
 		kind = "unavailable"
-	case code == http.StatusNotFound:
+	case http.StatusNotFound:
 		kind = "not_found"
 	}
 	b, _ := json.Marshal(map[string]string{

@@ -81,6 +81,7 @@ func Recover(logger *slog.Logger, onPanic func()) Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			rw := wrapResponseWriter(w)
+			//nolint:contextcheck // the closure logs with r.Context(); contextcheck cannot see through a deferred func literal inside an http.HandlerFunc.
 			defer func() {
 				rv := recover()
 				if rv == nil {
@@ -144,6 +145,7 @@ func AccessLog(logger *slog.Logger) Middleware {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			rw := wrapResponseWriter(w)
 			start := time.Now()
+			//nolint:contextcheck // the closure logs with r.Context(); contextcheck cannot see through a deferred func literal inside an http.HandlerFunc.
 			defer func() {
 				elapsed := time.Since(start)
 				logger.LogAttrs(r.Context(), levelForStatus(rw.Status()), "http request",

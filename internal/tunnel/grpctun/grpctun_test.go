@@ -5,7 +5,6 @@ package grpctun_test
 
 import (
 	"context"
-	"io"
 	"log/slog"
 	"net"
 	"testing"
@@ -19,7 +18,7 @@ import (
 // quietLogger keeps the suite's output readable; the transport logs every
 // session open and close at Info.
 func quietLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
+	return slog.New(slog.DiscardHandler)
 }
 
 // tcpSource is a grpctun.ConnSource over a plain TCP listener.

@@ -83,7 +83,9 @@ func run[In any, Out toolOut](
 		tl.metrics.ToolCall(name, result)
 		tl.metrics.ToolDuration(name, tl.now().Sub(start))
 		if terr != nil {
-			return out, mcpsurface.ErrorResult, nil
+			// A tool error travels in the result, not as a Go error: that is
+			// what puts a machine-readable code where the model can read it.
+			return out, mcpsurface.ErrorResult, nil //nolint:nilerr // deliberate; see above.
 		}
 		return out, mcpsurface.OKResult, nil
 	}

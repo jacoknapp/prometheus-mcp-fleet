@@ -285,7 +285,7 @@ func (b *bootstrapper) complete(
 		sec.Data = make(map[string][]byte, len(generated))
 	}
 
-	var filled []string
+	filled := make([]string, 0, len(generated))
 	for key, value := range generated {
 		if len(sec.Data[key]) > 0 {
 			continue // an existing value always wins

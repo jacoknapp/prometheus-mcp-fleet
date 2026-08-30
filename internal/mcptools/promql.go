@@ -335,7 +335,7 @@ func analyzePromQL(q string) promQLAnalysis {
 	a.Aggregations = sortedKeys(aggs)
 	a.Labels = sortedKeys(labels)
 	a.RangeWindows = windows
-	a.Suggestions = append(suggest, counterAdvice(a.Metrics, a.Functions)...)
+	a.Suggestions = slices.Concat(suggest, counterAdvice(a.Metrics, a.Functions))
 	return a
 }
 

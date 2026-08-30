@@ -375,7 +375,7 @@ func Validate(e Endpoint, form url.Values, gatedEnabled bool) error {
 		}
 		for _, v := range values {
 			if err := validateValue(p, v); err != nil {
-				return fmt.Errorf("%w: %q: %s", ErrInvalidParam, name, err)
+				return fmt.Errorf("%w: %q: %w", ErrInvalidParam, name, err)
 			}
 		}
 	}

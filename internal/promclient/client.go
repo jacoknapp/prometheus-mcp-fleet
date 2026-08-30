@@ -256,6 +256,7 @@ func (c *Client) Do(ctx context.Context, req *tunnel.Request) (*tunnel.Response,
 		limit = req.MaxResponseBytes
 	}
 
+	//nolint:bodyclose // ownership passes to newLimitedBody below, which closes it; bodyclose cannot follow the handoff.
 	resp, latency, cancel, err := c.roundTrip(ctx, route, labelName, form, req.AcceptGzip, req.RequestID)
 	if err != nil {
 		return nil, err
@@ -435,7 +436,7 @@ func (c *Client) probe(ctx context.Context, path string) error {
 	if err != nil {
 		return fmt.Errorf("%s: %w", path, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	// Drain a bounded amount so the connection can be reused.
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode/100 != 2 {

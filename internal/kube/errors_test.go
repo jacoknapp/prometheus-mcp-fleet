@@ -31,7 +31,7 @@ func TestAPIErrorUnwrap(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			got := tc.err.Unwrap()
-			if !errors.Is(got, tc.want) && !(got == nil && tc.want == nil) {
+			if !errors.Is(got, tc.want) && (got != nil || tc.want != nil) {
 				t.Errorf("Unwrap() = %v, want %v", got, tc.want)
 			}
 		})

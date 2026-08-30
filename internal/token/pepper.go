@@ -79,7 +79,7 @@ func createPepper(path string) ([]byte, error) {
 		return nil, fmt.Errorf("create pepper %s: %w", path, err)
 	}
 	if _, err := f.Write(fresh); err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, fmt.Errorf("write pepper %s: %w", path, err)
 	}
 	if err := f.Close(); err != nil {

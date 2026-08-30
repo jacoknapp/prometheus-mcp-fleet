@@ -314,7 +314,7 @@ func parseCertificatePEM(b []byte) (*x509.Certificate, error) {
 	}
 	cert, err := x509.ParseCertificate(blk.Bytes)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %s", ErrInvalidCA, err)
+		return nil, fmt.Errorf("%w: %w", ErrInvalidCA, err)
 	}
 	return cert, nil
 }

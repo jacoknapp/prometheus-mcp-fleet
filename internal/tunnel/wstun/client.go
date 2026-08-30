@@ -92,6 +92,7 @@ func Dial(ctx context.Context, cfg ClientConfig, h tunnel.Handler) error {
 	dialCtx, cancelDial := context.WithTimeout(ctx, dialTimeout)
 	defer cancelDial()
 
+	//nolint:bodyclose // websocket.Dial owns resp: on success the body is hijacked into the connection, and on failure the library has already closed it.
 	ws, resp, err := websocket.Dial(dialCtx, target, &websocket.DialOptions{
 		HTTPClient:      httpClient,
 		Subprotocols:    []string{Subprotocol},

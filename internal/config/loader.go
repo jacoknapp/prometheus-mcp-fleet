@@ -94,7 +94,7 @@ func (l *loader) lookup(name string) (string, bool) {
 // fail records an environment parse failure. Loading continues so the operator
 // learns about every bad variable at once.
 func (l *loader) fail(name, value string, err error) {
-	l.errs = append(l.errs, fmt.Errorf("%w: %s=%q: %v", ErrEnv, EnvKey(name), value, err))
+	l.errs = append(l.errs, fmt.Errorf("%w: %s=%q: %w", ErrEnv, EnvKey(name), value, err))
 }
 
 // usage decorates a flag's help text with the variable that backs it.
@@ -149,6 +149,8 @@ func (l *loader) bytesize(p *int64, name string, def int64, help string) {
 
 // boolean registers a bool flag. The environment accepts anything
 // strconv.ParseBool does, so "1", "true" and "TRUE" all work.
+//
+//nolint:unparam // def mirrors flag.BoolVar and the seven sibling helpers; that every bool flag happens to default to false today is not a property worth baking into the signature.
 func (l *loader) boolean(p *bool, name string, def bool, help string) {
 	if v, ok := l.lookup(name); ok {
 		b, err := strconv.ParseBool(v)
@@ -204,7 +206,7 @@ func (l *loader) parse(args []string) error {
 		if errors.Is(err, flag.ErrHelp) {
 			return &HelpError{Usage: l.usageText()}
 		}
-		return fmt.Errorf("%w: %v\n\n%s", ErrUsage, err, l.usageText())
+		return fmt.Errorf("%w: %w\n\n%s", ErrUsage, err, l.usageText())
 	}
 	if l.fs.NArg() > 0 {
 		return fmt.Errorf("%w: unexpected argument %q\n\n%s",

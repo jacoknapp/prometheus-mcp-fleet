@@ -102,7 +102,8 @@ func (s *server) issueRenewNonce(now time.Time) (nonce []byte, expiresAt time.Ti
 	expiresAt = now.Add(RenewChallengeTTL).UTC().Truncate(time.Second)
 
 	nonce = make([]byte, renewNonceLen)
-	rand.Read(nonce[:renewNonceRandomBytes])
+	_, _ = rand.Read(nonce[:renewNonceRandomBytes])
+	//nolint:gosec // G115: expiresAt is now + RenewChallengeTTL, so its Unix seconds are positive for any clock this side of 1970.
 	binary.BigEndian.PutUint64(nonce[renewNonceRandomBytes:renewNonceBodyBytes], uint64(expiresAt.Unix()))
 	copy(nonce[renewNonceBodyBytes:], s.hasher.Sum(renewNonceMACInput(nonce[:renewNonceBodyBytes])))
 	return nonce, expiresAt
@@ -122,6 +123,7 @@ func (s *server) verifyRenewNonce(nonce []byte, now time.Time) error {
 	if !s.hasher.Equal(nonce[renewNonceBodyBytes:], renewNonceMACInput(body)) {
 		return errRenewNonceInvalid
 	}
+	//nolint:gosec // G115: body is MAC-verified on the line above, so these are bytes this fleet wrote, not attacker-chosen.
 	expiresAt := time.Unix(int64(binary.BigEndian.Uint64(body[renewNonceRandomBytes:])), 0).UTC()
 	if now.After(expiresAt) {
 		return fmt.Errorf("%w at %s", errRenewNonceExpired, expiresAt.Format(time.RFC3339))

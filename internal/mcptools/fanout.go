@@ -256,7 +256,7 @@ func (t *Tools) fanoutQuery(
 		form.Set("query", in.Query)
 		form.Set("time", formatUpstreamTime(at))
 	} else {
-		start, end, terr = t.resolveRange(in.Start, in.End, now, time.Hour, map[string]any{
+		start, end, terr = t.resolveRange(in.Start, in.End, now, map[string]any{
 			"query": render.ClipRunes(in.Query, 512),
 			"start": in.Start, "end": in.End, "step": in.Step,
 		})

@@ -47,7 +47,7 @@ func DecodeAPIResponse(body []byte) (*APIResponse, error) {
 	}
 	var r APIResponse
 	if err := json.Unmarshal(body, &r); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrMalformedUpstream, err)
+		return nil, fmt.Errorf("%w: %w", ErrMalformedUpstream, err)
 	}
 	if r.Status == "" {
 		return nil, fmt.Errorf("%w: no status field", ErrMalformedUpstream)
@@ -72,7 +72,7 @@ func DecodeQueryData(data json.RawMessage) (*QueryData, error) {
 	}
 	var q QueryData
 	if err := json.Unmarshal(data, &q); err != nil {
-		return nil, fmt.Errorf("%w: query data: %v", ErrMalformedUpstream, err)
+		return nil, fmt.Errorf("%w: query data: %w", ErrMalformedUpstream, err)
 	}
 	return &q, nil
 }
@@ -90,25 +90,25 @@ type Point struct {
 func (p *Point) UnmarshalJSON(b []byte) error {
 	var raw []json.RawMessage
 	if err := json.Unmarshal(b, &raw); err != nil {
-		return fmt.Errorf("%w: sample: %v", ErrMalformedUpstream, err)
+		return fmt.Errorf("%w: sample: %w", ErrMalformedUpstream, err)
 	}
 	if len(raw) < 2 {
 		return fmt.Errorf("%w: sample has %d members, want 2", ErrMalformedUpstream, len(raw))
 	}
 	if err := json.Unmarshal(raw[0], &p.T); err != nil {
-		return fmt.Errorf("%w: sample timestamp: %v", ErrMalformedUpstream, err)
+		return fmt.Errorf("%w: sample timestamp: %w", ErrMalformedUpstream, err)
 	}
 	var s string
 	if err := json.Unmarshal(raw[1], &s); err != nil {
 		// Some Prometheus-compatible servers emit a bare number.
 		if err2 := json.Unmarshal(raw[1], &p.V); err2 != nil {
-			return fmt.Errorf("%w: sample value: %v", ErrMalformedUpstream, err)
+			return fmt.Errorf("%w: sample value: %w", ErrMalformedUpstream, err)
 		}
 		return nil
 	}
 	v, err := strconv.ParseFloat(s, 64)
 	if err != nil {
-		return fmt.Errorf("%w: sample value %q: %v", ErrMalformedUpstream, s, err)
+		return fmt.Errorf("%w: sample value %q: %w", ErrMalformedUpstream, s, err)
 	}
 	p.V = v
 	return nil
@@ -137,7 +137,7 @@ func DecodeMatrix(result json.RawMessage) (Matrix, error) {
 	}
 	var m Matrix
 	if err := json.Unmarshal(result, &m); err != nil {
-		return nil, fmt.Errorf("%w: matrix: %v", ErrMalformedUpstream, err)
+		return nil, fmt.Errorf("%w: matrix: %w", ErrMalformedUpstream, err)
 	}
 	return m, nil
 }
@@ -160,7 +160,7 @@ func DecodeVector(result json.RawMessage) (Vector, error) {
 	}
 	var v Vector
 	if err := json.Unmarshal(result, &v); err != nil {
-		return nil, fmt.Errorf("%w: vector: %v", ErrMalformedUpstream, err)
+		return nil, fmt.Errorf("%w: vector: %w", ErrMalformedUpstream, err)
 	}
 	return v, nil
 }

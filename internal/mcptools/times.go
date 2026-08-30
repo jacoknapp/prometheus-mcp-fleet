@@ -69,10 +69,10 @@ func parseRelative(s string, now time.Time) (time.Time, bool, error) {
 	default:
 		return time.Time{}, false, nil
 	}
-	sign := time.Duration(1)
+	negative := false
 	switch {
 	case strings.HasPrefix(body, "-"):
-		sign, body = -1, body[1:]
+		negative, body = true, body[1:]
 	case strings.HasPrefix(body, "+"):
 		body = body[1:]
 	default:
@@ -84,7 +84,10 @@ func parseRelative(s string, now time.Time) (time.Time, bool, error) {
 		return time.Time{}, true, fmt.Errorf(
 			"%q is not a time: %q is not a duration such as \"6h\", \"15m\" or \"1d\"", s, body)
 	}
-	return now.Add(sign * d).UTC(), true, nil
+	if negative {
+		d = -d
+	}
+	return now.Add(d).UTC(), true, nil
 }
 
 // ParseDuration resolves a duration argument in the Prometheus grammar,

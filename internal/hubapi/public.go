@@ -248,7 +248,7 @@ func (s *server) handleRenew(w http.ResponseWriter, r *http.Request) {
 	if err := s.verifyRenewNonce(req.Nonce, s.clock()); err != nil {
 		s.metrics.Enrollment(ResultDenied)
 		s.log.LogAttrs(r.Context(), slog.LevelWarn, "renewal challenge refused",
-			slog.String("remoteAddr", authn.SourceAddr(r)),
+			slog.String("remote_addr", authn.SourceAddr(r)),
 			slog.String("error", err.Error()))
 		s.fail(w, r, CodeUnauthenticated,
 			"the renewal challenge is missing, expired or was not issued by this hub; "+
@@ -264,7 +264,7 @@ func (s *server) handleRenew(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.metrics.Enrollment(ResultDenied)
 		s.log.LogAttrs(r.Context(), slog.LevelWarn, "renewal certificate refused",
-			slog.String("remoteAddr", authn.SourceAddr(r)),
+			slog.String("remote_addr", authn.SourceAddr(r)),
 			slog.String("error", err.Error()))
 		s.fail(w, r, CodeForbidden,
 			"the presented certificate is not a spoke identity issued by this hub")

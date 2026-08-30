@@ -310,8 +310,9 @@ func cloneCluster(in fleet.Cluster) fleet.Cluster {
 // MaxFactsBytes, and records that it did so. Namespaces go first and metric
 // prefixes last, because the prefixes are the single most informative fact an
 // agent gets from a cluster it has never queried.
-func (c *Collector) capSize(cluster *fleet.Cluster) bool {
+func (c *Collector) capSize(cluster *fleet.Cluster) {
 	truncated := false
+capping:
 	for range 32 {
 		b, err := json.Marshal(cluster)
 		if err != nil || len(b) <= c.maxFactsBytes {
@@ -329,14 +330,16 @@ func (c *Collector) capSize(cluster *fleet.Cluster) bool {
 		default:
 			// Nothing sampled is left; the remainder is operator-supplied text
 			// and is not ours to silently discard.
-			return truncated
+			break capping
 		}
 		truncated = true
 	}
+	// The note is appended even when the loop gave up with the payload still
+	// over the cap. That is precisely the case where the most was dropped, and
+	// truncation an agent cannot see is truncation it will reason past.
 	if truncated {
 		cluster.Description = appendNote(cluster.Description, truncationNote)
 	}
-	return truncated
 }
 
 // halve returns the first half of s, or nil once a single element is left.

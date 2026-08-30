@@ -14,6 +14,7 @@ package arch
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
 	"slices"
@@ -209,7 +210,7 @@ func listPackages(t *testing.T) []pkg {
 	out, err := cmd.Output()
 	if err != nil {
 		var ee *exec.ExitError
-		if ok := asExitError(err, &ee); ok {
+		if errors.As(err, &ee) {
 			t.Fatalf("go list: %v\n%s", err, ee.Stderr)
 		}
 		t.Fatalf("go list: %v", err)
@@ -228,15 +229,6 @@ func listPackages(t *testing.T) []pkg {
 		t.Fatal("go list returned no packages")
 	}
 	return pkgs
-}
-
-// asExitError reports whether err is an *exec.ExitError, assigning it to target.
-func asExitError(err error, target **exec.ExitError) bool {
-	ee, ok := err.(*exec.ExitError)
-	if ok {
-		*target = ee
-	}
-	return ok
 }
 
 // internalName strips the module and internal prefix, or returns "" for a

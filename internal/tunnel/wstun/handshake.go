@@ -106,7 +106,7 @@ func writeMessage(w io.Writer, v any) error {
 		return fmt.Errorf("%w: message is %d bytes", ErrHandshakeFailed, len(body))
 	}
 	var n [4]byte
-	binary.BigEndian.PutUint32(n[:], uint32(len(body)))
+	binary.BigEndian.PutUint32(n[:], uint32(len(body))) //nolint:gosec // G115: len(body) <= maxHandshakeBytes, checked immediately above.
 	if _, err := w.Write(n[:]); err != nil {
 		return fmt.Errorf("write handshake length: %w", err)
 	}

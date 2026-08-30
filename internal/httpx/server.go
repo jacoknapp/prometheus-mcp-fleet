@@ -187,15 +187,19 @@ func (s *Server) Addr() string {
 // caller may immediately connect to [Server.Addr] without polling for
 // readiness.
 //
+// ctx bounds the bind only. It is not retained: cancelling it after Start has
+// returned does not stop the server, which is what [Server.Shutdown] is for.
+//
 // Calling Start twice returns [ErrAlreadyStarted].
-func (s *Server) Start() error {
+func (s *Server) Start(ctx context.Context) error {
 	s.mu.Lock()
 	if s.started {
 		s.mu.Unlock()
 		return ErrAlreadyStarted
 	}
 
-	ln, err := net.Listen("tcp", s.addr)
+	var lc net.ListenConfig
+	ln, err := lc.Listen(ctx, "tcp", s.addr)
 	if err != nil {
 		s.mu.Unlock()
 		return fmt.Errorf("listen %s on %s: %w", s.name, s.addr, err)
@@ -209,7 +213,7 @@ func (s *Server) Start() error {
 	bound := s.boundAddr
 	s.mu.Unlock()
 
-	s.logger.LogAttrs(context.Background(), slog.LevelInfo, "listener started",
+	s.logger.LogAttrs(ctx, slog.LevelInfo, "listener started",
 		slog.String("server", s.name),
 		slog.String("addr", bound),
 		slog.Bool("tls", s.tlsConfig != nil),

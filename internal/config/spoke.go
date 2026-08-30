@@ -180,15 +180,15 @@ func LoadSpoke(args []string, getenv func(string) string) (*Spoke, error) {
 	return c, nil
 }
 
-// Validate reports every problem with the configuration at once, joined with
-// errors.Join. Each problem wraps [ErrInvalid] and names the flag and the
-// environment variable it came from.
 // identityBackends is the closed set accepted by --identity-backend.
 var identityBackends = []string{
 	IdentityBackendSecret, IdentityBackendFile,
 	IdentityBackendMemory, IdentityBackendAuto,
 }
 
+// Validate reports every problem with the configuration at once, joined with
+// errors.Join. Each problem wraps [ErrInvalid] and names the flag and the
+// environment variable it came from.
 func (c *Spoke) Validate() error {
 	var errs []error
 	add := func(err error) {
