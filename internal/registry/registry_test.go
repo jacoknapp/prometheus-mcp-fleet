@@ -84,6 +84,21 @@ func TestNewDefaultsAndValidation(t *testing.T) {
 			},
 		},
 		{
+			// The two cases above both land in a clamped region: a 5m grace
+			// derives 75s and is pulled down to the 1m ceiling, and a zero
+			// grace derives 0 and is pushed up to the 1s floor. In neither
+			// does the quarter actually decide the answer. A grace between
+			// 4s and 4m is the only band where it does, so it is the only
+			// band that tests the derivation rather than the clamps.
+			name: "a grace between the clamps sweeps at a quarter of it",
+			opts: Options{DisconnectGrace: 40 * time.Second},
+			check: func(t *testing.T, r *Registry) {
+				if r.sweepInterval != 10*time.Second {
+					t.Errorf("sweepInterval = %s, want 10s (a quarter of the 40s grace)", r.sweepInterval)
+				}
+			},
+		},
+		{
 			name: "explicit sweep interval is honoured",
 			opts: Options{SweepInterval: 3 * time.Second},
 			check: func(t *testing.T, r *Registry) {

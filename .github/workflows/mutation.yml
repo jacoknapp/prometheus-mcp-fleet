@@ -1,0 +1,122 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Mutation testing. Statement coverage says every line ran; this says a test
+# would have noticed if the line were wrong.
+#
+# WHY THIS IS NOT A REQUIRED CHECK, AND WHAT WOULD HAVE TO CHANGE
+#
+# It runs on a schedule and on demand, never on pull_request, and it does not
+# gate a merge. Three things are true today; each has to stop being true before
+# this becomes required.
+#
+#   1. Runtime. Every mutant relinks and reruns its package's tests, so a full
+#      sweep is tens of minutes. On every push to every pull request that is a
+#      tax paid per commit rather than per merge. Fix: shard the package list
+#      across a matrix.
+#
+#   2. Gremlins derives each mutant's timeout from how long the unmutated test
+#      binary took. On a loaded runner a package with timing-dependent tests
+#      can report TIMED OUT instead of a verdict -- internal/promproxy does,
+#      for about eleven mutants -- and which ones do is not a function of the
+#      diff. A gate that flaps for reasons unrelated to the change teaches
+#      people to press rerun, which is worse than having no gate. Fix: several
+#      consecutive scheduled runs showing zero timeouts.
+#
+#   3. hack/mutation-baseline.txt encodes each package's equivalent-mutant
+#      floor, derived by hand. Those numbers deserve a few months of
+#      observation before anyone is blocked by them.
+#
+# When all three are addressed, move the trigger to `pull_request` and delete
+# the `continue-on-error` on the mutate step.
+#
+# Until then this reports rather than blocks: a package below its baseline
+# turns the step red and says so in the job summary, while the job itself stays
+# green.
+name: mutation
+
+on:
+  schedule:
+    # Sunday 04:00 UTC. Clear of weekly-rebuild so the two do not contend.
+    - cron: "0 4 * * 0"
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: "Space-separated import paths. Empty means every package."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutation-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GO_VERSION: "1.27.x"
+
+jobs:
+  mutate:
+    name: gremlins
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+
+      # A red suite makes the whole run meaningless: Gremlins compares each
+      # mutant against a passing baseline, and if the baseline already fails it
+      # reads every mutant as killed and reports a perfect score.
+      - name: Baseline test run
+        run: go test ./...
+
+      - name: Mutation test
+        id: mutate
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          ./hack/mutation.sh ${{ inputs.packages }} 2>&1 | tee mutation.log
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo '## Mutation testing'
+            echo
+            if [ "${{ steps.mutate.outcome }}" = failure ]; then
+              echo 'A package scored below its baseline in'
+              echo '`hack/mutation-baseline.txt`, or produced no score at all.'
+              echo 'Every surviving mutant is one of three things: a missing'
+              echo 'assertion, an equivalent mutant, or a real defect. If it is'
+              echo 'the second, lower the baseline and say why in the commit'
+              echo 'message.'
+              echo
+            fi
+            echo '```'
+            tail -80 mutation.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the full log
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutation-log
+          path: mutation.log
+          retention-days: 30

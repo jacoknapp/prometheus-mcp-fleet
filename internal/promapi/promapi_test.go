@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -14,7 +15,23 @@ import (
 func TestGetKnownAndUnknown(t *testing.T) {
 	t.Parallel()
 
-	for _, e := range Endpoints() {
+	all := Endpoints()
+	// Every other test in this file, and the round trip in promproxy, is a
+	// `for range Endpoints()` loop. An empty table would satisfy all of them
+	// vacuously, so the table's contents are asserted here once, explicitly.
+	for _, want := range []Endpoint{EndpointQuery, EndpointQueryRange, EndpointSeries, EndpointLabelValues} {
+		if !slices.Contains(all, want) {
+			t.Fatalf("Endpoints() = %v, missing %q", all, want)
+		}
+	}
+	if !slices.IsSorted(all) {
+		t.Errorf("Endpoints() = %v, want sorted; callers render it as documentation", all)
+	}
+	if n := len(slices.Compact(slices.Clone(all))); n != len(all) {
+		t.Errorf("Endpoints() = %v, want no duplicates", all)
+	}
+
+	for _, e := range all {
 		r, err := Get(e)
 		if err != nil {
 			t.Fatalf("Get(%q): %v", e, err)
@@ -474,4 +491,128 @@ func repeat(s string, n int) []string {
 		out[i] = s
 	}
 	return out
+}
+
+// TestValidateAcceptsExactlyTheDocumentedLimits pins the accepting side of
+// every bound this package advertises.
+//
+// Each limit already had a test proving that one byte over is refused. That
+// alone does not distinguish `>` from `>=`: a limit written one too tight
+// rejects the largest legitimate value, and nothing here would have noticed.
+// The constants are part of the documented contract, so the value that sits
+// exactly on each one has to be accepted.
+func TestValidateAcceptsExactlyTheDocumentedLimits(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		endpoint Endpoint
+		form     url.Values
+	}{{
+		name: "PromQL of exactly MaxPromQLBytes", endpoint: EndpointQuery,
+		form: url.Values{"query": {strings.Repeat("a", MaxPromQLBytes)}},
+	}, {
+		// A matcher is not PromQL-kinded, so it takes the smaller cap.
+		name: "matcher of exactly MaxParamBytes", endpoint: EndpointSeries,
+		form: url.Values{"match[]": {strings.Repeat("a", MaxParamBytes)}},
+	}, {
+		name: "exactly MaxRepeatedParams repeats", endpoint: EndpointSeries,
+		form: url.Values{"match[]": repeat(`up`, MaxRepeatedParams)},
+	}, {
+		// Zero is a legitimate limit; only a negative one is refused.
+		name: "integer zero", endpoint: EndpointQuery,
+		form: url.Values{"query": {"up"}, "limit": {"0"}},
+	}}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if err := Validate(tc.endpoint, tc.form, false); err != nil {
+				t.Errorf("Validate(%q, ...) = %v, want nil", tc.endpoint, err)
+			}
+		})
+	}
+}
+
+// TestValidateKeepsThePromQLCapSeparate proves the two size caps are not
+// interchangeable. Collapsing them either truncates legitimate expressions to
+// the parameter cap or lets every other field grow to the PromQL cap.
+func TestValidateKeepsThePromQLCapSeparate(t *testing.T) {
+	t.Parallel()
+
+	oversizeForAParam := strings.Repeat("a", MaxParamBytes+1)
+
+	if err := Validate(EndpointQuery, url.Values{"query": {oversizeForAParam}}, false); err != nil {
+		t.Errorf("a %d-byte PromQL expression was rejected: %v", MaxParamBytes+1, err)
+	}
+	err := Validate(EndpointSeries, url.Values{"match[]": {oversizeForAParam}}, false)
+	if !errors.Is(err, ErrInvalidParam) {
+		t.Errorf("a %d-byte matcher = %v, want ErrInvalidParam", MaxParamBytes+1, err)
+	}
+}
+
+// TestValidateLabelNameLengthBoundary pins both sides of MaxLabelNameBytes.
+// The label is the only caller-influenced path segment this package builds.
+func TestValidateLabelNameLengthBoundary(t *testing.T) {
+	t.Parallel()
+
+	if err := ValidateLabelName(strings.Repeat("a", MaxLabelNameBytes)); err != nil {
+		t.Errorf("a label name of exactly %d bytes was rejected: %v", MaxLabelNameBytes, err)
+	}
+	err := ValidateLabelName(strings.Repeat("a", MaxLabelNameBytes+1))
+	if !errors.Is(err, ErrInvalidLabelName) {
+		t.Errorf("a %d-byte label name = %v, want ErrInvalidLabelName", MaxLabelNameBytes+1, err)
+	}
+}
+
+// TestForbiddenRunesAtTheEdges walks the exact boundaries of the control
+// character filter. This is the rule that stops a parameter carrying a
+// terminal escape or a log-injection newline into whatever reads the proxied
+// response, so which side of each edge a rune falls on is the whole point.
+func TestForbiddenRunesAtTheEdges(t *testing.T) {
+	t.Parallel()
+
+	rejected := []struct {
+		name  string
+		value string
+	}{
+		// Byte 0 specifically: a scan that started at the second byte would
+		// pass a value whose very first rune is a control character.
+		{"leading NUL", "\x00up"},
+		{"leading newline", "\nup"},
+		{"US, the last C0 rune", "up\x1f"},
+		{"DEL, the first rune of the C1 block", "up\x7f"},
+		{"APC, the last rune of the C1 block", "up\u009f"},
+	}
+	for _, tc := range rejected {
+		t.Run("rejected/"+tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := Validate(EndpointQuery, url.Values{"query": {tc.value}}, false)
+			if !errors.Is(err, ErrInvalidParam) {
+				t.Errorf("Validate(query=%q) = %v, want ErrInvalidParam", tc.value, err)
+			}
+		})
+	}
+
+	accepted := []struct {
+		name  string
+		value string
+	}{
+		// 0x20 is a space, the first printable rune, and PromQL is unreadable
+		// without it.
+		{"space", "sum by (job) (up)"},
+		// 0xa0 is the first rune above the C1 block. Everything from here up is
+		// ordinary text; a filter that swallowed it would reject any label
+		// value carrying a non-ASCII character.
+		{"NBSP, the first rune past the C1 block", "up{job=\"a\u00a0b\"}"},
+		{"an ordinary non-ASCII rune", "up{job=\"caf\u00e9\"}"},
+	}
+	for _, tc := range accepted {
+		t.Run("accepted/"+tc.name, func(t *testing.T) {
+			t.Parallel()
+			if err := Validate(EndpointQuery, url.Values{"query": {tc.value}}, false); err != nil {
+				t.Errorf("Validate(query=%q) = %v, want nil", tc.value, err)
+			}
+		})
+	}
 }

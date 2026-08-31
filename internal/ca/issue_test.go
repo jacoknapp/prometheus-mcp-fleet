@@ -258,6 +258,36 @@ func TestCheckCSRPublicKeyRSACeiling(t *testing.T) {
 	}
 }
 
+// TestCheckCSRPublicKeyRSABoundsAreInclusive pins both accepted edges of the
+// RSA size window. TestCheckCSRPublicKeyRSACeiling proves 16384 bits is
+// refused and the 2048-bit case above proves the floor admits a real key, but
+// neither distinguishes an inclusive bound from an exclusive one. A ceiling
+// written one bit tight would refuse the largest key the error message tells
+// operators is accepted.
+func TestCheckCSRPublicKeyRSABoundsAreInclusive(t *testing.T) {
+	t.Parallel()
+
+	// Lsh(1, n-1) has a bit length of exactly n. Synthetic moduli again: an
+	// 8192-bit keygen has no place in a unit test.
+	atCeiling := &rsa.PublicKey{E: 65537, N: new(big.Int).Lsh(big.NewInt(1), maxRSABits-1)}
+	if err := checkCSRPublicKey(atCeiling); err != nil {
+		t.Errorf("a key of exactly maxRSABits (%d) was rejected: %v", maxRSABits, err)
+	}
+	atFloor := &rsa.PublicKey{E: 65537, N: new(big.Int).Lsh(big.NewInt(1), minRSABits-1)}
+	if err := checkCSRPublicKey(atFloor); err != nil {
+		t.Errorf("a key of exactly minRSABits (%d) was rejected: %v", minRSABits, err)
+	}
+
+	overCeiling := &rsa.PublicKey{E: 65537, N: new(big.Int).Lsh(big.NewInt(1), maxRSABits)}
+	if err := checkCSRPublicKey(overCeiling); !errors.Is(err, ErrCSRInvalid) {
+		t.Errorf("a key of maxRSABits+1 (%d) = %v, want ErrCSRInvalid", maxRSABits+1, err)
+	}
+	underFloor := &rsa.PublicKey{E: 65537, N: new(big.Int).Lsh(big.NewInt(1), minRSABits-2)}
+	if err := checkCSRPublicKey(underFloor); !errors.Is(err, ErrCSRInvalid) {
+		t.Errorf("a key of minRSABits-1 (%d) = %v, want ErrCSRInvalid", minRSABits-1, err)
+	}
+}
+
 func TestIssueSpokeFromCSRRejectsBadClusterID(t *testing.T) {
 	t.Parallel()
 

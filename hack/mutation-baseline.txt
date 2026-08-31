@@ -1,0 +1,63 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Minimum Gremlins test efficacy per package, in percent. Read by
+# hack/mutation.sh, which fails a package scoring below its entry.
+#
+# THESE ARE CONSERVATIVE FLOORS, NOT FINISHED WORK, AND NOT THE MEASURED SCORE.
+#
+# Each entry is the score from the first full sweep, floored to a whole percent
+# and then reduced by 3. The margin is not padding -- it is the measured
+# reproducibility of the tool. Efficacy is killed/(killed+lived), and a mutant
+# that merely runs slowly is recorded as TIMED OUT rather than killed, so it
+# leaves the numerator without leaving the denominator. How many mutants land
+# in that bucket depends on how loaded the machine is. internal/hub, with the
+# source unchanged, scored:
+#
+#     92.93%  (8 workers, no memory cap)    1 timed out
+#     90.54%  (4 workers, no memory cap)   26 timed out
+#     89.71%  (4 workers, 8G memory cap)   32 timed out
+#
+# A baseline set to the best of those would fail on any differently loaded
+# machine, and a flaky gate teaches people to ignore the job. Three points
+# covers the swing observed; a package that drops further has genuinely lost
+# test strength.
+#
+# A package below 100 here has NOT had its survivors classified yet -- that
+# work is per-package and ongoing. When you finish one, raise its number and
+# record beside it the reason it stopped where it did. An equivalent mutant no
+# test can kill is a legitimate reason; a test written to satisfy the tool
+# rather than to describe the software is not.
+#
+# Lowering an entry needs a reason in the commit message.
+cmd/hub                     97   # measured 100.00
+cmd/spoke                   97   # measured 100.00
+internal/authn              93   # measured 96.92
+internal/ca                 90   # measured 93.90
+internal/certproof          80   # measured 83.33
+internal/clusterfacts       78   # measured 81.82
+internal/config             80   # measured 83.77
+internal/fleet              97   # measured 100.00
+internal/httpx              87   # measured 90.48
+internal/hub                89   # measured 92.93
+internal/hubapi             97   # measured 100.00
+internal/kube               89   # measured 92.96
+internal/mcpsurface         90   # measured 93.55
+internal/mcptools           80   # measured 83.95
+internal/obs                97   # measured 100.00
+internal/promapi            94   # measured 97.62
+internal/promclient         75   # measured 78.38
+internal/promproxy          93   # measured 96.55
+internal/registry           85   # measured 88.16
+internal/render             91   # measured 94.24
+internal/spoke              83   # measured 86.99
+internal/store              85   # measured 88.79
+internal/store/filestore    93   # measured 96.30
+internal/store/secretstore  73   # measured 76.19
+internal/testutil           66   # measured 69.05
+internal/token              97   # measured 100.00
+internal/tunnel             78   # measured 81.04
+internal/tunnel/grpctun     74   # measured 77.78
+internal/tunnel/memtun      72   # measured 75.00
+internal/tunnel/wstun       84   # measured 87.34
+internal/version            87   # measured 90.00

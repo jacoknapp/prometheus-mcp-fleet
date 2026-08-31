@@ -552,6 +552,47 @@ func TestRotateKeyEdgeCases(t *testing.T) {
 	})
 }
 
+// TestRotateKeyUsesTheCeilingForItsOwnClass proves rotation reads the maximum
+// lifetime from the class of the credential being rotated.
+//
+// The existing ceiling test asks for a TTL far above both maxima, which passes
+// whichever ceiling is consulted. A TTL between the two is what separates
+// them: swapping the classes would either cap an admin rotation at the agent
+// maximum, quietly shortening the highest-value credential in the system, or
+// let an agent rotation mint itself the ninety-day admin lifetime.
+func TestRotateKeyUsesTheCeilingForItsOwnClass(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+
+	// Between DefaultAgentKeyTTL (30 days) and DefaultAdminKeyTTL (90 days).
+	between := fleet.Duration(60 * 24 * time.Hour)
+	if time.Duration(between) <= DefaultAgentKeyTTL || time.Duration(between) >= DefaultAdminKeyTTL {
+		t.Fatalf("the chosen TTL %s no longer sits between the two ceilings", time.Duration(between))
+	}
+
+	var admin MintedKeyResponse
+	decode(t, h.adminDo(http.MethodPost, "/admin/v1/keys",
+		CreateKeyRequest{Class: fleet.ClassAdmin, Name: "admin-rotate"}), &admin)
+	resp := h.adminDo(http.MethodPost, "/admin/v1/keys/"+admin.Key.KID+"/rotate",
+		rotateRequest{TTL: between})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Errorf("rotating an admin key to %s = %d, want %d: the admin ceiling allows it",
+			time.Duration(between), resp.StatusCode, http.StatusCreated)
+	}
+
+	var agent MintedKeyResponse
+	decode(t, h.adminDo(http.MethodPost, "/admin/v1/keys",
+		CreateKeyRequest{Class: fleet.ClassAgent, Name: "agent-rotate", Scope: validScope()}), &agent)
+	resp = h.adminDo(http.MethodPost, "/admin/v1/keys/"+agent.Key.KID+"/rotate",
+		rotateRequest{TTL: between})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("rotating an agent key to %s = %d, want %d: the agent ceiling refuses it",
+			time.Duration(between), resp.StatusCode, http.StatusBadRequest)
+	}
+}
+
 func TestEnrollmentAdminRoutes(t *testing.T) {
 	t.Parallel()
 
@@ -670,6 +711,12 @@ func TestListAndRevokeEnrollments(t *testing.T) {
 	stored, _ := h.store.get(kid)
 	if stored.RevokedAt == nil {
 		t.Error("the enrollment token was not revoked")
+	}
+	// The security event has to name the cluster the token was bound to. It is
+	// the only field that ties the revocation to what was actually closed off,
+	// and the audit trail is the reason the event exists.
+	if !strings.Contains(h.logs.String(), `"cluster":"prod-eu"`) {
+		t.Errorf("the %s event did not name the cluster: %s", EventKeyRevoked, h.logs.String())
 	}
 
 	// An agent key id must not be reachable through the enrollment route: it

@@ -114,15 +114,24 @@ fuzz: ## Run every fuzz target briefly.
 deadcode: ## Fail on production functions unreachable from either binary unless reviewed.
 	./hack/check-deadcode.sh
 
-MUTATION_PACKAGES ?= ./...
-MUTATION_WORKERS  ?= 4
+MUTATION_WORKERS ?= 4
+
+.PHONY: mutate
+mutate: ## Mutation-test handwritten Go code against hack/mutation-baseline.txt.
+	MUTATION_WORKERS=$(MUTATION_WORKERS) ./hack/mutation.sh $(MUTATION_PACKAGES)
 
 .PHONY: mutation
-mutation: ## Mutation-test all handwritten Go code; override MUTATION_PACKAGES to shard.
-	go run github.com/go-gremlins/gremlins/cmd/gremlins@v0.6.0 unleash \
-		$(MUTATION_PACKAGES) --integration --workers $(MUTATION_WORKERS) \
-		--exclude-files '^internal/gen/' \
-		--threshold-efficacy 99.99 --threshold-mcover 99.99
+mutation: mutate ## Deprecated alias for `mutate`.
+
+.PHONY: mutate-deep
+mutate-deep: ## Second-opinion run with a wider mutator set; noisy, not a gate.
+	# go-mutesting also removes statements and whole branches, which Gremlins
+	# does not do at all. That catches a class Gremlins is blind to -- a test
+	# that ranges over a slice it never asserts is non-empty passes just as
+	# happily when the slice is empty -- at the cost of many more equivalent
+	# mutants. Read the output, do not threshold it. Writes report.json.
+	go run github.com/avito-tech/go-mutesting/cmd/go-mutesting@latest \
+		$(if $(MUTATION_PACKAGES),$(MUTATION_PACKAGES),./internal/...)
 
 .PHONY: vuln
 vuln: ## Check dependencies for known vulnerabilities.

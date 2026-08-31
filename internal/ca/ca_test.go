@@ -1021,6 +1021,36 @@ func TestCAOperationalFailures(t *testing.T) {
 		loadOrCreateCreate = origLoadOrCreateCreate
 	})
 
+	// LoadOrCreate polls initPollAttempts+1 times in total (the initial try
+	// plus initPollAttempts retries) before giving up. A race that resolves
+	// on the very last permitted attempt must still succeed; a budget that is
+	// one attempt short of that would report the race as never having
+	// settled instead.
+	t.Run("creation race settles on the last permitted attempt", func(t *testing.T) {
+		certPath, keyPath := paths(t)
+		calls := 0
+		loadOrCreateCreate = func(cp, kp string, o Options) (*CA, error) {
+			calls++
+			if calls <= initPollAttempts {
+				return nil, ErrCAExists
+			}
+			return origLoadOrCreateCreate(cp, kp, o)
+		}
+		got, err := LoadOrCreate(certPath, keyPath, Options{})
+		if err != nil {
+			t.Fatalf("LoadOrCreate: %v, want success on attempt %d of the %d-attempt budget",
+				err, calls, initPollAttempts+1)
+		}
+		if got == nil {
+			t.Fatal("LoadOrCreate returned a nil CA with no error")
+		}
+		if calls != initPollAttempts+1 {
+			t.Errorf("loadOrCreateCreate was called %d times, want exactly %d (the full budget)",
+				calls, initPollAttempts+1)
+		}
+		loadOrCreateCreate = origLoadOrCreateCreate
+	})
+
 	t.Run("certificate commit cleans key", func(t *testing.T) {
 		certPath, keyPath := paths(t)
 		caLink = func(old, new string) error {

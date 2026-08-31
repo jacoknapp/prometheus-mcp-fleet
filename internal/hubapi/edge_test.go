@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -367,6 +368,21 @@ func TestMintRetriesAreBounded(t *testing.T) {
 		t.Errorf("code = %q, want %q", env.Error.Code, CodeInternal)
 	}
 	assertNoSecretMaterial(t, h, "")
+
+	// The retry warning is the only signal an operator gets that key
+	// identifiers are colliding, so the count it reports has to be the
+	// attempt number and not the loop index. Both ends are pinned: a
+	// zero-based or otherwise shifted counter would misreport how close the
+	// hub came to exhausting its retries.
+	logs := h.logs.String()
+	for _, want := range []string{`"attempt":1`, fmt.Sprintf(`"attempt":%d`, mintRetries)} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("collision log does not contain %s: %s", want, logs)
+		}
+	}
+	if strings.Contains(logs, `"attempt":0`) || strings.Contains(logs, `"attempt":-1`) {
+		t.Errorf("collision log counts attempts from below one: %s", logs)
+	}
 }
 
 // TestMutationStoreFailures covers the write paths that only fail after the
@@ -664,3 +680,105 @@ func TestWriteJSONLogsWriteFailure(t *testing.T) {
 // adding a test-only seam to inject a fake mint function into hubapi -- which
 // would exist purely to dodge coverage and make the production code worse.
 // See the coverage report for the fuller writeup.
+
+// TestLimitsAcceptExactlyTheDocumentedValue pins the accepting side of every
+// size bound the enrollment and renewal paths advertise.
+//
+// Each of these already had a test proving that one over the limit is refused,
+// which does not distinguish `>` from `>=`. A bound written one too tight
+// rejects the largest legitimate request -- an operator stamping the full 32
+// labels the API documents, or a spoke presenting a chain of exactly
+// MaxChainCerts -- and every existing test would still have passed.
+func TestLimitsAcceptExactlyTheDocumentedValue(t *testing.T) {
+	t.Parallel()
+
+	t.Run("labels", func(t *testing.T) {
+		t.Parallel()
+
+		if err := validateLabels(manyLabels(MaxLabels)); err != nil {
+			t.Errorf("exactly MaxLabels (%d) labels were rejected: %v", MaxLabels, err)
+		}
+		if err := validateLabels(manyLabels(MaxLabels + 1)); err == nil {
+			t.Errorf("MaxLabels+1 (%d) labels were accepted", MaxLabels+1)
+		}
+
+		atKeyLimit := map[string]string{strings.Repeat("k", MaxLabelKeyBytes): "v"}
+		if err := validateLabels(atKeyLimit); err != nil {
+			t.Errorf("a key of exactly MaxLabelKeyBytes (%d) was rejected: %v", MaxLabelKeyBytes, err)
+		}
+		overKeyLimit := map[string]string{strings.Repeat("k", MaxLabelKeyBytes+1): "v"}
+		if err := validateLabels(overKeyLimit); err == nil {
+			t.Errorf("a key of MaxLabelKeyBytes+1 (%d) was accepted", MaxLabelKeyBytes+1)
+		}
+
+		atValueLimit := map[string]string{"env": strings.Repeat("v", MaxLabelValueBytes)}
+		if err := validateLabels(atValueLimit); err != nil {
+			t.Errorf("a value of exactly MaxLabelValueBytes (%d) was rejected: %v", MaxLabelValueBytes, err)
+		}
+		overValueLimit := map[string]string{"env": strings.Repeat("v", MaxLabelValueBytes+1)}
+		if err := validateLabels(overValueLimit); err == nil {
+			t.Errorf("a value of MaxLabelValueBytes+1 (%d) was accepted", MaxLabelValueBytes+1)
+		}
+	})
+
+	t.Run("chain and csr", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t, nil)
+		srv, err := newServer(Options{
+			Store: h.store, Hasher: h.hasher, CA: h.ca, Verifier: h.verifier, Clock: h.clock.Now,
+		})
+		if err != nil {
+			t.Fatalf("newServer: %v", err)
+		}
+		id := h.issueSpoke("prod")
+
+		// readChain and decodeCSRField answer the caller directly, so they are
+		// driven here rather than through a route: the size gate is what is
+		// under test, not the handler that follows it.
+		call := func(fn func(http.ResponseWriter, *http.Request) bool) (bool, string) {
+			w := httptest.NewRecorder()
+			r := httptest.NewRequest(http.MethodPost, "/", nil)
+			ok := fn(w, r)
+			return ok, w.Body.String()
+		}
+
+		atChainLimit := slices.Repeat(id.chain(), MaxChainCerts)
+		ok, body := call(func(w http.ResponseWriter, r *http.Request) bool {
+			chain, ok := srv.readChain(w, r, atChainLimit)
+			if ok && len(chain) != MaxChainCerts {
+				t.Errorf("readChain returned %d certificates, want %d", len(chain), MaxChainCerts)
+			}
+			return ok
+		})
+		if !ok {
+			t.Errorf("a chain of exactly MaxChainCerts (%d) was rejected: %s", MaxChainCerts, body)
+		}
+		overChainLimit := slices.Repeat(id.chain(), MaxChainCerts+1)
+		if ok, _ := call(func(w http.ResponseWriter, r *http.Request) bool {
+			_, ok := srv.readChain(w, r, overChainLimit)
+			return ok
+		}); ok {
+			t.Errorf("a chain of MaxChainCerts+1 (%d) was accepted", MaxChainCerts+1)
+		}
+
+		// "A" repeated is valid base64 of the right width, and decodeCSRField
+		// deliberately does not parse the request, so the size gate is the
+		// only thing that can refuse it.
+		atCSRLimit := strings.Repeat("A", MaxCSRBytes)
+		ok, body = call(func(w http.ResponseWriter, r *http.Request) bool {
+			_, ok := srv.decodeCSRField(w, r, atCSRLimit)
+			return ok
+		})
+		if !ok {
+			t.Errorf("a CSR field of exactly MaxCSRBytes (%d) was rejected: %s", MaxCSRBytes, body)
+		}
+		overCSRLimit := strings.Repeat("A", MaxCSRBytes+4)
+		if ok, _ := call(func(w http.ResponseWriter, r *http.Request) bool {
+			_, ok := srv.decodeCSRField(w, r, overCSRLimit)
+			return ok
+		}); ok {
+			t.Errorf("a CSR field of MaxCSRBytes+4 (%d) was accepted", MaxCSRBytes+4)
+		}
+	})
+}

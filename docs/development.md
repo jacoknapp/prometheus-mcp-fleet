@@ -20,7 +20,7 @@ to, see [CONTRIBUTING.md](../CONTRIBUTING.md).
 | `kubectl`, `kind` | recent | End-to-end tests |
 | `helm-unittest`, `helm-docs` | — | Chart tests and README generation |
 | `deadcode` | x/tools v0.49.0 | Production reachability gate |
-| `gremlins` | v0.6.0 | Mutation coverage and test-efficacy gate |
+| `gremlins` | v0.6.0 | Mutation testing (`make mutate`); fetched on demand |
 
 `make help` lists every target.
 
@@ -31,7 +31,7 @@ make check     # what CI runs on a pull request: fmt, vet, lint, test -race
 make test      # go test -race -covermode=atomic ./...
 make cover     # per-package coverage summary
 make deadcode  # fail review on production functions neither binary can reach
-make mutation  # 100% mutant coverage and efficacy; intentionally slow
+make mutate    # mutation testing against the per-package baseline; slow
 make build     # both binaries into ./bin
 ```
 
@@ -40,15 +40,91 @@ A single package while you work on it:
 ```bash
 go test -race -cover ./internal/promproxy/
 go test -race -run TestGenerationCAS -v ./internal/registry/
-make mutation MUTATION_PACKAGES=./internal/registry MUTATION_WORKERS=4
+make mutate MUTATION_PACKAGES=./internal/registry MUTATION_WORKERS=4
 ```
 
 `make test` rejects any uncovered statement block in handwritten code. Generated
 protobuf is excluded from that number because `buf breaking` and the regenerate
 diff are its executable contract; commands and reusable test-support packages
-are included. `make mutation` uses a 99.99 threshold because Gremlins treats a
-score *equal* to the configured threshold as a failure—99.99 therefore means an
-actual 100% for both mutant coverage and killed-mutant efficacy.
+are included.
+
+## Mutation testing
+
+100% statement coverage says every line ran. It does not say a test would have
+noticed if the line were wrong, and the gap between those two claims is where
+this project's real test debt lives. `make mutate` measures it: it rewrites one
+operator at a time — `>` to `>=`, `==` to `!=`, `+` to `-` — reruns the
+package's tests, and reports the mutants that survived.
+
+```bash
+make mutate                                       # every package
+make mutate MUTATION_PACKAGES=./internal/promapi   # one, while you work on it
+make mutate-deep MUTATION_PACKAGES=./internal/render  # wider mutators, noisy
+```
+
+Each package is scored separately against `hack/mutation-baseline.txt`, which
+records the efficacy it is expected to hold. **The baselines are not all 100,
+and they should not be.** Some mutants are *equivalent*: they change the source
+without changing anything a test could observe. `internal/certproof` sizes its
+transcript buffer with `make([]byte, 0, a+b+c)`; mutating that arithmetic
+changes an allocation hint and nothing else, because `append` grows the slice
+regardless. No test can distinguish those, and writing one that appears to
+would be writing a test for the tool rather than for the software.
+
+The current entries are **conservative floors, not measured scores**: the first
+full sweep's number, floored to a whole percent and then reduced by three. That
+margin is the tool's measured reproducibility, not padding. Efficacy is
+`killed/(killed+lived)`, and a mutant that merely runs slowly is recorded as
+TIMED OUT — leaving the numerator without leaving the denominator — so the
+score moves with machine load. `internal/hub`, source unchanged, scored 92.93%
+on 8 workers, 90.54% on 4, and 89.71% on 4 with a memory cap. A baseline set to
+the best of those would fail on any differently loaded machine, and a flaky
+gate teaches people to ignore the job.
+
+A package below 100 has not yet had its survivors classified; that work is
+per-package and ongoing. When you finish one, raise its number and record
+beside it the reason it stopped where it did.
+
+So when a mutant survives, classify it before reaching for the keyboard:
+
+- **A missing assertion.** The common case, and the valuable one. The recurring
+  shape in this codebase is an upper bound tested only from above: a test proves
+  that one byte over the limit is refused, and none proves that a value sitting
+  exactly *on* the documented limit is accepted, so nothing distinguishes `>`
+  from `>=`. Add the assertion.
+- **An equivalent mutant.** Record it, lower the baseline, move on.
+- **A real defect.** Fix the code and say so loudly in the commit message.
+
+Two properties of the tool are worth knowing before you trust a number:
+
+- **Cap the memory.** Mutating a bound check is the point of the tool, and a
+  bound check is sometimes the only thing between a test and an unbounded
+  allocation: flip the comparison on a size cap and the mutated binary allocates
+  whatever the input asks for. The timeout does not save you — the machine is
+  gone long before a 40× timeout expires. `hack/mutation.sh` runs each package
+  inside a `systemd-run` cgroup scope (`MUTATION_MEMORY_MAX`, default 8G) and
+  warns if no cgroup is available. A mutant that hits the ceiling is OOM-killed
+  and recorded as killed, which is honest: it was detected, by dying. There is
+  deliberately no `GOMEMLIMIT` — it makes the GC fight near the limit and turns
+  kills into timeouts.
+- **Pin the timeout coefficient.** Gremlins derives each mutant's test timeout
+  from the unmutated run. For a package whose tests finish in milliseconds the
+  compile dominates and *every* mutant is reported as TIMED OUT — producing a
+  clean-looking run with a fabricated score. `hack/mutation.sh` pins the
+  coefficient high and fails loudly if a package reports no kills and no
+  escapes; do not run `gremlins unleash` bare and believe the output.
+- **The suite must be green first.** Gremlins compares each mutant against a
+  passing baseline. Against a failing one it reads every mutant as killed and
+  reports a perfect score.
+
+`make mutate-deep` runs go-mutesting instead, which also deletes statements and
+whole branches. That finds a class Gremlins cannot see — a test that ranges
+over a slice it never asserts is non-empty passes just as happily when the
+slice is empty — but it produces far more equivalent mutants. It is a reading
+exercise, not a gate.
+
+CI runs `make mutate` weekly and on demand, and does not block a merge.
+`.github/workflows/mutation.yml` records what would have to be true first.
 
 ## Running it locally, without Kubernetes
 
@@ -207,6 +283,14 @@ the weekly CVE rebuild verifiable rather than a leap of faith.
 
 Base images are digest-pinned. Renovate bumps them; do not replace a digest with
 a tag.
+
+Nothing in the build or release path pulls from Docker Hub. The Go toolchain
+image and the QEMU emulator both come from `mirror.gcr.io`, and `docker.io` is
+not on the release workflow's egress allowlist. The mirror serves the identical
+digests, so these are the same images by content address rather than
+substitutes — a Docker Hub fetch failing is what broke the first v0.1.0 release
+attempt, and a build that can be stopped by a registry we do not publish to is
+a dependency worth not having. Published images go to GHCR.
 
 ## Debugging
 

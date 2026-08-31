@@ -31,6 +31,17 @@ type fakeStore struct {
 	getErr   error
 	epochErr error
 	touchErr error
+
+	// getNil makes GetKey report a miss the other legal way: no key and no
+	// error. A store is free to signal absence either way, so the verifier
+	// has to classify both as an unknown key.
+	getNil bool
+}
+
+func (f *fakeStore) setGetNil(v bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.getNil = v
 }
 
 func newFakeStore() *fakeStore {
@@ -43,6 +54,9 @@ func (f *fakeStore) GetKey(_ context.Context, kid string) (*fleet.Key, error) {
 	f.getCalls++
 	if f.getErr != nil {
 		return nil, f.getErr
+	}
+	if f.getNil {
+		return nil, nil
 	}
 	k, ok := f.keys[kid]
 	if !ok {

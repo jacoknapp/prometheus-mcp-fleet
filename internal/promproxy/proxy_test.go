@@ -104,6 +104,19 @@ func TestNewValidatesOptions(t *testing.T) {
 			opts:    Options{Registry: reg, DefaultTimeout: time.Hour, MaxTimeout: time.Minute},
 			wantErr: "exceeds max timeout",
 		},
+		{
+			// "exceeds" is a strict comparison. A deployment that pins both
+			// knobs to the same value is asking every call to be allowed the
+			// full ceiling by default, which is a coherent thing to want and
+			// must not be refused as a misconfiguration.
+			name: "default timeout equal to the ceiling is not an excess",
+			opts: Options{Registry: reg, DefaultTimeout: time.Minute, MaxTimeout: time.Minute},
+			check: func(t *testing.T, p *Proxy) {
+				if p.defaultTimeout != time.Minute || p.maxTimeout != time.Minute {
+					t.Errorf("timeouts = %s/%s, want 1m/1m", p.defaultTimeout, p.maxTimeout)
+				}
+			},
+		},
 	}
 
 	for _, tc := range tests {

@@ -90,6 +90,16 @@ func TestNewAppliesDefaults(t *testing.T) {
 	if got := len(v.pos.m); got != 0 {
 		t.Errorf("fresh cache holds %d entries, want 0", got)
 	}
+	// An unset CacheSize must reach DefaultCacheSize. newLRU floors a
+	// non-positive capacity at 1, so a defaulting rule that skipped zero
+	// would leave a one-entry cache: still correct, but it turns every
+	// second concurrent credential into a store round trip under load.
+	if got, want := v.pos.cap, DefaultCacheSize; got != want {
+		t.Errorf("positive cache capacity = %d, want %d", got, want)
+	}
+	if got, want := v.neg.cap, DefaultCacheSize; got != want {
+		t.Errorf("negative cache capacity = %d, want %d", got, want)
+	}
 }
 
 func TestVerify(t *testing.T) {
@@ -899,5 +909,68 @@ func TestVerifiedCacheIsBoundedAndEvicts(t *testing.T) {
 	}
 	if got := len(v.neg.m); got > size {
 		t.Errorf("negative cache holds %d entries, want at most %d", got, size)
+	}
+}
+
+// TestVerifyTreatsANilKeyWithNoErrorAsUnknown covers the other way a store may
+// report a miss.
+//
+// fleet.Store's contract permits both: an error the IsNotFound hook
+// recognises, or simply no key and no error. Only the first was exercised, so
+// the (nil, nil) miss was reaching the metrics as store_error. That label is
+// the one operators alert on for a backend outage, and a stream of
+// authentication attempts against key identifiers that do not exist would have
+// raised it.
+func TestVerifyTreatsANilKeyWithNoErrorAsUnknown(t *testing.T) {
+	t.Parallel()
+	v, store, metrics, _ := newTestVerifier(t, nil)
+	raw, _ := mintKey(t, store, v.hasher, fleet.ClassAgent, nil)
+	store.setGetNil(true)
+
+	if _, err := v.Verify(context.Background(), raw, fleet.ClassAgent); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("Verify() error = %v, want ErrUnauthenticated", err)
+	}
+	if got := metrics.failure(ReasonUnknownKey); got != 1 {
+		t.Errorf("%s failures = %d, want 1", ReasonUnknownKey, got)
+	}
+	if got := metrics.failure(ReasonStoreError); got != 0 {
+		t.Errorf("%s failures = %d, want 0: a miss is not a backend outage", ReasonStoreError, got)
+	}
+}
+
+// TestNegativeCacheEntryIsStaleExactlyAtTheTTL pins the edge of the negative
+// cache window. TestVerifyNegativeCache advances past the TTL, which cannot
+// tell an inclusive comparison from an exclusive one; an entry exactly
+// NegativeTTL old must already be stale, so the window is the half-open
+// interval the field name implies.
+func TestNegativeCacheEntryIsStaleExactlyAtTheTTL(t *testing.T) {
+	t.Parallel()
+	const ttl = 5 * time.Second
+	v, store, _, clock := newTestVerifier(t, func(o *Options) { o.NegativeTTL = ttl })
+	raw, key := mintKey(t, store, v.hasher, fleet.ClassAgent, nil)
+	store.mutate(key.KID, func(k *fleet.Key) { k.SecretHMAC = v.hasher.Sum([]byte("wrong")) })
+	ctx := context.Background()
+
+	if _, err := v.Verify(ctx, raw, fleet.ClassAgent); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("Verify: %v", err)
+	}
+	before := store.gets()
+
+	// One nanosecond short of the TTL the entry is still fresh.
+	clock.advance(ttl - time.Nanosecond)
+	if _, err := v.Verify(ctx, raw, fleet.ClassAgent); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("Verify just inside the TTL: %v", err)
+	}
+	if got := store.gets(); got != before {
+		t.Errorf("an entry %s old was discarded early: %d then %d", ttl-time.Nanosecond, before, got)
+	}
+
+	// At exactly the TTL it is not.
+	clock.advance(time.Nanosecond)
+	if _, err := v.Verify(ctx, raw, fleet.ClassAgent); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("Verify at the TTL: %v", err)
+	}
+	if got := store.gets(); got != before+1 {
+		t.Errorf("an entry exactly %s old was still served from cache: %d then %d", ttl, before, got)
 	}
 }

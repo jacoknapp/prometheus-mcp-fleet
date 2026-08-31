@@ -28,3 +28,6 @@ coverage.html
 !testdata/**/*.pem
 !testdata/**/*.key
 .env
+
+# Mutation testing (go-mutesting writes this into the working tree)
+report.json

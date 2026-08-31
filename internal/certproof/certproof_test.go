@@ -318,3 +318,47 @@ func TestSignAndVerifyRejectOversizedTranscriptFields(t *testing.T) {
 		t.Errorf("Verify() = %v, want ErrFieldTooLarge", err)
 	}
 }
+
+// TestTranscriptAcceptsAFieldAtExactlyTheLimit is the other half of
+// TestTranscriptRejectsAnOversizedField. MaxFieldBytes is documented as the
+// largest field a transcript may carry, so a field of exactly that size has to
+// build; a cap written one byte tight would refuse the largest legitimate
+// nonce and the rejection test above would still pass.
+func TestTranscriptAcceptsAFieldAtExactlyTheLimit(t *testing.T) {
+	t.Parallel()
+
+	atLimit := strings.Repeat("a", certproof.MaxFieldBytes)
+
+	tests := []struct {
+		name                       string
+		nonce                      []byte
+		protocolVersion, clusterID string
+	}{
+		{name: "nonce", nonce: []byte(atLimit), protocolVersion: "v1", clusterID: "prod"},
+		{name: "protocol version", nonce: []byte("n"), protocolVersion: atLimit, clusterID: "prod"},
+		{name: "cluster id", nonce: []byte("n"), protocolVersion: "v1", clusterID: atLimit},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := certproof.Transcript(tc.nonce, tc.protocolVersion, tc.clusterID)
+			if err != nil {
+				t.Fatalf("a field of exactly MaxFieldBytes was rejected: %v", err)
+			}
+			// An all-empty transcript is the domain tag plus the three
+			// length prefixes and nothing else, so it measures the fixed
+			// overhead without naming the unexported tag. Asserting the
+			// width from there proves each prefix really is 32 bits wide,
+			// which is the assumption MaxFieldBytes exists to keep safe.
+			empty, err := certproof.Transcript(nil, "", "")
+			if err != nil {
+				t.Fatalf("empty transcript: %v", err)
+			}
+			want := len(empty) + len(tc.nonce) + len(tc.protocolVersion) + len(tc.clusterID)
+			if len(got) != want {
+				t.Errorf("transcript is %d bytes, want %d", len(got), want)
+			}
+		})
+	}
+}
