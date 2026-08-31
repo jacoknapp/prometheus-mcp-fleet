@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1041,7 +1042,8 @@ func TestClose(t *testing.T) {
 	t.Run("closes every session and refuses new ones", func(t *testing.T) {
 		t.Parallel()
 		metrics := newCountingMetrics()
-		r := mustNew(t, Options{FactsPollInterval: time.Millisecond, Metrics: metrics})
+		log := &recordingHandler{}
+		r := mustNew(t, Options{FactsPollInterval: time.Millisecond, Metrics: metrics, Logger: slog.New(log)})
 		a := newFakeSession("prod-eu", 100)
 		b := newFakeSession("prod-us", 100)
 		b.closeErr = errors.New("already gone") // logged, never propagated
@@ -1054,6 +1056,15 @@ func TestClose(t *testing.T) {
 			if got := s.closes(); !cmp.Equal(got, []string{"hub-shutdown"}) {
 				t.Errorf("%s close reasons = %v, want [hub-shutdown]", s.ident.ClusterID, got)
 			}
+		}
+		// b's (prod-us) Close error must be logged, and a's (prod-eu) clean
+		// Close must not be: a warning on the successful close would be
+		// noise, and silence on the failing one would hide a real problem.
+		// Checking the cluster attribute, not just the count, catches a
+		// mutant that logs on success instead of failure -- both give
+		// exactly one warning, just attributed to the wrong session.
+		if clusters := log.stringAttrs("registry: closing session", "cluster"); !cmp.Equal(clusters, []string{"prod-us"}) {
+			t.Errorf("closeSession warnings for cluster = %v, want [prod-us] (prod-eu's close succeeded and must stay quiet)", clusters)
 		}
 		if got := r.ConnectedCount(); got != 0 {
 			t.Errorf("ConnectedCount = %d, want 0", got)
@@ -1217,10 +1228,12 @@ func TestSweepKeepsPresentEntries(t *testing.T) {
 	t.Parallel()
 
 	clock := newTestClock()
+	log := &recordingHandler{}
 	r := mustNew(t, Options{
 		FactsPollInterval: time.Hour,
 		DisconnectGrace:   time.Minute,
 		Clock:             clock.Now,
+		Logger:            slog.New(log),
 	})
 	attach(t, r, newFakeSession("live", 100))
 	releaseRecent := attach(t, r, newFakeSession("recent", 100))
@@ -1235,8 +1248,27 @@ func TestSweepKeepsPresentEntries(t *testing.T) {
 	if diff := cmp.Diff([]string{"live", "recent"}, ids(r.List())); diff != "" {
 		t.Errorf("List after sweep (-want +got):\n%s", diff)
 	}
+	evicted := 0
+	for _, m := range log.messages() {
+		if m == "registry: evicted clusters past the disconnect grace window" {
+			evicted++
+		}
+	}
+	if evicted != 1 {
+		t.Errorf("sweep that evicted one entry logged %d eviction messages, want 1", evicted)
+	}
+
 	if n := r.sweep(clock.Now()); n != 0 {
 		t.Errorf("sweep = %d on a clean registry, want 0", n)
+	}
+	evicted = 0
+	for _, m := range log.messages() {
+		if m == "registry: evicted clusters past the disconnect grace window" {
+			evicted++
+		}
+	}
+	if evicted != 1 {
+		t.Errorf("a no-op sweep logged an eviction message; total is now %d, want still 1", evicted)
 	}
 }
 

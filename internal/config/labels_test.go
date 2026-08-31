@@ -5,6 +5,7 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -46,9 +47,25 @@ func TestParseClusterLabels(t *testing.T) {
 		{name: "control character in value", in: "env=pr\x1bod", wantErr: true, reason: "control character"},
 		{name: "newline in value", in: "env=pr\nod", wantErr: true, reason: "control character"},
 		{
+			// The control-character scan uses strings.IndexFunc and checks
+			// i >= 0. A control character at byte 0 is the only input that
+			// distinguishes >= 0 from the off-by-one > 0: any later character
+			// satisfies both.
+			name: "control character at start of value", in: "env=\x01bad",
+			wantErr: true, reason: "control character",
+		},
+		{
 			name:    "too many labels",
 			in:      strings.TrimSuffix(strings.Repeat("k=v,", MaxClusterLabels+1), ","),
 			wantErr: true, reason: "exceeds the limit",
+		},
+		{
+			// Exactly at the limit must still be accepted: len(pairs) >
+			// MaxClusterLabels is the check, and only this boundary
+			// distinguishes > from the off-by-one >=.
+			name: "exactly at the label limit is accepted",
+			in:   nLabels(MaxClusterLabels),
+			want: nLabelsMap(MaxClusterLabels),
 		},
 	}
 
@@ -76,6 +93,25 @@ func TestParseClusterLabels(t *testing.T) {
 			}
 		})
 	}
+}
+
+// nLabels builds a "k0=v,k1=v,...,k<n-1>=v" string of n distinct, valid label
+// pairs, for exercising the MaxClusterLabels boundary exactly.
+func nLabels(n int) string {
+	pairs := make([]string, n)
+	for i := range pairs {
+		pairs[i] = fmt.Sprintf("k%d=v", i)
+	}
+	return strings.Join(pairs, ",")
+}
+
+// nLabelsMap is the map nLabels(n) parses to.
+func nLabelsMap(n int) map[string]string {
+	m := make(map[string]string, n)
+	for i := range n {
+		m[fmt.Sprintf("k%d", i)] = "v"
+	}
+	return m
 }
 
 func TestFormatClusterLabelsRoundTrips(t *testing.T) {
@@ -125,5 +161,42 @@ func TestValidateClusterLabels(t *testing.T) {
 	}
 	if err := validateClusterLabels(map[string]string{"bad key": "v"}); err == nil {
 		t.Error("validateClusterLabels(bad key) = nil, want an error")
+	}
+	// A control character at byte 0 is the only value that distinguishes the
+	// i >= 0 check from the off-by-one i > 0.
+	if err := validateClusterLabels(map[string]string{"env": "\x01bad"}); err == nil {
+		t.Error("validateClusterLabels(control char at start) = nil, want an error")
+	}
+	// len(labels) > MaxClusterLabels is the check; exactly at the limit must
+	// still validate, which is the only input distinguishing > from >=.
+	if err := validateClusterLabels(nLabelsMap(MaxClusterLabels)); err != nil {
+		t.Errorf("validateClusterLabels(%d labels) = %v, want nil", MaxClusterLabels, err)
+	}
+	if err := validateClusterLabels(nLabelsMap(MaxClusterLabels + 1)); err == nil {
+		t.Errorf("validateClusterLabels(%d labels) = nil, want an error", MaxClusterLabels+1)
+	}
+}
+
+// TestIsControl pins the two boundaries of the C1 range explicitly: 0x7f and
+// 0x9f are themselves control characters (>= and <=), while 0x7e and 0xa0,
+// one step outside the range on either side, are not.
+func TestIsControl(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		r    rune
+		want bool
+	}{
+		{0x1f, true},  // top of the C0 range
+		{0x20, false}, // space: just outside C0
+		{0x7e, false}, // just below the C1 range
+		{0x7f, true},  // DEL: lower bound of the C1 range
+		{0x9f, true},  // upper bound of the C1 range
+		{0xa0, false}, // just above the C1 range
+	}
+	for _, tc := range tests {
+		if got := isControl(tc.r); got != tc.want {
+			t.Errorf("isControl(%#x) = %v, want %v", tc.r, got, tc.want)
+		}
 	}
 }

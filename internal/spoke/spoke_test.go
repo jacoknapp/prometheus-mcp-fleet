@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -561,6 +562,43 @@ func TestRenewLoopRenewsAtHalfLifeAndReconnects(t *testing.T) {
 	}
 }
 
+// TestRenewLoopDoesNotEscalateAtExactlyOneDayLeft pins the boundary of
+// "remaining < 24h" against its off-by-one "remaining <= 24h": at exactly one
+// day remaining, escalation must not yet have kicked in.
+//
+// This cannot be a case in TestRenewLoopEscalatesInsideTheLastDay's table: an
+// x509 certificate's NotAfter truncates to whole seconds, so a NotAfter built
+// from a frozen clock reading with a sub-second fraction round-trips to
+// slightly less than the requested remaining -- close enough for that table's
+// hour-wide margins, but enough to manufacture a false escalation exactly at
+// the boundary this test needs. Aligning the clock to a whole second first
+// avoids that.
+func TestRenewLoopDoesNotEscalateAtExactlyOneDayLeft(t *testing.T) {
+	t.Parallel()
+
+	f := newRenewFixture(t)
+	f.hub.mu.Lock()
+	f.hub.renewStatus = http.StatusServiceUnavailable
+	f.hub.mu.Unlock()
+
+	aligned := f.clock.Now().Truncate(time.Second)
+	f.clock.Advance(aligned.Sub(f.clock.Now()))
+	now := f.clock.Now()
+
+	f.spoke.setIdentity(f.hub.ca.identityOver(t, "prod-eu-1",
+		now.Add(-14*24*time.Hour), now.Add(24*time.Hour)))
+
+	stop := f.run(t)
+	eventually(t, "the renewal to fail", func() bool {
+		return f.logs.has("certificate renewal failed")
+	})
+	stop()
+
+	if got := f.logs.level(t, "certificate renewal failed"); got != slog.LevelWarn {
+		t.Errorf("renewal failure with exactly 24h left logged at %s, want %s", got, slog.LevelWarn)
+	}
+}
+
 // TestRenewLoopWaitsWhenThereIsNoIdentity. renewLoop and establishIdentity run
 // in the same process but not in lockstep, so the loop has to tolerate being
 // asked before there is anything to renew.
@@ -814,6 +852,46 @@ func TestRunFactsCountsEveryRefresh(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestProbeLoopExactlyTwoFailuresAreEnough pins the boundary itself.
+// TestProbeLoopNeedsTwoFailuresBeforeReportingNotReady proves one failure is
+// not enough by polling generously for up to ten seconds, which would pass
+// just as happily if the real threshold were three: the loop keeps probing on
+// its own schedule and would eventually cross a higher threshold too. This
+// gives the loop only a fraction of one probe interval after the second
+// failure, a window a three-failure threshold could not meet.
+func TestProbeLoopExactlyTwoFailuresAreEnough(t *testing.T) {
+	t.Parallel()
+
+	prom, url := newSwitchableProm(t, false)
+	s, _ := newTestSpoke(t, newStubClock(), nil)
+	s.prom = newPromClient(t, url)
+	// Long enough that a deadline well short of one interval cannot be
+	// confused with a third probe arriving on schedule.
+	s.timing.probe = 2 * time.Second
+	s.health.Set("prometheus", true, "")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); s.probeLoop(ctx) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	// Ping is two requests per probe; four requests is the second probe done.
+	eventually(t, "the second probe to fail", func() bool { return prom.count() >= 4 })
+
+	deadline := time.Now().Add(time.Second) // well inside the 2s probe interval
+	for time.Now().Before(deadline) {
+		if _, blocked := notReady(s.health, "prometheus"); blocked {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("readiness had not dropped within one probe interval of the second " +
+		"consecutive failure; the threshold must be exactly two, not three")
 }
 
 // ---------------------------------------------------------------------------
@@ -1169,6 +1247,45 @@ func TestDialLoopResetsBackoffOnlyAfterAConnectionThatLasted(t *testing.T) {
 				"reset, so a hub that recovers is still being backed off", d)
 		}
 	}
+}
+
+// TestDialLoopDoesNotResetBackoffAtExactlyTheThreshold pins the boundary of
+// "lasted": minConnectionLifetime is a floor a connection must exceed, not
+// merely meet. TestDialLoopResetsBackoffOnlyAfterAConnectionThatLasted only
+// proves a connection a full second past the floor resets the backoff, which
+// an off-by-one ">=" threshold would do identically. Stepping the clock by
+// exactly the floor on every read makes each connection appear to have lasted
+// precisely minConnectionLifetime, which must not reset anything.
+func TestDialLoopDoesNotResetBackoffAtExactlyTheThreshold(t *testing.T) {
+	t.Parallel()
+
+	const base = time.Millisecond
+	clock := newStubClock()
+	s, logs := newTestSpoke(t, clock, &config.Spoke{
+		ClusterID:           "prod-eu-1",
+		ReconnectMinBackoff: base,
+		ReconnectMaxBackoff: 10 * time.Second,
+	})
+	s.timing.dialStagger = time.Millisecond
+	s.setIdentity(newTestCA(t).identityOver(t, "prod-eu-1", clock.Now().Add(-time.Hour), clock.Now().Add(time.Hour)))
+	// Every read of the clock advances it by exactly the floor, so
+	// s.now().Sub(connected) is exactly minConnectionLifetime on every
+	// attempt: "longer than" (>) must refuse to reset here, and the
+	// off-by-one ">=" would wrongly accept.
+	clock.setStep(minConnectionLifetime)
+
+	endpoint := "ws://" + deadAddr(t) + "/tunnel"
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); s.dialLoop(ctx, endpoint) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	eventually(t, "the backoff window to grow past its floor", func() bool {
+		return maxLoggedDelay(logs) > 8*base
+	})
 }
 
 // loggedDelays returns the reconnect delay from every "tunnel closed" line.
@@ -1698,6 +1815,92 @@ func TestRunDoesNotFailBecauseTracesCouldNotBeFlushed(t *testing.T) {
 	eventually(t, "the failed flush to be reported", func() bool {
 		return strings.Contains(stdout(), "flushing traces failed")
 	})
+}
+
+// TestRunTraceFlushRespectsItsOwnDeadline pins the 5-second budget Run gives
+// the trace flush at shutdown.
+//
+// TestRunDoesNotFailBecauseTracesCouldNotBeFlushed points the exporter at a
+// dead address, which fails fast (connection refused) regardless of the
+// budget and so cannot tell a 5-second deadline from one collapsed by a
+// mutated arithmetic expression to near zero. This test instead points it at
+// a listener that accepts a connection and then never completes the gRPC
+// handshake, so the flush can only be resolved by its deadline expiring, and
+// the elapsed time between cancellation and shutdown pins how long that
+// deadline actually was.
+//
+// It is not parallel: it captures os.Stdout and installs a global tracer
+// provider, same as its sibling.
+func TestRunTraceFlushRespectsItsOwnDeadline(t *testing.T) {
+	e, _ := newEnroller(t)
+	prom := pmftestutil.NewFakePrometheus(t, pmftestutil.FakeOptions{})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	var (
+		mu    sync.Mutex
+		conns []net.Conn
+	)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, conn)
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	})
+
+	cfg := spokeConfig(t, e.apiURL, "ws://"+deadAddr(t)+"/tunnel", prom.URL)
+	cfg.OTLPEndpoint = "http://" + ln.Addr().String()
+	cfg.TraceSampleRatio = 1
+
+	stdout := captureStdout(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, cfg) }()
+
+	eventually(t, "the spoke to obtain a certificate", func() bool {
+		return strings.Contains(stdout(), "obtained client certificate")
+	})
+	// Put a span in the batch so the shutdown flush has something to try to
+	// deliver. Run installed the global provider.
+	_, span := otel.Tracer("spoke-test").Start(context.Background(), "operation")
+	span.End()
+
+	cancel()
+	start := time.Now()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run() = %v, want nil: an undeliverable trace is not a process failure", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("Run did not return")
+	}
+	elapsed := time.Since(start)
+	// Comfortably below the real 5s budget, but far above what a budget
+	// collapsed by a mutated "5*time.Second" (to ~0, via division, or to a
+	// negative duration, via subtraction) would produce: either gives up
+	// almost immediately instead of waiting out a collector that never
+	// answers.
+	if elapsed < 3*time.Second {
+		t.Errorf("Run returned after %s; the flush must wait close to its 5s budget "+
+			"against a collector that never completes the handshake, not give up almost "+
+			"immediately", elapsed)
+	}
 }
 
 // captureStdout replaces os.Stdout for the duration of the test and returns a

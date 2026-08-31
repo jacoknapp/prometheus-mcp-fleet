@@ -139,6 +139,51 @@ func TestFullJitterDefaultsRepairAMisconfiguredBackoff(t *testing.T) {
 	}
 }
 
+// TestFullJitterNoMaxFallsBackToExactly30s pins the fallback's exact value.
+// TestFullJitterDefaultsRepairAMisconfiguredBackoff only proves every draw
+// lands inside [base/4, 35s), which a fallback smaller than the documented
+// 30s -- say, one broken by a mutated multiplication -- would just as happily
+// satisfy. This proves draws actually reach up near the 30s ceiling.
+func TestFullJitterNoMaxFallsBackToExactly30s(t *testing.T) {
+	t.Parallel()
+
+	const base = 20 * time.Second
+	var maxSeen time.Duration
+	for range 500 {
+		if got := fullJitter(base, 0, 5); got > maxSeen {
+			maxSeen = got
+		}
+	}
+	// Draws come from [5s, 35s) when the fallback is really 30s, saturated by
+	// attempt 5. A fallback that collapsed to 0 or to base (20s) could never
+	// produce anything close to 35s.
+	if maxSeen < 32*time.Second {
+		t.Errorf("largest of 500 draws was %s, want something close to the 30s-fallback ceiling of 35s", maxSeen)
+	}
+}
+
+// TestFullJitterMaxEqualToBaseIsNotTreatedAsMisconfigured pins the boundary of
+// "max < base": a cap exactly equal to the floor is a legitimate
+// configuration (no growth headroom, but not inverted), not something the
+// "max <= 0 || max < base" repair should touch. At attempt 0 the repair branch
+// is never exercised regardless (the window starts at base before any
+// doubling), so this needs an attempt that actually doubles past the
+// configured cap to tell the repaired case apart from the untouched one.
+func TestFullJitterMaxEqualToBaseIsNotTreatedAsMisconfigured(t *testing.T) {
+	t.Parallel()
+
+	const base = 5 * time.Second
+	lo, hiExcl := base/4, base+base/4 // [1.25s, 6.25s)
+	for range 500 {
+		got := fullJitter(base, base, 1)
+		if got < lo || got >= hiExcl {
+			t.Fatalf("fullJitter(base=%s, max=%s, attempt=1) = %s, want [%s, %s); "+
+				"a max equal to base must still cap the window at base, not fall back to 30s",
+				base, base, got, lo, hiExcl)
+		}
+	}
+}
+
 // TestSleepCtxReportsWhetherItSlept is what every loop in this package branches
 // on to decide between "carry on" and "we are shutting down".
 func TestSleepCtxReportsWhetherItSlept(t *testing.T) {

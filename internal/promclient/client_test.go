@@ -376,6 +376,7 @@ func TestDoEnforcesByteCapDuringRead(t *testing.T) {
 		wantTruncated bool
 	}{
 		{"under the cap", 2048, 1 << 20, false},
+		{"exactly at the cap", 4096, 4096, false},
 		{"over the cap", 200_000, 4096, true},
 		{"tiny cap", 200_000, 1, true},
 	}
@@ -400,6 +401,12 @@ func TestDoEnforcesByteCapDuringRead(t *testing.T) {
 				}
 				if trailer.Truncated {
 					t.Fatal("trailer reports truncation below the cap")
+				}
+				if int64(len(body)) != int64(tc.bodySize) {
+					t.Fatalf("delivered %d bytes, want the full %d byte body", len(body), tc.bodySize)
+				}
+				if trailer.BytesTotal != int64(tc.bodySize) {
+					t.Fatalf("trailer.BytesTotal = %d, want %d", trailer.BytesTotal, tc.bodySize)
 				}
 				return
 			}
@@ -519,6 +526,34 @@ func TestDoClientCapWinsOverRequestCap(t *testing.T) {
 	}
 }
 
+// TestDoZeroRequestCapUsesClientDefault proves a zero MaxResponseBytes on the
+// request is treated as "no request-side preference", not as a zero-byte
+// budget: the clamp in Do only tightens the client's own cap when the hub
+// asked for something smaller than it, and zero must not be read as smaller.
+func TestDoZeroRequestCapUsesClientDefault(t *testing.T) {
+	t.Parallel()
+	fake := testutil.NewFakePrometheus(t, testutil.FakeOptions{BodySize: 2048})
+	c := newClient(t, fake.URL, func(cfg *promclient.Config) { cfg.MaxResponseBytes = 4096 })
+
+	resp, err := c.Do(t.Context(), &tunnel.Request{
+		Method: "POST", Path: "/api/v1/query", Form: []byte("query=up"),
+		MaxResponseBytes: 0,
+	})
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	body, trailer, readErr := drain(t, resp)
+	if readErr != nil {
+		t.Fatalf("read: %v, want the client's 4096 byte default to cover a 2048 byte body", readErr)
+	}
+	if trailer.Truncated {
+		t.Fatal("trailer.Truncated = true; a zero request cap must not collapse the effective limit to zero")
+	}
+	if len(body) != 2048 {
+		t.Fatalf("delivered %d bytes, want the full 2048 byte body", len(body))
+	}
+}
+
 func TestDoReportsWarnings(t *testing.T) {
 	t.Parallel()
 
@@ -539,6 +574,18 @@ func TestDoReportsWarnings(t *testing.T) {
 		{
 			name: "large body is not peeked",
 			opts: testutil.FakeOptions{Warnings: []string{"dropped"}, BodySize: 200_000},
+		},
+		{
+			// 128 KiB is exactly promclient's unexported warningsPeekLimit. A
+			// body sitting exactly on it must still be peeked; only a body
+			// larger than the limit is skipped.
+			name:     "a body exactly at the peek limit is still peeked",
+			opts:     testutil.FakeOptions{Warnings: []string{"dropped"}, BodySize: 128 << 10},
+			wantWarn: []string{"dropped"},
+		},
+		{
+			name: "a body one byte over the peek limit is not peeked",
+			opts: testutil.FakeOptions{Warnings: []string{"dropped"}, BodySize: 128<<10 + 1},
 		},
 	}
 	for _, tc := range tests {

@@ -5,6 +5,7 @@ package filestore
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -144,6 +145,41 @@ func TestWriteReportsEveryTemporaryFileFailure(t *testing.T) {
 				t.Error("failed write changed the in-memory committed document")
 			}
 		})
+	}
+}
+
+// TestWriteDoesNotLeakTheDirectoryHandle proves the post-rename directory
+// fsync closes what it opens. write opens the containing directory only to
+// fsync the rename into it; a build that runs the sync/close pair when the
+// open FAILED instead of when it succeeded would leak one file descriptor
+// per successful write instead of zero.
+func TestWriteDoesNotLeakTheDirectoryHandle(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s, err := Open(Options{Path: path})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	countFDs := func() int {
+		t.Helper()
+		entries, err := os.ReadDir("/proc/self/fd")
+		if err != nil {
+			t.Skipf("cannot inspect /proc/self/fd: %v", err)
+		}
+		return len(entries)
+	}
+
+	const writes = 50
+	before := countFDs()
+	for i := range writes {
+		if err := s.write([]byte(fmt.Sprintf(`{"schemaVersion":1,"epoch":%d}`, i))); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+	after := countFDs()
+	if after > before+writes/2 {
+		t.Errorf("open file descriptors grew from %d to %d over %d writes; the directory handle opened to fsync the rename is leaking",
+			before, after, writes)
 	}
 }
 

@@ -231,8 +231,15 @@ func testMultiChunkBody(t *testing.T, newSession Factory) {
 	if !bytes.Equal(got, want) {
 		t.Fatalf("body differs from the source at offset %d", firstDiff(got, want))
 	}
-	if tr := resp.Trailer(); tr.BytesTotal != size {
+	tr := resp.Trailer()
+	if tr.BytesTotal != size {
 		t.Errorf("Trailer().BytesTotal = %d, want %d", tr.BytesTotal, size)
+	}
+	// The handler reported no UpstreamLatency of its own (its zero value), so
+	// the trailer must carry the transport's own measured latency rather than
+	// silently reporting zero.
+	if tr.UpstreamLatency <= 0 {
+		t.Errorf("Trailer().UpstreamLatency = %v, want the transport's own measured latency (> 0)", tr.UpstreamLatency)
 	}
 }
 

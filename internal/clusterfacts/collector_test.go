@@ -8,8 +8,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,6 +22,52 @@ import (
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/promclient"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/testutil"
 )
+
+// runFailureLogMessage is the message [Collector.Run] itself logs when a
+// refresh comes back with an error and the context is still live. It is
+// distinct from the per-source "cluster fact source failed" debug lines
+// [Collector.Refresh] emits for each failing endpoint -- those fire for
+// reasons unrelated to Run's own context guard, including the context
+// cancellation a test's own shutdown produces for whatever call was
+// in-flight, so a capture that counted every record would be testing the
+// wrong thing.
+const runFailureLogMessage = "cluster facts refresh incomplete"
+
+// logCapture is an slog.Handler that counts occurrences of
+// [runFailureLogMessage], so a test can assert on how many times Run itself
+// logged a refresh failure rather than only whether it ever did -- the count
+// is what distinguishes the immediate call's context guard from the
+// ticker's, since both share the same message text.
+type logCapture struct {
+	mu    sync.Mutex
+	count int
+}
+
+func newLogCapture() (*logCapture, *slog.Logger) {
+	c := &logCapture{}
+	return c, slog.New(c)
+}
+
+func (c *logCapture) Enabled(context.Context, slog.Level) bool { return true }
+
+func (c *logCapture) Handle(_ context.Context, r slog.Record) error {
+	if r.Message != runFailureLogMessage {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.count++
+	return nil
+}
+
+func (c *logCapture) WithAttrs([]slog.Attr) slog.Handler { return c }
+func (c *logCapture) WithGroup(string) slog.Handler      { return c }
+
+func (c *logCapture) get() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.count
+}
 
 // fixedNow is the instant every collector test runs at. A manually advanced
 // clock keeps LastSeen and LastRefresh assertable without a sleep.
@@ -577,6 +625,28 @@ func TestKubernetesFacts(t *testing.T) {
 			opts: testutil.FakeOptions{QueryResults: map[string]string{
 				"count(kube_node_info)": `{"status":"success","data":{"resultType":"vector","result":` +
 					`[{"metric":{},"value":[1,"1e30"]}]}}`,
+			}},
+			want: fleet.KubernetesInfo{Available: true, Version: "v1.32.4"},
+		},
+		{
+			// The largest value int32 can hold. One byte less than the reject
+			// threshold, so nothing distinguishes a strict upper bound from an
+			// off-by-one one unless this exact value is asserted kept.
+			name: "the maximum representable node count is kept",
+			opts: testutil.FakeOptions{QueryResults: map[string]string{
+				"count(kube_node_info)": `{"status":"success","data":{"resultType":"vector","result":` +
+					`[{"metric":{},"value":[1,"2147483647"]}]}}`,
+			}},
+			want: fleet.KubernetesInfo{Available: true, Version: "v1.32.4", NodeCount: 2147483647},
+		},
+		{
+			// One past the maximum representable value: the boundary's other
+			// side, without which the same off-by-one could hide in either
+			// direction.
+			name: "one past the maximum representable node count is discarded",
+			opts: testutil.FakeOptions{QueryResults: map[string]string{
+				"count(kube_node_info)": `{"status":"success","data":{"resultType":"vector","result":` +
+					`[{"metric":{},"value":[1,"2147483648"]}]}}`,
 			}},
 			want: fleet.KubernetesInfo{Available: true, Version: "v1.32.4"},
 		},
@@ -1150,5 +1220,176 @@ func TestMultiSampleProbesAreOrderStable(t *testing.T) {
 		} else if c.Facts().Fingerprint != first {
 			t.Fatal("fingerprint churned across refreshes of a multi-series cluster")
 		}
+	}
+}
+
+// TestRefreshExternalLabelsProbeSkipsASampleWithNothingExternal proves the
+// probe keeps examining prometheus_build_info samples in order until it finds
+// one that actually carries an external label, rather than returning the
+// first sample's empty result as soon as it has looked at one.
+func TestRefreshExternalLabelsProbeSkipsASampleWithNothingExternal(t *testing.T) {
+	t.Parallel()
+
+	// Sorted order matters: this first sample's rendered label key is a
+	// strict prefix of the second's, so it sorts first and is examined first.
+	// It carries nothing but the metric's own labels, and the loop must move
+	// on rather than settling for that empty answer.
+	body := `{"status":"success","data":{"resultType":"vector","result":[` +
+		`{"metric":{"__name__":"prometheus_build_info","instance":"a","job":"prometheus","version":"3.6.0"},"value":[1,"1"]},` +
+		`{"metric":{"__name__":"prometheus_build_info","instance":"a","job":"prometheus","version":"3.6.0","zone":"us-east-1"},"value":[1,"1"]}` +
+		`]}}`
+	fake := testutil.NewFakePrometheus(t, testutil.FakeOptions{QueryResults: map[string]string{
+		"prometheus_build_info": body,
+	}})
+	c, _ := newCollector(t, fake, nil)
+	if err := c.Refresh(t.Context()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	want := map[string]string{"zone": "us-east-1"}
+	if diff := cmp.Diff(want, c.Facts().Cluster.Prometheus.ExternalLabels); diff != "" {
+		t.Fatalf("external labels mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// TestRefreshReportsAScrapeIntervalProbeFailureIndependently proves the
+// scrape-interval probe's own error reaches Refresh's returned error even
+// when the external-labels probe -- which shares the same instant-query
+// endpoint -- succeeds. A broken guard on just this probe's error would
+// swallow the failure silently instead of joining it in.
+func TestRefreshReportsAScrapeIntervalProbeFailureIndependently(t *testing.T) {
+	t.Parallel()
+	fake := testutil.NewFakePrometheus(t, testutil.FakeOptions{
+		QueryResults: map[string]string{
+			`prometheus_target_interval_length_seconds{quantile="0.99"}`: `{"status":"error","errorType":"bad_data","error":"boom"}`,
+		},
+	})
+	c, _ := newCollector(t, fake, nil)
+
+	err := c.Refresh(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "scrape interval probe") {
+		t.Fatalf("Refresh() error = %v, want it to name the scrape interval probe", err)
+	}
+	if got := c.Facts().Cluster.Prometheus.ScrapeInterval; got != "" {
+		t.Fatalf("ScrapeInterval = %q, want empty after the probe failed", got)
+	}
+	// The external labels probe, which shares the "query" endpoint, must not
+	// have been disturbed by the other probe's failure.
+	if len(c.Facts().Cluster.Prometheus.ExternalLabels) == 0 {
+		t.Fatal("external labels probe was also affected; the two probes must fail independently")
+	}
+}
+
+// TestRunLogsAnImmediateRefreshFailureWhileTheContextIsLive pins Run's very
+// first call: a failed refresh is logged while the context has not been
+// cancelled. The refresh interval is an hour, long enough that the ticker
+// branch cannot fire during the test, isolating the immediate call's own
+// context guard.
+func TestRunLogsAnImmediateRefreshFailureWhileTheContextIsLive(t *testing.T) {
+	t.Parallel()
+	fake := testutil.NewFakePrometheus(t, testutil.FakeOptions{})
+	base := fake.URL
+	fake.Close()
+	client, err := promclient.New(promclient.Config{BaseURL: base, Timeout: 200 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture, logger := newLogCapture()
+	c, err := clusterfacts.New(clusterfacts.Config{
+		ClusterID: "prod", Client: client, RefreshInterval: time.Hour, Logger: logger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() { defer close(done); c.Run(ctx) }()
+
+	deadline := time.After(5 * time.Second)
+	for capture.get() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("Run did not log the initial refresh failure while the context was live")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancellation")
+	}
+}
+
+// TestRunLogsEveryFailedRefreshOnTheTicker proves the periodic branch keeps
+// logging its own failures independently of the immediate call, for as long
+// as the context stays live -- not merely once. A guard that silently stopped
+// reporting after the first call would leave an operator blind to a
+// Prometheus that stayed down.
+func TestRunLogsEveryFailedRefreshOnTheTicker(t *testing.T) {
+	t.Parallel()
+	fake := testutil.NewFakePrometheus(t, testutil.FakeOptions{})
+	base := fake.URL
+	fake.Close()
+	client, err := promclient.New(promclient.Config{BaseURL: base, Timeout: 200 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture, logger := newLogCapture()
+	c, err := clusterfacts.New(clusterfacts.Config{
+		ClusterID: "prod", Client: client, RefreshInterval: 5 * time.Millisecond, Logger: logger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() { defer close(done); c.Run(ctx) }()
+
+	// The immediate call plus at least two ticks, each logging its own
+	// failure while the context has not been cancelled.
+	deadline := time.After(5 * time.Second)
+	for capture.get() < 3 {
+		select {
+		case <-deadline:
+			t.Fatalf("Run logged only %d failures while the context was live, want at least 3", capture.get())
+		case <-time.After(time.Millisecond):
+		}
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancellation")
+	}
+}
+
+// TestRunTicksThroughRepeatedSuccessesWithoutLogging proves the ticker branch
+// takes the nothing-to-report path on every tick as long as refreshes keep
+// succeeding. The branch calls err.Error() to build the log line it emits on
+// failure; if it took that path with a nil error, it would panic, so a
+// healthy run that survives several ticks is itself the proof.
+func TestRunTicksThroughRepeatedSuccessesWithoutLogging(t *testing.T) {
+	t.Parallel()
+	fake := testutil.NewFakePrometheus(t, testutil.FakeOptions{})
+	capture, logger := newLogCapture()
+	c, _ := newCollector(t, fake, func(cfg *clusterfacts.Config) {
+		cfg.RefreshInterval = 5 * time.Millisecond
+		cfg.Logger = logger
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() { defer close(done); c.Run(ctx) }()
+
+	// Real time for the immediate refresh and several ticks, all against a
+	// healthy fake.
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancellation")
+	}
+	if got := capture.get(); got != 0 {
+		t.Fatalf("Run logged %d times against a healthy Prometheus, want 0", got)
 	}
 }

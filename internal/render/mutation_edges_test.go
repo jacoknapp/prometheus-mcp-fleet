@@ -357,3 +357,63 @@ func TestParsePromDurationAcceptsEveryDigit(t *testing.T) {
 		t.Errorf("ParsePromDuration(%q) = %s, %v; want 159m", "159m", got, err)
 	}
 }
+
+// TestSelectStepNeverReturnsZeroForAZeroWidthAutoRequest pins the fallback
+// SelectStep documents as its whole contract: "the returned duration is
+// always positive". An auto request (UserStep zero) over a zero-width range
+// gives the point-budget branch nothing to compute from -- span is zero, so
+// the derived step is zero too -- which makes the final "still zero, fall
+// back to the smallest ladder rung" guard the only thing standing between
+// this input and a zero step reaching a caller that will divide by it.
+func TestSelectStepNeverReturnsZeroForAZeroWidthAutoRequest(t *testing.T) {
+	t.Parallel()
+
+	step, d := SelectStep(StepRequest{Start: baseTime, End: baseTime})
+	if step <= 0 {
+		t.Fatalf("SelectStep = %s for a zero-width auto request, want a positive fallback step", step)
+	}
+	if step != StepLadder[0] {
+		t.Errorf("step = %s, want the smallest ladder rung %s", step, StepLadder[0])
+	}
+	if d.Reason != StepReasonMaxPoints {
+		t.Errorf("Reason = %q, want %q", d.Reason, StepReasonMaxPoints)
+	}
+}
+
+// TestEncodeRangeFactorsLabelsAcrossEverySeries proves the shared-label
+// intersection keeps narrowing against every series before it stops, not
+// just the first two. A loop that breaks out as soon as the running
+// intersection is non-empty would let a label two series happen to agree on
+// leak into SharedLabels even though a third series disagrees -- and
+// factorShared then deletes that key from every series' own Labels,
+// including the one whose real value it never matched.
+func TestEncodeRangeFactorsLabelsAcrossEverySeries(t *testing.T) {
+	t.Parallel()
+
+	// Descending values so ranking leaves this order alone: the two
+	// job="api" series rank first and second, agree with each other, and
+	// only the third (job="web", ranked last) breaks the intersection. A
+	// loop that stops as soon as the running intersection is non-empty --
+	// true after comparing only the first two -- never reaches the third.
+	start := baseTime
+	got := EncodeRange(RangeInput{
+		Matrix: Matrix{
+			{Metric: map[string]string{"job": "api"}, Values: points(start, time.Minute, 3)},
+			{Metric: map[string]string{"job": "api"}, Values: points(start, time.Minute, 2)},
+			{Metric: map[string]string{"job": "web"}, Values: points(start, time.Minute, 1)},
+		},
+		Start: start, End: start, Step: time.Minute,
+	}, Options{})
+
+	if _, ok := got.SharedLabels["job"]; ok {
+		t.Fatalf("SharedLabels = %v; \"job\" is not common to all three series", got.SharedLabels)
+	}
+	seen := map[string]bool{}
+	for _, s := range got.Series {
+		seen[s.Labels["job"]] = true
+	}
+	if !seen["api"] || !seen["web"] {
+		t.Fatalf("series job labels = %v, want both \"api\" and \"web\" to survive on their own series",
+			seen)
+	}
+}

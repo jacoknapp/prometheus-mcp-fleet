@@ -13,8 +13,41 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
+
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel"
 )
+
+// TestCloneRequestIsIndependentOfTheOriginal proves the handler gets its own
+// copy of Form, matching the real transport: a handler that mutated the bytes
+// it was handed must not be able to affect the caller's own request, because
+// the real transport re-materialises the request from protobuf and could never
+// share memory with the caller's copy either.
+func TestCloneRequestIsIndependentOfTheOriginal(t *testing.T) {
+	t.Parallel()
+
+	t.Run("form bytes are copied, not aliased", func(t *testing.T) {
+		t.Parallel()
+		req := &tunnel.Request{Method: http.MethodGet, Path: "/x", Form: []byte("query=up"), MaxResponseBytes: 1}
+		clone := cloneRequest(req)
+		if diff := cmp.Diff(req.Form, clone.Form); diff != "" {
+			t.Fatalf("clone.Form mismatch (-want +got):\n%s", diff)
+		}
+		clone.Form[0] = 'Q'
+		if req.Form[0] == 'Q' {
+			t.Fatal("mutating the clone's Form also mutated the original request")
+		}
+	})
+
+	t.Run("a nil Form clones to nil, not an empty slice", func(t *testing.T) {
+		t.Parallel()
+		req := &tunnel.Request{Method: http.MethodGet, Path: "/x", MaxResponseBytes: 1}
+		clone := cloneRequest(req)
+		if clone.Form != nil {
+			t.Fatalf("clone.Form = %#v, want nil", clone.Form)
+		}
+	})
+}
 
 type testHandler struct {
 	do       func(context.Context, *tunnel.Request) (*tunnel.Response, error)
@@ -70,6 +103,38 @@ func TestSessionErrorAndLifecyclePaths(t *testing.T) {
 	}
 	if _, err := s.Do(context.Background(), nil); !errors.Is(err, ErrInvalidRequest) {
 		t.Errorf("Do(nil) = %v, want ErrInvalidRequest", err)
+	}
+}
+
+// TestMapErrPrefersACancelledCallerContextOverTheHandlersOwnError proves that a
+// caller context which has already expired takes priority over whatever error
+// the handler itself produced, on a session that is not otherwise closed. A
+// caller asking "did my own deadline or cancellation cause this" must see its
+// own context.Canceled, not an unrelated handler failure that happened to race
+// it.
+func TestMapErrPrefersACancelledCallerContextOverTheHandlersOwnError(t *testing.T) {
+	t.Parallel()
+
+	h := testHandler{
+		do:       func(context.Context, *tunnel.Request) (*tunnel.Response, error) { return &tunnel.Response{}, nil },
+		describe: func(context.Context, string) (tunnel.Facts, error) { return tunnel.Facts{}, nil },
+	}
+	s := Pair(tunnel.Identity{ClusterID: "prod"}, 1, h).(*session)
+	t.Cleanup(func() { _ = s.Close("cleanup") })
+
+	callerCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	handlerErr := errors.New("unrelated handler failure")
+
+	got := s.mapErr(callerCtx, handlerErr)
+	if !errors.Is(got, context.Canceled) {
+		t.Fatalf("mapErr(cancelled ctx, handlerErr) = %v, want context.Canceled", got)
+	}
+	if errors.Is(got, handlerErr) {
+		t.Errorf("mapErr(cancelled ctx, handlerErr) = %v, must not still be the handler's error", got)
+	}
+	if errors.Is(got, tunnel.ErrSessionClosed) {
+		t.Errorf("mapErr(cancelled ctx, handlerErr) = %v, the session itself is not closed", got)
 	}
 }
 

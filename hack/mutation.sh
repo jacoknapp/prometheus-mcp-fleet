@@ -179,8 +179,16 @@ for pkg in "${packages[@]}"; do
 
 	if awk -v g="${got}" -v w="${want}" 'BEGIN { exit !(g + 0.0001 < w + 0) }'; then
 		echo "    efficacy ${got}% regressed below baseline ${want}%" >&2
-		grep '  LIVED' "${log}" >&2 || true
 		fail=1
+	fi
+
+	# Always list the survivors, not only on a regression. Someone working a
+	# package to 100% needs to see them every run, and when this script kept
+	# them back the workaround was to call gremlins directly -- which runs
+	# outside the memory ceiling above and took the machine down twice.
+	# Make the safe path the useful one.
+	if [[ "${lived}" != "0" ]]; then
+		grep '  LIVED' "${log}" || true
 	fi
 	results+=("${short}|${got}|${killed}|${lived}|${timedout}")
 done

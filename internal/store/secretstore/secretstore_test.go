@@ -403,7 +403,21 @@ func TestCacheServesReads(t *testing.T) {
 		t.Errorf("%d API reads for 5 cached lookups, want 0", gets-getsAfterWrite)
 	}
 
-	now = now.Add(11 * time.Second)
+	// 5s is well past DefaultCacheTTL (1s) but short of the 10s configured
+	// above. Serving this one from cache too proves the configured TTL is
+	// actually in effect, not silently replaced by the default -- both would
+	// pass the "0 refreshes so far" checks above, since nothing has aged past
+	// either one yet.
+	now = now.Add(5 * time.Second)
+	if _, err := s.GetKey(t.Context(), "agent0001"); err != nil {
+		t.Fatalf("GetKey: %v", err)
+	}
+	if gets, _, _, _ := api.counts(); gets != getsAfterWrite {
+		t.Errorf("API reads at 5s (past the 1s default, inside the configured 10s ttl) = %d, want 0: the configured CacheTTL is not being honoured",
+			gets-getsAfterWrite)
+	}
+
+	now = now.Add(6 * time.Second) // total 11s since the write
 	if _, err := s.GetKey(t.Context(), "agent0001"); err != nil {
 		t.Fatalf("GetKey: %v", err)
 	}

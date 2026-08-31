@@ -6,6 +6,7 @@ package registry
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -233,6 +234,58 @@ func mustNew(t *testing.T, opts Options) *Registry {
 		t.Fatalf("New: %v", err)
 	}
 	return r
+}
+
+// recordingHandler is a minimal slog.Handler that keeps every record it
+// receives, so a test can assert on log messages without a dependency.
+type recordingHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *recordingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *recordingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, r)
+	return nil
+}
+
+func (h *recordingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *recordingHandler) WithGroup(string) slog.Handler      { return h }
+
+// messages returns every record's message, in the order received.
+func (h *recordingHandler) messages() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]string, len(h.records))
+	for i, r := range h.records {
+		out[i] = r.Message
+	}
+	return out
+}
+
+// stringAttrs returns the string value of attr key from every record whose
+// message equals msg, in the order received. It exists so a test can check a
+// log line is attributed to the right entity, not merely that some line with
+// that message exists.
+func (h *recordingHandler) stringAttrs(msg, key string) []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []string
+	for _, r := range h.records {
+		if r.Message != msg {
+			continue
+		}
+		r.Attrs(func(a slog.Attr) bool {
+			if a.Key == key {
+				out = append(out, a.Value.String())
+			}
+			return true
+		})
+	}
+	return out
 }
 
 // attach admits s and returns its release function.

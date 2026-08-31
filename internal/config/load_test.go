@@ -58,6 +58,82 @@ func TestSplitListDropsOnlyEmptyItems(t *testing.T) {
 	}
 }
 
+// TestCsvValueStringNilSafety exercises every branch of csvValue.String's
+// nil guard directly: a nil receiver, a non-nil receiver with a nil dst, and
+// the ordinary populated case. Nothing in LoadHub/LoadSpoke's own tests ever
+// calls String() on a nil csvValue -- it only surfaces via flag.PrintDefaults
+// on a normally constructed flag -- so without a direct test here, negating
+// either half of "v == nil || v.dst == nil" changes nothing any existing test
+// can observe.
+func TestCsvValueStringNilSafety(t *testing.T) {
+	t.Parallel()
+
+	var nilPtr *csvValue
+	if got := nilPtr.String(); got != "" {
+		t.Errorf("(*csvValue)(nil).String() = %q, want \"\"", got)
+	}
+	if got := (&csvValue{}).String(); got != "" {
+		t.Errorf("csvValue{dst: nil}.String() = %q, want \"\"", got)
+	}
+	list := []string{"a", "b"}
+	if got := (&csvValue{dst: &list}).String(); got != "a,b" {
+		t.Errorf("csvValue{dst: &[a b]}.String() = %q, want %q", got, "a,b")
+	}
+}
+
+// TestLabelsValueStringNilSafety is the labelsValue analogue of
+// TestCsvValueStringNilSafety, for the same reason.
+func TestLabelsValueStringNilSafety(t *testing.T) {
+	t.Parallel()
+
+	var nilPtr *labelsValue
+	if got := nilPtr.String(); got != "" {
+		t.Errorf("(*labelsValue)(nil).String() = %q, want \"\"", got)
+	}
+	if got := (&labelsValue{}).String(); got != "" {
+		t.Errorf("labelsValue{dst: nil}.String() = %q, want \"\"", got)
+	}
+	m := map[string]string{"env": "prod"}
+	if got := (&labelsValue{dst: &m}).String(); got != "env=prod" {
+		t.Errorf("labelsValue{dst: &{env:prod}}.String() = %q, want %q", got, "env=prod")
+	}
+}
+
+// TestCheckAddrAcceptsMaxPort pins 65535 as valid: checkAddr rejects "n >
+// 65535", and 65535 is the only port that distinguishes that check from the
+// off-by-one "n >= 65535".
+func TestCheckAddrAcceptsMaxPort(t *testing.T) {
+	t.Parallel()
+	if err := checkAddr("addr", "host:65535"); err != nil {
+		t.Errorf("checkAddr(host:65535) = %v, want nil", err)
+	}
+}
+
+// TestCheckHubEndpointAcceptsBoundaryPorts pins both ends of the host:port
+// form's valid port range. checkHubEndpoint rejects "n < 1 || n > 65535", and
+// 1 and 65535 are the only values that distinguish those from the
+// off-by-one "n <= 1" and "n >= 65535".
+func TestCheckHubEndpointAcceptsBoundaryPorts(t *testing.T) {
+	t.Parallel()
+	for _, addr := range []string{"hub.example.com:1", "hub.example.com:65535"} {
+		if err := checkHubEndpoint("hub-endpoints", addr); err != nil {
+			t.Errorf("checkHubEndpoint(%q) = %v, want nil", addr, err)
+		}
+	}
+}
+
+// TestCheckRatioAcceptsBoundaries pins both ends of the documented [0,1]
+// range. checkRatio rejects "r < 0 || r > 1", and 0 and 1 are the only values
+// that distinguish those from the off-by-one "r <= 0" and "r >= 1".
+func TestCheckRatioAcceptsBoundaries(t *testing.T) {
+	t.Parallel()
+	for _, r := range []float64{0, 1} {
+		if err := checkRatio("trace-sample-ratio", r); err != nil {
+			t.Errorf("checkRatio(%v) = %v, want nil", r, err)
+		}
+	}
+}
+
 func TestLoadHubDefaults(t *testing.T) {
 	t.Parallel()
 

@@ -4,6 +4,7 @@
 package grpctun
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -44,9 +45,24 @@ func TestKeepaliveParameters(t *testing.T) {
 	if custom.Time != defaultClientPingTime || custom.Timeout != defaultClientPingTimeout || custom.PermitWithoutStream {
 		t.Errorf("partially invalid client parameters = %+v", custom)
 	}
+	// Time and Timeout are defaulted independently, each on its own <= 0
+	// boundary: a caller who only pinned one of the pair must not lose the
+	// other to the same fallback.
+	timeAtZero := (KeepaliveParams{Time: 0, Timeout: 7 * time.Second, PermitWithoutStream: true}).clientParams()
+	if timeAtZero.Time != defaultClientPingTime || timeAtZero.Timeout != 7*time.Second || !timeAtZero.PermitWithoutStream {
+		t.Errorf("client parameters with Time at its zero boundary = %+v", timeAtZero)
+	}
+	timeoutAtZero := (KeepaliveParams{Time: 9 * time.Second, Timeout: 0, PermitWithoutStream: true}).clientParams()
+	if timeoutAtZero.Time != 9*time.Second || timeoutAtZero.Timeout != defaultClientPingTimeout || !timeoutAtZero.PermitWithoutStream {
+		t.Errorf("client parameters with Timeout at its zero boundary = %+v", timeoutAtZero)
+	}
 	policy := (KeepaliveParams{Time: -1}).enforcementPolicy()
 	if policy.MinTime != defaultServerMinPingTime || policy.PermitWithoutStream {
 		t.Errorf("custom enforcement policy = %+v", policy)
+	}
+	policyAtZero := (KeepaliveParams{Time: 0, Timeout: time.Second, PermitWithoutStream: true}).enforcementPolicy()
+	if policyAtZero.MinTime != defaultServerMinPingTime || !policyAtZero.PermitWithoutStream {
+		t.Errorf("enforcement policy with Time at its zero boundary = %+v", policyAtZero)
 	}
 	defPolicy := (KeepaliveParams{}).enforcementPolicy()
 	if defPolicy.MinTime != defaultServerMinPingTime || !defPolicy.PermitWithoutStream {
@@ -154,6 +170,11 @@ func TestConversionsAndDialError(t *testing.T) {
 	}
 	if _, err := requestFromProto(&fleetv1.ProxyRequest{Method: http.MethodGet, Path: "/x", MaxResponseBytes: 1<<62 + 1}); !errors.Is(err, ErrInvalidRequest) {
 		t.Errorf("requestFromProto(overflow) = %v", err)
+	}
+	// 1<<62 itself is the documented ceiling and must still convert cleanly;
+	// only one bit further overflows.
+	if req, err := requestFromProto(&fleetv1.ProxyRequest{Method: http.MethodGet, Path: "/x", MaxResponseBytes: 1 << 62}); err != nil || req.MaxResponseBytes != 1<<62 {
+		t.Errorf("requestFromProto(1<<62) = (%+v, %v), want it accepted with MaxResponseBytes 1<<62", req, err)
 	}
 	if _, err := requestFromProto(&fleetv1.ProxyRequest{Method: "DELETE", Path: "/x", MaxResponseBytes: 1}); !errors.Is(err, ErrInvalidRequest) {
 		t.Errorf("requestFromProto(invalid) = %v", err)
@@ -275,6 +296,25 @@ func TestSpokeServerFailuresAndStreaming(t *testing.T) {
 		err := (&spokeServer{h: baseHandler, chunkBytes: 2}).Proxy(validProtoRequest(), stream)
 		if !errors.Is(err, errFixture) {
 			t.Errorf("Proxy = %v, want trailer send failure", err)
+		}
+	})
+
+	// A trailer is still owed even when the stream's context happens to have
+	// been cancelled by the time the copy finishes cleanly: the early return
+	// that skips the trailer is only for a copy that itself failed because the
+	// hub cancelled mid-transfer (RST_STREAM already told it everything).
+	// copyErr == nil means the copy did not fail, so the cancellation must not
+	// swallow the trailer here.
+	t.Run("a trailer is still sent when the context is already done but the copy did not fail", func(t *testing.T) {
+		cancelledCtx, cancel := context.WithCancel(context.Background())
+		cancel()
+		stream := &fakeProxyServer{ctx: cancelledCtx}
+		err := (&spokeServer{h: baseHandler, chunkBytes: 2}).Proxy(validProtoRequest(), stream)
+		if err != nil {
+			t.Fatalf("Proxy = %v, want nil: the copy succeeded, so cancellation must not suppress the trailer", err)
+		}
+		if len(stream.sent) == 0 || stream.sent[len(stream.sent)-1].GetTrail() == nil {
+			t.Errorf("sent = %+v, want the last chunk to be a trailer", stream.sent)
 		}
 	})
 
@@ -486,6 +526,34 @@ func TestBodyReaderProtocolAndTerminalPaths(t *testing.T) {
 		}
 	})
 
+	// TestBodyReaderProtocolAndTerminalPaths's own "oversized data" case only
+	// ever sees b.received == 0: the single chunk it sends already exceeds the
+	// budget on its own. That leaves the budget arithmetic untested once
+	// received bytes have already accumulated across earlier chunks -- a
+	// mutant that swapped the subtraction for addition would still refuse the
+	// very first chunk correctly, for the wrong reason, and only misbehave
+	// from the second chunk on.
+	t.Run("budget spans multiple chunks", func(t *testing.T) {
+		b := &bodyReader{
+			stream: &fakeClientStream{results: []recvResult{
+				{chunk: dataChunk("abc")},  // received 0 -> 3, under the budget of 5
+				{chunk: dataChunk("de")},   // received 3 -> 5, lands exactly on the budget
+				{chunk: dataChunk("f")},    // one byte past the budget: must truncate now, not before
+				{chunk: dataChunk("more")}, // never reached; truncation already latched
+			}}, budget: 5, cleanup: func() {}, release: func() {}, mapErr: func(err error) error { return err },
+		}
+		got, err := io.ReadAll(b)
+		if string(got) != "abcde" {
+			t.Errorf("body = %q, want abcde", got)
+		}
+		if !errors.Is(err, tunnel.ErrResponseTooLarge) {
+			t.Errorf("terminal error = %v, want tunnel.ErrResponseTooLarge", err)
+		}
+		if trail := b.Trailer(); trail.BytesTotal != 5 || !trail.Truncated {
+			t.Errorf("Trailer() = %+v, want BytesTotal 5 and Truncated true", trail)
+		}
+	})
+
 	t.Run("early close", func(t *testing.T) {
 		var calls atomic.Int32
 		b := &bodyReader{stream: &fakeClientStream{}, budget: 3, cleanup: func() { calls.Add(1) }, release: func() { calls.Add(1) }, mapErr: func(err error) error { return err }}
@@ -556,7 +624,13 @@ func TestListenerConstructionStateAndShutdown(t *testing.T) {
 		t.Error("session cap was not enforced")
 	}
 	state.release()
+	// A release beyond what was ever reserved must not drive the counter
+	// negative: that would let reserve() admit an extra session it should
+	// have refused, silently exceeding MaxSessions.
 	state.release()
+	if state.active != 0 {
+		t.Errorf("active = %d after releasing more than was reserved, want 0", state.active)
+	}
 	state.closed = true
 	if state.reserve() || !state.isClosed() {
 		t.Error("closed listener reserved a slot or reported open")
@@ -600,6 +674,98 @@ func TestServeConnValidationAndDefaults(t *testing.T) {
 	err := ServeConn(ctx, local, DialerConfig{Endpoint: "hub", MaxChunkBytes: defaultChunkBytes + 1}, h)
 	if dialReason(err) != ReasonContextCancelled || !errors.Is(err, context.Canceled) {
 		t.Errorf("ServeConn(cancelled) = %v", err)
+	}
+}
+
+// TestServeConnMaxChunkBytesControlsWireChunking proves the effective chunk
+// size ServeConn's config clamp settles on is really what ends up on the
+// wire, not just a value that lets ServeConn return without error. It does so
+// by reading exactly one wire chunk (a fresh bodyReader's first Read call
+// returns precisely one chunk's worth, no more, no less) from a body larger
+// than the chunk, over a real gRPC connection.
+func TestServeConnMaxChunkBytesControlsWireChunking(t *testing.T) {
+	t.Parallel()
+
+	// The <= 0 side of the clamp is deliberately not exercised here: a mutant
+	// on that boundary (e.g. chunk < 0, leaving a configured 0 unclamped)
+	// turns spokeServer.streamBody's chunk buffer into make([]byte, 0), and
+	// every Read into a zero-length slice returns (0, nil) forever per the
+	// io.Reader contract -- an unkillable-by-timeout busy loop with nothing to
+	// observe. Gremlins itself reports that boundary as TIMED OUT, not LIVED,
+	// so it costs nothing to leave it alone. Only the upper bound is tested.
+	tests := []struct {
+		name       string
+		configured int
+		wantChunk  int
+	}{
+		{name: "over the cap is clamped to the default", configured: defaultChunkBytes + 1, wantChunk: defaultChunkBytes},
+		{name: "exactly the cap is honoured, not clamped", configured: defaultChunkBytes, wantChunk: defaultChunkBytes},
+		{name: "a small valid value is honoured", configured: 4, wantChunk: 4},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			body := bytes.Repeat([]byte("x"), tc.wantChunk*2+7)
+			h := handlerFuncs{
+				do: func(context.Context, *tunnel.Request) (*tunnel.Response, error) {
+					return &tunnel.Response{Body: io.NopCloser(bytes.NewReader(body))}, nil
+				},
+				describe: func(context.Context, string) (tunnel.Facts, error) { return tunnel.Facts{}, nil },
+			}
+
+			local, peer := net.Pipe()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			spokeDone := make(chan error, 1)
+			go func() {
+				spokeDone <- ServeConn(ctx, peer, DialerConfig{
+					Endpoint: "fixture", Logger: discardLogger(), MaxChunkBytes: tc.configured,
+				}, h)
+			}()
+
+			l := &listener{log: discardLogger(), hsTO: 10 * time.Second, sessions: make(map[*session]struct{}), stopped: make(chan struct{})}
+			sess, err := l.newSession(ctx, local, tunnel.Identity{ClusterID: "prod"})
+			if err != nil {
+				t.Fatalf("newSession: %v", err)
+			}
+			defer func() { _ = sess.Close("test complete") }()
+
+			resp, err := sess.Do(ctx, &tunnel.Request{Method: "GET", Path: "/x", MaxResponseBytes: int64(len(body))})
+			if err != nil {
+				t.Fatalf("Do: %v", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+
+			// A misconfigured chunk size (notably a clamp that leaves it at
+			// zero) turns the spoke's streamBody loop into a busy spin that
+			// never sends data or terminates, so the read is bounded rather
+			// than left to hang the whole test binary.
+			type readResult struct {
+				n   int
+				err error
+			}
+			buf := make([]byte, len(body))
+			readDone := make(chan readResult, 1)
+			go func() {
+				n, err := resp.Body.Read(buf)
+				readDone <- readResult{n, err}
+			}()
+			select {
+			case r := <-readDone:
+				if r.err != nil {
+					t.Fatalf("first Read: %v", r.err)
+				}
+				if r.n != tc.wantChunk {
+					t.Errorf("first Read returned %d bytes, want exactly one wire chunk of %d", r.n, tc.wantChunk)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("first Read did not return within 5s; the configured chunk size of %d likely produced a zero-length wire chunk", tc.configured)
+			}
+
+			cancel()
+			<-spokeDone
+		})
 	}
 }
 
@@ -694,6 +860,41 @@ func TestAttachFailureRejectionAndRelease(t *testing.T) {
 		}
 	})
 
+	t.Run("an identity's own RemoteAddr is not overwritten", func(t *testing.T) {
+		l := newListener()
+		local, peer := net.Pipe()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		h := handlerFuncs{
+			do: func(context.Context, *tunnel.Request) (*tunnel.Response, error) {
+				return &tunnel.Response{Body: io.NopCloser(strings.NewReader(""))}, nil
+			},
+			describe: func(context.Context, string) (tunnel.Facts, error) { return tunnel.Facts{}, nil },
+		}
+		spokeDone := make(chan error, 1)
+		go func() {
+			spokeDone <- ServeConn(ctx, peer, DialerConfig{Endpoint: "fixture", Logger: discardLogger()}, h)
+		}()
+		var captured tunnel.Session
+		l.active = 1
+		// net.Pipe's RemoteAddr() is non-nil ("pipe"), so an identity that
+		// already carries an address (e.g. from an X-Forwarded-For header)
+		// must win over it, not be replaced by it.
+		l.attach(ctx, local, tunnel.Identity{ClusterID: "prod", RemoteAddr: "203.0.113.9"}, tunnel.SessionHandlerFunc(func(_ context.Context, s tunnel.Session) (func(), error) {
+			captured = s
+			return nil, nil
+		}))
+		if captured == nil {
+			t.Fatal("session handler was not called")
+		}
+		if got := captured.Identity().RemoteAddr; got != "203.0.113.9" {
+			t.Errorf("Identity().RemoteAddr = %q, want the identity's own address preserved", got)
+		}
+		_ = captured.Close("test complete")
+		cancel()
+		<-spokeDone
+	})
+
 	for _, tc := range []struct {
 		name   string
 		reject bool
@@ -728,6 +929,12 @@ func TestAttachFailureRejectionAndRelease(t *testing.T) {
 			}))
 			if captured == nil {
 				t.Fatal("session handler was not called")
+			}
+			// The identity carried no RemoteAddr of its own, so attach must
+			// have filled it in from the connection rather than leaving it
+			// empty.
+			if got := captured.Identity().RemoteAddr; got == "" {
+				t.Error("Identity().RemoteAddr is empty, want it filled in from the connection")
 			}
 			if tc.reject {
 				select {

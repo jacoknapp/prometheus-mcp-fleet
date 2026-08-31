@@ -9,14 +9,17 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestTheFakeHubIsAsStrictAsTheRealOne. Every other assertion in this package
@@ -352,6 +355,106 @@ func TestStatusErrorTruncatesAnUnboundedBody(t *testing.T) {
 	if strings.Count(msg, "A") > 512 {
 		t.Errorf("the refusal carried %d body bytes into the error, want at most 512",
 			strings.Count(msg, "A"))
+	}
+}
+
+// TestStatusErrorDoesNotTruncateAtExactlyTheLimit pins the boundary of the
+// truncation check itself: TestStatusErrorTruncatesAnUnboundedBody only proves
+// a body far over the limit gets truncated, which an off-by-one threshold
+// would just as happily do. A detail of exactly 512 bytes is the only input
+// that tells "> 512" apart from ">= 512".
+func TestStatusErrorDoesNotTruncateAtExactlyTheLimit(t *testing.T) {
+	t.Parallel()
+
+	e := &enroller{apiURL: "https://hub.test", logger: quiet()}
+	err := e.statusError("/enroll", http.StatusInternalServerError, []byte(strings.Repeat("A", 512)))
+	if strings.Contains(err.Error(), "…") {
+		t.Errorf("a 512-byte detail was truncated, want the boundary itself left untouched: %v", err)
+	}
+	if strings.Count(err.Error(), "A") != 512 {
+		t.Errorf("error carries %d body bytes, want all 512", strings.Count(err.Error(), "A"))
+	}
+}
+
+// TestHTTPClientTimeouts pins the exact timeout budget of the client used for
+// enrollment and renewal. Nothing else in this package inspects these fields
+// directly; the behavioural tests only prove the client works at all, not
+// that a slow or hanging hub is bounded by the budget this package documents.
+func TestHTTPClientTimeouts(t *testing.T) {
+	t.Parallel()
+
+	e := &enroller{logger: quiet()}
+	client, err := e.httpClient()
+	if err != nil {
+		t.Fatalf("httpClient: %v", err)
+	}
+	if client.Timeout != 30*time.Second {
+		t.Errorf("client.Timeout = %s, want 30s", client.Timeout)
+	}
+	tr, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("Transport is %T, want *http.Transport", client.Transport)
+	}
+	if tr.MaxIdleConnsPerHost != 2 {
+		t.Errorf("MaxIdleConnsPerHost = %d, want 2", tr.MaxIdleConnsPerHost)
+	}
+	if tr.IdleConnTimeout != 30*time.Second {
+		t.Errorf("IdleConnTimeout = %s, want 30s", tr.IdleConnTimeout)
+	}
+	if tr.TLSHandshakeTimeout != 10*time.Second {
+		t.Errorf("TLSHandshakeTimeout = %s, want 10s", tr.TLSHandshakeTimeout)
+	}
+	if tr.ResponseHeaderTimeout != 20*time.Second {
+		t.Errorf("ResponseHeaderTimeout = %s, want 20s", tr.ResponseHeaderTimeout)
+	}
+}
+
+// TestClusterIDFromCert walks every source clusterIDFromCert reads from: the
+// URI SAN when it carries the expected prefix, and the common-name fallback
+// when the URI is absent, lacks the prefix, or is exactly the prefix with
+// nothing after it (which TrimPrefix reduces to the empty string).
+func TestClusterIDFromCert(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		cert *x509.Certificate
+		want string
+	}{
+		{
+			name: "a uri with the spoke prefix",
+			cert: &x509.Certificate{URIs: []*url.URL{{Path: "/spoke/prod-eu-1"}}},
+			want: "prod-eu-1",
+		},
+		{
+			name: "a uri without the spoke prefix falls back to the common name",
+			cert: &x509.Certificate{
+				URIs:    []*url.URL{{Path: "/other/prod-eu-1"}},
+				Subject: pkix.Name{CommonName: "spoke:prod-eu-1"},
+			},
+			want: "prod-eu-1",
+		},
+		{
+			name: "a uri that is exactly the prefix falls back to the common name",
+			cert: &x509.Certificate{
+				URIs:    []*url.URL{{Path: "/spoke/"}},
+				Subject: pkix.Name{CommonName: "spoke:prod-eu-1"},
+			},
+			want: "prod-eu-1",
+		},
+		{
+			name: "no uris at all falls back to the common name",
+			cert: &x509.Certificate{Subject: pkix.Name{CommonName: "spoke:prod-eu-1"}},
+			want: "prod-eu-1",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := clusterIDFromCert(tc.cert); got != tc.want {
+				t.Errorf("clusterIDFromCert() = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 

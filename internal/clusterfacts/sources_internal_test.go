@@ -5,12 +5,16 @@ package clusterfacts
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/fleet"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/promclient"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/testutil"
 )
@@ -335,6 +339,11 @@ func TestUnquote(t *testing.T) {
 		{"unquoted", "a", "a"},
 		{"one character", `"`, `"`},
 		{"mismatched", `"a'`, `"a'`},
+		// Exactly two characters is the smallest input the quote check can
+		// ever match against: nothing else here proves the length guard
+		// admits two runes rather than requiring three or more.
+		{"empty double-quoted", `""`, ""},
+		{"empty single-quoted", `''`, ""},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -384,6 +393,13 @@ func TestTruncateReason(t *testing.T) {
 	if len(got) != 300+len("...[clipped]") {
 		t.Fatalf("truncateReason(long) length = %d", len(got))
 	}
+
+	// Exactly at the cap: nothing else here distinguishes <= from <, so a
+	// reason landing precisely on the limit must survive untouched.
+	exact := strings.Repeat("y", 300)
+	if got := truncateReason(exact); got != exact {
+		t.Fatalf("truncateReason clipped a reason exactly at the cap: %q", got)
+	}
 }
 
 func TestLabelKeyIsCanonical(t *testing.T) {
@@ -413,4 +429,183 @@ func TestHalveAndAppendNote(t *testing.T) {
 	if got := appendNote("desc", "note"); got != "desc note" {
 		t.Fatalf("appendNote = %q", got)
 	}
+}
+
+// TestCapSizeAcceptsAPayloadExactlyAtTheCap proves the size check is
+// inclusive: a payload landing exactly on MaxFactsBytes must survive
+// untouched. Every other capSize test here is comfortably over or under the
+// cap, so nothing else distinguishes <= from <.
+func TestCapSizeAcceptsAPayloadExactlyAtTheCap(t *testing.T) {
+	t.Parallel()
+
+	cluster := fleet.Cluster{
+		ID:         "prod",
+		Prometheus: fleet.PrometheusInfo{Jobs: []string{"a", "b"}},
+	}
+	b, err := json.Marshal(cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &Collector{maxFactsBytes: len(b)}
+	c.capSize(&cluster)
+
+	if diff := cmp.Diff([]string{"a", "b"}, cluster.Prometheus.Jobs); diff != "" {
+		t.Fatalf("a payload exactly at the cap was truncated (-want +got):\n%s", diff)
+	}
+	if cluster.Description != "" {
+		t.Fatalf("description = %q, want no truncation note", cluster.Description)
+	}
+}
+
+// TestShrinkSampledSkipsFieldsAlreadyEmpty proves the precedence chain moves
+// past a field with nothing left in it rather than mistaking "empty" for
+// "worth shrinking": each len(...) > 0 guard has to be strict, or the chain
+// gets stuck on an already-empty field and the ones behind it -- which may
+// still have something to give -- are never reached.
+func TestShrinkSampledSkipsFieldsAlreadyEmpty(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		cluster fleet.Cluster
+		want    fleet.Cluster
+		wantOK  bool
+	}{
+		{
+			name:    "namespaces present: they are the first to shrink",
+			cluster: fleet.Cluster{Prometheus: fleet.PrometheusInfo{Namespaces: []string{"a", "b", "c", "d"}}},
+			want:    fleet.Cluster{Prometheus: fleet.PrometheusInfo{Namespaces: []string{"a", "b"}}},
+			wantOK:  true,
+		},
+		{
+			name:    "namespaces empty, jobs present: jobs shrink",
+			cluster: fleet.Cluster{Prometheus: fleet.PrometheusInfo{Jobs: []string{"a", "b", "c", "d"}}},
+			want:    fleet.Cluster{Prometheus: fleet.PrometheusInfo{Jobs: []string{"a", "b"}}},
+			wantOK:  true,
+		},
+		{
+			name:    "namespaces and jobs empty, metric prefixes present: prefixes shrink",
+			cluster: fleet.Cluster{Prometheus: fleet.PrometheusInfo{MetricPrefixes: []string{"a", "b", "c", "d"}}},
+			want:    fleet.Cluster{Prometheus: fleet.PrometheusInfo{MetricPrefixes: []string{"a", "b"}}},
+			wantOK:  true,
+		},
+		{
+			name: "only external labels present: they are cleared",
+			cluster: fleet.Cluster{Prometheus: fleet.PrometheusInfo{
+				ExternalLabels: map[string]string{"cluster": "prod"},
+			}},
+			want:   fleet.Cluster{Prometheus: fleet.PrometheusInfo{ExternalLabels: nil}},
+			wantOK: true,
+		},
+		{
+			name:    "nothing sampled is left",
+			cluster: fleet.Cluster{},
+			want:    fleet.Cluster{},
+			wantOK:  false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := tc.cluster
+			ok := shrinkSampled(&c)
+			if ok != tc.wantOK {
+				t.Fatalf("shrinkSampled() ok = %v, want %v", ok, tc.wantOK)
+			}
+			if diff := cmp.Diff(tc.want, c); diff != "" {
+				t.Fatalf("shrinkSampled mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestTSDBStatusMetricNamesSentinelSurvivesAMissingEntry proves the
+// metricNames sentinel is only overwritten when
+// labelValueCountByLabelName actually reports the __name__ entry. Unlike
+// activeSeries, which every response path assigns unconditionally, metricNames
+// is only set inside a loop that may never find its target -- a
+// Prometheus-compatible server that omits it must still report the honest
+// "unknown" sentinel rather than a value that happens to look like zero.
+func TestTSDBStatusMetricNamesSentinelSurvivesAMissingEntry(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"success","data":{"headStats":{"numSeries":42},` +
+			`"labelValueCountByLabelName":[{"name":"job","value":7}]}}`))
+	}))
+	defer srv.Close()
+
+	client, err := promclient.New(promclient.Config{BaseURL: srv.URL, Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &Collector{client: client}
+	got, err := c.tsdbStatus(context.Background())
+	if err != nil {
+		t.Fatalf("tsdbStatus: %v", err)
+	}
+	if got.activeSeries != 42 {
+		t.Fatalf("activeSeries = %d, want 42", got.activeSeries)
+	}
+	if got.metricNames != -1 {
+		t.Fatalf("metricNames = %d, want the -1 sentinel when __name__ is absent from the response", got.metricNames)
+	}
+}
+
+// TestHasAlertmanagerRequiresAtLeastOneActivePeer proves the check is a
+// genuine emptiness test: a response that decodes cleanly but lists zero
+// active Alertmanagers must report false, not "decoded without error
+// therefore true".
+func TestHasAlertmanagerRequiresAtLeastOneActivePeer(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"success","data":{"activeAlertmanagers":[]}}`))
+	}))
+	defer srv.Close()
+
+	client, err := promclient.New(promclient.Config{BaseURL: srv.URL, Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &Collector{client: client}
+	got, err := c.hasAlertmanager(context.Background())
+	if err != nil {
+		t.Fatalf("hasAlertmanager: %v", err)
+	}
+	if got {
+		t.Fatal("hasAlertmanager() = true with zero active peers")
+	}
+}
+
+// TestSortedSamplesIsStableForEqualLabelSets proves the ordering function is a
+// strict less-than. sort.SliceStable's guarantee for genuinely tied elements
+// -- that they keep their original relative order -- depends on that: a
+// comparator that also reports "less" when two keys are equal makes every tied
+// pair look reorderable, and Go's stable sort resolves that by walking a tied
+// element past everything before it, reversing the run.
+func TestSortedSamplesIsStableForEqualLabelSets(t *testing.T) {
+	t.Parallel()
+
+	in := make(promclient.Vector, 6)
+	for i := range in {
+		// Every sample renders the same label key; Value is the only way to
+		// tell them apart afterwards.
+		in[i] = promclient.Sample{Labels: map[string]string{"job": "x"}, Value: float64(i)}
+	}
+	got := sortedSamples(in)
+	for i, s := range got {
+		if s.Value != float64(i) {
+			t.Fatalf("sortedSamples reordered equal-key samples: got order %v, want 0..%d unchanged",
+				valuesOf(got), len(in)-1)
+		}
+	}
+}
+
+// valuesOf collects a vector's values in order, for a readable failure
+// message.
+func valuesOf(v promclient.Vector) []float64 {
+	out := make([]float64, len(v))
+	for i, s := range v {
+		out[i] = s.Value
+	}
+	return out
 }

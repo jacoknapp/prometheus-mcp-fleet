@@ -99,6 +99,32 @@ func TestOptionsDefaults(t *testing.T) {
 	}
 }
 
+// TestValidateRejectsZeroTTLDirectly calls validate without withDefaults
+// first. Every production caller defaults before validating, so a zero TTL
+// never reaches validate() in the running binary -- but validate's own job is
+// to reject a non-positive TTL outright, and the only way to put a literal 0
+// in front of it is to call the unexported method directly, which a
+// same-package test can do.
+func TestValidateRejectsZeroTTLDirectly(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		opts Options
+	}{
+		{name: "zero spoke ttl", opts: Options{TrustDomain: "fleet.local", SpokeCertTTL: 0, CATTL: time.Hour}},
+		{name: "zero ca ttl", opts: Options{TrustDomain: "fleet.local", SpokeCertTTL: time.Hour, CATTL: 0}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if err := tc.opts.validate(); !errors.Is(err, ErrInvalidOptions) {
+				t.Fatalf("validate() = %v, want ErrInvalidOptions", err)
+			}
+		})
+	}
+}
+
 func TestOptionsValidate(t *testing.T) {
 	t.Parallel()
 
@@ -378,6 +404,45 @@ func TestLoadOrCreateCreatesWhenAbsent(t *testing.T) {
 		if _, err := os.Stat(p); err != nil {
 			t.Errorf("stat %s: %v", p, err)
 		}
+	}
+}
+
+// TestLoadOrCreateFirstAttemptDoesNotPoll proves attempt 0 never pays the
+// poll delay: that budget exists for retries after a losing race, not for the
+// common case where nothing else is contending for these paths.
+//
+// It cannot use t.Parallel: it overrides the package-level caStat hook that
+// every regularFileExists call in the suite goes through.
+//
+// Timing the whole LoadOrCreate call would be flaky under load, since key
+// generation and a cert write can occasionally take longer than
+// initPollInterval when the machine is busy. Instead this times only the gap
+// between entering the loop and the first existence check, which is where an
+// attempt-0 sleep would show up; that isolates the signal from the unrelated
+// crypto and I/O cost that follows it, leaving a wide margin (initPollInterval
+// versus microseconds) between "slept" and "didn't."
+func TestLoadOrCreateFirstAttemptDoesNotPoll(t *testing.T) {
+	origStat := caStat
+	t.Cleanup(func() { caStat = origStat })
+
+	certPath, keyPath := paths(t)
+	var firstStatAt time.Time
+	caStat = func(name string) (os.FileInfo, error) {
+		if firstStatAt.IsZero() {
+			firstStatAt = time.Now()
+		}
+		return origStat(name)
+	}
+	start := time.Now()
+	if _, err := LoadOrCreate(certPath, keyPath, Options{TrustDomain: "made.up"}); err != nil {
+		t.Fatalf("LoadOrCreate: %v", err)
+	}
+	if firstStatAt.IsZero() {
+		t.Fatal("regularFileExists never reached caStat")
+	}
+	if gap := firstStatAt.Sub(start); gap >= initPollInterval/2 {
+		t.Errorf("LoadOrCreate waited %v before its first existence check, want near-zero (< %v): attempt 0 appears to sleep before trying anything",
+			gap, initPollInterval/2)
 	}
 }
 

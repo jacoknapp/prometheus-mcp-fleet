@@ -4,6 +4,7 @@
 package registry
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -75,6 +76,35 @@ func cmpEmptySlice() cmp.Option {
 		func(a, b []string) bool { return len(a) == 0 && len(b) == 0 },
 		cmp.Comparer(func(a, b []string) bool { return true }),
 	)
+}
+
+// TestNearestZeroOrNegativeReturnsBeforeAnyWork proves n <= 0 is a genuine
+// short-circuit and not just a path that happens to end up empty: it must
+// return before touching the clock or the entry map, not after scoring every
+// cluster and truncating the result to nothing. A test that only checks the
+// returned slice cannot tell these apart, since both give an empty result.
+func TestNearestZeroOrNegativeReturnsBeforeAnyWork(t *testing.T) {
+	t.Parallel()
+
+	for _, n := range []int{0, -1} {
+		t.Run(fmt.Sprintf("n=%d", n), func(t *testing.T) {
+			t.Parallel()
+			var clockCalls int
+			r := mustNew(t, Options{
+				FactsPollInterval: time.Hour,
+				Clock:             func() time.Time { clockCalls++; return time.Now() },
+			})
+			attach(t, r, newFakeSession("prod", 100))
+			clockCalls = 0 // attach itself reads the clock; only count from here
+
+			if got := r.Nearest("prod", n); len(got) != 0 {
+				t.Fatalf("Nearest(id, %d) = %v, want empty", n, got)
+			}
+			if clockCalls != 0 {
+				t.Errorf("Nearest(id, %d) read the clock %d times, want 0: it must return before scoring anything", n, clockCalls)
+			}
+		})
+	}
 }
 
 // TestNearestIsBoundedOnLongInput pins the O(n*m) guard. A pathological guess

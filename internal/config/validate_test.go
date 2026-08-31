@@ -149,6 +149,72 @@ func TestHubValidateAcceptsPublicURLAndPairs(t *testing.T) {
 	}
 }
 
+// TestHubValidateAcceptsHTTPPublicURL pins that a plain http --public-url is
+// valid, not just https. The scheme check is "!= https && != http": without
+// a case exercising the http side, negating that second comparison to
+// "== http" is unobservable, because every other test's public URL is https.
+func TestHubValidateAcceptsHTTPPublicURL(t *testing.T) {
+	t.Parallel()
+	c := validHub(t)
+	c.PublicURL = "http://mcp.example.com/mcp"
+	if err := c.Validate(); err != nil {
+		t.Errorf("Validate() = %v, want nil for an http --public-url", err)
+	}
+}
+
+// TestHubValidateEmptyPublicURLReportsExactlyOneProblem guards against a
+// second, redundant checkURL call firing when --public-url is empty. Validate
+// checks PublicURL == "" first (which reports "is required" and stops there
+// conceptually) and then later, unconditionally when the guard says non-empty,
+// runs checkURL again. Negating that second guard to "== \"\"" would run
+// checkURL("") too, which finds a non-empty-string-shaped scheme problem and
+// adds a second error that nothing today checks for.
+func TestHubValidateEmptyPublicURLReportsExactlyOneProblem(t *testing.T) {
+	t.Parallel()
+	c := validHub(t)
+	c.PublicURL = ""
+	err := c.Validate()
+	joined, ok := err.(interface{ Unwrap() []error })
+	if !ok {
+		t.Fatalf("Validate() error %T does not unwrap to a list; it must use errors.Join", err)
+	}
+	if n := len(joined.Unwrap()); n != 1 {
+		t.Errorf("Validate() reported %d problems for empty --public-url, want 1:\n%v", n, err)
+	}
+}
+
+// TestHubValidateZeroBudgetDoesNotAlsoFailBelowCheck guards the first half of
+// the compound "budget > 0 && max > 0 && budget < max" guard. At budget == 0
+// the guard's own checkPositiveBytes already reports the zero-budget problem;
+// mutating "budget > 0" to "budget >= 0" would additionally, and wrongly, fire
+// the below-check's own problem message, since 0 < any positive max is true.
+func TestHubValidateZeroBudgetDoesNotAlsoFailBelowCheck(t *testing.T) {
+	t.Parallel()
+	c := validHub(t)
+	c.MaxResponseBudgetBytes = 0
+	err := c.Validate()
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("Validate() = %v, want an error wrapping ErrInvalid", err)
+	}
+	if strings.Contains(err.Error(), "below --max-response-bytes") {
+		t.Errorf("Validate() = %q, a zero budget must not also trip the below-check", err)
+	}
+}
+
+// TestHubValidateAcceptsBudgetEqualToMaxResponseBytes pins the boundary of the
+// compound budget check's third clause, "budget < max": a budget exactly
+// equal to max-response-bytes can still complete one response and must be
+// accepted, which is the only case distinguishing "<" from the off-by-one
+// "<=".
+func TestHubValidateAcceptsBudgetEqualToMaxResponseBytes(t *testing.T) {
+	t.Parallel()
+	c := validHub(t)
+	c.MaxResponseBudgetBytes = c.MaxResponseBytes
+	if err := c.Validate(); err != nil {
+		t.Errorf("Validate() = %v, want nil when the budget equals max-response-bytes", err)
+	}
+}
+
 func TestSpokeValidate(t *testing.T) {
 	t.Parallel()
 
@@ -217,8 +283,20 @@ func TestSpokeValidate(t *testing.T) {
 			"--cluster-display-name",
 		},
 		{
+			// indexControl checks "i >= 0"; a control character at byte 0 is
+			// the only value distinguishing that from the off-by-one "i > 0".
+			"display name control character at start",
+			func(c *Spoke) { c.ClusterDisplayName = "\x01prod" },
+			"--cluster-display-name",
+		},
+		{
 			"description control character",
 			func(c *Spoke) { c.ClusterDescription = "line\nbreak" },
+			"--cluster-description",
+		},
+		{
+			"description control character at start",
+			func(c *Spoke) { c.ClusterDescription = "\x01desc" },
 			"--cluster-description",
 		},
 		{"data dir", func(c *Spoke) { c.DataDir = "" }, "--data-dir"},
@@ -284,6 +362,38 @@ func TestCheckPairAcceptsBothPathsEmpty(t *testing.T) {
 	t.Parallel()
 	if err := checkPair("cert", "", "key", ""); err != nil {
 		t.Errorf("checkPair(empty, empty) = %v, want nil", err)
+	}
+}
+
+// TestSpokeValidateZeroMaxBackoffDoesNotAlsoFailBelowCheck guards the second
+// clause of the compound "min > 0 && max > 0 && max < min" guard. At max == 0
+// checkPositive already reports the zero-max-backoff problem; mutating
+// "max > 0" to "max >= 0" would additionally, and wrongly, fire the
+// below-check's own problem message, since a positive min is always > 0.
+func TestSpokeValidateZeroMaxBackoffDoesNotAlsoFailBelowCheck(t *testing.T) {
+	t.Parallel()
+	c := validSpoke(t)
+	c.ReconnectMaxBackoff = 0
+	err := c.Validate()
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("Validate() = %v, want an error wrapping ErrInvalid", err)
+	}
+	if strings.Contains(err.Error(), "below --reconnect-min-backoff") {
+		t.Errorf("Validate() = %q, a zero max-backoff must not also trip the below-check", err)
+	}
+}
+
+// TestSpokeValidateAcceptsEqualBackoffs pins the boundary of the compound
+// backoff check's third clause, "max < min": a max-backoff exactly equal to
+// min-backoff means no growth, not an inversion, and must be accepted -- the
+// only case distinguishing "<" from the off-by-one "<=".
+func TestSpokeValidateAcceptsEqualBackoffs(t *testing.T) {
+	t.Parallel()
+	c := validSpoke(t)
+	c.ReconnectMinBackoff = 5 * time.Second
+	c.ReconnectMaxBackoff = 5 * time.Second
+	if err := c.Validate(); err != nil {
+		t.Errorf("Validate() = %v, want nil when max-backoff equals min-backoff", err)
 	}
 }
 
