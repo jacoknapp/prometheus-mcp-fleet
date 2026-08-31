@@ -84,6 +84,19 @@ type Spoke struct {
 	// survives contact with every organisation. The cost is that prod and
 	// production can coexist across a fleet, and nothing here prevents it.
 	ClusterSDLC string
+	// ClusterK8sVersion, ClusterK8sUID and ClusterK8sNodes are optional
+	// operator-supplied Kubernetes facts.
+	//
+	// The spoke has no Kubernetes API access by design -- zero RBAC and no
+	// projected token -- so it derives these from Prometheus, typically from
+	// kubernetes_build_info and kube_node_info published by kube-state-metrics.
+	// A cluster that does not scrape those has no other source, and these exist
+	// so an operator can supply what the spoke cannot discover. Set, they win:
+	// somebody who bothered to write the version down knows it better than a
+	// metric that may be stale or absent.
+	ClusterK8sVersion string
+	ClusterK8sUID     string
+	ClusterK8sNodes   int
 	// ClusterLabels are operator-supplied selectors, parsed from "k=v,k=v".
 	// ClusterSDLC is merged in as "sdlc" and wins over any entry of that name,
 	// so selectors need no special case for it.
@@ -166,6 +179,9 @@ func LoadSpoke(args []string, getenv func(string) string) (*Spoke, error) {
 	l.str(&c.ClusterSDLC, "cluster-sdlc", "", "lifecycle stage such as dev, staging or prod (required)")
 	l.str(&c.ClusterDisplayName, "cluster-display-name", "", "human-facing cluster name")
 	l.str(&c.ClusterDescription, "cluster-description", "", "one line describing what this cluster runs")
+	l.str(&c.ClusterK8sVersion, "cluster-k8s-version", "", "Kubernetes version, when Prometheus cannot supply it")
+	l.str(&c.ClusterK8sUID, "cluster-k8s-uid", "", "Kubernetes cluster UID, when Prometheus cannot supply it")
+	l.integer(&c.ClusterK8sNodes, "cluster-k8s-nodes", 0, "node count, when Prometheus cannot supply it")
 	l.labels(&c.ClusterLabels, "cluster-labels", "operator-supplied selectors as k=v,k=v")
 
 	l.str(&c.IdentityBackend, "identity-backend", IdentityBackendAuto, "where the client key and certificate live: secret, file, memory or auto")
@@ -294,6 +310,9 @@ func (c *Spoke) Validate() error {
 		add(problem("cluster-sdlc", "is required (for example dev, staging or prod)"))
 	case !clusterSDLCRE.MatchString(c.ClusterSDLC):
 		add(problem("cluster-sdlc", "%q must match %s", c.ClusterSDLC, clusterSDLCRE))
+	}
+	if c.ClusterK8sNodes < 0 {
+		add(problem("cluster-k8s-nodes", "%d must not be negative", c.ClusterK8sNodes))
 	}
 	if err := validateClusterLabels(c.ClusterLabels); err != nil {
 		add(problem("cluster-labels", "%s", err))

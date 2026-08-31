@@ -199,6 +199,19 @@
               }
             }
           }
+        },
+        "k8sVersion": {
+          "description": "PMF_CLUSTER_K8S_VERSION. Kubernetes version, when Prometheus cannot supply it.",
+          "type": "string"
+        },
+        "k8sUid": {
+          "description": "PMF_CLUSTER_K8S_UID. Kubernetes cluster UID, when Prometheus cannot supply it.",
+          "type": "string"
+        },
+        "k8sNodes": {
+          "description": "PMF_CLUSTER_K8S_NODES. Node count, when Prometheus cannot supply it. 0 means unset.",
+          "type": "integer",
+          "minimum": 0
         }
       }
     },

@@ -229,16 +229,22 @@ func (s *spoke) run(ctx context.Context, registry prometheusRegistry) error {
 	}
 
 	if s.facts, err = clusterfacts.New(clusterfacts.Config{
-		ClusterID:       s.cfg.ClusterID,
-		DisplayName:     s.cfg.ClusterDisplayName,
-		Description:     s.cfg.ClusterDescription,
-		Labels:          labelsWithSDLC(s.cfg.ClusterLabels, s.cfg.ClusterSDLC),
-		AgentVersion:    s.build.Version,
-		ProtocolVersion: protocolVersion,
-		StartedAt:       s.started,
-		Client:          s.prom,
-		RefreshInterval: s.cfg.FactsRefreshInterval,
-		Logger:          s.logger,
+		ClusterID:   s.cfg.ClusterID,
+		DisplayName: s.cfg.ClusterDisplayName,
+		Description: s.cfg.ClusterDescription,
+		Labels:      labelsWithSDLC(s.cfg.ClusterLabels, s.cfg.ClusterSDLC),
+		// Operator-supplied Kubernetes facts, for a cluster whose Prometheus
+		// does not publish kubernetes_build_info or kube_node_info. They take
+		// precedence over anything derived from PromQL.
+		KubernetesVersion:    s.cfg.ClusterK8sVersion,
+		KubernetesClusterUID: s.cfg.ClusterK8sUID,
+		KubernetesNodeCount:  int32(s.cfg.ClusterK8sNodes),
+		AgentVersion:         s.build.Version,
+		ProtocolVersion:      protocolVersion,
+		StartedAt:            s.started,
+		Client:               s.prom,
+		RefreshInterval:      s.cfg.FactsRefreshInterval,
+		Logger:               s.logger,
 	}); err != nil {
 		return fmt.Errorf("configure the facts collector: %w", err)
 	}

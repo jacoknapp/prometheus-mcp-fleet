@@ -275,6 +275,7 @@ func TestSpokeValidate(t *testing.T) {
 		{"cluster sdlc missing", func(c *Spoke) { c.ClusterSDLC = "" }, "--cluster-sdlc"},
 		{"cluster sdlc invalid character", func(c *Spoke) { c.ClusterSDLC = "prod!" }, "--cluster-sdlc"},
 		{"cluster sdlc too long", func(c *Spoke) { c.ClusterSDLC = strings.Repeat("a", 33) }, "--cluster-sdlc"},
+		{"negative node count", func(c *Spoke) { c.ClusterK8sNodes = -1 }, "--cluster-k8s-nodes"},
 		{
 			"label key invalid",
 			func(c *Spoke) { c.ClusterLabels = map[string]string{"1env": "prod"} },

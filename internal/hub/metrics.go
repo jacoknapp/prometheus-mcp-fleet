@@ -39,6 +39,14 @@ func (a *metricsAdapter) SpokeConnected(clusterID string, connected bool) {
 // SpokesConnected records the total number of connected clusters.
 func (a *metricsAdapter) SpokesConnected(n int) { a.m.SpokesConnected.Set(float64(n)) }
 
+// SessionsPerCluster records how many live tunnels one cluster holds. It
+// satisfies registry.SessionsGauge, which the registry type-asserts: a cluster
+// running several spoke pods is invisible without it, because SpokeConnected is
+// a boolean and SpokesConnected counts clusters rather than sessions.
+func (a *metricsAdapter) SessionsPerCluster(clusterID string, n int) {
+	a.m.SpokeSessions.WithLabelValues(clusterID).Set(float64(n))
+}
+
 // SpokeCertExpiry records seconds remaining on a spoke's certificate.
 func (a *metricsAdapter) SpokeCertExpiry(clusterID string, notAfter time.Time) {
 	a.m.SpokeCertExpiry.WithLabelValues(clusterID).Set(time.Until(notAfter).Seconds())

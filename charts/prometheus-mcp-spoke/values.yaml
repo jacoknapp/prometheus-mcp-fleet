@@ -92,6 +92,14 @@ cluster:
   displayName: ""
   # -- `PMF_CLUSTER_DESCRIPTION`. One line describing what this cluster runs, to orient an agent.
   description: ""
+  # -- `PMF_CLUSTER_K8S_VERSION`. Kubernetes version, for a cluster whose Prometheus does not
+  # publish `kubernetes_build_info`. The spoke has no Kubernetes API access by design, so
+  # without either source this fact is simply unavailable. Set, it wins over anything derived.
+  k8sVersion: ""
+  # -- `PMF_CLUSTER_K8S_UID`. Kubernetes cluster UID, same reasoning as `k8sVersion`.
+  k8sUid: ""
+  # -- `PMF_CLUSTER_K8S_NODES`. Node count, for a cluster that does not scrape `kube_node_info`.
+  k8sNodes: 0
   # -- `PMF_CLUSTER_LABELS`. Operator-supplied selectors, rendered as `k=v,k=v`. A list, so
   # entries stay ordered and readable in review and a GitOps overlay can append one without
   # rewriting a map. Keys must be unique; the chart refuses duplicates rather than letting

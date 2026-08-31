@@ -47,6 +47,16 @@ var binaryRE = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 type HubMetrics struct {
 	// SpokeConnected is 1 while a cluster has a live tunnel.
 	SpokeConnected *prometheus.GaugeVec
+	// SpokeSessions is how many live tunnels one cluster currently has.
+	//
+	// A cluster may run several spoke pods for its own availability, and the
+	// hub pools their sessions. This is what shows an operator that a cluster
+	// they scaled to three pods really has three, and that a rolling spoke
+	// upgrade never dropped it to zero.
+	//
+	// Cardinality: one series per enrolled cluster, the same bound as
+	// SpokeConnected.
+	SpokeSessions *prometheus.GaugeVec
 	// SpokesConnected is the number of live tunnels.
 	SpokesConnected prometheus.Gauge
 	// SecurityEventsTotal counts credential mints, revocations, enrollment
@@ -91,6 +101,10 @@ func NewHubMetrics(r prometheus.Registerer) *HubMetrics {
 		SpokeConnected: f.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: Namespace, Subsystem: SubsystemHub, Name: "spoke_connected",
 			Help: "1 while the cluster has a live tunnel to this hub, 0 otherwise.",
+		}, []string{"cluster"}),
+		SpokeSessions: f.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: Namespace, Subsystem: SubsystemHub, Name: "spoke_sessions",
+			Help: "Live tunnels held for one cluster; more than one means that cluster runs several spoke pods.",
 		}, []string{"cluster"}),
 		SpokesConnected: f.NewGauge(prometheus.GaugeOpts{
 			Namespace: Namespace, Subsystem: SubsystemHub, Name: "spokes_connected",

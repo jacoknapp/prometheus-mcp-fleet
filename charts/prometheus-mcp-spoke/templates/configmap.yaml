@@ -45,6 +45,15 @@ data:
 
   PMF_CLUSTER_ID: {{ .Values.cluster.id | quote }}
   PMF_CLUSTER_SDLC: {{ .Values.cluster.sdlc | quote }}
+  {{- with .Values.cluster.k8sVersion }}
+  PMF_CLUSTER_K8S_VERSION: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.cluster.k8sUid }}
+  PMF_CLUSTER_K8S_UID: {{ . | quote }}
+  {{- end }}
+  {{- if gt (int .Values.cluster.k8sNodes) 0 }}
+  PMF_CLUSTER_K8S_NODES: {{ .Values.cluster.k8sNodes | quote }}
+  {{- end }}
   {{- with .Values.cluster.displayName }}
   PMF_CLUSTER_DISPLAY_NAME: {{ . | quote }}
   {{- end }}
