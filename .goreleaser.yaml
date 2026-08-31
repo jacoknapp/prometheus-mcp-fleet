@@ -123,17 +123,26 @@ source:
 # Keyless cosign signature over checksums.txt. Signing the checksum file rather
 # than every archive keeps the Release page readable while still covering every
 # artifact transitively. Requires `id-token: write` and cosign on PATH.
+# cosign v3 emits a Sigstore bundle rather than a detached signature plus a
+# certificate, and the old --output-signature/--output-certificate pair fails
+# with "create bundle file: open :" because the bundle path is unset. The
+# bundle carries the certificate and the transparency-log entry together, so it
+# is one artifact to publish and one to verify:
+#
+#   cosign verify-blob checksums.txt \
+#     --bundle checksums.txt.bundle \
+#     --certificate-identity-regexp '^https://github.com/jacoknapp/prometheus-mcp-fleet/' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com
 signs:
   - id: cosign-checksums
     cmd: cosign
     artifacts: checksum
     output: true
-    certificate: "${artifact}.pem"
+    signature: "${artifact}.bundle"
     args:
       - sign-blob
       - "--yes"
-      - "--output-certificate=${certificate}"
-      - "--output-signature=${signature}"
+      - "--bundle=${signature}"
       - "${artifact}"
 
 snapshot:

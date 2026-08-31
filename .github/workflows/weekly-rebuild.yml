@@ -385,7 +385,8 @@ jobs:
             COMMIT=${{ needs.plan.outputs.commit }}
             SOURCE_DATE_EPOCH=${{ needs.plan.outputs.source_date_epoch }}
           provenance: mode=max
-          sbom: true
+          # buildkit-syft-scanner otherwise comes from Docker Hub; see release.yml.
+          sbom: generator=mirror.gcr.io/docker/buildkit-syft-scanner:stable-1@sha256:ae4f3b554449e7e25548e7d8ccc029d17357348e30c6e3df01b92bc93654d6a9
         env:
           SOURCE_DATE_EPOCH: ${{ needs.plan.outputs.source_date_epoch }}
 

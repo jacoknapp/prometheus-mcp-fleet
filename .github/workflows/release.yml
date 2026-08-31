@@ -434,7 +434,10 @@ jobs:
             COMMIT=${{ needs.meta.outputs.commit }}
             SOURCE_DATE_EPOCH=${{ needs.meta.outputs.source_date_epoch }}
           provenance: mode=max
-          sbom: true
+          # `sbom: true` runs buildkit-syft-scanner, which BuildKit pulls from
+          # Docker Hub by default. Same dependency as the emulator and BuildKit
+          # itself, in the last place it was still implicit.
+          sbom: generator=mirror.gcr.io/docker/buildkit-syft-scanner:stable-1@sha256:ae4f3b554449e7e25548e7d8ccc029d17357348e30c6e3df01b92bc93654d6a9
           cache-from: type=gha,scope=release-${{ matrix.component }}
           cache-to: type=gha,scope=release-${{ matrix.component }},mode=max
         env:
