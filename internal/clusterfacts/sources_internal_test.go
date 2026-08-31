@@ -50,6 +50,48 @@ func TestQueryFallbacksReturnEmptyResultsHonestly(t *testing.T) {
 	}
 }
 
+// TestNodeCountByQueryRejectsOverflow proves the int32 range check at the top
+// of nodeCountByQuery, in isolation from the "n > 0" filter its only caller
+// applies. That filter happens to mask an overflowed conversion too (a
+// too-large float64 saturates to a negative int32 on this platform), so a
+// test that only goes through Refresh cannot tell a correct upper bound from
+// one shifted by a couple of counts. Calling the method directly can.
+func TestNodeCountByQueryRejectsOverflow(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		value string
+		want  int32
+	}{
+		{"the maximum representable value is kept", "2147483647", 2147483647},
+		{"one past the maximum representable value is rejected", "2147483648", 0},
+		{"far past the maximum representable value is rejected", "1e30", 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fake := testutil.NewFakePrometheus(t, testutil.FakeOptions{QueryResults: map[string]string{
+				"count(kube_node_info)": `{"status":"success","data":{"resultType":"vector","result":` +
+					`[{"metric":{},"value":[1,"` + tc.value + `"]}]}}`,
+			}})
+			client, err := promclient.New(promclient.Config{BaseURL: fake.URL, Timeout: time.Second})
+			if err != nil {
+				t.Fatalf("promclient.New: %v", err)
+			}
+			c := &Collector{client: client}
+
+			got, err := c.nodeCountByQuery(context.Background())
+			if err != nil {
+				t.Fatalf("nodeCountByQuery: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("nodeCountByQuery(%s) = %d, want %d", tc.value, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestDetectFlavor(t *testing.T) {
 	t.Parallel()
 

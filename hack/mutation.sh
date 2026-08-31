@@ -66,6 +66,32 @@ TIMEOUT_COEFFICIENT="${MUTATION_TIMEOUT_COEFFICIENT:-40}"
 # nothing until a mutant actually runs away.
 MEMORY_MAX="${MUTATION_MEMORY_MAX:-8G}"
 
+# Mutation testing compiles a fresh binary for every mutant, and Go caches all
+# of them. A single full sweep grew the shared build cache to 90G and filled
+# the disk, which fails as "no space left on device" in the middle of a run and
+# reports a package as scoreless rather than as broken. Give the run its own
+# cache in a scratch directory and delete it afterwards, so the cost is bounded
+# per sweep and the developer's real build cache is left alone.
+cachedir="$(mktemp -d)"
+export GOCACHE="${cachedir}"
+
+# Gremlins copies the whole module into /tmp/gremlins-<n> per run and does not
+# always clean up after itself -- an interrupted sweep leaves the copy behind,
+# and they accumulated to over a gigabyte here. Sweep away any that no running
+# process owns before starting, so a killed run cannot silently fill the disk
+# for the next one.
+# Guarded on fuser existing: without it `! fuser ...` succeeds for every
+# directory, including ones a concurrent run is using, and the cleanup would
+# delete live state instead of stale state. No fuser, no sweep.
+if command -v fuser >/dev/null 2>&1; then
+	for stale in /tmp/gremlins-*; do
+		[[ -d "${stale}" ]] || continue
+		if ! fuser -s "${stale}" 2>/dev/null; then
+			rm -rf "${stale}"
+		fi
+	done
+fi
+
 # systemd-run is how we get a cgroup without being root-only or writing to
 # /sys/fs/cgroup by hand. Where it is unavailable the run still works; it is
 # just unprotected, and says so rather than pretending otherwise.
@@ -88,7 +114,7 @@ fi
 
 # Resolve the tool once so that N package runs do not each re-link it.
 tooldir="$(mktemp -d)"
-trap 'rm -rf "${tooldir}"' EXIT
+trap 'rm -rf "${tooldir}" "${cachedir}"' EXIT
 echo "==> building gremlins ${GREMLINS_VERSION}"
 GOBIN="${tooldir}" go install "github.com/go-gremlins/gremlins/cmd/gremlins@${GREMLINS_VERSION}"
 gremlins="${tooldir}/gremlins"
@@ -123,7 +149,7 @@ else
 fi
 
 outdir="$(mktemp -d)"
-trap 'rm -rf "${tooldir}" "${outdir}"' EXIT
+trap 'rm -rf "${tooldir}" "${outdir}" "${cachedir}"' EXIT
 
 fail=0
 results=()
