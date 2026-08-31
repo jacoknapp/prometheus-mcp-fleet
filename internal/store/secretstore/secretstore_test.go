@@ -548,15 +548,75 @@ func TestCancelledContextDuringBackoff(t *testing.T) {
 		secretstore.DefaultKey: []byte(`{"schemaVersion":1,"epoch":1}`),
 	})
 	ctx, cancel := context.WithCancel(context.Background())
+
+	// Cancel from a separate goroutine once a conflict has actually been
+	// served, not from inside the write hook.
+	//
+	// beforeWrite runs while the update request is still in flight, so
+	// cancelling there raced the response: sometimes the store saw the 409 and
+	// was cancelled in the hour-long backoff, which is the path this test is
+	// named for, and sometimes the HTTP round trip itself was cancelled and
+	// the store took the non-conflict error return instead. errors.Is matched
+	// context.Canceled either way, so the test passed either way -- while
+	// which of the two statements got executed flipped between runs, and the
+	// package's 100% coverage floor failed CI whenever the loser was the
+	// non-conflict return. That one now has TestUpdateFailurePropagates.
+	//
+	// The backoff is an hour, so once a conflict is counted the store is
+	// parked in sleep() and cancelling is unambiguous.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			if _, _, _, conflicts := api.counts(); conflicts > 0 {
+				cancel()
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Millisecond):
+			}
+		}
+	}()
+	t.Cleanup(func() { cancel(); <-done })
+
 	api.beforeWrite = func() {
 		api.seed(secretstore.DefaultSecretName, map[string][]byte{
 			secretstore.DefaultKey: []byte(`{"schemaVersion":1,"epoch":1}`),
 		})
-		cancel()
 	}
 	err := s.PutKey(ctx, agentKey("agent0001"))
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("PutKey error = %v, want context.Canceled rather than a full backoff", err)
+	}
+}
+
+// TestUpdateFailurePropagates covers the update error that is not a conflict.
+// It is a distinct statement from the conflict retry beside it, and leaving it
+// to be reached incidentally by a racing cancellation is how it went uncovered
+// at random.
+func TestUpdateFailurePropagates(t *testing.T) {
+	t.Parallel()
+	api, s := newStore(t, secretstore.Options{})
+	api.seed(secretstore.DefaultSecretName, map[string][]byte{
+		secretstore.DefaultKey: []byte(`{"schemaVersion":1,"epoch":1}`),
+	})
+	api.failEvery = func(method string) (int, string, string, bool) {
+		if method == http.MethodPut {
+			return http.StatusInternalServerError, "InternalError", "etcd is unavailable", true
+		}
+		return 0, "", "", false
+	}
+	err := s.PutKey(t.Context(), agentKey("agent0001"))
+	if err == nil {
+		t.Fatal("PutKey = nil, want the update failure")
+	}
+	if errors.Is(err, kube.ErrConflict) {
+		t.Fatalf("PutKey error = %v, want a non-conflict failure", err)
+	}
+	if !strings.Contains(err.Error(), "secretstore:") {
+		t.Errorf("error %q is not wrapped by the store", err)
 	}
 }
 

@@ -661,9 +661,21 @@ func TestServeLimitsAndClosedClassification(t *testing.T) {
 func TestAttachFailureRejectionAndRelease(t *testing.T) {
 	t.Parallel()
 
+	// hsTO is generous on purpose. It bounds the HTTP/2 preface exchange with
+	// a ServeConn that the subtests below start in a goroutine and then
+	// immediately race, so it is really bounding goroutine scheduling latency.
+	// At 100ms this flaked on a loaded machine roughly one run in three: the
+	// handshake timed out, attach took its setup-failure path, the session
+	// handler was never called, and the release() inside attach's watcher
+	// goroutine went unexecuted — which also dropped the package below the
+	// 100% coverage floor and failed CI for a reason that had nothing to do
+	// with the change under test. Nothing here depends on this expiring:
+	// waitReady returns as soon as the connection reaches TransientFailure, so
+	// the deliberately-broken subtest below still fails fast rather than
+	// waiting this out.
 	newListener := func() *listener {
 		return &listener{
-			log: discardLogger(), hsTO: 100 * time.Millisecond,
+			log: discardLogger(), hsTO: 30 * time.Second,
 			sessions: make(map[*session]struct{}), stopped: make(chan struct{}),
 		}
 	}
