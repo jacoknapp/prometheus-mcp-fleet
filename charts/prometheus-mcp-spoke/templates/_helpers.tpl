@@ -461,3 +461,40 @@ render error here.
 {{- end -}}
 
 {{- end -}}
+
+{{/*
+Bytes in a Kubernetes memory quantity, as an integer.
+
+This exists because GOMEMLIMIT must be computed here rather than by the
+downward API. `resourceFieldRef` can only divide — the value it produces is
+ceil(resource / divisor) — and Kubernetes accepts a divisor of only 1 and the
+unit quantities (1k, 1M, 1Gi, ...). There is no divisor that yields 90% of a
+limit, so the obvious spelling, divisor: 1/ratio, renders "1.1111" and the API
+server rejects the whole Deployment with "only divisor's values 1, 1k, 1M, ...
+are supported". It renders and validates fine offline, which is why this
+survived helm template, helm lint and kubeconform alike and only failed on a
+real API server.
+*/}}
+{{- define "prometheus-mcp-spoke.memoryBytes" -}}
+{{- $q := . | toString | trim -}}
+{{- $num := regexFind "^[0-9]+(\\.[0-9]+)?" $q -}}
+{{- if eq $num "" -}}
+{{- fail (printf "prometheus-mcp-spoke: cannot read %q as a memory quantity." $q) -}}
+{{- end -}}
+{{- $suffix := substr (len $num) (len $q) $q -}}
+{{- $units := dict "" 1.0 "k" 1000.0 "M" 1000000.0 "G" 1000000000.0 "T" 1000000000000.0 "P" 1000000000000000.0 "E" 1000000000000000000.0 "Ki" 1024.0 "Mi" 1048576.0 "Gi" 1073741824.0 "Ti" 1099511627776.0 "Pi" 1125899906842624.0 "Ei" 1152921504606846976.0 -}}
+{{- if not (hasKey $units $suffix) -}}
+{{- fail (printf "prometheus-mcp-spoke: memory quantity %q has an unsupported suffix %q. Use bytes or one of k, M, G, T, P, E, Ki, Mi, Gi, Ti, Pi, Ei." $q $suffix) -}}
+{{- end -}}
+{{- mulf (float64 $num) (get $units $suffix) | floor | int64 -}}
+{{- end -}}
+
+{{/*
+GOMEMLIMIT: goRuntime.memLimitRatio of the declared container memory limit, in
+bytes. Only ever rendered when resources.limits.memory is set, so it is always
+derived from the cgroup limit and never from node allocatable.
+*/}}
+{{- define "prometheus-mcp-spoke.goMemLimit" -}}
+{{- $bytes := include "prometheus-mcp-spoke.memoryBytes" (dig "limits" "memory" "" .Values.resources) | float64 -}}
+{{- mulf $bytes .Values.goRuntime.memLimitRatio | floor | int64 -}}
+{{- end -}}

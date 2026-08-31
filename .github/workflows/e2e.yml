@@ -4,10 +4,21 @@
 # End-to-end: a real kind cluster, a real Prometheus, both real images, both
 # real charts, and a real MCP tool call through the hub.
 #
+# This job deliberately owns almost nothing. `make e2e` creates the cluster,
+# builds and side-loads the images, installs Prometheus and both charts, mints
+# its own credentials through the hub's admin API and makes every assertion.
+# The workflow installs tools and runs it.
+#
+# It used to own all of that in bash, in parallel with a Go suite that owned it
+# too, and the two drifted: the workflow was passing `bootstrap.enrollmentToken`,
+# `bootstrap.agentToken` and `hub.caCert` — three keys no chart here has ever
+# had — while the Go suite shelled into the hub pod to run `mcp-call` and
+# `admin` subcommands the binary has never had. Neither had ever executed. One
+# path is the fix.
+#
 # Fork safety: this workflow is `pull_request` (not `pull_request_target`), the
-# workflow-level permission is `contents: read`, and every credential it uses is
-# generated inside the job with `openssl rand`. There is nothing here for a
-# malicious PR to exfiltrate.
+# workflow-level permission is `contents: read`, and it needs no secrets at all
+# — every credential is minted by the hub inside the ephemeral kind cluster.
 name: e2e
 
 on:
@@ -42,22 +53,19 @@ env:
   HELM_VERSION: "v3.21.4"
   # renovate: datasource=github-releases depName=kubernetes-sigs/kind
   KIND_VERSION: "v0.33.0"
-  # renovate: datasource=helm depName=kube-prometheus-stack registryUrl=https://prometheus-community.github.io/helm-charts
-  KUBE_PROMETHEUS_STACK_VERSION: "88.6.1"
-  IMAGE_PREFIX: "localhost/prometheus-mcp-fleet"
-  IMAGE_TAG: "e2e"
+  # These four are duplicated as constants in test/e2e/e2e_test.go, which owns
+  # them. They are here only so the diagnostics step can find the namespaces.
   HUB_NAMESPACE: "pmf-hub"
   SPOKE_NAMESPACE: "pmf-spoke"
   MONITORING_NAMESPACE: "monitoring"
   HUB_RELEASE: "prometheus-mcp-hub"
   SPOKE_RELEASE: "prometheus-mcp-spoke"
-  CLUSTER_ID: "e2e-kind"
 
 jobs:
   e2e:
     name: kind end-to-end
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     permissions:
       contents: read
     steps:
@@ -71,9 +79,8 @@ jobs:
         with:
           persist-credentials: false
 
-      # The suite is owned by another workstream. If it is not there yet this
-      # job fails loudly: an e2e workflow that silently skips is worse than no
-      # e2e workflow, because the green tick claims coverage that is absent.
+      # An e2e workflow that silently skips is worse than no e2e workflow,
+      # because the green tick claims coverage that is absent.
       - name: Require the e2e suite and both charts to exist
         run: |
           set -euo pipefail
@@ -101,205 +108,51 @@ jobs:
         with:
           version: ${{ env.HELM_VERSION }}
 
-      # Fail in 10 seconds on a values-schema mismatch rather than 20 minutes
-      # later on a mysterious `helm upgrade` error, after a kind cluster and two
-      # image builds have already been paid for. The contract this asserts is
-      # written out in the headers of .github/e2e/{hub,spoke}-values.yaml.
+      - name: Set up kind
+        run: |
+          set -euo pipefail
+          curl -fsSLo /tmp/kind \
+            "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          sudo install -m 0755 /tmp/kind /usr/local/bin/kind
+          kind version
+
+      # Fail in seconds on a values-schema mismatch rather than 40 minutes later
+      # on a mysterious `helm upgrade` error, after a kind cluster and two image
+      # builds have already been paid for. This is the exact install the suite
+      # performs; the contract it asserts is written out in the headers of
+      # .github/e2e/{hub,spoke}-values.yaml.
+      #
+      # This catches a nested typo only because values.schema.json sets
+      # additionalProperties:false at every level the charts read field by
+      # field. With it set only at the top — as it was — `hub.caCert` validated
+      # cleanly and was then silently discarded, which is precisely how the
+      # drift above survived being "preflighted".
       - name: Preflight the chart value contract
         run: |
           set -euo pipefail
           helm template preflight-hub charts/prometheus-mcp-hub \
             --values .github/e2e/hub-values.yaml \
-            --set-string bootstrap.enrollmentToken=pmf_enr_preflight \
-            --set-string bootstrap.agentToken=pmf_agt_preflight \
             >/dev/null || {
-              echo "::error file=.github/e2e/hub-values.yaml::the hub chart rejected the e2e values. Reconcile .github/e2e/hub-values.yaml and the --set-string flags in this workflow with charts/prometheus-mcp-hub/values.schema.json."
+              echo "::error file=.github/e2e/hub-values.yaml::the hub chart rejected the e2e values. Reconcile .github/e2e/hub-values.yaml with charts/prometheus-mcp-hub/values.schema.json."
               exit 1
             }
           helm template preflight-spoke charts/prometheus-mcp-spoke \
             --values .github/e2e/spoke-values.yaml \
-            --set-string enrollment.token=pmf_enr_preflight \
-            --set-string hub.caCert=preflight \
+            --set-string enrollment.existingSecret=pmf-enrollment \
             >/dev/null || {
-              echo "::error file=.github/e2e/spoke-values.yaml::the spoke chart rejected the e2e values. Reconcile .github/e2e/spoke-values.yaml and the --set-string flags in this workflow with charts/prometheus-mcp-spoke/values.schema.json."
+              echo "::error file=.github/e2e/spoke-values.yaml::the spoke chart rejected the e2e values. Reconcile .github/e2e/spoke-values.yaml and the --set flags in test/e2e/e2e_test.go with charts/prometheus-mcp-spoke/values.schema.json."
               exit 1
             }
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
-      # `make images` == `make image-hub image-spoke`, i.e. one docker build per
-      # component off the single root Dockerfile with --build-arg COMPONENT.
-      - name: Build hub and spoke images
-        run: make images REGISTRY="${IMAGE_PREFIX}" VERSION="${IMAGE_TAG}"
-
-      - name: Create kind cluster
-        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
-        with:
-          version: ${{ env.KIND_VERSION }}
-          config: .github/e2e/kind.yaml
-          cluster_name: pmf-e2e
-          wait: 300s
-
-      - name: Side-load images into kind
-        run: |
-          set -euo pipefail
-          for component in hub spoke; do
-            kind load docker-image "${IMAGE_PREFIX}/${component}:${IMAGE_TAG}" --name pmf-e2e
-          done
-
-      - name: Install a real Prometheus
-        run: |
-          set -euo pipefail
-          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-          helm repo update
-          helm upgrade --install kube-prometheus-stack \
-            prometheus-community/kube-prometheus-stack \
-            --version "${KUBE_PROMETHEUS_STACK_VERSION}" \
-            --namespace "${MONITORING_NAMESPACE}" --create-namespace \
-            --values .github/e2e/prometheus-values.yaml \
-            --wait --timeout 10m
-          kubectl -n "${MONITORING_NAMESPACE}" rollout status \
-            statefulset/prometheus-kube-prometheus-stack-prometheus --timeout=5m
-          # The spoke chart's default PROMETHEUS_URL points at this Service.
-          kubectl -n "${MONITORING_NAMESPACE}" get service prometheus-operated
-
-      - name: Mint ephemeral bootstrap credentials
-        id: creds
-        run: |
-          set -euo pipefail
-          enrollment="pmf_enr_$(openssl rand -hex 32)"
-          agent="pmf_agt_$(openssl rand -hex 32)"
-          echo "::add-mask::${enrollment}"
-          echo "::add-mask::${agent}"
-          {
-            echo "enrollment_token=${enrollment}"
-            echo "agent_token=${agent}"
-          } >> "${GITHUB_OUTPUT}"
-
-      - name: Install the hub
-        env:
-          ENROLLMENT_TOKEN: ${{ steps.creds.outputs.enrollment_token }}
-          AGENT_TOKEN: ${{ steps.creds.outputs.agent_token }}
-        run: |
-          set -euo pipefail
-          helm upgrade --install "${HUB_RELEASE}" charts/prometheus-mcp-hub \
-            --namespace "${HUB_NAMESPACE}" --create-namespace \
-            --values .github/e2e/hub-values.yaml \
-            --set-string "bootstrap.enrollmentToken=${ENROLLMENT_TOKEN}" \
-            --set-string "bootstrap.agentToken=${AGENT_TOKEN}" \
-            --wait --timeout 10m
-          kubectl -n "${HUB_NAMESPACE}" rollout status \
-            "deployment/${HUB_RELEASE}" --timeout=5m
-
-      - name: Install the spoke
-        env:
-          ENROLLMENT_TOKEN: ${{ steps.creds.outputs.enrollment_token }}
-        run: |
-          set -euo pipefail
-          # The spoke must trust the hub's tunnel certificate. In production the
-          # operator supplies this out of band; here we read it back out of the
-          # hub's own state, which since BUILD_SPEC addendum 3a lives in a
-          # Kubernetes Secret rather than on a PVC. Try the dedicated CA Secret
-          # first, then the consolidated state Secret.
-          ca_pem=""
-          for secret in "${HUB_RELEASE}-ca" "${HUB_RELEASE}-state" prometheus-mcp-fleet-state; do
-            for key in 'ca\.crt' 'ca\.pem' 'tls\.crt'; do
-              candidate="$(kubectl -n "${HUB_NAMESPACE}" get secret "${secret}" \
-                -o "jsonpath={.data.${key}}" 2>/dev/null | base64 -d 2>/dev/null || true)"
-              if [ -n "${candidate}" ]; then
-                echo "read the hub CA from secret/${secret} key ${key}"
-                ca_pem="${candidate}"
-                break 2
-              fi
-            done
-          done
-          if [ -z "${ca_pem}" ]; then
-            echo "::error::could not find the hub CA bundle in any of ${HUB_RELEASE}-ca, ${HUB_RELEASE}-state, prometheus-mcp-fleet-state. The hub chart must expose it under one of ca.crt / ca.pem / tls.crt; see the CHART VALUE CONTRACT header in .github/e2e/hub-values.yaml."
-            kubectl -n "${HUB_NAMESPACE}" get secrets
-            exit 1
-          fi
-
-          helm upgrade --install "${SPOKE_RELEASE}" charts/prometheus-mcp-spoke \
-            --namespace "${SPOKE_NAMESPACE}" --create-namespace \
-            --values .github/e2e/spoke-values.yaml \
-            --set-string "enrollment.token=${ENROLLMENT_TOKEN}" \
-            --set-string "hub.caCert=${ca_pem}" \
-            --wait --timeout 10m
-
-      # Spoke readiness is defined as "a tunnel is attached to at least one hub
-      # endpoint", so a Ready spoke pod *is* the enrolment assertion.
-      - name: Assert the spoke enrolled and the tunnel is up
-        run: |
-          set -euo pipefail
-          kubectl -n "${SPOKE_NAMESPACE}" rollout status \
-            "deployment/${SPOKE_RELEASE}" --timeout=5m
-          kubectl -n "${SPOKE_NAMESPACE}" wait --for=condition=Ready pod \
-            -l "app.kubernetes.io/instance=${SPOKE_RELEASE}" --timeout=5m
-
-          # Cross-check from the hub's side: the admin listener is bound to
-          # loopback inside the pod, which port-forward reaches directly.
-          kubectl -n "${HUB_NAMESPACE}" port-forward "deployment/${HUB_RELEASE}" 19090:9090 \
-            >/tmp/pf-admin.log 2>&1 &
-          pf=$!
-          trap 'kill "${pf}" 2>/dev/null || true' EXIT
-          for _ in $(seq 1 30); do
-            if curl -fsS --max-time 2 http://127.0.0.1:19090/healthz >/dev/null 2>&1; then
-              break
-            fi
-            sleep 2
-          done
-
-          connected=""
-          for _ in $(seq 1 30); do
-            # `|| true` is load-bearing: under `set -euo pipefail` a transient
-            # curl failure inside this retry loop would abort the whole step,
-            # which is exactly the failure the loop exists to ride out.
-            connected="$(curl -fsS --max-time 5 http://127.0.0.1:19090/metrics 2>/dev/null \
-              | awk '/^promfleet_hub_spokes_connected /{print $2}' || true)"
-            if [ -n "${connected}" ] && [ "${connected%.*}" -ge 1 ] 2>/dev/null; then
-              echo "hub reports ${connected} connected spoke(s)"
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "::error::hub never reported a connected spoke (promfleet_hub_spokes_connected=${connected:-<absent>})"
-          exit 1
-
-      # The assertion that a real MCP `query` tool call through the hub returns
-      # up == 1 lives in the Go suite, which owns the MCP client and the JSON
-      # decoding. `make e2e` is `go test -tags e2e -timeout 20m ./test/e2e/...`.
+      # `make e2e` is `go test -tags e2e -timeout 40m ./test/e2e/...`. It builds
+      # the images through `make images`, creates the kind cluster from
+      # .github/e2e/kind.yaml, installs everything from .github/e2e/*-values.yaml
+      # and reaches the hub over `kubectl port-forward`.
       - name: Run the e2e suite
-        env:
-          PMF_E2E: "1"
-          PMF_E2E_AGENT_TOKEN: ${{ steps.creds.outputs.agent_token }}
-          PMF_E2E_CLUSTER_ID: ${{ env.CLUSTER_ID }}
-          PMF_E2E_HUB_NAMESPACE: ${{ env.HUB_NAMESPACE }}
-          PMF_E2E_SPOKE_NAMESPACE: ${{ env.SPOKE_NAMESPACE }}
-          PMF_E2E_HUB_RELEASE: ${{ env.HUB_RELEASE }}
-          PMF_E2E_SPOKE_RELEASE: ${{ env.SPOKE_RELEASE }}
-        run: |
-          set -euo pipefail
-          # Port-forward and test run share a step so the tunnel cannot outlive
-          # the assertion and hang the job at cleanup.
-          kubectl -n "${HUB_NAMESPACE}" port-forward "deployment/${HUB_RELEASE}" 18080:8080 \
-            >/tmp/pf-mcp.log 2>&1 &
-          pf_mcp=$!
-          kubectl -n "${HUB_NAMESPACE}" port-forward "deployment/${HUB_RELEASE}" 19090:9090 \
-            >/tmp/pf-admin2.log 2>&1 &
-          pf_admin=$!
-          trap 'kill "${pf_mcp}" "${pf_admin}" 2>/dev/null || true' EXIT
-
-          for _ in $(seq 1 30); do
-            if curl -fsS --max-time 2 -o /dev/null http://127.0.0.1:19090/healthz; then
-              break
-            fi
-            sleep 2
-          done
-
-          export PMF_E2E_MCP_URL="http://127.0.0.1:18080/mcp"
-          export PMF_E2E_HUB_ADMIN_URL="http://127.0.0.1:19090"
-          make e2e
+        run: make e2e
 
       - name: Collect diagnostics
         if: failure()
@@ -321,7 +174,6 @@ jobs:
           done
           helm -n "${HUB_NAMESPACE}"   get manifest "${HUB_RELEASE}"   > e2e-debug/hub-manifest.yaml   2>&1
           helm -n "${SPOKE_NAMESPACE}" get manifest "${SPOKE_RELEASE}" > e2e-debug/spoke-manifest.yaml 2>&1
-          cp /tmp/pf-*.log e2e-debug/ 2>/dev/null
           true
 
       - name: Upload diagnostics

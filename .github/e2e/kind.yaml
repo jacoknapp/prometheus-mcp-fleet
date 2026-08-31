@@ -3,13 +3,14 @@
 #
 # Single-node kind cluster for the end-to-end suite. One node is enough: the
 # hub and the spoke are exercised for protocol behaviour, not scheduling.
+#
+# There is deliberately no `taints: []` InitConfiguration patch here. kind
+# already removes the control-plane taint after `kubeadm init`, and doing it
+# twice is not idempotent: with the taint patched away at init time, kind's own
+# `kubectl taint nodes --all node-role.kubernetes.io/control-plane-` finds
+# nothing to remove, exits 1, and fails cluster creation outright. This file
+# carried that patch from the day it was written and had never been run.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
   - role: control-plane
-    kubeadmConfigPatches:
-      # Let workloads schedule on the control plane; there is no other node.
-      - |
-        kind: InitConfiguration
-        nodeRegistration:
-          taints: []

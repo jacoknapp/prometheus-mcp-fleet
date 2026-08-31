@@ -85,18 +85,19 @@ tests:
       - notExists:
           path: spec.template.spec.containers[0].resources.limits.cpu
 
-  - it: takes GOMEMLIMIT from the memory limit and PMF_NAMESPACE from the downward API
+  # 256Mi * 0.9 = 241591910 bytes. A literal, not a downward-API
+  # resourceFieldRef: a divisor can only divide, and Kubernetes accepts only 1
+  # and the unit quantities, so the ratio cannot be expressed as one. The
+  # rejected form rendered and validated offline and failed only on a real API
+  # server, so assert the exact number here rather than the shape.
+  - it: computes GOMEMLIMIT as a literal byte count and takes PMF_NAMESPACE from the downward API
     template: templates/deployment.yaml
     asserts:
       - contains:
           path: spec.template.spec.containers[0].env
           content:
             name: GOMEMLIMIT
-            valueFrom:
-              resourceFieldRef:
-                containerName: spoke
-                resource: limits.memory
-                divisor: "1.1111"
+            value: "241591910"
       - contains:
           path: spec.template.spec.containers[0].env
           content:

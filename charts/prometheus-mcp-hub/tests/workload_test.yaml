@@ -79,18 +79,44 @@ tests:
       - notExists:
           path: spec.template.spec.containers[0].resources.limits.cpu
 
-  - it: takes GOMEMLIMIT from the memory limit through the downward API
+  # 1Gi * 0.9 = 966367641 bytes. A literal, not a downward-API
+  # resourceFieldRef: a divisor can only divide, and Kubernetes accepts only 1
+  # and the unit quantities, so the ratio cannot be expressed as one. The
+  # rejected form rendered and validated offline and failed only on a real API
+  # server, so assert the exact number here rather than the shape.
+  - it: computes GOMEMLIMIT as a literal byte count from the memory limit
     template: templates/deployment.yaml
     asserts:
       - contains:
           path: spec.template.spec.containers[0].env
           content:
             name: GOMEMLIMIT
-            valueFrom:
-              resourceFieldRef:
-                containerName: hub
-                resource: limits.memory
-                divisor: "1.1111"
+            value: "966367641"
+
+  - it: rescales GOMEMLIMIT with the limit and the ratio
+    template: templates/deployment.yaml
+    set:
+      resources:
+        limits:
+          memory: 512Mi
+      goRuntime:
+        memLimitRatio: 0.5
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GOMEMLIMIT
+            value: "268435456"
+
+  - it: refuses a memory limit it cannot parse rather than rendering a wrong one
+    template: templates/deployment.yaml
+    set:
+      resources:
+        limits:
+          memory: 1Gib
+    asserts:
+      - failedTemplate:
+          errorMessage: 'prometheus-mcp-hub: memory quantity "1Gib" has an unsupported suffix "Gib". Use bytes or one of k, M, G, T, P, E, Ki, Mi, Gi, Ti, Pi, Ei.'
 
   - it: takes PMF_NAMESPACE from the downward API, never from a rendered guess
     template: templates/deployment.yaml

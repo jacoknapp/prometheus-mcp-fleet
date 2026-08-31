@@ -361,8 +361,8 @@ Kubernetes: `>=1.28.0-0`
 | extraVolumeMounts | list | `[]` | Extra volume mounts for the spoke container. |
 | extraVolumes | list | `[]` | Extra volumes for the spoke pod. |
 | fullnameOverride | string | `""` | Override the fully qualified name of every object this chart renders. |
-| goRuntime.memLimit | bool | `true` | Set `GOMEMLIMIT` from `resources.limits.memory` via the downward API. Skipped when no memory limit is set, because the downward API would then report node allocatable. |
-| goRuntime.memLimitRatio | float | `0.9` | Fraction of the memory limit used for `GOMEMLIMIT`, as a downward API divisor. 0.9 leaves headroom for non-Go allocations before the kernel OOM killer. |
+| goRuntime.memLimit | bool | `true` | Set `GOMEMLIMIT` from `resources.limits.memory`. Skipped when no memory limit is set, because there would be nothing but node allocatable to derive it from. |
+| goRuntime.memLimitRatio | float | `0.9` | Fraction of the memory limit used for `GOMEMLIMIT`. 0.9 leaves headroom for non-Go allocations before the kernel OOM killer. Computed at render time into a literal byte count: a downward API `resourceFieldRef` can only divide, and Kubernetes accepts no divisor that expresses a ratio. |
 | hostNetwork | bool | `false` | `spec.template.spec.hostNetwork`. |
 | hub.allowInsecure | bool | `false` | `PMF_ALLOW_INSECURE`. The second key that must be turned for any insecure option to take effect. Two independent settings mean an insecure spoke cannot be reached by a single typo. |
 | hub.apiUrl | string | `""` | `PMF_HUB_API_URL`. REQUIRED, no default. `https://host[:port]` base URL of the hub's enrollment listener, which the hub serves on its MCP port — the same listener and the same Ingress host as `hub.endpoints`, so in practice this is the `https://` form of it without the tunnel path. External, like `hub.endpoints`. |
@@ -464,7 +464,7 @@ Kubernetes: `>=1.28.0-0`
 | readinessProbe.successThreshold | int | `1` | Success threshold. |
 | readinessProbe.timeoutSeconds | int | `3` | Probe timeout. |
 | replicaCount | int | `1` | Number of spoke replicas. This must stay 1 and the chart refuses to render anything else. A spoke's identity is one X.509 certificate bound to one cluster ID. Two pods sharing that identity would renew over each other in the same Secret and each would deregister the other's tunnel at the hub. Scale the hub, never the spoke. |
-| resources.limits.memory | string | `"256Mi"` | Memory limit. Also the source of `GOMEMLIMIT` via the downward API. |
+| resources.limits.memory | string | `"256Mi"` | Memory limit. Also the source of `GOMEMLIMIT`. |
 | resources.requests.cpu | string | `"25m"` | CPU request. The spoke streams opaque bytes and never parses Prometheus JSON, so it is genuinely this small. |
 | resources.requests.memory | string | `"64Mi"` | Memory request. |
 | restartOnConfigChange | bool | `true` | Roll the pod when the rendered ConfigMap changes, by stamping its checksum as a pod annotation. |

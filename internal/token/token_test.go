@@ -462,16 +462,84 @@ func TestEntropyFailure(t *testing.T) {
 	})
 
 	t.Run("secret", func(t *testing.T) {
-		calls := 0
+		// Fail the secret draw and only the secret draw, so the error can
+		// come from no path but mintWith's second read.
+		//
+		// Selecting on the buffer length rather than the call ordinal is
+		// load-bearing. randomBase62 rejection-samples -- it discards bytes
+		// >= 248 to keep the base62 reduction unbiased -- so a KID needs a
+		// second read whenever fewer than KIDLen of its first KIDLen bytes
+		// survive, which is 1-(248/256)^10 ~= 27% of runs. An ordinal gate
+		// hands boom to that retry instead, and the assertion below still
+		// passes because "mint kid" also wraps boom: the test stays green
+		// while the statement it exists to cover goes unexecuted. The two
+		// draws take distinct widths (KIDLen=10, SecretBytes=32), so the
+		// width discriminates them exactly.
 		read := func(b []byte) (int, error) {
-			calls++
-			if calls == 1 {
-				return restore(b)
+			if len(b) == SecretBytes {
+				return 0, boom
 			}
-			return 0, boom
+			return restore(b)
 		}
-		if _, err := mintWith(fleet.ClassAgent, "", read); !errors.Is(err, boom) {
+		_, err := mintWith(fleet.ClassAgent, "", read)
+		if !errors.Is(err, boom) {
 			t.Fatalf("mintWith error = %v, want %v", err, boom)
 		}
+		if !strings.Contains(err.Error(), "mint secret") {
+			t.Fatalf("mintWith error = %v, want it to come from the secret draw", err)
+		}
 	})
+}
+
+// TestRandomBase62RejectionThreshold pins the exact byte at which rejection
+// sampling starts, which no statistical test can do.
+//
+// 62 does not divide 256. Reducing a uniform byte modulo 62 would therefore
+// make the first 256-4*62 = 8 digits of the alphabet measurably more likely,
+// and every secret this package mints would carry that bias. The guard drops
+// any byte >= 248 = 4*62 so that only whole cycles of the alphabet survive.
+//
+// TestRandomBase62Alphabet says in its own comment that modulo bias would
+// still pass it, and it would: the biased digits are all still reachable.
+// Feeding a fixed byte sequence is what distinguishes the two, because moving
+// the threshold by one changes which bytes are consumed and therefore the
+// exact output string.
+func TestRandomBase62RejectionThreshold(t *testing.T) {
+	t.Parallel()
+
+	// 247 is the last accepted byte and 248 the first rejected one, so this
+	// sequence straddles the edge. 249 and 255 are rejected either way, which
+	// forces a second read and makes the consumed-byte count observable.
+	first := []byte{247, 248, 249, 255}
+	call := 0
+	read := func(b []byte) (int, error) {
+		call++
+		if call == 1 {
+			copy(b, first)
+		} else {
+			for i := range b {
+				b[i] = byte(i)
+			}
+		}
+		return len(b), nil
+	}
+
+	got, err := randomBase62(4, read)
+	if err != nil {
+		t.Fatalf("randomBase62: %v", err)
+	}
+
+	// 247 % 62 == 61 -> 'z'; 248, 249 and 255 are discarded; the second read
+	// supplies 0, 1, 2 -> '0', '1', '2'.
+	//
+	// Accepting 248 instead would emit alphabet[248%62] == '0' in second
+	// position and shift everything after it, giving "z001".
+	const want = "z012"
+	if got != want {
+		t.Errorf("randomBase62 = %q, want %q; a byte on the wrong side of the "+
+			"rejection threshold biases every minted secret", got, want)
+	}
+	if call != 2 {
+		t.Errorf("read was called %d times, want 2", call)
+	}
 }

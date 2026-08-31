@@ -406,8 +406,8 @@ Kubernetes: `>=1.28.0-0`
 | extraVolumeMounts | list | `[]` | Extra volume mounts for the hub container. |
 | extraVolumes | list | `[]` | Extra volumes for the hub pod. |
 | fullnameOverride | string | `""` | Override the fully qualified name of every object this chart renders. |
-| goRuntime.memLimit | bool | `true` | Set `GOMEMLIMIT` from `resources.limits.memory` via the downward API. Skipped when no memory limit is set, because the downward API would then report node allocatable. |
-| goRuntime.memLimitRatio | float | `0.9` | Fraction of the memory limit used for `GOMEMLIMIT`, as a downward API divisor. 0.9 leaves headroom for non-Go allocations before the kernel OOM killer. |
+| goRuntime.memLimit | bool | `true` | Set `GOMEMLIMIT` from `resources.limits.memory`. Skipped when no memory limit is set, because there would be nothing but node allocatable to derive it from. |
+| goRuntime.memLimitRatio | float | `0.9` | Fraction of the memory limit used for `GOMEMLIMIT`. 0.9 leaves headroom for non-Go allocations before the kernel OOM killer. Computed at render time into a literal byte count: a downward API `resourceFieldRef` can only divide, and Kubernetes accepts no divisor that expresses a ratio. |
 | hostNetwork | bool | `false` | `spec.template.spec.hostNetwork`. |
 | image.digest | string | `""` | Image digest (`sha256:...`). When set the image is pinned by digest and the tag is ignored. Recommended for production and set automatically by the release workflow. |
 | image.pullPolicy | string | `"IfNotPresent"` | Image pull policy. |
@@ -505,7 +505,7 @@ Kubernetes: `>=1.28.0-0`
 | readinessProbe.successThreshold | int | `1` | Success threshold. |
 | readinessProbe.timeoutSeconds | int | `3` | Probe timeout. |
 | replicaCount | int | `1` | Number of hub replicas. Read before raising above 1: a spoke tunnel is pinned to exactly one replica and there is deliberately no hub-to-hub forwarding (BUILD_SPEC 1.11). Credential state is shared because it lives in one Secret, but tunnels are not. Real HA needs every replica individually addressable from outside the cluster and every spoke configured with all N addresses in `hub.endpoints`. |
-| resources.limits.memory | string | `"1Gi"` | Memory limit. Also the source of `GOMEMLIMIT` via the downward API. |
+| resources.limits.memory | string | `"1Gi"` | Memory limit. Also the source of `GOMEMLIMIT`. |
 | resources.requests.cpu | string | `"250m"` | CPU request. |
 | resources.requests.memory | string | `"256Mi"` | Memory request. |
 | restartOnConfigChange | bool | `true` | Roll the pods when the rendered ConfigMap changes, by stamping its checksum as a pod annotation. |

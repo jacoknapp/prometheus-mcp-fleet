@@ -111,13 +111,12 @@ spec:
                 fieldRef:
                   fieldPath: metadata.namespace
             {{- if and .Values.goRuntime.memLimit (dig "limits" "memory" "" .Values.resources) }}
-            # GOMEMLIMIT from the cgroup limit, not from node allocatable.
+            # GOMEMLIMIT as a literal byte count, computed from the declared
+            # limit. Not a downward-API resourceFieldRef: its divisor cannot
+            # express a ratio and Kubernetes rejects anything but 1 and the
+            # unit quantities. See the helper for the whole story.
             - name: GOMEMLIMIT
-              valueFrom:
-                resourceFieldRef:
-                  containerName: spoke
-                  resource: limits.memory
-                  divisor: {{ divf 1.0 .Values.goRuntime.memLimitRatio | printf "%.4f" | quote }}
+              value: {{ include "prometheus-mcp-spoke.goMemLimit" . | quote }}
             {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}

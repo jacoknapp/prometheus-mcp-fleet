@@ -121,16 +121,16 @@ resources:
     # -- Memory request.
     memory: 256Mi
   limits:
-    # -- Memory limit. Also the source of `GOMEMLIMIT` via the downward API.
+    # -- Memory limit. Also the source of `GOMEMLIMIT`.
     memory: 1Gi
     # There is deliberately NO default CPU limit. CFS-throttling a process that terminates
     # ~100 long-lived spoke tunnels turns a CPU spike into fleet-wide latency. Set
     # `resources.limits.cpu` only if a ResourceQuota forces you to.
 
 goRuntime:
-  # -- Set `GOMEMLIMIT` from `resources.limits.memory` via the downward API. Skipped when no memory limit is set, because the downward API would then report node allocatable.
+  # -- Set `GOMEMLIMIT` from `resources.limits.memory`. Skipped when no memory limit is set, because there would be nothing but node allocatable to derive it from.
   memLimit: true
-  # -- Fraction of the memory limit used for `GOMEMLIMIT`, as a downward API divisor. 0.9 leaves headroom for non-Go allocations before the kernel OOM killer.
+  # -- Fraction of the memory limit used for `GOMEMLIMIT`. 0.9 leaves headroom for non-Go allocations before the kernel OOM killer. Computed at render time into a literal byte count: a downward API `resourceFieldRef` can only divide, and Kubernetes accepts no divisor that expresses a ratio.
   memLimitRatio: 0.9
 
 # -- `sizeLimit` of the `/tmp` emptyDir that makes `readOnlyRootFilesystem: true` workable.

@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "prometheus-mcp-hub values",
-  "description": "Values for the prometheus-mcp-hub chart. additionalProperties is false at the top level on purpose: a mistyped top-level key in a chart deployed to a fleet is a silent default, not an error, and that is exactly the failure this schema exists to catch. There is no persistence section and no PVC: all durable hub state lives in two Kubernetes Secrets the hub reads and writes itself.",
+  "description": "Values for the prometheus-mcp-hub chart. additionalProperties is false at every level that this chart reads field by field, not only at the top: a mistyped key is a silent default wherever it sits, and `bootstrap.enrollmentToken` typed into a nested object is exactly as invisible as a mistyped top-level key. The exceptions are resources, podSecurityContext and containerSecurityContext, which are rendered into the manifest with toYaml; their key set belongs to Kubernetes rather than to this chart, so an unmodelled key there is a legitimate passthrough and stays allowed. There is no persistence section and no PVC: all durable hub state lives in two Kubernetes Secrets the hub reads and writes itself.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -32,6 +32,7 @@
     "image": {
       "description": "Hub image.",
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "registry": {
           "description": "Image registry. Empty means the repository is fully qualified already.",
@@ -80,6 +81,7 @@
     "updateStrategy": {
       "description": "Deployment strategy.",
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "type": {
           "description": "Strategy type.",
@@ -98,6 +100,7 @@
     "serviceAccount": {
       "description": "ServiceAccount for the hub.",
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "create": {
           "description": "Create a ServiceAccount.",
@@ -120,6 +123,7 @@
     "rbac": {
       "description": "Namespaced RBAC. Nothing cluster-scoped is ever rendered by this chart.",
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "create": {
           "description": "Render the Role and RoleBinding over the hub's own Secrets.",
@@ -141,6 +145,7 @@
     "state": {
       "description": "Durable state. There is no database and no PVC.",
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "backend": {
           "description": "PMF_STATE_BACKEND. `secret` is production; `file` writes one JSON file on the /tmp emptyDir and LOSES every credential on restart, which orphans every spoke.",
@@ -167,6 +172,7 @@
     "bootstrap": {
       "description": "Operator-supplied CA material and HMAC pepper, adopted from a Secret this chart does NOT create, so no key material passes through Helm values.",
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "existingSecret": {
           "description": "Name of the existing Secret. Empty disables the whole block.",
@@ -359,6 +365,7 @@
     "goRuntime": {
       "description": "Go runtime tuning.",
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "memLimit": {
           "description": "Set GOMEMLIMIT from resources.limits.memory via the downward API.",
@@ -379,6 +386,7 @@
     "ports": {
       "description": "Container ports. There is no tunnel port: the tunnel is a WebSocket on the MCP listener (ADR-0014).",
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "mcp": {
           "description": "Agent-facing MCP listener (PMF_MCP_ADDR).",
@@ -397,6 +405,7 @@
     "config": {
       "description": "PMF_ configuration. Every key maps to one flag in internal/config/hub.go.",
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "dataDir": {
           "description": "PMF_DATA_DIR. Scratch only; it is the /tmp emptyDir and must stay under /tmp.",
@@ -494,6 +503,7 @@
     "tracing": {
       "description": "OTLP trace export.",
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "enabled": {
           "description": "Enable OTLP trace export.",
@@ -513,6 +523,7 @@
     "service": {
       "description": "MCP + admin Service. Must stay ClusterIP while service.admin.enabled is true.",
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "type": {
           "description": "Service type.",
@@ -563,6 +574,7 @@
         "admin": {
           "description": "Admin/metrics port on the ClusterIP Service.",
           "type": "object",
+          "additionalProperties": false,
           "properties": {
             "enabled": {
               "description": "Publish the admin/metrics port so a ServiceMonitor can scrape it.",
@@ -581,6 +593,7 @@
     "tunnel": {
       "description": "The spoke tunnel, which is a WebSocket on the MCP listener rather than a listener of its own. An Ingress terminates TLS and cannot pass a client certificate through, so mutual authentication happens inside the connection over the spoke's certificate; the Ingress is a plain proxy and verifies nothing (ADR-0014).",
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "path": {
           "description": "PMF_TUNNEL_PATH. Path on the MCP listener where spokes open the tunnel WebSocket. A spoke's hub.endpoints entry is wss://<ingress host><tunnel.path>. It may not be \"/\", which would swallow the MCP endpoint; the binary refuses that too.",
@@ -593,6 +606,7 @@
     "ingress": {
       "description": "Standard networking.k8s.io/v1 Ingress for the MCP port, which publishes BOTH the agent-facing MCP endpoint and the spoke tunnel WebSocket at tunnel.path. A path that does not cover tunnel.path gets a second rule rendered automatically.",
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "enabled": {
           "description": "Render the Ingress. It carries MCP and the spoke tunnel alike; there is no second Service and no ssl-passthrough to arrange.",
@@ -637,6 +651,7 @@
         "tls": {
           "description": "Ingress TLS.",
           "type": "object",
+          "additionalProperties": false,
           "properties": {
             "enabled": {
               "description": "Terminate TLS at the Ingress.",
@@ -660,6 +675,7 @@
     "certManager": {
       "description": "cert-manager resources. It supplies the hub's SERVING certificate and nothing else. The hub's internal CA is NOT a cert-manager Certificate: it signs spoke identities, so the hub must hold its private key, and it is generated on first boot into the CA Secret the hub owns. Spoke certificates come from the hub's enrollment API for the same reason. Every resource is guarded by the cert-manager.io/v1 capability, and certManager.enabled on a cluster without the CRDs is a render-time failure.",
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "enabled": {
           "description": "Render cert-manager resources. Requires the cert-manager.io/v1 CRDs.",
@@ -668,6 +684,7 @@
         "issuerRef": {
           "description": "The existing Issuer or ClusterIssuer that signs the hub's serving certificate. The chart never creates one.",
           "type": "object",
+          "additionalProperties": false,
           "properties": {
             "name": {
               "description": "Issuer name. Required when certManager.serving.enabled.",
@@ -690,6 +707,7 @@
         "serving": {
           "description": "The hub's serving certificate, wired to ingress.tls.secretName automatically.",
           "type": "object",
+          "additionalProperties": false,
           "properties": {
             "enabled": {
               "description": "Render the Certificate.",
@@ -729,6 +747,7 @@
     "podDisruptionBudget": {
       "description": "PodDisruptionBudget. Force-disabled whenever replicaCount < 2: minAvailable 1 on a single-replica workload blocks every node drain forever.",
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "enabled": {
           "description": "Render a PDB, subject to the replicaCount >= 2 guard.",
@@ -762,6 +781,7 @@
     "networkPolicy": {
       "description": "NetworkPolicy. On by default: the hub terminates connections from outside the cluster and holds a CA.",
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "enabled": {
           "description": "Render the NetworkPolicy.",
@@ -774,6 +794,7 @@
         "mcp": {
           "description": "Ingress to the MCP port. This carries spoke tunnels as well as agent traffic -- both arrive on this port from the Ingress controller -- so there is no separate tunnel rule.",
           "type": "object",
+          "additionalProperties": false,
           "properties": {
             "allowAll": {
               "description": "Allow the MCP port from any source.",
@@ -799,6 +820,7 @@
         "admin": {
           "description": "Ingress to the admin/metrics port. This port is never published outside.",
           "type": "object",
+          "additionalProperties": false,
           "properties": {
             "namespaceSelector": {
               "description": "namespaceSelector for the only namespace allowed to scrape.",
@@ -820,6 +842,7 @@
         "egress": {
           "description": "Hub egress: DNS, the Kubernetes API for its state Secret, and optionally OTLP.",
           "type": "object",
+          "additionalProperties": false,
           "properties": {
             "enabled": {
               "description": "Restrict hub egress.",
@@ -853,10 +876,12 @@
     "metrics": {
       "description": "Prometheus Operator integration.",
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "serviceMonitor": {
           "description": "Prometheus Operator ServiceMonitor. Requires the monitoring.coreos.com/v1 CRDs.",
           "type": "object",
+          "additionalProperties": false,
           "properties": {
             "enabled": {
               "description": "Render the ServiceMonitor. Requires service.admin.enabled.",
@@ -916,6 +941,7 @@
         "prometheusRule": {
           "description": "Prometheus Operator PrometheusRule. Every metric name in the shipped expressions comes from internal/obs/metrics.go; both *_cert_expiry_seconds gauges hold SECONDS REMAINING, not a unix timestamp.",
           "type": "object",
+          "additionalProperties": false,
           "properties": {
             "enabled": {
               "description": "Render the PrometheusRule.",
@@ -948,6 +974,7 @@
             "rules": {
               "description": "Individual alert toggles.",
               "type": "object",
+              "additionalProperties": false,
               "properties": {
                 "hubDown": {
                   "description": "PrometheusMCPHubDown.",
@@ -982,6 +1009,7 @@
             "thresholds": {
               "description": "Alert thresholds.",
               "type": "object",
+              "additionalProperties": false,
               "properties": {
                 "spokesDisconnectedRatio": {
                   "description": "Fraction of enrolled spokes that may be disconnected.",
@@ -1026,6 +1054,7 @@
     "autoUpdate": {
       "description": "Auto-update CronJob. OFF BY DEFAULT: an automatic weekly rollout to 100 production clusters is a fleet-wide outage delivery mechanism. When enabled it is digest-pinned, cosign signature- and provenance-verified, staggered by a hash of the release identity and split into cohorts.",
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "enabled": {
           "description": "Render the auto-update CronJob and its Role, RoleBinding and ServiceAccount.",
@@ -1101,6 +1130,7 @@
         "image": {
           "description": "Updater image. It must provide a POSIX shell plus kubectl, cosign, crane and jq; the hub image is distroless and has none of them.",
           "type": "object",
+          "additionalProperties": false,
           "properties": {
             "registry": {
               "description": "Image registry. Empty means the repository is fully qualified already.",
@@ -1217,10 +1247,12 @@
     "tests": {
       "description": "helm test settings.",
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "image": {
           "description": "Image for the `helm test` pod. It needs wget.",
           "type": "object",
+          "additionalProperties": false,
           "properties": {
             "registry": {
               "description": "Image registry. Empty means the repository is fully qualified already.",
@@ -1358,6 +1390,7 @@
     "startupProbe": {
       "description": "Startup probe on /healthz, served by the admin listener.",
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "enabled": {
           "description": "Enable the probe.",
@@ -1392,6 +1425,7 @@
     "livenessProbe": {
       "description": "Liveness probe on /healthz, which never checks a dependency, served by the admin listener.",
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "enabled": {
           "description": "Enable the probe.",
@@ -1426,6 +1460,7 @@
     "readinessProbe": {
       "description": "Readiness probe on /readyz, served by the admin listener.",
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "enabled": {
           "description": "Enable the probe.",

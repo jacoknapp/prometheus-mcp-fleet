@@ -80,7 +80,7 @@ config:
   logFormat: json
   trustDomain: e2e.local
   # Required: it is the RFC 9728 "resource" and the target of the 401 challenge.
-  publicURL: http://pmf-hub.prometheus-mcp-hub.svc:8080/mcp
+  publicURL: http://prometheus-mcp-hub.pmf-hub.svc:8080/mcp
   # Short TTLs keep the suite honest about renewal paths without slowing it.
   spokeCertTTL: 1h
   enrollmentTokenTTL: 30m
