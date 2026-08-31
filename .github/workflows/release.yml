@@ -183,6 +183,7 @@ jobs:
             release-assets.githubusercontent.com:443
             storage.googleapis.com:443
             sum.golang.org:443
+            timestamp.sigstore.dev:443
             tuf-repo-cdn.sigstore.dev:443
             uploads.github.com:443
 
@@ -273,6 +274,7 @@ jobs:
             release-assets.githubusercontent.com:443
             storage.googleapis.com:443
             sum.golang.org:443
+            timestamp.sigstore.dev:443
             toolbox-data.anchore.io:443
             tuf-repo-cdn.sigstore.dev:443
 
@@ -378,21 +380,41 @@ jobs:
         env:
           SOURCE_DATE_EPOCH: ${{ needs.meta.outputs.source_date_epoch }}
 
+      # Trivy runs from its own container rather than trivy-action.
+      #
+      # trivy-action installs the binary via setup-trivy, which downloads a
+      # release tarball from the GitHub asset CDN, and that download failed
+      # here with curl exit 7 (cannot connect) even with every host it resolves
+      # to on the egress allowlist. Running the published image instead removes
+      # the download entirely: the job already authenticates to GHCR to push,
+      # so this is a registry it is known to reach, and the scanner is pinned by
+      # digest like every other image in this pipeline rather than resolved
+      # through a version lookup at build time.
+      #
+      # The database still comes from GHCR (TRIVY_*_DB_REPOSITORY below), which
+      # is what the action was configured to use anyway.
       - name: Trivy gate (HIGH/CRITICAL with a fix available)
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: ${{ env.IMAGE }}:scan
-          format: table
-          severity: HIGH,CRITICAL
-          # A CVE with no upstream fix cannot be resolved by rebuilding, so it
-          # must not block a release. weekly-rebuild.yml is what tracks those
-          # and opens an issue when a new one appears.
-          ignore-unfixed: true
-          exit-code: "1"
-          scanners: vuln,secret
         env:
-          TRIVY_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-db:2
-          TRIVY_JAVA_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-java-db:1
+          TRIVY_IMAGE: ghcr.io/aquasecurity/trivy:0.70.0@sha256:be1190afcb28352bfddc4ddeb71470835d16462af68d310f9f4bca710961a41e
+          SCAN_REF: ${{ env.IMAGE }}:scan
+          # Trivy pulls its database from GHCR; the token lifts the anonymous
+          # pull rate limit. Referenced under `set -u`, so it must be defined.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${HOME}/.cache/trivy:/root/.cache/trivy" \
+            -e TRIVY_DB_REPOSITORY=ghcr.io/aquasecurity/trivy-db:2 \
+            -e TRIVY_JAVA_DB_REPOSITORY=ghcr.io/aquasecurity/trivy-java-db:1 \
+            -e GITHUB_TOKEN="${GITHUB_TOKEN}" \
+            "${TRIVY_IMAGE}" image \
+            --format table \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            --scanners vuln,secret \
+            --exit-code 1 \
+            "${SCAN_REF}"
 
       - name: Build and push multi-arch image
         id: build
@@ -509,6 +531,7 @@ jobs:
             rekor.sigstore.dev:443
             release-assets.githubusercontent.com:443
             storage.googleapis.com:443
+            timestamp.sigstore.dev:443
             tuf-repo-cdn.sigstore.dev:443
 
       - name: Checkout

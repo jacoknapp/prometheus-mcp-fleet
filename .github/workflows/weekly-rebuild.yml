@@ -205,6 +205,7 @@ jobs:
             release-assets.githubusercontent.com:443
             storage.googleapis.com:443
             sum.golang.org:443
+            timestamp.sigstore.dev:443
             toolbox-data.anchore.io:443
             tuf-repo-cdn.sigstore.dev:443
 
