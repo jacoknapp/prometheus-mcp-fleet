@@ -344,6 +344,7 @@ func (h *hub) apiOptions() hubapi.Options {
 		AgentKeyTTL:   h.cfg.AgentKeyTTL,
 		EnrollmentTTL: h.cfg.EnrollmentTokenTTL,
 		SpokeCertTTL:  h.cfg.SpokeCertTTL,
+		RenewGrace:    h.cfg.RenewGrace,
 		// The built-in CA is always the issuer in this release, so enrollment
 		// is always available. An external-PKI mode would disable it outright
 		// rather than leaving a second live credential path open.

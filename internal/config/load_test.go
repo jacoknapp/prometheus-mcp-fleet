@@ -157,6 +157,7 @@ func TestLoadHubDefaults(t *testing.T) {
 		CAKeyFile:              filepath.Join(DefaultDataDir, CAKeyFileName),
 		TrustDomain:            DefaultTrustDomain,
 		SpokeCertTTL:           336 * time.Hour,
+		RenewGrace:             30 * 24 * time.Hour,
 		EnrollmentTokenTTL:     15 * time.Minute,
 		AgentKeyTTL:            720 * time.Hour,
 		MaxSpokes:              256,
@@ -263,6 +264,24 @@ func TestLoadHubPrecedence(t *testing.T) {
 			kv:   map[string]string{"PMF_QUERY_TIMEOUT": "45s"},
 			want: func(c *Hub) any { return c.QueryTimeout },
 			got:  45 * time.Second,
+		},
+		{
+			name: "renew grace from flag",
+			args: []string{"--renew-grace=48h"},
+			want: func(c *Hub) any { return c.RenewGrace },
+			got:  48 * time.Hour,
+		},
+		{
+			name: "renew grace from env",
+			kv:   map[string]string{"PMF_RENEW_GRACE": "72h"},
+			want: func(c *Hub) any { return c.RenewGrace },
+			got:  72 * time.Hour,
+		},
+		{
+			name: "renew grace of zero is accepted, disabling the grace",
+			args: []string{"--renew-grace=0"},
+			want: func(c *Hub) any { return c.RenewGrace },
+			got:  time.Duration(0),
 		},
 		{
 			name: "duration flag beats env",

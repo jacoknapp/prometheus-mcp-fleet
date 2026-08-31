@@ -85,6 +85,7 @@ kubectl exec -n prometheus-mcp-hub deploy/pmf-hub -- \
 ```bash
 kubectl exec -n prometheus-mcp-hub deploy/pmf-hub -- \
   hub keys create \
+    --admin-token-file /var/run/pmf/admin-token \
     --class agent \
     --name sre-oncall-bot \
     --clusters 'env=prod' \

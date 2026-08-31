@@ -59,8 +59,10 @@ identity:
   # existing certificate. It costs exactly one `Role` with `get,create,update` on that one
   # Secret by name — see the "RBAC" section of the README.
   # `memory` needs NO RBAC at all, but the key is lost on every restart, so the spoke
-  # re-enrolls each time and therefore needs a MULTI-USE enrollment token. That is strictly
-  # weaker: a multi-use token is a standing credential that mints cluster identities.
+  # re-enrolls each time and therefore needs a REUSABLE enrollment token (mint it with
+  # `hub enroll create --reusable`). That is strictly weaker: a reusable token is a standing
+  # credential that mints cluster identities, though only ever for the one cluster it is
+  # bound to, and it can be capped with `--max-redemptions` and revoked.
   # `file` writes under `config.dataDir`, which is the `/tmp` emptyDir, so in a pod it behaves
   # like `memory` while looking durable. It exists for running the binary outside Kubernetes.
   backend: secret
@@ -74,12 +76,30 @@ cluster:
   # over one certificate identity at the hub and each would deregister the other, so there
   # is nothing sensible to default it to.
   id: ""
+  # -- `PMF_CLUSTER_SDLC`. REQUIRED. Lifecycle stage: `dev`, `staging`, `prod`, or whatever
+  # taxonomy this fleet uses. Case and separators are normalised, so `PROD`, `Pre Prod` and
+  # `pre_prod` become `prod` and `pre-prod`; the result must be a lowercase slug.
+  # It is published as the reserved label `sdlc`, which is how agent key scopes
+  # (`matchLabels`) and `fanout_query` select on it. It is required because a cluster with no
+  # lifecycle label is one no scoped credential can reach and no fleet-wide query targets —
+  # a failure that is silent at install and mysterious at query time.
+  sdlc: ""
   # -- `PMF_CLUSTER_DISPLAY_NAME`. Human-facing name an agent sees when choosing a cluster.
   displayName: ""
   # -- `PMF_CLUSTER_DESCRIPTION`. One line describing what this cluster runs, to orient an agent.
   description: ""
-  # -- `PMF_CLUSTER_LABELS`. Operator-supplied selectors, rendered as `k=v,k=v`.
-  labels: {}
+  # -- `PMF_CLUSTER_LABELS`. Operator-supplied selectors, rendered as `k=v,k=v`. A list, so
+  # entries stay ordered and readable in review and a GitOps overlay can append one without
+  # rewriting a map. Keys must be unique; the chart refuses duplicates rather than letting
+  # one silently win. `sdlc` is reserved — set `cluster.sdlc` instead, and it wins over any
+  # entry of that name here.
+  # These are what agent key scopes (`matchLabels`) and `fanout_query` select on, so they are
+  # worth deciding before onboarding the first cluster rather than the fiftieth.
+  labels: []
+  #  - name: team
+  #    value: platform
+  #  - name: region
+  #    value: eu-west-1
 
 # THE HUB IS IN A DIFFERENT CLUSTER. Every value below describes something outside this
 # cluster, reached over ordinary egress. There is deliberately no `.svc` default, no
@@ -128,7 +148,7 @@ hub:
   allowInsecure: false
 
 enrollment:
-  # -- A single-use `pmf_enr_` enrollment token, rendered into a Secret by this chart. Convenient, but it puts the token into the Helm release values, which are stored in a Secret in this namespace and show up in `helm get values`. `enrollment.existingSecret` is better.
+  # -- A `pmf_enr_` enrollment token, rendered into a Secret by this chart. Convenient, but it puts the token into the Helm release values, which are stored in a Secret in this namespace and show up in `helm get values`. `enrollment.existingSecret` is better. For GitOps the token must be REUSABLE (`hub enroll create --reusable`): a single-use token cannot survive being reconciled from git, and a rebuilt cluster would find it burned.
   token: ""
   # -- Name of an existing Secret holding the enrollment token. Preferred over `enrollment.token`. The chart never creates it.
   existingSecret: ""

@@ -11,6 +11,7 @@ templates:
 set:
   cluster:
     id: prod-us-east-1
+    sdlc: prod
   hub:
     endpoints:
       - wss://hub.example.com/tunnel
@@ -175,8 +176,10 @@ tests:
     set:
       cluster:
         labels:
-          region: us-east-1
-          env: prod
+          - name: region
+            value: us-east-1
+          - name: env
+            value: prod
     asserts:
       - equal:
           path: "data.PMF_CLUSTER_LABELS"

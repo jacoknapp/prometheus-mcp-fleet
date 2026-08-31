@@ -8,6 +8,7 @@
 # credential that mints cluster identities.
 cluster:
   id: airgap-dc1
+  sdlc: dev
 hub:
   endpoints:
     - wss://198.51.100.10/tunnel

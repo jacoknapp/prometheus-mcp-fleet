@@ -15,6 +15,7 @@ tests:
     set:
       cluster:
         id: prod-us-east-1
+        sdlc: prod
       hub:
         endpoints:
           - wss://hub.example.com/tunnel
@@ -28,6 +29,7 @@ tests:
     set:
       cluster:
         id: prod-us-east-1
+        sdlc: prod
       hub:
         endpoints:
           - wss://hub.example.com/tunnel
@@ -42,6 +44,7 @@ tests:
     set:
       cluster:
         id: prod-us-east-1
+        sdlc: prod
       hub:
         endpoints:
           - wss://hub.example.com/tunnel
@@ -56,6 +59,7 @@ tests:
     set:
       cluster:
         id: prod-us-east-1
+        sdlc: prod
       hub:
         endpoints:
           - wss://hub.example.com/tunnel
@@ -71,6 +75,7 @@ tests:
     set:
       cluster:
         id: prod-us-east-1
+        sdlc: prod
       hub:
         endpoints:
           - wss://hub.example.com/tunnel
@@ -85,6 +90,7 @@ tests:
     set:
       cluster:
         id: prod-us-east-1
+        sdlc: prod
       hub:
         endpoints:
           - wss://hub.example.com/tunnel
@@ -99,6 +105,7 @@ tests:
     set:
       cluster:
         id: prod-us-east-1
+        sdlc: prod
       hub:
         endpoints:
           - wss://hub.example.com/tunnel
@@ -116,6 +123,7 @@ tests:
     set:
       cluster:
         id: prod-us-east-1
+        sdlc: prod
       hub:
         endpoints:
           - wss://hub.example.com/tunnel
@@ -130,6 +138,7 @@ tests:
     set:
       cluster:
         id: prod-us-east-1
+        sdlc: prod
       hub:
         endpoints:
           - wss://hub.example.com/tunnel

@@ -7,11 +7,14 @@
 # would fight over one certificate identity.
 cluster:
   id: prod-us-east-1
+  sdlc: prod
   displayName: Production US East 1
   description: Customer-facing workloads, us-east-1
   labels:
-    env: prod
-    region: us-east-1
+    - name: env
+      value: prod
+    - name: region
+      value: us-east-1
 hub:
   endpoints:
     - wss://hub.example.com/tunnel

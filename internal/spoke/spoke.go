@@ -207,7 +207,7 @@ func (s *spoke) run(ctx context.Context, registry prometheusRegistry) error {
 		ClusterID:       s.cfg.ClusterID,
 		DisplayName:     s.cfg.ClusterDisplayName,
 		Description:     s.cfg.ClusterDescription,
-		Labels:          s.cfg.ClusterLabels,
+		Labels:          labelsWithSDLC(s.cfg.ClusterLabels, s.cfg.ClusterSDLC),
 		AgentVersion:    s.build.Version,
 		ProtocolVersion: protocolVersion,
 		StartedAt:       s.started,
@@ -581,4 +581,28 @@ func (s *spoke) stopAdmin(srv *httpx.Server) {
 	if err := srv.Shutdown(ctx); err != nil {
 		s.logger.Warn("admin listener did not shut down cleanly", "error", err)
 	}
+}
+
+// labelsWithSDLC merges the required lifecycle stage into the operator's
+// labels under the reserved "sdlc" key.
+//
+// Publishing it as an ordinary label is what makes it usable: agent key scopes
+// select clusters with matchLabels and fanout_query takes a label selector, so
+// putting the stage there means every existing selector mechanism can target it
+// with no special case anywhere. The dedicated field is what makes it
+// *required*; this is what makes it *reachable*.
+//
+// The field wins over a hand-written "sdlc" label rather than the other way
+// round: one of them was validated and normalised, and the other was typed into
+// a map.
+func labelsWithSDLC(labels map[string]string, sdlc string) map[string]string {
+	if sdlc == "" {
+		return labels
+	}
+	merged := make(map[string]string, len(labels)+1)
+	for k, v := range labels {
+		merged[k] = v
+	}
+	merged["sdlc"] = sdlc
+	return merged
 }

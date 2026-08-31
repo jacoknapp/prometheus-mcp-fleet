@@ -21,6 +21,7 @@ import (
 
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/config"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/hub"
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/hubcli"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/version"
 )
 
@@ -60,6 +61,14 @@ func runWith(
 			return err
 		}
 		return nil
+	}
+
+	// Administrative subcommands talk to the hub's loopback admin API rather
+	// than starting a server. They are documented as
+	// `kubectl exec deploy/pmf-hub -- hub enroll create ...`, which is why they
+	// live in the same binary as the server.
+	if len(args) > 0 && (args[0] == "enroll" || args[0] == "keys") {
+		return hubcli.Run(context.Background(), args, getenv, stdout, nil)
 	}
 
 	cfg, err := config.LoadHub(args, getenv)

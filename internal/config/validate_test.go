@@ -29,6 +29,7 @@ func validSpoke(t *testing.T) *Spoke {
 		"PMF_HUB_ENDPOINTS": "wss://hub.example.com/tunnel",
 		"PMF_HUB_API_URL":   "https://hub.example.com",
 		"PMF_CLUSTER_ID":    "prod-us-east-1",
+		"PMF_CLUSTER_SDLC":  "prod",
 	}))
 	if err != nil {
 		t.Fatalf("LoadSpoke() error = %v", err)
@@ -70,6 +71,7 @@ func TestHubValidate(t *testing.T) {
 		{"trust domain uppercase", func(c *Hub) { c.TrustDomain = "Fleet.Local" }, "--trust-domain"},
 		{"spoke cert ttl", func(c *Hub) { c.SpokeCertTTL = 0 }, "--spoke-cert-ttl"},
 		{"enrollment token ttl", func(c *Hub) { c.EnrollmentTokenTTL = -time.Second }, "--enrollment-token-ttl"},
+		{"renew grace negative", func(c *Hub) { c.RenewGrace = -time.Second }, "--renew-grace"},
 		{"agent key ttl", func(c *Hub) { c.AgentKeyTTL = 0 }, "--agent-key-ttl"},
 		{"max spokes", func(c *Hub) { c.MaxSpokes = 0 }, "--max-spokes"},
 		{"query timeout", func(c *Hub) { c.QueryTimeout = 0 }, "--query-timeout"},
@@ -153,6 +155,19 @@ func TestHubValidateAcceptsPublicURLAndPairs(t *testing.T) {
 // valid, not just https. The scheme check is "!= https && != http": without
 // a case exercising the http side, negating that second comparison to
 // "== http" is unobservable, because every other test's public URL is https.
+// TestHubValidateAcceptsZeroRenewGrace pins that --renew-grace of exactly
+// zero is legal, not merely non-negative: it is the documented way to
+// disable the renewal grace period and require strict expiry, so
+// checkNonNegative's "d < 0" must not have drifted to "d <= 0".
+func TestHubValidateAcceptsZeroRenewGrace(t *testing.T) {
+	t.Parallel()
+	c := validHub(t)
+	c.RenewGrace = 0
+	if err := c.Validate(); err != nil {
+		t.Errorf("Validate() = %v, want nil for --renew-grace=0", err)
+	}
+}
+
 func TestHubValidateAcceptsHTTPPublicURL(t *testing.T) {
 	t.Parallel()
 	c := validHub(t)
@@ -257,6 +272,9 @@ func TestSpokeValidate(t *testing.T) {
 		{"cluster id trailing dash", func(c *Spoke) { c.ClusterID = "prod-" }, "--cluster-id"},
 		{"cluster id underscore", func(c *Spoke) { c.ClusterID = "prod_1" }, "--cluster-id"},
 		{"cluster id too long", func(c *Spoke) { c.ClusterID = strings.Repeat("a", 64) }, "--cluster-id"},
+		{"cluster sdlc missing", func(c *Spoke) { c.ClusterSDLC = "" }, "--cluster-sdlc"},
+		{"cluster sdlc invalid character", func(c *Spoke) { c.ClusterSDLC = "prod!" }, "--cluster-sdlc"},
+		{"cluster sdlc too long", func(c *Spoke) { c.ClusterSDLC = strings.Repeat("a", 33) }, "--cluster-sdlc"},
 		{
 			"label key invalid",
 			func(c *Spoke) { c.ClusterLabels = map[string]string{"1env": "prod"} },

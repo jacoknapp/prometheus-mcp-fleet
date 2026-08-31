@@ -327,7 +327,23 @@ func (s *server) handleCreateEnrollment(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	grant := &fleet.EnrollmentGrant{ClusterID: req.ClusterID, Labels: req.Labels}
+	if req.MaxRedemptions < 0 {
+		s.fail(w, r, CodeInvalidRequest, "maxRedemptions cannot be negative")
+		return
+	}
+	if req.MaxRedemptions > 0 && !req.Reusable {
+		// Silently ignoring the cap would leave an operator believing a
+		// single-use token had a limit of their choosing.
+		s.fail(w, r, CodeInvalidRequest,
+			"maxRedemptions requires reusable: a single-use token is already capped at one")
+		return
+	}
+	grant := &fleet.EnrollmentGrant{
+		ClusterID:      req.ClusterID,
+		Labels:         req.Labels,
+		Reusable:       req.Reusable,
+		MaxRedemptions: req.MaxRedemptions,
+	}
 	key, raw, err := s.mintKey(r.Context(), fleet.ClassEnrollment, name, req.Owner, ttl, nil, grant)
 	if err != nil {
 		s.failInternal(w, r, "mint enrollment", err)

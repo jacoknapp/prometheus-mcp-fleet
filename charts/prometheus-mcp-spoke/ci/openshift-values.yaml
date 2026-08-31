@@ -6,6 +6,7 @@
 # hardening all stay; only the numeric IDs go.
 cluster:
   id: ocp-lab-1
+  sdlc: prod
 hub:
   endpoints:
     - wss://hub.apps.example.com/tunnel

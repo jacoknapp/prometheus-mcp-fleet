@@ -48,6 +48,14 @@ type CreateEnrollmentRequest struct {
 	Owner string `json:"owner,omitempty"`
 	// TTL is a Go duration string. Empty means the configured default.
 	TTL fleet.Duration `json:"ttl,omitempty"`
+	// Reusable allows the token to be redeemed more than once, for the same
+	// cluster. It exists for declarative deployment, where the credential is
+	// reconciled from git rather than handed over once by a human, and where a
+	// rebuilt cluster must be able to re-enrol without anyone minting anything.
+	// It remains bound to one cluster, revocable and expiring.
+	Reusable bool `json:"reusable,omitempty"`
+	// MaxRedemptions caps a reusable token. Zero means no cap.
+	MaxRedemptions int `json:"maxRedemptions,omitempty"`
 }
 
 // MintedKeyResponse is returned by every route that creates a credential.
@@ -94,6 +102,12 @@ type EnrollmentView struct {
 	Labels     map[string]string `json:"labels,omitempty"`
 	UsedAt     *time.Time        `json:"usedAt,omitempty"`
 	CertSerial string            `json:"certSerial,omitempty"`
+	// Reusable reports whether this token survives redemption.
+	Reusable bool `json:"reusable,omitempty"`
+	// Redemptions is how many times it has been redeemed.
+	Redemptions int `json:"redemptions,omitempty"`
+	// MaxRedemptions is its cap, or zero for none.
+	MaxRedemptions int `json:"maxRedemptions,omitempty"`
 }
 
 // KeyListResponse is the body of the list routes.
@@ -250,10 +264,13 @@ func viewKey(k *fleet.Key, now time.Time) KeyView {
 	}
 	if k.Enrollment != nil {
 		v.Enrollment = &EnrollmentView{
-			ClusterID:  k.Enrollment.ClusterID,
-			Labels:     k.Enrollment.Labels,
-			UsedAt:     k.Enrollment.UsedAt,
-			CertSerial: k.Enrollment.CertSerial,
+			ClusterID:      k.Enrollment.ClusterID,
+			Labels:         k.Enrollment.Labels,
+			UsedAt:         k.Enrollment.UsedAt,
+			CertSerial:     k.Enrollment.CertSerial,
+			Reusable:       k.Enrollment.Reusable,
+			Redemptions:    k.Enrollment.Redemptions,
+			MaxRedemptions: k.Enrollment.MaxRedemptions,
 		}
 	}
 	return v

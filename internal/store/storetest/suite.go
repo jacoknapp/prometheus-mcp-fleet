@@ -61,6 +61,8 @@ func RunSuite(t *testing.T, open OpenFunc) {
 		{"BurnEnrollmentTwice", testBurnEnrollmentTwice},
 		{"BurnEnrollmentRejects", testBurnEnrollmentRejects},
 		{"BurnEnrollmentConcurrent", testBurnEnrollmentConcurrent},
+		{"BurnEnrollmentReusableUnlimited", testBurnEnrollmentReusableUnlimited},
+		{"BurnEnrollmentReusableCapped", testBurnEnrollmentReusableCapped},
 		{"RevokedCerts", testRevokedCerts},
 		{"RevokedCertsOrdering", testRevokedCertsOrdering},
 		{"RevokedCertValidates", testRevokedCertValidates},
@@ -124,6 +126,15 @@ func enrollmentKey(kid string, createdAt time.Time) *fleet.Key {
 		CreatedAt: createdAt,
 		ExpiresAt: createdAt.Add(15 * time.Minute),
 	}
+}
+
+// reusableEnrollmentKey is enrollmentKey with Reusable set and an optional
+// redemption cap; maxRedemptions of 0 means unlimited.
+func reusableEnrollmentKey(kid string, createdAt time.Time, maxRedemptions int) *fleet.Key {
+	k := enrollmentKey(kid, createdAt)
+	k.Enrollment.Reusable = true
+	k.Enrollment.MaxRedemptions = maxRedemptions
+	return k
 }
 
 func mustPut(t *testing.T, s store.Store, k *fleet.Key) {
@@ -792,6 +803,83 @@ func testBurnEnrollmentConcurrent(t *testing.T, s store.Store) {
 	if stored.Enrollment.CertSerial != winners[0] {
 		t.Errorf("stored CertSerial = %q, want the winner's %q",
 			stored.Enrollment.CertSerial, winners[0])
+	}
+}
+
+// testBurnEnrollmentReusableUnlimited proves a reusable grant with no cap
+// (MaxRedemptions == 0) may be redeemed any number of times, each redemption
+// incrementing Redemptions and overwriting CertSerial and UsedAt, for every
+// backend.
+func testBurnEnrollmentReusableUnlimited(t *testing.T, s store.Store) {
+	ctx := t.Context()
+	k := reusableEnrollmentKey("enrol0009", tBase, 0)
+	mustPut(t, s, k)
+
+	for i, serial := range []string{"serial-01", "serial-02", "serial-03"} {
+		at := tBase.Add(time.Duration(i) * time.Minute)
+		got, err := s.BurnEnrollment(ctx, k.KID, serial, at)
+		if err != nil {
+			t.Fatalf("redemption %d: BurnEnrollment: %v", i, err)
+		}
+		if got.Enrollment.Redemptions != i+1 {
+			t.Errorf("redemption %d: Redemptions = %d, want %d", i, got.Enrollment.Redemptions, i+1)
+		}
+		if got.Enrollment.CertSerial != serial {
+			t.Errorf("redemption %d: CertSerial = %q, want %q", i, got.Enrollment.CertSerial, serial)
+		}
+		if !got.Enrollment.UsedAt.Equal(at) {
+			t.Errorf("redemption %d: UsedAt = %s, want %s", i, got.Enrollment.UsedAt, at)
+		}
+		if got.Enrollment.ClusterID != "prod-eu-1" {
+			t.Errorf("redemption %d: ClusterID changed to %q", i, got.Enrollment.ClusterID)
+		}
+
+		reread, err := s.GetKey(ctx, k.KID)
+		if err != nil {
+			t.Fatalf("redemption %d: GetKey: %v", i, err)
+		}
+		if diff := cmp.Diff(got, reread); diff != "" {
+			t.Errorf("redemption %d: returned key differs from the stored key (-returned +stored):\n%s", i, diff)
+		}
+	}
+}
+
+// testBurnEnrollmentReusableCapped proves a reusable grant refuses
+// redemption once Redemptions reaches MaxRedemptions, without disturbing the
+// state left by the redemptions that already succeeded, for every backend.
+func testBurnEnrollmentReusableCapped(t *testing.T, s store.Store) {
+	ctx := t.Context()
+	k := reusableEnrollmentKey("enrol0010", tBase, 2)
+	mustPut(t, s, k)
+
+	for i, serial := range []string{"serial-01", "serial-02"} {
+		if _, err := s.BurnEnrollment(ctx, k.KID, serial, tBase.Add(time.Duration(i)*time.Minute)); err != nil {
+			t.Fatalf("redemption %d: BurnEnrollment: %v", i, err)
+		}
+	}
+	epochAfterCap := mustEpoch(t, s)
+
+	got, err := s.BurnEnrollment(ctx, k.KID, "serial-03", tBase.Add(3*time.Minute))
+	if !errors.Is(err, store.ErrEnrollmentUsed) {
+		t.Fatalf("redemption over the cap: error = %v, want ErrEnrollmentUsed", err)
+	}
+	if got != nil {
+		t.Error("a redemption over the cap returned a key alongside an error")
+	}
+	if after := mustEpoch(t, s); after != epochAfterCap {
+		t.Errorf("epoch moved %d -> %d on a redemption over the cap", epochAfterCap, after)
+	}
+
+	stored, err := s.GetKey(ctx, k.KID)
+	if err != nil {
+		t.Fatalf("GetKey: %v", err)
+	}
+	if stored.Enrollment.Redemptions != 2 {
+		t.Errorf("Redemptions = %d after a refused redemption over the cap, want 2", stored.Enrollment.Redemptions)
+	}
+	if stored.Enrollment.CertSerial != "serial-02" {
+		t.Errorf("CertSerial = %q after a refused redemption over the cap, want the last successful one",
+			stored.Enrollment.CertSerial)
 	}
 }
 

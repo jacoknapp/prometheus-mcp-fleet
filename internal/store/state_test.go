@@ -49,6 +49,15 @@ func enrollmentKey(kid string, createdAt time.Time) *fleet.Key {
 	}
 }
 
+// reusableEnrollmentKey is enrollmentKey with Reusable set and an optional
+// redemption cap; maxRedemptions of 0 means unlimited.
+func reusableEnrollmentKey(kid string, createdAt time.Time, maxRedemptions int) *fleet.Key {
+	k := enrollmentKey(kid, createdAt)
+	k.Enrollment.Reusable = true
+	k.Enrollment.MaxRedemptions = maxRedemptions
+	return k
+}
+
 func TestDecode(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -519,6 +528,80 @@ func TestBurnEnrollment(t *testing.T) {
 				t.Errorf("error %q does not contain %q", err, want)
 			}
 		}
+	})
+
+	t.Run("reusable", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("unlimited: repeated redemption increments Redemptions and never fails", func(t *testing.T) {
+			t.Parallel()
+			s := newWith(t, reusableEnrollmentKey("enrol0006", tBase, 0))
+			for i, serial := range []string{"serial-01", "serial-02", "serial-03"} {
+				got, changed, err := s.BurnEnrollment("enrol0006", serial, tBase.Add(time.Duration(i)*time.Minute), time.Now)
+				if err != nil || !changed {
+					t.Fatalf("redemption %d: BurnEnrollment = %v, %v", i, changed, err)
+				}
+				if got.Enrollment.Redemptions != i+1 {
+					t.Errorf("redemption %d: Redemptions = %d, want %d", i, got.Enrollment.Redemptions, i+1)
+				}
+				if got.Enrollment.CertSerial != serial {
+					t.Errorf("redemption %d: CertSerial = %q, want %q", i, got.Enrollment.CertSerial, serial)
+				}
+				if got.Enrollment.ClusterID != "prod-eu-1" {
+					t.Errorf("redemption %d: ClusterID changed to %q", i, got.Enrollment.ClusterID)
+				}
+			}
+		})
+
+		t.Run("capped: redemptions beyond MaxRedemptions are refused", func(t *testing.T) {
+			t.Parallel()
+			s := newWith(t, reusableEnrollmentKey("enrol0007", tBase, 2))
+
+			for i, serial := range []string{"serial-01", "serial-02"} {
+				got, changed, err := s.BurnEnrollment("enrol0007", serial, tBase.Add(time.Duration(i)*time.Minute), time.Now)
+				if err != nil || !changed {
+					t.Fatalf("redemption %d: BurnEnrollment = %v, %v", i, changed, err)
+				}
+				if got.Enrollment.Redemptions != i+1 {
+					t.Errorf("redemption %d: Redemptions = %d, want %d", i, got.Enrollment.Redemptions, i+1)
+				}
+			}
+
+			before := s.Epoch
+			got, changed, err := s.BurnEnrollment("enrol0007", "serial-03", tBase.Add(3*time.Minute), time.Now)
+			if !errors.Is(err, ErrEnrollmentUsed) {
+				t.Fatalf("third redemption: error = %v, want ErrEnrollmentUsed", err)
+			}
+			if got != nil || changed {
+				t.Error("a redemption over the cap reported a change")
+			}
+			if s.Epoch != before {
+				t.Errorf("epoch moved to %d on a redemption over the cap", s.Epoch)
+			}
+			stored, err := s.GetKey("enrol0007")
+			if err != nil {
+				t.Fatalf("GetKey: %v", err)
+			}
+			if stored.Enrollment.Redemptions != 2 {
+				t.Errorf("Redemptions = %d after a refused third attempt, want 2", stored.Enrollment.Redemptions)
+			}
+		})
+
+		t.Run("single-use is unaffected: a second attempt still fails", func(t *testing.T) {
+			t.Parallel()
+			// Not reusable, MaxRedemptions irrelevant: this is the ordinary
+			// single-use path, pinned here beside the reusable cases so a
+			// regression that made every grant reusable would be caught next
+			// to the behaviour it must not disturb.
+			s := newWith(t, enrollmentKey("enrol0008", tBase))
+			if _, _, err := s.BurnEnrollment("enrol0008", "serial-01", tBase, time.Now); err != nil {
+				t.Fatalf("BurnEnrollment: %v", err)
+			}
+			_, _, err := s.BurnEnrollment("enrol0008", "serial-02", tBase, time.Now)
+			if !errors.Is(err, ErrEnrollmentUsed) {
+				t.Fatalf("second attempt: error = %v, want ErrEnrollmentUsed", err)
+			}
+		})
 	})
 }
 

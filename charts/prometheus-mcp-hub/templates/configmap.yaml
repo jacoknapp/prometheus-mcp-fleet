@@ -68,6 +68,7 @@ data:
   PMF_TRUST_DOMAIN: {{ .Values.config.trustDomain | quote }}
   PMF_SPOKE_CERT_TTL: {{ .Values.config.spokeCertTTL | quote }}
   PMF_ENROLLMENT_TOKEN_TTL: {{ .Values.config.enrollmentTokenTTL | quote }}
+  PMF_RENEW_GRACE: {{ .Values.config.renewGrace | quote }}
   PMF_AGENT_KEY_TTL: {{ .Values.config.agentKeyTTL | quote }}
   PMF_MAX_SPOKES: {{ .Values.config.maxSpokes | int64 | quote }}
   PMF_QUERY_TIMEOUT: {{ .Values.config.queryTimeout | quote }}

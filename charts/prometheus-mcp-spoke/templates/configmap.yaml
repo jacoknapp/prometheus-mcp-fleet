@@ -44,6 +44,7 @@ data:
   {{- end }}
 
   PMF_CLUSTER_ID: {{ .Values.cluster.id | quote }}
+  PMF_CLUSTER_SDLC: {{ .Values.cluster.sdlc | quote }}
   {{- with .Values.cluster.displayName }}
   PMF_CLUSTER_DISPLAY_NAME: {{ . | quote }}
   {{- end }}
@@ -52,8 +53,18 @@ data:
   {{- end }}
   {{- with .Values.cluster.labels }}
   {{- $pairs := list }}
-  {{- range $k, $v := . }}{{ $pairs = append $pairs (printf "%s=%s" $k $v) }}{{ end }}
-  PMF_CLUSTER_LABELS: {{ join "," $pairs | quote }}
+  {{- $seen := dict }}
+  {{- range . }}
+    {{- if hasKey $seen .name }}
+      {{- fail (printf "cluster.labels has %q twice; one would silently win" .name) }}
+    {{- end }}
+    {{- if eq .name "sdlc" }}
+      {{- fail "cluster.labels must not set \"sdlc\"; it is reserved for cluster.sdlc, which is validated and normalised" }}
+    {{- end }}
+    {{- $seen = set $seen .name true }}
+    {{- $pairs = append $pairs (printf "%s=%s" .name .value) }}
+  {{- end }}
+  PMF_CLUSTER_LABELS: {{ join "," (sortAlpha $pairs) | quote }}
   {{- end }}
 
   PMF_IDENTITY_BACKEND: {{ .Values.identity.backend | quote }}

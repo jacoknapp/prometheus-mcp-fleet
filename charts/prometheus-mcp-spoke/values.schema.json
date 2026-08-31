@@ -151,7 +151,8 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "id"
+        "id",
+        "sdlc"
       ],
       "properties": {
         "id": {
@@ -160,6 +161,13 @@
           "minLength": 1,
           "maxLength": 63,
           "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"
+        },
+        "sdlc": {
+          "description": "PMF_CLUSTER_SDLC. REQUIRED. Lifecycle stage such as dev, staging or prod. Published as the reserved label \"sdlc\", which agent key scopes and fanout_query select on. Case and separators are normalised by the spoke, but the chart requires a value that is already a lowercase slug so a typo fails the render rather than the query.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32,
+          "pattern": "^[a-z0-9]([-a-z0-9]{0,30}[a-z0-9])?$"
         },
         "displayName": {
           "description": "PMF_CLUSTER_DISPLAY_NAME.",
@@ -170,10 +178,27 @@
           "type": "string"
         },
         "labels": {
-          "description": "PMF_CLUSTER_LABELS, rendered as k=v,k=v.",
-          "type": "object",
-          "additionalProperties": {
-            "type": "string"
+          "description": "PMF_CLUSTER_LABELS, rendered as k=v,k=v. A list of {name, value} entries. Keys must be unique and must not be \"sdlc\", which is reserved for cluster.sdlc.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "value"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 63,
+                "pattern": "^[a-zA-Z]([-_.a-zA-Z0-9]{0,61}[a-zA-Z0-9])?$"
+              },
+              "value": {
+                "type": "string",
+                "maxLength": 255
+              }
+            }
           }
         }
       }

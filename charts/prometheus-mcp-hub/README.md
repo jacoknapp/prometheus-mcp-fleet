@@ -377,7 +377,7 @@ Kubernetes: `>=1.28.0-0`
 | config.agentKeyTTL | string | `"720h"` | `PMF_AGENT_KEY_TTL`. Default lifetime of a minted `pmf_agt_` agent key. |
 | config.dataDir | string | `"/tmp/prometheus-mcp-fleet"` | `PMF_DATA_DIR`. Scratch directory for the self-generated HMAC pepper and the CA material materialised out of the CA Secret. NOTHING here is durable — it is the `/tmp` emptyDir. It must stay under `/tmp` unless you mount a writable volume elsewhere with `extraVolumes`/`extraVolumeMounts`; the chart refuses to render otherwise. |
 | config.enableStatusConfig | bool | `false` | `PMF_ENABLE_STATUS_CONFIG`. Ungates the `/api/v1/status/config` Prometheus endpoint. Off by default because scrape configurations routinely embed bearer tokens and basic-auth passwords in plain text, and this hub hands its output to an AI agent. |
-| config.enrollmentTokenTTL | string | `"15m"` | `PMF_ENROLLMENT_TOKEN_TTL`. Lifetime of a single-use `pmf_enr_` token. |
+| config.enrollmentTokenTTL | string | `"15m"` | `PMF_ENROLLMENT_TOKEN_TTL`. Lifetime of a `pmf_enr_` token. The 15 minute default suits an imperative install where a human mints a token and uses it immediately. A GitOps rollout wants a reusable token with a much longer TTL, because the credential is reconciled from git rather than handed over once. |
 | config.factsPollInterval | string | `"60s"` | `PMF_FACTS_POLL_INTERVAL`. How often the hub refreshes cluster facts. |
 | config.logFormat | string | `"json"` | `PMF_LOG_FORMAT`. One of `json`, `text`. |
 | config.logLevel | string | `"info"` | `PMF_LOG_LEVEL`. One of `debug`, `info`, `warn`, `error`. |
@@ -389,6 +389,7 @@ Kubernetes: `>=1.28.0-0`
 | config.publicURL | string | `""` | `PMF_PUBLIC_URL`. Canonical external MCP URL, used for the OAuth protected-resource-metadata document. Set this to whatever your Ingress publishes. |
 | config.queryTimeout | string | `"30s"` | `PMF_QUERY_TIMEOUT`. Instant and metadata query deadline. |
 | config.rangeQueryTimeout | string | `"120s"` | `PMF_RANGE_QUERY_TIMEOUT`. Range query deadline. |
+| config.renewGrace | string | `"720h"` | `PMF_RENEW_GRACE`. How long after a spoke certificate expires the hub will still renew it, given proof the spoke still holds the private key. A spoke renews at half its certificate's life, so an expired certificate means the cluster was unreachable for half a lifetime; without this it is locked out permanently, because `/renew` refuses the expired certificate and its enrollment token was burned at install. Nothing else is relaxed: the chain must still verify, the certificate must not be revoked, and the possession proof must still pass. Set to `0` to require an unexpired certificate. |
 | config.shutdownDrainDelay | string | `"5s"` | `PMF_SHUTDOWN_DRAIN_DELAY`. Time `/readyz` reports 503 before work stops, so load balancers notice. |
 | config.shutdownGrace | string | `"30s"` | `PMF_SHUTDOWN_GRACE`. Graceful shutdown budget for in-flight work. |
 | config.spokeCertTTL | string | `"336h"` | `PMF_SPOKE_CERT_TTL`. Lifetime of an issued spoke client certificate. |

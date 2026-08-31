@@ -233,12 +233,21 @@ func (f *fakeStore) BurnEnrollment(_ context.Context, kid, certSerial string, at
 	if k.Class != fleet.ClassEnrollment || k.Enrollment == nil {
 		return nil, fmt.Errorf("kid %s: not an enrollment token", kid)
 	}
-	if k.Enrollment.UsedAt != nil {
+	// A reusable grant is redeemed rather than burned, capped by
+	// MaxRedemptions (zero meaning unlimited); this mirrors
+	// internal/store.State.BurnEnrollment so a test exercising handleEnroll
+	// against this fake sees the same behaviour a real backend would give it.
+	if k.Enrollment.Reusable {
+		if m := k.Enrollment.MaxRedemptions; m > 0 && k.Enrollment.Redemptions >= m {
+			return nil, fmt.Errorf("kid %s: %w", kid, ErrEnrollmentUsed)
+		}
+	} else if k.Enrollment.UsedAt != nil {
 		return nil, fmt.Errorf("kid %s: %w", kid, ErrEnrollmentUsed)
 	}
 	when := at
 	k.Enrollment.UsedAt = &when
 	k.Enrollment.CertSerial = certSerial
+	k.Enrollment.Redemptions++
 	f.epoch++
 	return cloneKey(k), nil
 }

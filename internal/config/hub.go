@@ -124,6 +124,17 @@ type Hub struct {
 
 	// SpokeCertTTL is the lifetime of an issued spoke client certificate.
 	SpokeCertTTL time.Duration
+	// RenewGrace is how long after a spoke certificate expires the hub will
+	// still renew it, given proof the spoke still holds the private key.
+	//
+	// A spoke renews at half its certificate's life, so an expired certificate
+	// means the cluster was unreachable for half a lifetime. Without a grace
+	// period that spoke is locked out for good: /renew refuses the expired
+	// certificate and its enrollment token was single-use and burned at
+	// install. Re-enrolling by hand is not a step that exists in a GitOps
+	// rollout, so the default is generous. Zero disables the grace entirely and
+	// restores strict expiry.
+	RenewGrace time.Duration
 	// EnrollmentTokenTTL bounds how long a single-use enrollment token lives.
 	EnrollmentTokenTTL time.Duration
 	// AgentKeyTTL is the default lifetime of a newly minted agent key.
@@ -201,6 +212,8 @@ func LoadHub(args []string, getenv func(string) string) (*Hub, error) {
 
 	l.duration(&c.SpokeCertTTL, "spoke-cert-ttl", 336*time.Hour, "lifetime of an issued spoke client certificate")
 	l.duration(&c.EnrollmentTokenTTL, "enrollment-token-ttl", 15*time.Minute, "lifetime of a single-use enrollment token")
+	l.duration(&c.RenewGrace, "renew-grace", 30*24*time.Hour,
+		"how long after expiry a spoke certificate may still be renewed; 0 to require an unexpired certificate")
 	l.duration(&c.AgentKeyTTL, "agent-key-ttl", 720*time.Hour, "default lifetime of a minted agent key")
 	l.integer(&c.MaxSpokes, "max-spokes", 256, "maximum number of enrolled clusters")
 
@@ -293,6 +306,7 @@ func (c *Hub) Validate() error {
 
 	add(checkPositive("spoke-cert-ttl", c.SpokeCertTTL))
 	add(checkPositive("enrollment-token-ttl", c.EnrollmentTokenTTL))
+	add(checkNonNegative("renew-grace", c.RenewGrace))
 	add(checkPositive("agent-key-ttl", c.AgentKeyTTL))
 	add(checkPositiveInt("max-spokes", c.MaxSpokes))
 

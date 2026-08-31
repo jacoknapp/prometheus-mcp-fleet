@@ -95,6 +95,14 @@ const (
 	// event rather than a plain refusal: the certificate is public, so this is
 	// what somebody quoting one they do not hold the key for looks like.
 	EventRenewalUnproven = "renewal.unproven"
+	// EventCertRenewedExpired is a renewal accepted on a certificate that had
+	// already expired, inside the configured grace period. It is recorded
+	// separately from EventCertRenewed because it means a spoke was gone for
+	// more than half a certificate lifetime, which is worth noticing whether it
+	// was a long outage or somebody replaying an old identity -- the possession
+	// proof still had to pass, but the certificate itself no longer vouches for
+	// currency.
+	EventCertRenewedExpired = "cert.renewed.expired"
 )
 
 // ErrorEnvelope is the single error shape every route in this package returns.

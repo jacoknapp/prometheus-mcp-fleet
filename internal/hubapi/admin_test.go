@@ -661,6 +661,21 @@ func TestEnrollmentAdminRoutes(t *testing.T) {
 			body:       CreateEnrollmentRequest{ClusterID: "prod-eu", TTL: fleet.Duration(time.Hour)},
 			wantStatus: http.StatusBadRequest,
 		},
+		{
+			name:       "negative maxRedemptions",
+			body:       CreateEnrollmentRequest{ClusterID: "prod-eu", MaxRedemptions: -1},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "maxRedemptions without reusable",
+			body:       CreateEnrollmentRequest{ClusterID: "prod-eu", MaxRedemptions: 5},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "reusable with zero maxRedemptions is fine: zero means no cap",
+			body:       CreateEnrollmentRequest{ClusterID: "prod-eu-1", Reusable: true},
+			wantStatus: http.StatusCreated,
+		},
 	}
 
 	for _, tc := range tests {

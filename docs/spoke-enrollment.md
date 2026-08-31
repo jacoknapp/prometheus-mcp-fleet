@@ -79,10 +79,20 @@ safe:
 ```bash
 kubectl exec -n prometheus-mcp-hub deploy/pmf-hub -- \
   hub enroll create \
+    --admin-token-file /var/run/pmf/admin-token \
     --cluster prod-us-east-1 \
     --labels env=prod,region=us-east-1,tier=customer-facing
 # pmf_enr_9dK2mQ4pLz…   valid 15 minutes, redeemable once
 ```
+
+The subcommand is an HTTP client against the hub's own admin listener, which
+binds to loopback and is never in a Service — exec'ing into the pod is already
+the privileged path, so the credential never crosses the network. It still needs
+an admin credential of its own: mount one as a file and pass
+`--admin-token-file`, or set `PMF_ADMIN_TOKEN` in the pod's environment. Prefer
+the file. There is no way to set an environment variable on a `kubectl exec`
+without putting it in the argument list, where it lands in the node's process
+table.
 
 The **labels matter more than they look**. Agent key scopes select clusters by
 label (`matchLabels: {env: prod}`), so a cluster enrolled without them is a
@@ -135,12 +145,56 @@ part of the rollout rather than ahead of it.
 ```bash
 while read -r id env region; do
   token=$(kubectl exec -n prometheus-mcp-hub deploy/pmf-hub -- \
-    hub enroll create --cluster "$id" --labels "env=$env,region=$region" --quiet)
+    hub enroll create --admin-token-file /var/run/pmf/admin-token \
+      --cluster "$id" --labels "env=$env,region=$region" --quiet)
   # Hand $token to whatever installs into that cluster: a sealed secret, an
   # ExternalSecret, your CD system's secret store. It is valid for 15 minutes.
   ./install-spoke.sh "$id" "$token"
 done < clusters.tsv
 ```
+
+### GitOps: reusable tokens
+
+The loop above is an *imperative* rollout: something mints a token and pushes it
+into a cluster within fifteen minutes. A GitOps rollout has no such moment. Argo
+CD or Flux reconciles the chart from git continuously, so the credential has to
+be declared rather than handed over, and three things go wrong with a single-use
+token:
+
+1. **Bootstrap.** A fifteen-minute token cannot be committed. By the time the
+   commit merges and the controller syncs, it has expired.
+2. **Rebuild.** A cluster recreated six months later finds its token burned, and
+   nothing in the pipeline mints a replacement.
+3. **Long outage.** A spoke away for longer than its certificate life comes back
+   to a certificate `/renew` refuses.
+
+Mint a **reusable** token instead. It is still bound to exactly one cluster, so
+a leak buys an attacker one cluster's identity and not the fleet's; it still
+expires; it is still revocable; and the hub still ignores what the CSR asks for.
+
+```bash
+hub enroll create \
+  --cluster prod-eu-west-1 \
+  --labels env=prod,region=eu-west-1 \
+  --reusable \
+  --max-redemptions 10 \
+  --ttl 8760h \
+  --quiet
+```
+
+Put that token in the secret store your CD system already reads — an
+`ExternalSecret`, a `SecretProviderClass`, a sealed secret — and point
+`enrollment.existingSecret` at it. The declared state is then stable: reconciling
+the same chart with the same token is a no-op once the spoke holds a
+certificate, and a re-enrollment after a rebuild just works.
+
+`--max-redemptions` is a blast-radius control, not a correctness one. Set it to
+something comfortably above how often you expect that cluster to be rebuilt; the
+counter is visible on the token's admin view. Omit it for no cap.
+
+Point 3 needs no token at all. See [Renewal](#renewal): a spoke that still holds
+its private key can renew an *expired* certificate inside the hub's
+`--renew-grace` window, so an outage does not consume a redemption.
 
 Notes for a fleet-scale rollout:
 
@@ -153,8 +207,9 @@ Notes for a fleet-scale rollout:
 - **Watch `promfleet_hub_enrollments_total{result="denied"}`.** A cluster of
   failures usually means the tokens expired between minting and install.
 - Set `PMF_ENROLLMENT_TOKEN_TTL` higher on the hub if your delivery pipeline is
-  slower than fifteen minutes — but treat that as a pipeline problem, not a
-  configuration one.
+  slower than fifteen minutes. For an imperative rollout treat that as a
+  pipeline problem; for a declarative one a long TTL on a reusable token is the
+  intended shape, not a workaround.
 
 ## What the certificate contains
 
@@ -203,6 +258,31 @@ expired; that the chain verifies against its CA; that the serial is not on the
 revocation denylist; and that the signature over
 `transcript(nonce, "renew-v1", clusterID)` checks out under the leaf's public
 key. Only then does it issue.
+
+### Renewing an expired certificate
+
+A spoke renews at half its certificate's life, so reaching expiry means the
+cluster was unreachable for half a lifetime — switched off over a holiday, a
+long outage, a rollout paused mid-flight. Refusing that renewal strands the
+spoke permanently: its enrollment token was single-use and burned at install,
+and in a declarative deployment nobody is standing by to mint another.
+
+So the hub renews an expired certificate for `--renew-grace` after expiry
+(`PMF_RENEW_GRACE`, default 30 days; `0` restores strict expiry).
+
+Nothing else is relaxed. The chain must still verify against the hub's CA, the
+serial must still be absent from the denylist, and the possession proof must
+still check out — the certificate is public, so on its own it proves nothing.
+What the grace period concedes is only *currency*: the certificate no longer
+vouches for the holder being live, and the signature has to carry that weight
+alone. The chain is re-verified as of the leaf's own `notAfter` rather than with
+expiry checking disabled, so an intermediate that had already gone bad when the
+leaf expired is still rejected.
+
+These renewals are logged as `cert.renewed.expired` rather than `cert.renewed`,
+with `was_expired=true`, so a sweep for them is one grep. Each is worth a look:
+it is either a cluster that was away a long time, or somebody replaying an
+identity they should not still have.
 
 `GET /renew/challenge` needs no credential — it is the step that lets a spoke
 authenticate at all — and it stores nothing. The nonce carries its own proof

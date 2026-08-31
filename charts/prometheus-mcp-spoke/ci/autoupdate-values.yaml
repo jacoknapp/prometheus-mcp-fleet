@@ -7,6 +7,7 @@
 # which is the exact failure the stagger exists to prevent.
 cluster:
   id: prod-ap-south-1
+  sdlc: staging
 hub:
   endpoints:
     - wss://hub.example.com/tunnel

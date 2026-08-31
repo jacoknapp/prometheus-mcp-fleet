@@ -106,11 +106,36 @@ type EnrollmentGrant struct {
 	// Labels are stamped onto the cluster registry entry at enrollment so the
 	// hub can route by selector before the spoke reports anything itself.
 	Labels map[string]string `json:"labels,omitempty"`
-	// UsedAt is set exactly once, by an atomic conditional update. A second
-	// redemption attempt is a security event, not a retry.
+	// UsedAt is the moment of redemption. For a single-use grant it is set
+	// exactly once, by an atomic conditional update, and a second attempt is a
+	// security event rather than a retry. For a reusable grant it is the most
+	// recent redemption.
 	UsedAt *time.Time `json:"usedAt,omitempty"`
-	// CertSerial records which certificate the token was burned for.
+	// CertSerial records which certificate the token was burned for. For a
+	// reusable grant it is the most recently issued one.
 	CertSerial string `json:"certSerial,omitempty"`
+
+	// Reusable allows this grant to be redeemed more than once.
+	//
+	// Single use is the default and remains right for an imperative install,
+	// where a human mints a token and hands it straight to one cluster. It does
+	// not survive contact with GitOps: the chart is reconciled from git
+	// continuously, so a credential that is valid for fifteen minutes and dies
+	// on first use cannot be committed, and a cluster rebuilt six months later
+	// finds its token burned with nobody minting a replacement.
+	//
+	// What a reusable grant deliberately does NOT give up: it is still bound to
+	// exactly one ClusterID, so a leak compromises one cluster and not the
+	// fleet; it is still revocable; it still expires; and the hub still ignores
+	// what the CSR asks for and mints its own subject and SAN.
+	Reusable bool `json:"reusable,omitempty"`
+	// Redemptions counts successful redemptions. It is meaningful only for a
+	// reusable grant, where it is the audit trail that a single-use grant gets
+	// from UsedAt being set at most once.
+	Redemptions int `json:"redemptions,omitempty"`
+	// MaxRedemptions caps a reusable grant. Zero means no cap, which is the
+	// sensible default for a cluster that may be rebuilt any number of times.
+	MaxRedemptions int `json:"maxRedemptions,omitempty"`
 }
 
 // Principal is the authenticated caller attached to a request context. It is

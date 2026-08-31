@@ -77,8 +77,9 @@ var layer = map[string]int{
 	"mcptools": 3,
 
 	// L4 — composition roots. These may import anything.
-	"hub":   4,
-	"spoke": 4,
+	"hub":    4,
+	"hubcli": 4,
+	"spoke":  4,
 
 	// Test helpers are importable from anywhere; they are excluded from the
 	// layer check but not from the forbidden-edge check.

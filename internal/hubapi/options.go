@@ -160,6 +160,11 @@ type Options struct {
 	// CRLValidity sets the published CRL's NextUpdate. Zero means
 	// [DefaultCRLValidity].
 	CRLValidity time.Duration
+	// RenewGrace is how long after expiry a spoke certificate may still be
+	// renewed, given proof the spoke still holds the matching private key.
+	// Zero requires an unexpired certificate. See
+	// [ca.CA.VerifyChainAllowingExpiry] for why this exists.
+	RenewGrace time.Duration
 
 	// EnrollmentEnabled gates /enroll. When false the route answers 503, which
 	// lets an operator close the enrollment window for a fleet that is fully
@@ -204,6 +209,7 @@ type server struct {
 	enrollmentTTL time.Duration
 	spokeCertTTL  time.Duration
 	crlValidity   time.Duration
+	renewGrace    time.Duration
 
 	enrollmentEnabled bool
 	draining          func() bool
@@ -280,6 +286,7 @@ func newServer(opts Options) (*server, error) {
 		adminKeyTTL:       opts.AdminKeyTTL,
 		enrollmentTTL:     opts.EnrollmentTTL,
 		spokeCertTTL:      opts.SpokeCertTTL,
+		renewGrace:        opts.RenewGrace,
 		crlValidity:       opts.CRLValidity,
 		enrollmentEnabled: opts.EnrollmentEnabled,
 		draining:          opts.Draining,

@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/config"
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/hubcli"
 )
 
 func TestRunWith(t *testing.T) {
@@ -48,6 +49,37 @@ func TestRunWith(t *testing.T) {
 			getenv:  func(string) string { return "" },
 			run:     func(context.Context, *config.Hub) error { return nil },
 			wantErr: flag.ErrHelp,
+		},
+		{
+			// "enroll" alone dispatches to hubcli.Run rather than being parsed
+			// as hub server flags, and never starts the hub itself. hubcli.Run
+			// with fewer than two arguments reports its own usage error, which
+			// is enough to prove the dispatch happened without needing a fake
+			// admin listener.
+			name: "enroll subcommand dispatches to hubcli instead of starting the hub",
+			args: []string{"enroll"},
+			getenv: func(string) string {
+				t.Fatal("the enroll subcommand consulted the environment before dispatch")
+				return ""
+			},
+			run: func(context.Context, *config.Hub) error {
+				t.Fatal("the enroll subcommand started the hub")
+				return nil
+			},
+			wantErr: hubcli.ErrUsage,
+		},
+		{
+			name: "keys subcommand dispatches to hubcli instead of starting the hub",
+			args: []string{"keys"},
+			getenv: func(string) string {
+				t.Fatal("the keys subcommand consulted the environment before dispatch")
+				return ""
+			},
+			run: func(context.Context, *config.Hub) error {
+				t.Fatal("the keys subcommand started the hub")
+				return nil
+			},
+			wantErr: hubcli.ErrUsage,
 		},
 		{
 			name:      "unknown flag",

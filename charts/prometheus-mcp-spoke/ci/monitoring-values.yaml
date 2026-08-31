@@ -5,6 +5,7 @@
 # install, but renders and lints without them.
 cluster:
   id: prod-eu-west-1
+  sdlc: prod
 hub:
   endpoints:
     - wss://hub.example.com/tunnel

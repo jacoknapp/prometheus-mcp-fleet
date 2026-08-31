@@ -371,13 +371,25 @@ func (s *State) BurnEnrollment(kid, certSerial string, at time.Time, now func() 
 	if !rec.Key.Usable(when) {
 		return nil, false, fmt.Errorf("enrollment %s: %w", kid, ErrNotUsable)
 	}
-	if rec.Key.Enrollment.UsedAt != nil {
+	// A reusable grant is redeemed rather than burned: it is bound to one
+	// cluster and exists so a GitOps rollout can reconcile the same declared
+	// credential repeatedly, including after that cluster is rebuilt. It is
+	// still capped, still expiring and still revocable, and the counter below
+	// is its audit trail.
+	if rec.Key.Enrollment.Reusable {
+		if m := rec.Key.Enrollment.MaxRedemptions; m > 0 && rec.Key.Enrollment.Redemptions >= m {
+			return nil, false, fmt.Errorf(
+				"enrollment %s has been redeemed %d times, its limit: %w",
+				kid, rec.Key.Enrollment.Redemptions, ErrEnrollmentUsed)
+		}
+	} else if rec.Key.Enrollment.UsedAt != nil {
 		return nil, false, fmt.Errorf("enrollment %s was redeemed at %s for certificate %q: %w",
 			kid, rec.Key.Enrollment.UsedAt.UTC(), rec.Key.Enrollment.CertSerial, ErrEnrollmentUsed)
 	}
 	grant := *rec.Key.Enrollment
 	grant.UsedAt = &when
 	grant.CertSerial = certSerial
+	grant.Redemptions++
 	rec.Key.Enrollment = &grant
 	s.Keys[kid] = rec
 	s.bump()

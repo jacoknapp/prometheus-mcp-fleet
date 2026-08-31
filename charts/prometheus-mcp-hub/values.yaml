@@ -153,8 +153,10 @@ config:
   trustDomain: fleet.local
   # -- `PMF_SPOKE_CERT_TTL`. Lifetime of an issued spoke client certificate.
   spokeCertTTL: 336h
-  # -- `PMF_ENROLLMENT_TOKEN_TTL`. Lifetime of a single-use `pmf_enr_` token.
+  # -- `PMF_ENROLLMENT_TOKEN_TTL`. Lifetime of a `pmf_enr_` token. The 15 minute default suits an imperative install where a human mints a token and uses it immediately. A GitOps rollout wants a reusable token with a much longer TTL, because the credential is reconciled from git rather than handed over once.
   enrollmentTokenTTL: 15m
+  # -- `PMF_RENEW_GRACE`. How long after a spoke certificate expires the hub will still renew it, given proof the spoke still holds the private key. A spoke renews at half its certificate's life, so an expired certificate means the cluster was unreachable for half a lifetime; without this it is locked out permanently, because `/renew` refuses the expired certificate and its enrollment token was burned at install. Nothing else is relaxed: the chain must still verify, the certificate must not be revoked, and the possession proof must still pass. Set to `0` to require an unexpired certificate.
+  renewGrace: 720h
   # -- `PMF_AGENT_KEY_TTL`. Default lifetime of a minted `pmf_agt_` agent key.
   agentKeyTTL: 720h
   # -- `PMF_MAX_SPOKES`. Hard cap on enrolled clusters.

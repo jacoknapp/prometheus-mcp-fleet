@@ -152,6 +152,82 @@ func TestEnroll(t *testing.T) {
 			t.Fatal("a certificate was returned even though the burn lost")
 		}
 	})
+
+	// TestReusableEnrollment exercises the whole point of a reusable grant:
+	// the same token buys a second certificate instead of being refused as a
+	// replay, remains capped, and reports its redemption count through the
+	// admin API afterward.
+	t.Run("reusable token may be redeemed more than once, up to its cap", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t, nil)
+		raw := h.mint(fleet.ClassEnrollment, func(k *fleet.Key) {
+			k.Name = "enroll:prod-eu-1"
+			k.Enrollment = &fleet.EnrollmentGrant{ClusterID: "prod-eu-1", Reusable: true, MaxRedemptions: 2}
+		})
+		kid := kidOf(t, raw)
+
+		csr1, _ := makeCSR(t, csrOptions{CommonName: "first"})
+		first := h.do(h.public, http.MethodPost, "/enroll", raw, EnrollRequest{CSR: csr1})
+		if first.StatusCode != http.StatusCreated {
+			t.Fatalf("first /enroll status = %d, want %d (%s)", first.StatusCode, http.StatusCreated, decode(t, first, nil))
+		}
+		var firstResp EnrollResponse
+		decode(t, first, &firstResp)
+
+		// The second redemption is the behaviour that distinguishes this from
+		// a single-use token: it must succeed, not be reported as a replay,
+		// and it must mint a distinct certificate.
+		csr2, _ := makeCSR(t, csrOptions{CommonName: "second"})
+		second := h.do(h.public, http.MethodPost, "/enroll", raw, EnrollRequest{CSR: csr2})
+		if second.StatusCode != http.StatusCreated {
+			t.Fatalf("second /enroll status = %d, want %d (%s)", second.StatusCode, http.StatusCreated, decode(t, second, nil))
+		}
+		var secondResp EnrollResponse
+		decode(t, second, &secondResp)
+		if secondResp.Serial == firstResp.Serial {
+			t.Error("the second redemption reused the first certificate's serial")
+		}
+		if h.metrics.securityEvents(EventEnrollmentReplay) != 0 {
+			t.Error("a redemption within the cap was reported as a replay")
+		}
+
+		// A third redemption exceeds MaxRedemptions and must be refused
+		// exactly like a single-use token's second attempt.
+		csr3, _ := makeCSR(t, csrOptions{CommonName: "third"})
+		third := h.do(h.public, http.MethodPost, "/enroll", raw, EnrollRequest{CSR: csr3})
+		if third.StatusCode != http.StatusConflict {
+			t.Fatalf("third /enroll status = %d, want %d (%s)", third.StatusCode, http.StatusConflict, decode(t, third, nil))
+		}
+
+		// The admin view must report the grant as still reusable, still
+		// capped at 2, and having been redeemed exactly twice: the count the
+		// refused third attempt must not have touched.
+		var list KeyListResponse
+		decode(t, h.adminDo(http.MethodGet, "/admin/v1/enrollments", nil), &list)
+		var view *KeyView
+		for i := range list.Keys {
+			if list.Keys[i].KID == kid {
+				view = &list.Keys[i]
+			}
+		}
+		if view == nil || view.Enrollment == nil {
+			t.Fatalf("enrollment %s not found in the admin listing: %+v", kid, list)
+		}
+		if !view.Enrollment.Reusable {
+			t.Error("EnrollmentView.Reusable = false, want true")
+		}
+		if view.Enrollment.MaxRedemptions != 2 {
+			t.Errorf("EnrollmentView.MaxRedemptions = %d, want 2", view.Enrollment.MaxRedemptions)
+		}
+		if view.Enrollment.Redemptions != 2 {
+			t.Errorf("EnrollmentView.Redemptions = %d, want 2 (the refused third attempt must not count)",
+				view.Enrollment.Redemptions)
+		}
+		if view.Enrollment.CertSerial != secondResp.Serial {
+			t.Errorf("EnrollmentView.CertSerial = %q, want the last successful redemption's %q",
+				view.Enrollment.CertSerial, secondResp.Serial)
+		}
+	})
 }
 
 // TestEnrollIgnoresTheCSRSubjectAndSANs is the spec's "a CSR requesting
@@ -620,6 +696,103 @@ func TestRenewSucceedsWithoutAnyTLSClientCertificate(t *testing.T) {
 	if !strings.Contains(h.logs.String(), id.serial) {
 		t.Error("the renewal audit line does not name the previous serial")
 	}
+}
+
+// TestRenewGracePeriod covers the renewal grace period end to end through the
+// real /renew route: a certificate that has expired within grace still
+// renews, is logged distinctly as cert.renewed.expired, and remains refused
+// once grace is disabled or exhausted.
+func TestRenewGracePeriod(t *testing.T) {
+	t.Parallel()
+
+	const grace = 30 * 24 * time.Hour
+
+	t.Run("expired within grace: renews and is logged as cert.renewed.expired", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t, func(o *Options) { o.RenewGrace = grace })
+		id := h.issueSpoke("prod-eu-1")
+
+		// The default spoke certificate lifetime is 14 days; this pushes well
+		// past it while staying inside the 30 day grace.
+		h.clock.advance(15 * 24 * time.Hour)
+
+		var got EnrollResponse
+		resp := h.renew(h.renewRequestFor(id))
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("status = %d, want %d (%s)", resp.StatusCode, http.StatusCreated, decode(t, resp, nil))
+		}
+		decode(t, resp, &got)
+		if got.ClusterID != "prod-eu-1" {
+			t.Errorf("ClusterID = %q, want prod-eu-1", got.ClusterID)
+		}
+		if !got.NotAfter.After(h.clock.Now()) {
+			t.Errorf("NotAfter = %s, which is not in the future", got.NotAfter)
+		}
+		if h.metrics.securityEvents(EventCertRenewedExpired) != 1 {
+			t.Error("no cert.renewed.expired security event")
+		}
+		if h.metrics.securityEvents(EventCertRenewed) != 0 {
+			t.Error("an expired-but-in-grace renewal was also logged as an ordinary cert.renewed event")
+		}
+		if !strings.Contains(h.logs.String(), `"event":"`+EventCertRenewedExpired+`"`) {
+			t.Error("the renewal was not written to the security log as cert.renewed.expired")
+		}
+		if !strings.Contains(h.logs.String(), `"was_expired":true`) {
+			t.Errorf("security log does not carry was_expired=true: %s", h.logs.String())
+		}
+	})
+
+	t.Run("unexpired renewal is still logged as plain cert.renewed", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t, func(o *Options) { o.RenewGrace = grace })
+		id := h.issueSpoke("prod-eu-1")
+
+		resp := h.renew(h.renewRequestFor(id))
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("status = %d, want %d (%s)", resp.StatusCode, http.StatusCreated, decode(t, resp, nil))
+		}
+		if h.metrics.securityEvents(EventCertRenewed) != 1 {
+			t.Error("no cert.renewed security event for an unexpired renewal")
+		}
+		if h.metrics.securityEvents(EventCertRenewedExpired) != 0 {
+			t.Error("an unexpired renewal was logged as cert.renewed.expired")
+		}
+		if !strings.Contains(h.logs.String(), `"was_expired":false`) {
+			t.Errorf("security log does not carry was_expired=false: %s", h.logs.String())
+		}
+	})
+
+	t.Run("expired beyond grace is refused", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t, func(o *Options) { o.RenewGrace = grace })
+		id := h.issueSpoke("prod-eu-1")
+
+		h.clock.advance(14*24*time.Hour + grace + time.Hour)
+
+		resp := h.renew(h.renewRequestFor(id))
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("status = %d, want %d (%s)", resp.StatusCode, http.StatusForbidden, decode(t, resp, nil))
+		}
+		if h.metrics.securityEvents(EventCertRenewedExpired) != 0 {
+			t.Error("a renewal beyond grace was still logged as a successful expired renewal")
+		}
+	})
+
+	t.Run("grace disabled (zero) refuses an otherwise-in-window expired certificate", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t, nil) // RenewGrace defaults to zero: strict expiry.
+		id := h.issueSpoke("prod-eu-1")
+
+		h.clock.advance(15 * 24 * time.Hour)
+
+		resp := h.renew(h.renewRequestFor(id))
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("status = %d, want %d (%s)", resp.StatusCode, http.StatusForbidden, decode(t, resp, nil))
+		}
+		if h.metrics.securityEvents(EventCertRenewedExpired) != 0 {
+			t.Error("a renewal with grace disabled was still logged as a successful expired renewal")
+		}
+	})
 }
 
 // TestRenewIgnoresTheTLSLayerEntirely presents one spoke's certificate at the

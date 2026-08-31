@@ -6,6 +6,7 @@ package config
 import (
 	"errors"
 	"log/slog"
+	"strings"
 	"time"
 )
 
@@ -68,7 +69,24 @@ type Spoke struct {
 	ClusterDisplayName string
 	// ClusterDescription orients an agent choosing between clusters.
 	ClusterDescription string
+	// ClusterSDLC is the cluster's lifecycle stage: dev, staging, prod or
+	// whatever taxonomy this fleet uses. It is REQUIRED.
+	//
+	// It is a field of its own rather than one more entry in ClusterLabels
+	// because it is the selector everything else is built on. Agent key scopes
+	// choose clusters by label and fanout_query takes a label selector, so a
+	// cluster that reached production without a lifecycle label is a cluster no
+	// scoped credential can reach and no fleet-wide query will target -- and
+	// nothing would have told the operator. Requiring it makes that failure
+	// impossible at install rather than mysterious at query time.
+	//
+	// The value is a free-form slug by deliberate choice: no fixed taxonomy
+	// survives contact with every organisation. The cost is that prod and
+	// production can coexist across a fleet, and nothing here prevents it.
+	ClusterSDLC string
 	// ClusterLabels are operator-supplied selectors, parsed from "k=v,k=v".
+	// ClusterSDLC is merged in as "sdlc" and wins over any entry of that name,
+	// so selectors need no special case for it.
 	ClusterLabels map[string]string
 
 	// DataDir holds the client key, the issued certificate and the cached hub
@@ -145,6 +163,7 @@ func LoadSpoke(args []string, getenv func(string) string) (*Spoke, error) {
 	l.str(&c.EnrollmentTokenFile, "enrollment-token-file", "", "file holding the single-use enrollment token")
 
 	l.str(&c.ClusterID, "cluster-id", "", "immutable cluster identity (required)")
+	l.str(&c.ClusterSDLC, "cluster-sdlc", "", "lifecycle stage such as dev, staging or prod (required)")
 	l.str(&c.ClusterDisplayName, "cluster-display-name", "", "human-facing cluster name")
 	l.str(&c.ClusterDescription, "cluster-description", "", "one line describing what this cluster runs")
 	l.labels(&c.ClusterLabels, "cluster-labels", "operator-supplied selectors as k=v,k=v")
@@ -177,7 +196,44 @@ func LoadSpoke(args []string, getenv func(string) string) (*Spoke, error) {
 	if err := l.parse(args); err != nil {
 		return nil, err
 	}
+	// Normalise before validating, so that "PROD", " Prod " and "Pre Prod" are
+	// accepted and become "prod" and "pre-prod" rather than being refused for
+	// their spelling. The value is a label an agent key scope selects on, so
+	// what matters is that a hundred clusters agree on one form -- refusing an
+	// operator's capitalisation achieves that by making them retype it, which
+	// is worse than just fixing it here.
+	c.ClusterSDLC = NormaliseSDLC(c.ClusterSDLC)
 	return c, nil
+}
+
+// NormaliseSDLC canonicalises a lifecycle stage: trimmed, lowercased, with
+// runs of whitespace and underscores folded to a single hyphen.
+//
+// It deliberately does not reject anything -- Validate does that against the
+// normalised value, so an operator is told their input is unusable only when it
+// still is after the obvious repairs.
+func NormaliseSDLC(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	var b strings.Builder
+	b.Grow(len(s))
+	lastHyphen := false
+	for _, r := range s {
+		switch {
+		case r == ' ' || r == '\t' || r == '_' || r == '-':
+			// Collapse separators rather than emitting "pre--prod", and never
+			// start with one.
+			if b.Len() > 0 && !lastHyphen {
+				b.WriteByte('-')
+				lastHyphen = true
+			}
+		default:
+			b.WriteRune(r)
+			lastHyphen = false
+		}
+	}
+	// A trailing separator would fail the slug pattern for a value the operator
+	// clearly meant, so drop it.
+	return strings.TrimSuffix(b.String(), "-")
 }
 
 // identityBackends is the closed set accepted by --identity-backend.
@@ -232,6 +288,12 @@ func (c *Spoke) Validate() error {
 		add(problem("cluster-id", "is required"))
 	case !clusterIDRE.MatchString(c.ClusterID):
 		add(problem("cluster-id", "%q must match %s", c.ClusterID, clusterIDRE))
+	}
+	switch {
+	case c.ClusterSDLC == "":
+		add(problem("cluster-sdlc", "is required (for example dev, staging or prod)"))
+	case !clusterSDLCRE.MatchString(c.ClusterSDLC):
+		add(problem("cluster-sdlc", "%q must match %s", c.ClusterSDLC, clusterSDLCRE))
 	}
 	if err := validateClusterLabels(c.ClusterLabels); err != nil {
 		add(problem("cluster-labels", "%s", err))

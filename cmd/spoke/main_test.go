@@ -67,6 +67,7 @@ func TestRunWith(t *testing.T) {
 			getenv: func(key string) string {
 				values := map[string]string{
 					"PMF_CLUSTER_ID":    "prod-us",
+					"PMF_CLUSTER_SDLC":  "prod",
 					"PMF_HUB_ENDPOINTS": "wss://fleet.example/tunnel",
 					"PMF_HUB_API_URL":   "https://fleet.example",
 				}

@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
+
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel/grpctun"
 )
 
@@ -318,6 +320,67 @@ func TestClassifyMapsEveryShapeToTheClosedSet(t *testing.T) {
 			t.Parallel()
 			if got := classify(tc.err); got != tc.want {
 				t.Errorf("classify(%v) = %q, want %q", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLabelsWithSDLC pins the reserved-label merge.
+//
+// The lifecycle stage is published as an ordinary label so that agent key
+// scopes (matchLabels) and fanout_query's label selector can target it with no
+// special case. Two properties matter and are asserted here: the caller's map
+// is never mutated, because it is the config's own map and the collector holds
+// it for the process lifetime; and the validated field beats a hand-written
+// "sdlc" label, because one of them went through normalisation and the other
+// was typed into a map.
+func TestLabelsWithSDLC(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		labels map[string]string
+		sdlc   string
+		want   map[string]string
+	}{{
+		name:   "merged alongside operator labels",
+		labels: map[string]string{"env": "prod", "region": "eu-west-1"},
+		sdlc:   "prod",
+		want:   map[string]string{"env": "prod", "region": "eu-west-1", "sdlc": "prod"},
+	}, {
+		name: "no labels at all",
+		sdlc: "staging",
+		want: map[string]string{"sdlc": "staging"},
+	}, {
+		// Not reachable through Validate, which requires the field, but the
+		// helper must not invent an empty label if it ever is.
+		name:   "empty stage leaves labels untouched",
+		labels: map[string]string{"env": "dev"},
+		want:   map[string]string{"env": "dev"},
+	}, {
+		name:   "field wins over a hand-written sdlc label",
+		labels: map[string]string{"sdlc": "typed-by-hand"},
+		sdlc:   "prod",
+		want:   map[string]string{"sdlc": "prod"},
+	}}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			original := make(map[string]string, len(tc.labels))
+			for k, v := range tc.labels {
+				original[k] = v
+			}
+
+			got := labelsWithSDLC(tc.labels, tc.sdlc)
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Errorf("labelsWithSDLC() mismatch (-want +got):\n%s", diff)
+			}
+			if tc.sdlc != "" && tc.labels != nil {
+				if diff := cmp.Diff(original, tc.labels); diff != "" {
+					t.Errorf("caller's map was mutated (-before +after):\n%s", diff)
+				}
 			}
 		})
 	}

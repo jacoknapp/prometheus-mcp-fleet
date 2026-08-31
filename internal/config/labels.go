@@ -20,6 +20,12 @@ var labelKeyRE = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 // starting and ending with an alphanumeric.
 var clusterIDRE = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`)
 
+// clusterSDLCRE is the lifecycle-stage grammar. It is the cluster ID grammar
+// with a shorter bound: the value becomes a label value and appears in agent
+// key scopes, so it has to be a plain lowercase slug, but no fleet needs a
+// 63-character word for "prod".
+var clusterSDLCRE = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,30}[a-z0-9])?$`)
+
 // MaxClusterLabels bounds how many labels one spoke may declare, so that a
 // mis-set variable cannot inflate the cardinality of everything the hub
 // derives from cluster labels.

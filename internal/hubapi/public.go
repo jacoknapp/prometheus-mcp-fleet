@@ -129,7 +129,13 @@ func (s *server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	clusterID := key.Enrollment.ClusterID
-	if key.Enrollment.UsedAt != nil {
+	// This is a cheap pre-check that avoids minting a certificate for a token
+	// the store is about to refuse; the authoritative decision is the
+	// compare-and-swap in BurnEnrollment, which is what makes it atomic across
+	// replicas. A reusable token has no such terminal state -- its cap is
+	// enforced by that same CAS -- so only a single-use token short-circuits
+	// here.
+	if !key.Enrollment.Reusable && key.Enrollment.UsedAt != nil {
 		s.replay(w, r, key.KID, clusterID)
 		return
 	}
@@ -260,7 +266,13 @@ func (s *server) handleRenew(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	identity, err := s.ca.VerifyChain(chain)
+	// An expired certificate is accepted inside the grace period, because a
+	// spoke that has been unreachable for half a certificate lifetime otherwise
+	// has no way back: /renew would refuse it and its enrollment token was
+	// single-use and burned at install. Nothing else is relaxed -- the chain
+	// must still reach this CA, the certificate must still not be revoked, and
+	// the possession proof below must still succeed.
+	identity, expired, err := s.ca.VerifyChainAllowingExpiry(chain, s.renewGrace)
 	if err != nil {
 		s.metrics.Enrollment(ResultDenied)
 		s.log.LogAttrs(r.Context(), slog.LevelWarn, "renewal certificate refused",
@@ -319,10 +331,17 @@ func (s *server) handleRenew(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	serial := ca.SerialHex(cert.SerialNumber)
-	s.security(r, EventCertRenewed,
+	event := EventCertRenewed
+	if expired {
+		// Recorded distinctly so a fleet-wide sweep of these is greppable: each
+		// one is a spoke that was gone longer than half a certificate lifetime.
+		event = EventCertRenewedExpired
+	}
+	s.security(r, event,
 		slog.String("cluster", identity.ClusterID),
 		slog.String("serial", serial),
-		slog.String("previous_serial", identity.CertSerial))
+		slog.String("previous_serial", identity.CertSerial),
+		slog.Bool("was_expired", expired))
 	s.metrics.Enrollment(ResultIssued)
 	s.writeJSON(w, r, http.StatusCreated, EnrollResponse{
 		Certificate: string(certPEM),

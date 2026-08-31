@@ -442,6 +442,10 @@
           "description": "PMF_ENROLLMENT_TOKEN_TTL.",
           "type": "string"
         },
+        "renewGrace": {
+          "description": "PMF_RENEW_GRACE. How long after expiry a spoke certificate may still be renewed. 0 requires an unexpired certificate.",
+          "type": "string"
+        },
         "agentKeyTTL": {
           "description": "PMF_AGENT_KEY_TTL.",
           "type": "string"

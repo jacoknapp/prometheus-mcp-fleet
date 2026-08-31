@@ -6,6 +6,7 @@
 # authenticating https Prometheus behind a bearer token.
 cluster:
   id: prod-tls
+  sdlc: prod
 hub:
   endpoints:
     - wss://hub.example.com/tunnel
