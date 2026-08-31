@@ -198,4 +198,3 @@ type Envelope struct {
 func untrusted() Envelope { return Envelope{Untrusted: render.UntrustedNotice} }
 
 // failed returns an Envelope carrying a tool error.
-func failed(e *ToolError) Envelope { return Envelope{Error: e} }

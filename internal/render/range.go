@@ -249,6 +249,14 @@ func buildSeries(ranked []rankedSeries, start time.Time, step time.Duration, poi
 // factorShared removes the labels every series has in common and returns them
 // separately. With a single series everything is common, which is exactly the
 // case where factoring pays best.
+//
+// gosec reports G602 four times in this function and is wrong four times.
+// series[1:] is guarded by the len(series) == 0 return immediately above it,
+// and every other index is the loop variable of `for i := range series`, which
+// cannot leave the slice. Its taint analysis loses the length through
+// buildSeries' append loop; there is no unbounded index here.
+//
+//nolint:gosec // G602: bounded by the len check above and by `range series`.
 func factorShared(series []RangeSeries) (map[string]string, []RangeSeries) {
 	if len(series) == 0 {
 		return nil, series

@@ -73,6 +73,13 @@ func intRange(lo, hi, def int) mcpsurface.Constraint {
 	}
 }
 
+// These named constructors keep run's error envelope allocation testable even
+// for tools whose transport schema rejects every input that could make their
+// implementation return a ToolError.
+func newListClustersOut() *ListClustersOut { return &ListClustersOut{} }
+
+func newExplainPromQLOut() *ExplainPromQLOut { return &ExplainPromQLOut{} }
+
 // Register installs every tool, resource and prompt on s.
 //
 // It is the composition root's single entry point: the hub does not need to
@@ -130,8 +137,7 @@ func (t *Tools) registerDiscovery(s *mcpsurface.Server) {
 				Examples: []any{map[string]string{"env": "prod", "region": "eu-west"}},
 			},
 		},
-	}, run(t, ToolListClusters,
-		func() *ListClustersOut { return &ListClustersOut{} }, t.listClusters))
+	}, run(t, ToolListClusters, newListClustersOut, t.listClusters))
 
 	mcpsurface.AddTool(s, mcpsurface.Tool{
 		Name:  ToolDescribeCluster,
@@ -223,8 +229,7 @@ func (t *Tools) registerQuery(s *mcpsurface.Server) {
 				Examples:  []any{`rate(http_requests_total{job="api"}[5m])`},
 			},
 		},
-	}, run(t, ToolExplainPromQL,
-		func() *ExplainPromQLOut { return &ExplainPromQLOut{} }, t.explainPromQL))
+	}, run(t, ToolExplainPromQL, newExplainPromQLOut, t.explainPromQL))
 }
 
 // registerMetadata registers the discovery tools that read series metadata.

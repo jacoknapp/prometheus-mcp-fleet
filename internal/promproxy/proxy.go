@@ -248,7 +248,7 @@ func (p *Proxy) Do(ctx context.Context, principal *fleet.Principal, call Call) (
 			Limit:      int64(inflight),
 			RetryAfter: ClusterBusyRetryAfter,
 		}
-		p.log.Warn("promproxy: cluster in-flight budget exhausted",
+		p.log.WarnContext(ctx, "promproxy: cluster in-flight budget exhausted",
 			"cluster", call.ClusterID, "endpoint", string(call.Endpoint), "limit", inflight)
 		p.observe(call, start, CodeBusy)
 		return nil, err
@@ -276,7 +276,7 @@ func (p *Proxy) Do(ctx context.Context, principal *fleet.Principal, call Call) (
 			Limit:      p.bytes.capacity,
 			RetryAfter: HubBusyRetryAfter,
 		}
-		p.log.Warn("promproxy: hub response budget exhausted",
+		p.log.WarnContext(ctx, "promproxy: hub response budget exhausted",
 			"cluster", call.ClusterID, "endpoint", string(call.Endpoint), "want_bytes", maxBytes)
 		p.observe(call, start, CodeBusy)
 		return nil, busy

@@ -195,6 +195,26 @@ func (s *State) PutKey(k *fleet.Key) (bool, error) {
 	if _, ok := s.Keys[k.KID]; ok {
 		return false, fmt.Errorf("key %s: %w", k.KID, ErrAlreadyExists)
 	}
+	s.putKey(k)
+	s.bump()
+	return true, nil
+}
+
+// PutKeyIfNoUsable stores k when the current record is absent or unusable at
+// at. The check and replacement occur within the backend's single mutation.
+func (s *State) PutKeyIfNoUsable(k *fleet.Key, at time.Time) (bool, error) {
+	if err := validateKey(k); err != nil {
+		return false, err
+	}
+	if rec, ok := s.Keys[k.KID]; ok && rec.value().Usable(at) {
+		return false, nil
+	}
+	s.putKey(k)
+	s.bump()
+	return true, nil
+}
+
+func (s *State) putKey(k *fleet.Key) {
 	rec := KeyRecord{V: SchemaVersion, Key: cloneKey(*k), SecretHMAC: slices.Clone(k.SecretHMAC)}
 	// The digest lives in exactly one place, the record's own field. Leaving a
 	// copy on the embedded domain value would make the in-memory document and
@@ -202,8 +222,6 @@ func (s *State) PutKey(k *fleet.Key) (bool, error) {
 	// that difference is the kind that shows up as a bug months later.
 	rec.Key.SecretHMAC = nil
 	s.Keys[k.KID] = rec
-	s.bump()
-	return true, nil
 }
 
 // GetKey returns the key with the given KID. See [Store.GetKey].

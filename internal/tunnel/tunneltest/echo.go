@@ -265,7 +265,9 @@ func DeterministicBody(n int) []byte {
 		state ^= state >> 12
 		state ^= state << 25
 		state ^= state >> 27
-		out[i] = byte((state * 0x2545F4914F6CDD1D) >> 33)
+		// The mask says what the byte conversion already did: take the low
+		// eight bits. Truncation is the point -- this is a PRNG byte, not a length.
+		out[i] = byte(((state * 0x2545F4914F6CDD1D) >> 33) & 0xFF)
 	}
 	return out
 }

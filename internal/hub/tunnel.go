@@ -22,6 +22,11 @@ import (
 // exactly one implementation and nothing here benefits from indirection.
 type prometheusRegistry = prometheus.Registry
 
+// osHostname is indirected so the "this host cannot name itself" path can be
+// exercised, following the same convention internal/ca and internal/token use
+// for the syscalls they have to handle failing.
+var osHostname = os.Hostname
+
 // newTunnelServer builds the hub side of the WebSocket tunnel.
 //
 // There is no tunnel certificate and no tunnel listener any more. An Ingress
@@ -39,8 +44,9 @@ func (h *hub) newTunnelServer(ctx context.Context) (*wstun.Server, error) {
 	}
 
 	// Name the replica in the ServerHello so a spoke's logs say which hub
-	// accepted it. It is diagnostic only and never authenticates anything.
-	serverID, err := os.Hostname()
+	// accepted it. It is diagnostic only and never authenticates anything, so
+	// a host that cannot tell us its own name costs a log line, not a startup.
+	serverID, err := osHostname()
 	if err != nil {
 		serverID = ""
 	}

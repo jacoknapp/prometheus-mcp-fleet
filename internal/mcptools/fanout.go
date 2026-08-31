@@ -403,6 +403,13 @@ func (t *Tools) selectClusters(
 // commonStep picks one step for every cluster: the largest of the per-cluster
 // automatic steps. A shared step is what makes the merged rows comparable, and
 // taking the largest keeps every cluster at or above its own scrape interval.
+//
+// targets is never empty here: fanoutQuery's sole call site only reaches this
+// after selectClusters has already refused an empty selection. Combined with
+// [render.SelectStep]'s own guarantee that it always returns a positive
+// duration, the loop below always runs at least once and always drives best
+// above zero, so there is deliberately no empty-targets fallback branch — it
+// could never fire and would be an untested branch.
 func (t *Tools) commonStep(
 	targets []fleet.Cluster, start, end time.Time, userStep time.Duration,
 ) (time.Duration, render.Downsampled) {
@@ -421,11 +428,6 @@ func (t *Tools) commonStep(
 			best, chosen = step, down
 		}
 	}
-	if best <= 0 {
-		best, chosen = render.SelectStep(render.StepRequest{
-			Start: start, End: end, UserStep: userStep, MaxPoints: render.DefaultMaxPoints,
-		})
-	}
 	chosen.AppliedStep = render.FormatDuration(best)
 	if len(targets) > 1 {
 		chosen.Reason = chosen.Reason + "; common step across " +
@@ -440,22 +442,40 @@ func (t *Tools) dispatch(
 	endpoint promapi.Endpoint, form url.Values, concurrency int, perCluster time.Duration,
 ) []fanoutResult {
 	results := make([]fanoutResult, len(targets))
-	sem := make(chan struct{}, concurrency)
-	var wg sync.WaitGroup
-	for i, c := range targets {
-		wg.Add(1)
-		go func(i int, c fleet.Cluster) {
-			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-ctx.Done():
-				results[i] = fanoutResult{cluster: c.ID, timedOut: true}
-				return
-			}
-			results[i] = t.queryOne(ctx, p, c, endpoint, form, perCluster)
-		}(i, c)
+	type job struct {
+		index   int
+		cluster fleet.Cluster
 	}
+	jobs := make(chan job)
+	var wg sync.WaitGroup
+	workers := min(concurrency, len(targets))
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				results[j.index] = t.queryOne(
+					ctx, p, j.cluster, endpoint, form, perCluster,
+				)
+			}
+		}()
+	}
+
+	for i, c := range targets {
+		select {
+		case jobs <- job{index: i, cluster: c}:
+		case <-ctx.Done():
+			// Unassigned targets never reached a worker, so name each one and
+			// account it as timed out rather than leaving a misleading zero value.
+			for j := i; j < len(targets); j++ {
+				results[j] = fanoutResult{cluster: targets[j].ID, timedOut: true}
+			}
+			close(jobs)
+			wg.Wait()
+			return results
+		}
+	}
+	close(jobs)
 	wg.Wait()
 	return results
 }
@@ -515,10 +535,11 @@ func (t *Tools) mergeInstant(out *FanoutQueryOut, results []fanoutResult, maxSer
 			Vector: r.vector, ResultType: "vector", Warnings: r.warnings,
 		}, render.Options{MaxItems: maxSeries, TokenCeiling: -1})
 		total += enc.Total
+		// enc.Rows are always the {name, labels, value} 3-tuples EncodeInstant's
+		// own vector branch builds (see instantTable in query.go for the same
+		// guarantee), so there is deliberately no defensive short-row skip
+		// here — it could never fire and would be an untested branch.
 		for _, row := range enc.Rows {
-			if len(row) < 3 {
-				continue
-			}
 			labels, _ := row[1].(map[string]string)
 			labels, warn := injectCluster(labels, r.cluster, enc.SharedLabels)
 			if warn != "" {

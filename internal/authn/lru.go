@@ -96,13 +96,6 @@ func (c *lruCache[K, V]) Purge() {
 	c.head, c.tail = nil, nil
 }
 
-// Len returns the number of entries currently held.
-func (c *lruCache[K, V]) Len() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return len(c.m)
-}
-
 // pushFront links n at the most-recently-used end. The caller holds c.mu.
 func (c *lruCache[K, V]) pushFront(n *lruNode[K, V]) {
 	n.prev = nil

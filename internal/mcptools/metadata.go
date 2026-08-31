@@ -150,7 +150,7 @@ func (t *Tools) searchMetrics(
 		if terr != nil {
 			// Metadata is an enrichment, not the answer. A cluster that does
 			// not serve it must not turn a working search into a failure.
-			t.log.Debug("mcptools: metric metadata unavailable", "code", terr.Code)
+			t.log.DebugContext(ctx, "mcptools: metric metadata unavailable", "code", terr.Code)
 		} else {
 			for i := range out.Metrics {
 				if m, ok := meta[out.Metrics[i].Name]; ok {

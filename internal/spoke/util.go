@@ -42,6 +42,12 @@ func fullJitter(base, max time.Duration, attempt int) time.Duration {
 	if max <= 0 || max < base {
 		max = 30 * time.Second
 	}
+	if max < base {
+		// The fallback cap can itself land below an unusually large base. The
+		// configured minimum delay is a floor, so the cap is raised to meet it
+		// rather than the window silently exceeding the cap on attempt zero.
+		max = base
+	}
 	window := base
 	for range attempt {
 		window *= 2

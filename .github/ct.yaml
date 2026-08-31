@@ -4,8 +4,13 @@
 # helm/chart-testing configuration, consumed by `.github/workflows/chart.yml`
 # and reproducible locally with:
 #
-#   ct lint    --config .github/ct.yaml --check-version-increment --all
-#   ct install --config .github/ct.yaml --all      # needs a kube context
+#   ct lint --config .github/ct.yaml --check-version-increment --all
+#
+# Lint only. `ct install` is deliberately not run against these charts: it
+# installs each chart from its own ci/*.yaml, and those are render fixtures
+# naming an image no release has published and seven Secrets an operator is
+# expected to supply. A live install lives in .github/workflows/e2e.yml, which
+# has values built for exactly that. See the header of chart.yml.
 remote: origin
 target-branch: main
 
@@ -22,11 +27,3 @@ validate-maintainers: true
 # A chart change without a Chart.yaml version bump is the single most common
 # way a fleet of 100 clusters ends up unable to tell two renders apart.
 check-version-increment: true
-
-# `ct install` gets a fresh namespace per chart so a leaked resource in one
-# chart cannot mask a bug in the other.
-namespace: ""
-release-label: app.kubernetes.io/instance
-
-# Give the tunnel listener and the CA bootstrap time on a cold kind node.
-helm-extra-args: --timeout 600s

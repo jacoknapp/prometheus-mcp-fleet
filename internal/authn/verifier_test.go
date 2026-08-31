@@ -40,7 +40,7 @@ func newTestVerifier(t *testing.T, tweak func(*Options)) (*Verifier, *fakeStore,
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	t.Cleanup(func() { _ = v.Close() })
+	t.Cleanup(v.Close)
 	return v, store, metrics, clock
 }
 
@@ -74,7 +74,7 @@ func TestNewAppliesDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	t.Cleanup(func() { _ = v.Close() })
+	t.Cleanup(v.Close)
 	if got, want := v.cacheTTL, DefaultCacheTTL; got != want {
 		t.Errorf("cacheTTL = %s, want %s", got, want)
 	}
@@ -87,7 +87,7 @@ func TestNewAppliesDefaults(t *testing.T) {
 	if v.clock == nil || v.metrics == nil || v.log == nil || v.decoy == nil {
 		t.Fatal("New left a defaulted field nil")
 	}
-	if got := v.pos.Len(); got != 0 {
+	if got := len(v.pos.m); got != 0 {
 		t.Errorf("fresh cache holds %d entries, want 0", got)
 	}
 }
@@ -463,9 +463,7 @@ func TestVerifyTouchesKeyAsynchronously(t *testing.T) {
 	if _, err := v.Verify(context.Background(), raw, fleet.ClassAgent); err != nil {
 		t.Fatalf("Verify: %v", err)
 	}
-	if err := v.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
+	v.Close()
 	at, ok := store.touchedAt(key.KID)
 	if !ok {
 		t.Fatal("TouchKey was never called")
@@ -486,9 +484,7 @@ func TestVerifyTouchFailureNeverFailsTheRequest(t *testing.T) {
 	if _, err := v.Verify(context.Background(), raw, fleet.ClassAgent); err != nil {
 		t.Fatalf("Verify: %v", err)
 	}
-	if err := v.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
+	v.Close()
 }
 
 func TestVerifyTouchSurvivesRequestCancellation(t *testing.T) {
@@ -501,9 +497,7 @@ func TestVerifyTouchSurvivesRequestCancellation(t *testing.T) {
 		t.Fatalf("Verify: %v", err)
 	}
 	cancel() // the client hangs up the instant the response is written
-	if err := v.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
+	v.Close()
 	if _, ok := store.touchedAt(key.KID); !ok {
 		t.Error("a cancelled request dropped the best-effort last-used write")
 	}
@@ -673,9 +667,7 @@ func TestSlogNeverSeesACredential(t *testing.T) {
 	}
 	store.mutate(key.KID, func(k *fleet.Key) { k.SecretHMAC = v.hasher.Sum([]byte("no")) })
 	_, _ = v.Verify(ctx, raw, fleet.ClassAgent)
-	if err := v.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
+	v.Close()
 
 	logged := buf.String()
 	if strings.Contains(logged, raw) {
@@ -809,9 +801,7 @@ func TestTouchIsBestEffortAndDoesNotBumpTheEpoch(t *testing.T) {
 		t.Fatal("TouchKey completed synchronously; it must not be on the request path")
 	}
 	close(gate)
-	if err := v.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
+	v.Close()
 	if _, ok := store.touchedAt(key.KID); !ok {
 		t.Error("the best-effort last-used write never happened")
 	}
@@ -854,9 +844,7 @@ func TestTouchIsDroppedWhenTheWorkerBudgetIsExhausted(t *testing.T) {
 		}
 	}
 	close(gate)
-	if err := v.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
+	v.Close()
 
 	var touched int
 	for _, kid := range kids {
@@ -886,7 +874,7 @@ func TestVerifiedCacheIsBoundedAndEvicts(t *testing.T) {
 			t.Fatalf("Verify: %v", err)
 		}
 	}
-	if got := v.pos.Len(); got > size {
+	if got := len(v.pos.m); got > size {
 		t.Errorf("positive cache holds %d entries, want at most %d", got, size)
 	}
 	// The oldest entry was evicted, so re-presenting it costs a lookup.
@@ -909,7 +897,7 @@ func TestVerifiedCacheIsBoundedAndEvicts(t *testing.T) {
 			t.Fatal("an unknown key identifier authenticated")
 		}
 	}
-	if got := v.neg.Len(); got > size {
+	if got := len(v.neg.m); got > size {
 		t.Errorf("negative cache holds %d entries, want at most %d", got, size)
 	}
 }

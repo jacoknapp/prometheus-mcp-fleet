@@ -103,6 +103,13 @@ type fakeStore struct {
 	// caller's own admin credential, and every route answers 401 instead of
 	// the failure being examined.
 	errGetKID string
+	// revokedCertsNil makes ListRevokedCerts return a nil slice with no error,
+	// the shape a store backed by a data format with no empty/absent
+	// distinction (or a bug in one) could plausibly return. Every other path
+	// through this fake builds a non-nil empty slice even when there is
+	// nothing revoked, so this is the only way to exercise a handler's own
+	// nil-to-empty normalization.
+	revokedCertsNil bool
 }
 
 func newFakeStore() *fakeStore {
@@ -252,6 +259,9 @@ func (f *fakeStore) ListRevokedCerts(context.Context) ([]RevokedCert, error) {
 	defer f.mu.Unlock()
 	if f.errListRevoked != nil {
 		return nil, f.errListRevoked
+	}
+	if f.revokedCertsNil {
+		return nil, nil
 	}
 	out := make([]RevokedCert, 0, len(f.revoked))
 	for _, rc := range f.revoked {
@@ -452,7 +462,7 @@ func newHarness(t *testing.T, tweak func(*Options)) *harness {
 	if err != nil {
 		t.Fatalf("authn.New: %v", err)
 	}
-	t.Cleanup(func() { _ = verifier.Close() })
+	t.Cleanup(verifier.Close)
 	h.verifier = verifier
 
 	opts := Options{
@@ -1063,6 +1073,62 @@ func (h *harness) rogueClientCert(commonName string) spokeIdentity {
 		tlsCert: tls.Certificate{Certificate: [][]byte{der}, PrivateKey: leafKey, Leaf: leaf},
 		key:     leafKey,
 	}
+}
+
+// failingRandReader is a [crypto/rand.Reader] replacement that always fails,
+// for exercising the entropy-failure paths of [token.Mint] and [ca.CA]'s
+// serial and CRL/certificate signing -- none of which internal/hubapi can
+// inject directly, since the seams for that (internal/token's randRead,
+// internal/ca's caRandomInt) are private to their own packages and internal/ca
+// is out of scope for this pass. crypto/rand.Reader is the one entropy source
+// every one of them ultimately reads from, and it is an exported, assignable
+// package variable for exactly this purpose.
+type failingRandReader struct{}
+
+func (failingRandReader) Read([]byte) (int, error) {
+	return 0, errors.New("entropy source unavailable")
+}
+
+// withFailingRand replaces crypto/rand.Reader with one that always fails for
+// the remainder of the test, restoring it in cleanup.
+//
+// It must be called only from a test that never calls t.Parallel(), directly
+// or in any subtest: crypto/rand.Reader is process-global state, and a
+// parallel test's body could be reading real entropy concurrently. This is
+// safe because the testing package does not start running any test that has
+// called t.Parallel() until every non-parallel top-level test has already
+// returned -- so a plain, serial top-level test in this package is guaranteed
+// to run with no parallel test executing alongside it. See
+// internal/ca/ca_test.go's TestCAOperationalFailures for the same pattern
+// applied to that package's own, private entropy seam.
+func withFailingRand(t *testing.T) {
+	t.Helper()
+	orig := rand.Reader
+	rand.Reader = failingRandReader{}
+	t.Cleanup(func() { rand.Reader = orig })
+}
+
+// failingResponseWriter is an http.ResponseWriter whose Write always fails
+// after a real status and headers have been recorded, the shape a client that
+// hung up mid-response takes. It exists to reach the log-and-continue branch
+// every handler in this package runs after writing a body, without the
+// httptest.Server/net/http client round trip that a real broken connection
+// would otherwise require to simulate reliably.
+type failingResponseWriter struct {
+	header http.Header
+	status int
+}
+
+func newFailingResponseWriter() *failingResponseWriter {
+	return &failingResponseWriter{header: http.Header{}}
+}
+
+func (f *failingResponseWriter) Header() http.Header { return f.header }
+
+func (f *failingResponseWriter) WriteHeader(status int) { f.status = status }
+
+func (f *failingResponseWriter) Write([]byte) (int, error) {
+	return 0, errors.New("write: connection reset by peer")
 }
 
 // mustRequest builds a request or fails the test.

@@ -62,7 +62,7 @@ func Run(ctx context.Context, cfg *config.Hub) error {
 	}
 	build := version.Get()
 	logger = logger.With("component", "hub")
-	logger.Info("starting", "version", build.Version, "commit", build.Commit)
+	logger.InfoContext(ctx, "starting", "version", build.Version, "commit", build.Commit)
 
 	promRegistry := obs.NewRegistry(build, "hub")
 	metrics := newMetricsAdapter(obs.NewHubMetrics(promRegistry))
@@ -80,13 +80,7 @@ func Run(ctx context.Context, cfg *config.Hub) error {
 	if err != nil {
 		return fmt.Errorf("initialise tracing: %w", err)
 	}
-	defer func() {
-		flush, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer cancel()
-		if err := shutdownTracing(flush); err != nil {
-			logger.Warn("flushing traces failed", "error", err)
-		}
-	}()
+	defer flushTraces(ctx, logger, shutdownTracing)
 
 	h := &hub{
 		cfg:      cfg,
@@ -98,6 +92,26 @@ func Run(ctx context.Context, cfg *config.Hub) error {
 		startedA: time.Now(),
 	}
 	return h.run(ctx)
+}
+
+// traceFlushTimeout bounds the final span export at shutdown. It is short: a
+// collector that has not accepted the batch by then is not going to, and the
+// process is trying to exit.
+const traceFlushTimeout = 5 * time.Second
+
+// flushTraces drains the trace exporter on the way out.
+//
+// A failure is logged and swallowed on purpose. Spans that never reached the
+// collector are a diagnostic loss, and turning that into a non-zero exit code
+// would make an unreachable collector look like a crashed hub.
+func flushTraces(ctx context.Context, logger *slog.Logger, shutdown func(context.Context) error) {
+	// The parent context is cancelled by the time this runs, so the flush
+	// carries its own deadline rather than inheriting a dead one.
+	flush, cancel := context.WithTimeout(context.WithoutCancel(ctx), traceFlushTimeout)
+	defer cancel()
+	if err := shutdown(flush); err != nil {
+		logger.WarnContext(flush, "flushing traces failed", "error", err)
+	}
 }
 
 // hub holds the wired-up components for one process.
@@ -121,17 +135,26 @@ type hub struct {
 	tunnel    *wstun.Server
 	// now is injectable for tests; nil means time.Now.
 	now func() time.Time
+	// inCluster resolves the in-cluster Kubernetes client. It is injectable
+	// because the real one reads a projected service account from an absolute
+	// path outside the test's control, so the whole secret-backed startup path
+	// would otherwise be unreachable from a test. nil means kube.InCluster.
+	inCluster func() (*kube.Client, error)
+}
+
+// kubeClient resolves the in-cluster Kubernetes client.
+func (h *hub) kubeClient() (*kube.Client, error) {
+	if h.inCluster != nil {
+		return h.inCluster()
+	}
+	return kube.InCluster()
 }
 
 func (h *hub) run(ctx context.Context) error {
 	if err := h.openState(ctx); err != nil {
 		return err
 	}
-	defer func() {
-		if err := h.store.Close(); err != nil {
-			h.logger.Warn("closing the credential store failed", "error", err)
-		}
-	}()
+	defer h.closeStore(ctx)
 
 	// Mint the first admin credential before anything is served, so an
 	// operator can administer a hub that has just come up for the first time.
@@ -167,7 +190,7 @@ func (h *hub) run(ctx context.Context) error {
 
 	listener := h.tunnel.Listener()
 	h.health.Set("tunnel", true, "")
-	h.logger.Info("tunnel endpoint ready",
+	h.logger.InfoContext(ctx, "tunnel endpoint ready",
 		"path", h.cfg.TunnelPath, "addr", public.Addr(), "max_spokes", h.cfg.MaxSpokes)
 
 	group, gctx := errgroup.WithContext(ctx)
@@ -180,10 +203,18 @@ func (h *hub) run(ctx context.Context) error {
 	//nolint:contextcheck // deliberate: draining needs a live deadline, not a cancelled parent.
 	h.drain(listener)
 
-	if err := group.Wait(); err != nil && !errors.Is(err, context.Canceled) {
-		return err
+	// serveTunnel already reports a cancelled context as a clean stop, and the
+	// other two goroutines never fail, so there is nothing left to filter here.
+	return group.Wait()
+}
+
+// closeStore reports a persistence shutdown failure without changing the
+// process result. At this point all request-serving work is already stopping;
+// returning a second error would hide the error that caused run to unwind.
+func (h *hub) closeStore(ctx context.Context) {
+	if err := h.store.Close(); err != nil {
+		h.logger.WarnContext(ctx, "closing the credential store failed", "error", err)
 	}
-	return nil
 }
 
 // openState brings up the Kubernetes client, the CA, the pepper and the
@@ -191,22 +222,28 @@ func (h *hub) run(ctx context.Context) error {
 func (h *hub) openState(ctx context.Context) error {
 	backend := h.cfg.StateBackend
 	if backend == config.StateBackendAuto {
-		if _, err := kube.InCluster(); err == nil {
+		if _, err := h.kubeClient(); err == nil {
 			backend = config.StateBackendSecret
 		} else {
 			backend = config.StateBackendFile
 		}
-		h.logger.Info("resolved state backend", "backend", backend)
+		h.logger.InfoContext(ctx, "resolved state backend", "backend", backend)
 	}
 
 	if backend == config.StateBackendSecret {
-		client, err := kube.InCluster()
+		client, err := h.kubeClient()
 		if err != nil {
 			return fmt.Errorf("state backend %q needs an in-cluster service account: %w",
 				backend, err)
 		}
+		// A configured namespace overrides the projected one, and nothing
+		// else. The API server address, the bearer token file and the CA
+		// bundle are knowledge only the in-cluster resolver has, so building a
+		// second client out of the namespace alone yields a client with no API
+		// server to talk to -- which is a startup failure on every install
+		// that sets PMF_NAMESPACE, and the chart always sets it.
 		if h.cfg.Namespace != "" {
-			if client, err = kube.New(kube.Config{Namespace: h.cfg.Namespace}); err != nil {
+			if client, err = client.WithNamespace(h.cfg.Namespace); err != nil {
 				return fmt.Errorf("configure the Kubernetes client: %w", err)
 			}
 		}
@@ -226,7 +263,7 @@ func (h *hub) openState(ctx context.Context) error {
 	h.authority, h.hasher = authority, hasher
 	h.metrics.CACertExpiry(authority.NotAfter())
 	h.health.Set("ca", true, "")
-	h.logger.Info("certificate authority ready",
+	h.logger.InfoContext(ctx, "certificate authority ready",
 		"not_after", authority.NotAfter().Format(time.RFC3339),
 		"trust_domain", h.cfg.TrustDomain)
 
@@ -276,10 +313,8 @@ func (h *hub) buildRequestPath() error {
 	if h.proxy, err = h.newProxy(); err != nil {
 		return err
 	}
-	if h.mcp, err = h.buildMCP(); err != nil {
-		return err
-	}
-	return nil
+	h.mcp, err = h.buildMCP()
+	return err
 }
 
 // newProxy builds the routing and budget layer.
@@ -360,7 +395,7 @@ func (h *hub) startAdmin(ctx context.Context) (*httpx.Server, error) {
 	mux.Handle("GET /metrics", obs.MetricsHandler(h.promReg))
 	if h.cfg.PprofEnabled {
 		mux.Handle("/debug/pprof/", obs.PprofHandler())
-		h.logger.Warn("pprof is enabled; keep this listener off the network")
+		h.logger.WarnContext(ctx, "pprof is enabled; keep this listener off the network")
 	}
 
 	srv := httpx.NewServer(httpx.ServerConfig{
@@ -374,7 +409,7 @@ func (h *hub) startAdmin(ctx context.Context) (*httpx.Server, error) {
 	if err := srv.Start(ctx); err != nil {
 		return nil, fmt.Errorf("start the admin listener: %w", err)
 	}
-	h.logger.Info("admin listener ready", "addr", srv.Addr())
+	h.logger.InfoContext(ctx, "admin listener ready", "addr", srv.Addr())
 	return srv, nil
 }
 
@@ -410,7 +445,7 @@ func (h *hub) startPublic(ctx context.Context) (*httpx.Server, error) {
 	if err := srv.Start(ctx); err != nil {
 		return nil, fmt.Errorf("start the MCP listener: %w", err)
 	}
-	h.logger.Info("mcp listener ready", "addr", srv.Addr())
+	h.logger.InfoContext(ctx, "mcp listener ready", "addr", srv.Addr())
 	return srv, nil
 }
 
@@ -463,9 +498,7 @@ func (h *hub) drain(listener tunnel.Listener) {
 	if err := listener.Shutdown(ctx); err != nil {
 		h.logger.Warn("tunnel listener did not shut down cleanly", "error", err)
 	}
-	if err := h.verifier.Close(); err != nil {
-		h.logger.Warn("closing the verifier failed", "error", err)
-	}
+	h.verifier.Close()
 }
 
 // shutdown stops one HTTP server within the configured grace.

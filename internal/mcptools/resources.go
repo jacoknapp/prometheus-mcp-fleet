@@ -105,11 +105,14 @@ func (t *Tools) readClusters(
 	if err != nil {
 		return mcpsurface.ResourceContent{}, err
 	}
-	out, terr := t.listClusters(ctx, p, ListClustersIn{Limit: 500})
-	if terr != nil {
-		return mcpsurface.ResourceContent{}, mcpsurface.ProtocolError(
-			mcpsurface.CodeInvalidParams, "%s: %s", terr.Code, terr.Message)
-	}
+	// listClusters can only fail on a caller-supplied format or status outside
+	// its closed sets (see clusters.go); the fixed ListClustersIn below
+	// supplies neither, so there is deliberately no error branch here — it
+	// could never fire and would be an untested one. (See
+	// TestResourceListClustersFailure, which proves the same shape of failure
+	// through readFiringAlerts instead, because this call site cannot
+	// produce it.)
+	out, _ := t.listClusters(ctx, p, ListClustersIn{Limit: 500})
 	return jsonContent(out)
 }
 

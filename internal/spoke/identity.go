@@ -32,6 +32,17 @@ var (
 	ErrEnrollmentRequired = errors.New("spoke: enrollment required")
 )
 
+// These are the narrow process and cryptographic boundaries whose failures the
+// spoke must survive but cannot provoke: a CSPRNG that fails, a key the
+// standard library declines to marshal, a signer that refuses. Tests replace
+// one at a time, as [github.com/jacoknapp/prometheus-mcp-fleet/internal/ca]
+// does for the same reason.
+var (
+	spokeGenerateKey = ecdsa.GenerateKey
+	spokeCreateCSR   = x509.CreateCertificateRequest
+	spokeInCluster   = kube.InCluster
+)
+
 // Keys in the identity Secret and in the file backend.
 const (
 	keyClientKey  = "tls.key"
@@ -88,7 +99,7 @@ type identityStore interface {
 func newIdentityStore(cfg *config.Spoke, logger *slog.Logger) (identityStore, error) {
 	backend := cfg.IdentityBackend
 	if backend == config.IdentityBackendAuto {
-		if _, err := kube.InCluster(); err == nil {
+		if _, err := spokeInCluster(); err == nil {
 			backend = config.IdentityBackendSecret
 		} else {
 			backend = config.IdentityBackendFile
@@ -98,7 +109,7 @@ func newIdentityStore(cfg *config.Spoke, logger *slog.Logger) (identityStore, er
 
 	switch backend {
 	case config.IdentityBackendSecret:
-		client, err := kube.InCluster()
+		client, err := spokeInCluster()
 		if err != nil {
 			return nil, fmt.Errorf("identity backend %q: %w", backend, err)
 		}
@@ -256,7 +267,7 @@ func (m *memoryIdentityStore) Save(_ context.Context, key, cert, ca []byte) erro
 // the hub's CA will sign, and it is generated here so that it never crosses the
 // network: only a certificate signing request does.
 func generateKey() (*ecdsa.PrivateKey, []byte, error) {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	key, err := spokeGenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, nil, fmt.Errorf("generate key: %w", err)
 	}
@@ -278,7 +289,7 @@ func buildCSR(key *ecdsa.PrivateKey, clusterID string) ([]byte, error) {
 		Subject:            pkixName("spoke:" + clusterID),
 		SignatureAlgorithm: x509.ECDSAWithSHA256,
 	}
-	der, err := x509.CreateCertificateRequest(rand.Reader, tmpl, key)
+	der, err := spokeCreateCSR(rand.Reader, tmpl, key)
 	if err != nil {
 		return nil, fmt.Errorf("create csr: %w", err)
 	}
@@ -286,21 +297,19 @@ func buildCSR(key *ecdsa.PrivateKey, clusterID string) ([]byte, error) {
 }
 
 // loadIdentity assembles an Identity from stored PEM material.
+//
+// It does not re-parse the leaf: crypto/tls parses it during X509KeyPair and
+// stores it on the result, so a certificate that got past the line above is
+// already a *x509.Certificate. There used to be a fallback that parsed it
+// again when Leaf was nil, which no build of Go since 1.23 can reach.
 func loadIdentity(keyPEM, certPEM, caPEM []byte) (*Identity, error) {
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		return nil, fmt.Errorf("parse stored identity: %w", err)
 	}
-	leaf := cert.Leaf
-	if leaf == nil {
-		if leaf, err = x509.ParseCertificate(cert.Certificate[0]); err != nil {
-			return nil, fmt.Errorf("parse stored certificate: %w", err)
-		}
-		cert.Leaf = leaf
-	}
 	return &Identity{
 		Certificate: cert,
-		Leaf:        leaf,
+		Leaf:        cert.Leaf,
 		CABundle:    caPEM,
 		KeyPEM:      keyPEM,
 		CertPEM:     certPEM,

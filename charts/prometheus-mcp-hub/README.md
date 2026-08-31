@@ -1,6 +1,7 @@
+
 # prometheus-mcp-hub
 
-![Version: 0.1.0](https://img.shields.io/badge/Version-0.1.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.1.0](https://img.shields.io/badge/AppVersion-0.1.0-informational?style=flat-square)
+![Version: 0.2.0](https://img.shields.io/badge/Version-0.2.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.1.0](https://img.shields.io/badge/AppVersion-0.1.0-informational?style=flat-square)
 
 MCP server that gives AI agents Prometheus capability across a fleet of Kubernetes clusters, terminating WebSocket tunnels dialled out by prometheus-mcp-spoke through a standard Ingress.
 
@@ -330,7 +331,7 @@ Kubernetes: `>=1.28.0-0`
 | autoUpdate.channelTag | string | `"stable"` | Moving OCI tag the updater resolves to a digest. It is never written into the pod spec. |
 | autoUpdate.cohort | string | `"stable"` | Release cohort. `canary` accepts a promotion immediately, `early` after 72h, `stable` after 7 days. The cohort also shifts the derived weekday so canaries always move first. |
 | autoUpdate.concurrencyPolicy | string | `"Forbid"` | `spec.concurrencyPolicy`. |
-| autoUpdate.containerSecurityContext | object | `{"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"capabilities":{"drop":["ALL"]}}` | Container security context for the update job. |
+| autoUpdate.containerSecurityContext | object | `{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"readOnlyRootFilesystem":true}` | Container security context for the update job. |
 | autoUpdate.enabled | bool | `false` | Render a CronJob that resolves `autoUpdate.channelTag` to a digest, verifies the signature and SLSA provenance with cosign, and patches this Deployment to that DIGEST. OFF BY DEFAULT AND DISCOURAGED ON THE HUB. An unattended weekly rollout across a fleet is a fleet-wide outage delivery mechanism, and the hub is the single point of failure for every agent. Read "Automatic updates" in the README before enabling. |
 | autoUpdate.extraEnv | list | `[]` | Extra environment variables for the update job, in raw `EnvVar` form. Proxy settings and registry credential helpers go here. |
 | autoUpdate.failedJobsHistoryLimit | int | `3` | `spec.failedJobsHistoryLimit`. |
@@ -414,7 +415,7 @@ Kubernetes: `>=1.28.0-0`
 | image.repository | string | `"jacoknapp/prometheus-mcp-fleet/hub"` | Image repository, without the registry. |
 | image.tag | string | `""` | Image tag. Empty means `.Chart.AppVersion`. Ignored when `image.digest` is set. |
 | imagePullSecrets | list | `[]` | Image pull secrets for a private registry. |
-| ingress.annotations | object | `{}` | Annotations for the Ingress. IDLE TIMEOUTS: an Ingress controller closes an idle upgraded connection, and the tunnel is a long-lived WebSocket. nginx defaults to 60s while the tunnel's HTTP/2 keepalive pings run every 10s, so the defaults are fine — but a controller tuned BELOW ~30s disconnects every spoke in the fleet, repeatedly, and the hub still looks healthy. Raise it there: nginx.ingress.kubernetes.io/proxy-read-timeout: "3600" nginx.ingress.kubernetes.io/proxy-send-timeout: "3600" (HAProxy: `haproxy.org/timeout-tunnel`. Traefik: the entrypoint's respondingTimeouts.) |
+| ingress.annotations | object | `{}` | Annotations for the Ingress. IDLE TIMEOUTS: an Ingress controller closes an idle upgraded connection, and the tunnel is a long-lived WebSocket. nginx defaults to 60s while the tunnel's HTTP/2 keepalive pings run every 10s, so the defaults are fine — but a controller tuned BELOW ~30s disconnects every spoke in the fleet, repeatedly, and the hub still looks healthy. Raise it there:   nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"   nginx.ingress.kubernetes.io/proxy-send-timeout: "3600" (HAProxy: `haproxy.org/timeout-tunnel`. Traefik: the entrypoint's respondingTimeouts.) |
 | ingress.className | string | `""` | `spec.ingressClassName`. |
 | ingress.enabled | bool | `false` | Render a standard `networking.k8s.io/v1` Ingress for the MCP port. This carries EVERYTHING: the agent-facing MCP endpoint and the spoke tunnel WebSocket at `tunnel.path` share the one listener, so one rule and one certificate publish the whole product. There is no second Service, no LoadBalancer and no `ssl-passthrough` to arrange. The controller only has to proxy `Connection: Upgrade`, which every Ingress controller does natively. |
 | ingress.extraHosts | list | `[]` | Additional hosts, each an object with `host`, and optionally `path` and `pathType`. Each one gets the same tunnel-path treatment as `ingress.host`. |
@@ -503,7 +504,7 @@ Kubernetes: `>=1.28.0-0`
 | readinessProbe.periodSeconds | int | `10` | Probe period. |
 | readinessProbe.successThreshold | int | `1` | Success threshold. |
 | readinessProbe.timeoutSeconds | int | `3` | Probe timeout. |
-| replicaCount | int | `1` | Number of hub replicas. Read before raising above 1: a spoke tunnel is pinned to exactly one replica and there is deliberately no hub-to-hub forwarding (BUILD_SPEC 1.11). Credential state is shared because it lives in one Secret, but tunnels are not. Real HA needs every replica individually routable from outside the cluster and every spoke configured with all N URLs in `hub.endpoints`. |
+| replicaCount | int | `1` | Number of hub replicas. Read before raising above 1: a spoke tunnel is pinned to exactly one replica and there is deliberately no hub-to-hub forwarding (BUILD_SPEC 1.11). Credential state is shared because it lives in one Secret, but tunnels are not. Real HA needs every replica individually addressable from outside the cluster and every spoke configured with all N addresses in `hub.endpoints`. |
 | resources.limits.memory | string | `"1Gi"` | Memory limit. Also the source of `GOMEMLIMIT` via the downward API. |
 | resources.requests.cpu | string | `"250m"` | CPU request. |
 | resources.requests.memory | string | `"256Mi"` | Memory request. |

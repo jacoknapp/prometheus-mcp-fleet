@@ -63,7 +63,7 @@ func run[In any, Out toolOut](
 				"tool %q requires an authenticated principal", name)
 		}
 		if !p.Scope.AllowsTool(name) {
-			tl.log.Warn("mcptools: tool denied by scope",
+			tl.log.WarnContext(ctx, "mcptools: tool denied by scope",
 				"principal", p.String(), "tool", name)
 			tl.metrics.ToolCall(name, "FORBIDDEN")
 			tl.metrics.ToolDuration(name, tl.now().Sub(start))

@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -152,6 +153,67 @@ func TestMintWithKID(t *testing.T) {
 			t.Errorf("MintWithKID(%q) returned secret material with error", bad)
 		}
 	}
+}
+
+// TestPattern checks the regex [Pattern] returns against real minted
+// credentials of every class: this is the string published to GitHub secret
+// scanning (see internal/token/doc.go and SECURITY.md), so a change to the
+// wire format that this regex stops matching would silently blind the
+// scanner. It also checks the two documented negative cases: a string that
+// merely resembles a token, and a corrupted CRC, which the pattern matches on
+// shape alone by design.
+func TestPattern(t *testing.T) {
+	t.Parallel()
+
+	re, err := regexp.Compile("^" + Pattern() + "$")
+	if err != nil {
+		t.Fatalf("Pattern() did not compile: %v", err)
+	}
+
+	for _, class := range []fleet.KeyClass{fleet.ClassAdmin, fleet.ClassAgent, fleet.ClassEnrollment} {
+		m, err := Mint(class)
+		if err != nil {
+			t.Fatalf("Mint(%s): %v", class, err)
+		}
+		raw := m.Raw.Reveal()
+		if !re.MatchString(raw) {
+			t.Errorf("Pattern() does not match a freshly minted %s token", class)
+		}
+	}
+
+	for _, bad := range []string{
+		"",
+		"not a token at all",
+		"pmf_xyz_" + strings.Repeat("a", KIDLen+SecretLen) + "_" + strings.Repeat("a", CRCLen),
+	} {
+		if re.MatchString(bad) {
+			t.Errorf("Pattern() matched %q, want no match (unknown class or non-token text)", bad)
+		}
+	}
+
+	// The pattern matches shape, not validity: a well-formed token with a
+	// deliberately wrong checksum must still match, per Pattern's doc comment.
+	m, err := Mint(fleet.ClassAgent)
+	if err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+	raw := m.Raw.Reveal()
+	corrupted := raw[:len(raw)-1] + string(flipBase62Digit(raw[len(raw)-1]))
+	if !re.MatchString(corrupted) {
+		t.Errorf("Pattern() did not match a shape-valid token with a corrupted checksum: %q", corrupted)
+	}
+	if _, _, _, err := Parse(corrupted); !errors.Is(err, ErrBadChecksum) {
+		t.Fatalf("Parse(corrupted) error = %v, want ErrBadChecksum (test fixture is not exercising what it claims)", err)
+	}
+}
+
+// flipBase62Digit returns a base62 digit different from b, so a test can
+// corrupt exactly one character of a token without risking a no-op edit.
+func flipBase62Digit(b byte) byte {
+	if b == '0' {
+		return '1'
+	}
+	return '0'
 }
 
 func TestIsBase62(t *testing.T) {

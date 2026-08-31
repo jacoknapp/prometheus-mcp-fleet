@@ -1,0 +1,31 @@
+# Reflection/interface hooks that static call-graph analysis cannot see.
+Hub.LogValue
+Minted.GoString
+Minted.LogValue
+Minted.MarshalJSON
+Minted.String
+RawToken.GoString
+RawToken.IsZero
+RawToken.LogValue
+RawToken.MarshalJSON
+RawToken.MarshalText
+RawToken.String
+
+# Deliberate package contracts used by conformance tests, SDK adapters,
+# operator tooling, or the shipped secret-scanning pattern. These internal
+# package APIs are kept explicit so additions require review here.
+CA.Certificate
+Endpoints
+ErrorCode
+MaxBody
+Pattern
+PromptNames
+Register
+ResourceURIs
+Server.InputSchema
+Server.MCPServer
+Server.Mount
+Server.ResourceTemplateURIs
+StaticTokenVerifier
+ToolNames
+WriteJSON

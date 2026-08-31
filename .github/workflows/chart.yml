@@ -4,6 +4,24 @@
 # Helm chart quality gates for charts/prometheus-mcp-hub and
 # charts/prometheus-mcp-spoke. Unprivileged: `contents: read` everywhere, so a
 # fork PR runs the identical set with no secrets.
+#
+# This workflow renders and validates; it does not install into a live cluster.
+# `ct install` used to be here and could never have passed. It installs each
+# chart against its own ci/*.yaml, and those files are RENDER fixtures: they
+# name ghcr.io/.../{hub,spoke}:0.1.0, which no release has published yet, and
+# they mount seven operator-supplied Secrets (hub-bootstrap, hub-ca,
+# spoke-enrollment, prometheus-sa-token, ...) that chart-testing never creates.
+# Every release would have sat in ImagePullBackOff or ContainerCreating until
+# the 600s timeout. The two properties it was reaching for are both covered,
+# and covered better:
+#
+#   * "the manifests are valid for k8s 1.28 / 1.31 / 1.34" -> the kubeconform
+#     job below, which checks every chart x ci/ values combination against all
+#     three API versions.
+#   * "it actually comes up and works in a cluster" -> .github/workflows/e2e.yml,
+#     which builds both images, side-loads them into kind, installs both charts
+#     with purpose-built values in .github/e2e/, mints real credentials and
+#     makes a real MCP tool call through the hub.
 name: chart
 
 on:
@@ -29,8 +47,6 @@ env:
   HELM_UNITTEST_VERSION: "1.1.2"
   # renovate: datasource=github-releases depName=norwoodj/helm-docs
   HELM_DOCS_VERSION: "v1.14.2"
-  # renovate: datasource=github-releases depName=kubernetes-sigs/kind
-  KIND_VERSION: "v0.33.0"
   CHARTS: "charts/prometheus-mcp-hub charts/prometheus-mcp-spoke"
 
 jobs:
@@ -155,12 +171,9 @@ jobs:
 
           validate() {
             local chart="$1" values="$2"
-            echo "==> ${chart} (${values:-defaults}) against k8s ${K8S_VERSION}"
-            local args=(template release-name "${chart}" --kube-version "${K8S_VERSION}")
-            if [ -n "${values}" ]; then
-              args+=(--values "${values}")
-            fi
-            helm "${args[@]}" \
+            echo "==> ${chart} (${values}) against k8s ${K8S_VERSION}"
+            helm template release-name "${chart}" \
+                --kube-version "${K8S_VERSION}" --values "${values}" \
               | docker run --rm -i "${KUBECONFORM_IMAGE}" \
                   -strict \
                   -summary \
@@ -171,31 +184,35 @@ jobs:
                   -
           }
 
+          # Deliberately no defaults-only render. The spoke's values.schema.json
+          # marks cluster.id, hub.endpoints and hub.apiUrl required with no
+          # defaults -- that absence is the guard stopping a hundred clusters
+          # from silently sharing one identity -- so `helm template <chart>`
+          # with nothing else can only ever fail, and it did. ci/*.yaml holds
+          # the renderable shapes, including a default-values.yaml that is the
+          # defaults plus exactly the values that have no sane default. Same
+          # reasoning as `make helm-lint` and `ct lint`.
+          #
+          # An empty ci/ directory would make this loop a silent no-op, so it
+          # is an error rather than a green tick.
           rc=0
           for chart in ${CHARTS}; do
-            validate "${chart}" "" || rc=1
+            if ! ls "${chart}"/ci/*.yaml >/dev/null 2>&1; then
+              echo "::error file=${chart}/Chart.yaml::${chart}/ci/ has no values files; kubeconform would validate nothing"
+              rc=1
+              continue
+            fi
             for values in "${chart}"/ci/*.yaml; do
-              [ -e "${values}" ] || continue
               validate "${chart}" "${values}" || rc=1
             done
           done
           exit "${rc}"
 
   chart-testing:
-    name: ct k8s ${{ matrix.k8s }}
+    name: ct lint
     runs-on: ubuntu-24.04
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - k8s: "1.28.15"
-            node_image: "kindest/node:v1.28.15@sha256:a7c05c7ae043a0b8c818f5a06188bc2c4098f6cb59ca7d1856df00375d839251"
-          - k8s: "1.31.14"
-            node_image: "kindest/node:v1.31.14@sha256:6f86cf509dbb42767b6e79debc3f2c32e4ee01386f0489b3b2be24b0a55aac2b"
-          - k8s: "1.34.11"
-            node_image: "kindest/node:v1.34.11@sha256:44e222ee2132dab25ff87301682f89eb82c7880ea3a1bf543bfe9708fd08d67d"
     steps:
       - name: Harden the runner
         uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
@@ -230,39 +247,6 @@ jobs:
           set -euo pipefail
           # shellcheck disable=SC2086 # CT_SCOPE is a deliberate word-split flag pair.
           ct lint --config .github/ct.yaml --check-version-increment ${CT_SCOPE}
-
-      - name: Create kind cluster
-        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
-        with:
-          version: ${{ env.KIND_VERSION }}
-          node_image: ${{ matrix.node_image }}
-          cluster_name: ct-${{ matrix.k8s }}
-          wait: 300s
-
-      - name: ct install
-        env:
-          CT_SCOPE: ${{ github.event_name == 'pull_request' && '--target-branch main' || '--all' }}
-        run: |
-          set -euo pipefail
-          # shellcheck disable=SC2086 # CT_SCOPE is a deliberate word-split flag pair.
-          ct install --config .github/ct.yaml ${CT_SCOPE}
-
-      - name: Dump cluster state on failure
-        if: failure()
-        run: |
-          set +e
-          mkdir -p ct-debug
-          kubectl cluster-info dump --all-namespaces --output-directory ct-debug/cluster-dump
-          kubectl get events --all-namespaces --sort-by=.lastTimestamp > ct-debug/events.txt
-
-      - name: Upload failure diagnostics
-        if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: ct-debug-${{ matrix.k8s }}
-          path: ct-debug
-          if-no-files-found: warn
-          retention-days: 7
 
   helm-docs:
     name: helm-docs (verify only)

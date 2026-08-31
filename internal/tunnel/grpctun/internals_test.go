@@ -248,7 +248,9 @@ func TestSpokeServerFailuresAndStreaming(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			stream := &fakeProxyServer{ctx: context.Background(), failSend: tc.fail}
 			err := (&spokeServer{h: tc.h, chunkBytes: 2}).Proxy(tc.req, stream)
-			if status.Code(err) != tc.code && !(tc.fail > 0 && errors.Is(err, errFixture)) {
+			codeMatches := status.Code(err) == tc.code
+			injectedSendFailure := tc.fail > 0 && errors.Is(err, errFixture)
+			if !codeMatches && !injectedSendFailure {
 				t.Errorf("Proxy = %v, want code %v", err, tc.code)
 			}
 		})
@@ -393,7 +395,7 @@ func TestSessionErrorMappingAndProtocol(t *testing.T) {
 		if s.CloseReason() != "" {
 			t.Error("live session has a close reason")
 		}
-		if got := s.mapErr(nil, nil); got != nil {
+		if got := s.mapErr(context.Background(), nil); got != nil {
 			t.Errorf("mapErr(nil) = %v", got)
 		}
 		ctx, cancel := context.WithCancel(context.Background())
@@ -783,11 +785,11 @@ func TestWatchStoppedAndCloseError(t *testing.T) {
 	if err := s.cc.Close(); err != nil {
 		t.Fatalf("pre-close ClientConn: %v", err)
 	}
-	// Closing a ClientConn that is already closed reports Canceled, and that
-	// is the idempotent case rather than a fault: Close documents itself as
-	// idempotent, so surfacing it would make every ordinary double-close look
-	// like a failure. A genuine, non-Canceled error from cc.Close must still
-	// propagate, which is what closeErr exists for.
+	// Closing a ClientConn that is already closed reports the deprecated
+	// grpc.ErrClientConnClosing (itself a Canceled status), which session.Close
+	// now discards unconditionally: a real *grpc.ClientConn has no other error
+	// to give it, so surfacing this one would make every ordinary double-close
+	// look like a fault.
 	if err := s.Close("again"); err != nil {
 		t.Errorf("second Close returned %v, want nil for the idempotent case", err)
 	}

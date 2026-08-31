@@ -160,7 +160,7 @@ func (l *listener) Serve(ctx context.Context, h tunnel.SessionHandler) error {
 		// cap: the goroutine, its buffers and its handshake have already been
 		// paid for by the time it says no.
 		if !l.reserve() {
-			l.log.Warn("tunnel rejected",
+			l.log.WarnContext(ctx, "tunnel rejected",
 				slog.String("remote", id.RemoteAddr),
 				slog.String("cluster", id.ClusterID),
 				slog.Int("max_sessions", l.cfg.MaxSessions),
@@ -187,7 +187,7 @@ func (l *listener) attach(ctx context.Context, conn net.Conn, id tunnel.Identity
 	sess, err := l.newSession(ctx, conn, id)
 	if err != nil {
 		l.release()
-		l.log.Warn("tunnel setup failed",
+		l.log.WarnContext(ctx, "tunnel setup failed",
 			slog.String("remote", id.RemoteAddr),
 			slog.String("cluster", id.ClusterID),
 			slog.Any("err", err))
@@ -197,7 +197,7 @@ func (l *listener) attach(ctx context.Context, conn net.Conn, id tunnel.Identity
 
 	release, err := h.OnSession(ctx, sess)
 	if err != nil {
-		l.log.Warn("tunnel refused by session handler",
+		l.log.WarnContext(ctx, "tunnel refused by session handler",
 			slog.String("remote", id.RemoteAddr),
 			slog.String("cluster", id.ClusterID),
 			slog.Any("err", err))
@@ -207,7 +207,7 @@ func (l *listener) attach(ctx context.Context, conn net.Conn, id tunnel.Identity
 		return
 	}
 
-	l.log.Info("tunnel session established",
+	l.log.InfoContext(ctx, "tunnel session established",
 		slog.String("remote", id.RemoteAddr),
 		slog.String("cluster", id.ClusterID),
 		slog.String("cert_serial", id.CertSerial))

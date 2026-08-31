@@ -25,11 +25,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 const (
@@ -60,6 +65,10 @@ const (
 // credentials, enrol a spoke, and drive a real MCP tool call that reaches a
 // real Prometheus and comes back with a real answer.
 func TestFleetEndToEnd(t *testing.T) {
+	if os.Getenv("PMF_E2E") != "" {
+		testProvisionedFleet(t)
+		return
+	}
 	requireTools(t, "kind", "docker", "kubectl", "helm")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
@@ -137,6 +146,199 @@ func TestFleetEndToEnd(t *testing.T) {
 		// rebuild-from-reconnect path that replaced the database.
 		waitForConnectedCluster(ctx, t, env, agentKey)
 	})
+}
+
+// testProvisionedFleet is the mode used by .github/workflows/e2e.yml. The
+// workflow owns the expensive cluster/image/chart setup and supplies stable
+// port-forwards plus ephemeral credentials; this test owns the MCP protocol
+// assertions and the reconnect check. Keeping that ownership boundary avoids
+// trying to create the already-existing pmf-e2e cluster a second time.
+func testProvisionedFleet(t *testing.T) {
+	t.Helper()
+	requireTools(t, "kubectl")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	defer cancel()
+
+	cfg := provisionedConfig{
+		mcpURL:         requiredEnv(t, "PMF_E2E_MCP_URL"),
+		adminURL:       requiredEnv(t, "PMF_E2E_HUB_ADMIN_URL"),
+		agentToken:     requiredEnv(t, "PMF_E2E_AGENT_TOKEN"),
+		clusterID:      requiredEnv(t, "PMF_E2E_CLUSTER_ID"),
+		hubNamespace:   requiredEnv(t, "PMF_E2E_HUB_NAMESPACE"),
+		hubRelease:     requiredEnv(t, "PMF_E2E_HUB_RELEASE"),
+		spokeNamespace: requiredEnv(t, "PMF_E2E_SPOKE_NAMESPACE"),
+		spokeRelease:   requiredEnv(t, "PMF_E2E_SPOKE_RELEASE"),
+	}
+
+	waitProvisionedConnected(ctx, t, cfg)
+	sess := connectMCP(ctx, t, cfg.mcpURL, cfg.agentToken)
+	t.Cleanup(func() { _ = sess.Close() })
+
+	t.Run("list_clusters", func(t *testing.T) {
+		out, err := provisionedCall(ctx, sess, "list_clusters", map[string]any{})
+		if err != nil {
+			t.Fatalf("list_clusters: %v\n%s", err, out)
+		}
+		if !strings.Contains(out, cfg.clusterID) || !strings.Contains(strings.ToLower(out), "connected") {
+			t.Fatalf("list_clusters did not report %q connected:\n%s", cfg.clusterID, out)
+		}
+	})
+
+	t.Run("query returns up==1", func(t *testing.T) {
+		out, err := provisionedCall(ctx, sess, "query", map[string]any{
+			"cluster": cfg.clusterID,
+			"query":   "up",
+		})
+		if err != nil {
+			t.Fatalf("query: %v\n%s", err, out)
+		}
+		if !strings.Contains(out, `"1"`) && !strings.Contains(out, ":1") {
+			t.Fatalf("query for up did not return a 1 value:\n%s", out)
+		}
+	})
+
+	t.Run("destructive endpoints are unreachable", func(t *testing.T) {
+		out, err := provisionedCall(ctx, sess, "delete_series", map[string]any{"cluster": cfg.clusterID})
+		lower := strings.ToLower(out)
+		if err == nil && !strings.Contains(lower, "unknown") && !strings.Contains(lower, "not found") {
+			t.Fatalf("a delete_series tool appears to exist:\n%s", out)
+		}
+	})
+
+	t.Run("an invalid key is refused", func(t *testing.T) {
+		client := mcp.NewClient(&mcp.Implementation{Name: "pmf-e2e-invalid", Version: "0"}, nil)
+		bad := "pmf_agt_" + strings.Repeat("0", 64)
+		badCtx, badCancel := context.WithTimeout(ctx, 15*time.Second)
+		defer badCancel()
+		badSession, err := client.Connect(badCtx, &mcp.StreamableClientTransport{
+			Endpoint:   cfg.mcpURL,
+			HTTPClient: &http.Client{Transport: bearerTransport{token: bad}},
+			MaxRetries: -1,
+		}, nil)
+		if badSession != nil {
+			_ = badSession.Close()
+		}
+		if err == nil {
+			t.Fatal("an invalid agent key established an MCP session")
+		}
+	})
+
+	t.Run("spoke reconnects after a hub restart", func(t *testing.T) {
+		run(ctx, t, os.Environ(), "kubectl", "-n", cfg.hubNamespace, "rollout", "restart",
+			"deployment/"+cfg.hubRelease)
+		run(ctx, t, os.Environ(), "kubectl", "-n", cfg.hubNamespace, "rollout", "status",
+			"deployment/"+cfg.hubRelease, "--timeout=3m")
+		waitProvisionedConnected(ctx, t, cfg)
+
+		// A restart invalidates any transport state held by the prior session.
+		// Reconnecting also proves the public endpoint came back, not only metrics.
+		reconnected := connectMCP(ctx, t, cfg.mcpURL, cfg.agentToken)
+		defer reconnected.Close()
+		out, err := provisionedCall(ctx, reconnected, "list_clusters", map[string]any{})
+		if err != nil || !strings.Contains(out, cfg.clusterID) {
+			t.Fatalf("list_clusters after restart = %v\n%s", err, out)
+		}
+	})
+}
+
+type provisionedConfig struct {
+	mcpURL, adminURL, agentToken, clusterID string
+	hubNamespace, hubRelease                string
+	spokeNamespace, spokeRelease            string
+}
+
+type bearerTransport struct{ token string }
+
+func (b bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	clone := req.Clone(req.Context())
+	clone.Header.Set("Authorization", "Bearer "+b.token)
+	return http.DefaultTransport.RoundTrip(clone)
+}
+
+func connectMCP(ctx context.Context, t *testing.T, endpoint, token string) *mcp.ClientSession {
+	t.Helper()
+	client := mcp.NewClient(&mcp.Implementation{Name: "prometheus-mcp-fleet-e2e", Version: "0"}, nil)
+	sess, err := client.Connect(ctx, &mcp.StreamableClientTransport{
+		Endpoint:   endpoint,
+		HTTPClient: &http.Client{Transport: bearerTransport{token: token}},
+		MaxRetries: -1,
+	}, nil)
+	if err != nil {
+		t.Fatalf("connect to MCP endpoint %s: %v", endpoint, err)
+	}
+	return sess
+}
+
+func provisionedCall(ctx context.Context, sess *mcp.ClientSession, tool string, args map[string]any) (string, error) {
+	res, err := sess.CallTool(ctx, &mcp.CallToolParams{Name: tool, Arguments: args})
+	if res == nil {
+		return "", err
+	}
+	out, marshalErr := json.Marshal(res)
+	if marshalErr != nil {
+		return "", marshalErr
+	}
+	if err != nil {
+		return string(out), err
+	}
+	if res.IsError {
+		return string(out), fmt.Errorf("tool %s returned an error", tool)
+	}
+	return string(out), nil
+}
+
+func waitProvisionedConnected(ctx context.Context, t *testing.T, cfg provisionedConfig) {
+	t.Helper()
+	deadline := time.Now().Add(settleTimeout)
+	var last string
+	for time.Now().Before(deadline) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+			strings.TrimRight(cfg.adminURL, "/")+"/metrics", nil)
+		if err != nil {
+			t.Fatalf("build metrics request: %v", err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil {
+			body, readErr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+			_ = resp.Body.Close()
+			last = string(body)
+			if readErr == nil && resp.StatusCode == http.StatusOK && connectedMetric(last) > 0 {
+				return
+			}
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("waiting for connected spoke: %v", ctx.Err())
+		case <-time.After(2 * time.Second):
+		}
+	}
+	t.Fatalf("hub never reported a connected spoke within %s; last metrics tail:\n%s",
+		settleTimeout, tail([]byte(last), 30))
+}
+
+func connectedMetric(metrics string) float64 {
+	for line := range strings.SplitSeq(metrics, "\n") {
+		if !strings.HasPrefix(line, "promfleet_hub_spokes_connected ") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			return 0
+		}
+		value, _ := strconv.ParseFloat(fields[1], 64)
+		return value
+	}
+	return 0
+}
+
+func requiredEnv(t *testing.T, name string) string {
+	t.Helper()
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		t.Fatalf("%s is required when PMF_E2E is set", name)
+	}
+	return value
 }
 
 // setupCluster creates a kind cluster and returns the path to its kubeconfig.

@@ -87,6 +87,50 @@ func TestUnauthenticatedIsProtocolError(t *testing.T) {
 	}
 }
 
+// TestRunAttachesToolErrorToZeroResult covers run's own business-error path
+// directly: a *ToolError from the wrapped function must produce a fresh zero
+// result carrying that error, marked as an MCP tool error (not a protocol
+// error) and counted under the error's own code rather than "ok". Every other
+// test in this package calls a tool method directly and inspects the
+// returned *ToolError itself, never through run, so this line of run was
+// otherwise unexercised.
+func TestRunAttachesToolErrorToZeroResult(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	fn := run(h.tools, ToolDescribeCluster,
+		func() *DescribeClusterOut { return &DescribeClusterOut{} }, h.tools.describeCluster)
+	out, res, err := fn(ctx(t), request(ToolDescribeCluster, h.p),
+		DescribeClusterIn{Cluster: "no-such-cluster"})
+	if err != nil {
+		t.Fatalf("a business error became a Go error: %v", err)
+	}
+	if !res.IsError {
+		t.Error("res.IsError is false for a tool that returned a *ToolError")
+	}
+	if out == nil {
+		t.Fatal("nil result")
+	}
+	if out.Error == nil || out.Error.Code != CodeUnknownCluster {
+		t.Errorf("out.Error = %+v, want UNKNOWN_CLUSTER", out.Error)
+	}
+	// setError clears Untrusted: an error body is text this project authored,
+	// not remote data, and it must not carry the untrusted notice.
+	if out.Untrusted != "" {
+		t.Errorf("untrusted = %q, want cleared on an error result", out.Untrusted)
+	}
+	// The zero() factory built a fresh result rather than reusing whatever fn
+	// partially populated before failing.
+	if out.Name != "" || out.Prometheus.Version != "" {
+		t.Errorf("out = %+v, want the zero value plus only the error", out)
+	}
+	if h.metrics.count(ToolDescribeCluster, CodeUnknownCluster) != 1 {
+		t.Error("the failure was not counted under its own code")
+	}
+	if h.metrics.count(ToolDescribeCluster, "ok") != 0 {
+		t.Error("a failed call was counted as ok")
+	}
+}
+
 // callTool invokes one tool through the shared wrapper with minimally valid
 // arguments, returning the wrapper's error.
 func callTool(t *testing.T, h *harness, name string, p *fleet.Principal) error {
@@ -224,6 +268,79 @@ func TestUnknownClusterDoesNotEnumerateFleet(t *testing.T) {
 	if denied == nil || denied.Code != CodeUnknownCluster {
 		t.Fatalf("denied = %v, want UNKNOWN_CLUSTER for an out-of-scope cluster", denied)
 	}
+	// The two results must be identical in every field a caller could use to
+	// distinguish "does not exist" from "exists but denied" — code, hint
+	// wording and the suggestion list — not merely share a code.
+	_, nonexistent := h.tools.describeCluster(ctx(t), narrow,
+		DescribeClusterIn{Cluster: "totally-nonexistent-cluster"})
+	if nonexistent == nil || nonexistent.Code != CodeUnknownCluster {
+		t.Fatalf("nonexistent = %v, want UNKNOWN_CLUSTER", nonexistent)
+	}
+	if denied.Hint != nonexistent.Hint {
+		t.Errorf("hint differs between denied and nonexistent: %q vs %q",
+			denied.Hint, nonexistent.Hint)
+	}
+	if diff := cmp.Diff(nonexistent.DidYouMean, denied.DidYouMean); diff != "" {
+		t.Errorf("didYouMean differs between denied and nonexistent (-nonexistent +denied):\n%s", diff)
+	}
+	if *denied.Retryable != *nonexistent.Retryable {
+		t.Error("retryable differs between denied and nonexistent")
+	}
+}
+
+// TestUnknownClusterEmptyVisibleScope covers the credential-can-see-nothing
+// case: didYouMean must be empty (not merely short) and the hint must not
+// dangle a promise of suggestions that were never offered. No other test
+// principal has an empty Clusters.Allow, so this path — and the "else" branch
+// of unknownCluster's hint choice — was otherwise unreached.
+func TestUnknownClusterEmptyVisibleScope(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	blind := principal(&fleet.Scope{
+		Role:     fleet.RoleViewer,
+		Clusters: fleet.ClusterScope{}, // no Allow, no MatchLabels: authorizes nothing.
+		Tools:    fleet.ToolScope{Allow: []string{"*"}},
+	})
+	_, terr := h.tools.describeCluster(ctx(t), blind, DescribeClusterIn{Cluster: okCluster})
+	if terr == nil || terr.Code != CodeUnknownCluster {
+		t.Fatalf("terr = %v, want UNKNOWN_CLUSTER", terr)
+	}
+	if terr.DidYouMean != nil {
+		t.Errorf("didYouMean = %v, want nil when the credential can see no clusters at all",
+			terr.DidYouMean)
+	}
+	if strings.Contains(terr.Hint, "didYouMean") {
+		t.Errorf("hint references didYouMean despite there being none: %q", terr.Hint)
+	}
+	if !strings.Contains(terr.Hint, "list_clusters") {
+		t.Errorf("hint does not point at list_clusters: %q", terr.Hint)
+	}
+}
+
+// TestUnknownClusterDidYouMeanCapsAtFive proves didYouMean stops at
+// DidYouMeanCount even when more visible clusters are plausible neighbours,
+// covering the loop's own break — every other did-you-mean test has too few
+// clusters in the fleet to fill it.
+func TestUnknownClusterDidYouMeanCapsAtFive(t *testing.T) {
+	t.Parallel()
+	entries := make([]fleet.Cluster, 0, 8)
+	for _, suffix := range []string{"a", "b", "c", "d", "e", "f", "g", "h"} {
+		entries = append(entries, fleet.Cluster{
+			ID: "prod-" + suffix, State: fleet.StateConnected, LastSeen: testNow,
+			Labels: map[string]string{"env": "prod"},
+		})
+	}
+	big := &fakeClusters{entries: entries}
+	h := newHarness(t, func(o *Options) { o.Clusters = big })
+	p := principal(&fleet.Scope{
+		Role:     fleet.RoleViewer,
+		Clusters: fleet.ClusterScope{Allow: []string{"*"}},
+		Tools:    fleet.ToolScope{Allow: []string{"*"}},
+	})
+	terr := h.tools.unknownCluster(p, "prod-x")
+	if len(terr.DidYouMean) != DidYouMeanCount {
+		t.Fatalf("didYouMean = %v, want exactly %d entries", terr.DidYouMean, DidYouMeanCount)
+	}
 }
 
 // TestListClusters covers filtering, the table encoding and the untrusted
@@ -333,6 +450,37 @@ func TestListClustersTable(t *testing.T) {
 	}
 }
 
+// TestListClustersInvalidStatus covers the status validation the input
+// schema's enum already forecloses for a real MCP client, but which remains
+// live business logic for any direct caller of the Go method — the same
+// defence describeCluster and friends apply to their own enum arguments.
+func TestListClustersInvalidStatus(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	_, terr := h.tools.listClusters(ctx(t), h.p, ListClustersIn{Status: "bogus"})
+	if terr == nil || terr.Code != CodeInvalidArgument {
+		t.Fatalf("terr = %v, want INVALID_ARGUMENT", terr)
+	}
+}
+
+// TestListClustersTokenCeiling proves the hub's own token budget beats a
+// listing that fits under limit but not under the ceiling.
+func TestListClustersTokenCeiling(t *testing.T) {
+	t.Parallel()
+	const ceiling = 40
+	h := newHarness(t, func(o *Options) { o.TokenCeiling = ceiling })
+	out, terr := h.tools.listClusters(ctx(t), h.p, ListClustersIn{})
+	if terr != nil {
+		t.Fatalf("listClusters: %v", terr)
+	}
+	if out.Truncated == nil || out.Truncated.Reason != render.ReasonTokenCeiling {
+		t.Fatalf("truncation = %+v, want reason %q", out.Truncated, render.ReasonTokenCeiling)
+	}
+	if out.Truncated.Total != 4 {
+		t.Errorf("total = %d, want the honest 4", out.Truncated.Total)
+	}
+}
+
 // TestDescribeCluster covers the include sections and the staleness report.
 func TestDescribeCluster(t *testing.T) {
 	t.Parallel()
@@ -438,6 +586,41 @@ func TestDescribeClusterTopNTruncation(t *testing.T) {
 	}
 	if out.Truncated.Selection == "" || out.Truncated.Hint == "" {
 		t.Error("truncation did not name its selection or a next action")
+	}
+}
+
+// TestDescribeClusterKeepsLargerSectionOverflow proves that when topN cuts
+// more than one section, the reported truncation names the section that lost
+// the most entries, not simply the last one processed.
+func TestDescribeClusterKeepsLargerSectionOverflow(t *testing.T) {
+	t.Parallel()
+	custom := testClusters()
+	for i := range custom {
+		if custom[i].ID != okCluster {
+			continue
+		}
+		custom[i].Prometheus.Jobs = []string{"a", "b", "c"}
+		custom[i].Prometheus.MetricPrefixes = []string{
+			"p1_", "p2_", "p3_", "p4_", "p5_", "p6_", "p7_", "p8_", "p9_", "p10_",
+		}
+	}
+	h := newHarness(t, func(o *Options) { o.Clusters = &fakeClusters{entries: custom} })
+
+	out, terr := h.tools.describeCluster(ctx(t), h.p, DescribeClusterIn{Cluster: okCluster, TopN: 2})
+	if terr != nil {
+		t.Fatalf("describeCluster: %v", terr)
+	}
+	if out.Truncated == nil {
+		t.Fatal("truncation was silent")
+	}
+	// Jobs overflowed by 1 (3 -> 2), metricPrefixes by 8 (10 -> 2): the
+	// larger overflow must win regardless of processing order.
+	if out.Truncated.Selection != "metricPrefixes_first_2" {
+		t.Errorf("selection = %q, want the metricPrefixes section (larger overflow)",
+			out.Truncated.Selection)
+	}
+	if out.Truncated.Total != 10 || out.Truncated.Returned != 2 {
+		t.Errorf("truncation = %+v", out.Truncated)
 	}
 }
 
@@ -821,6 +1004,148 @@ func TestQueryRangeRejectsInvertedRange(t *testing.T) {
 	}
 }
 
+// TestQueryRangeArgumentValidationErrors covers queryRange's own
+// argument-validation call sites: format, an empty query, a malformed step
+// and a malformed timeout. Each pure helper (parseFormat, validateExpr,
+// ParseDuration) is unit-tested elsewhere, but queryRange's own "if err !=
+// nil { return }" statements around each call were otherwise never reached.
+func TestQueryRangeArgumentValidationErrors(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+
+	_, terr := h.tools.queryRange(ctx(t), h.p,
+		QueryRangeIn{Cluster: okCluster, Query: "up", Format: "yaml"})
+	if terr == nil || terr.Code != CodeInvalidArgument {
+		t.Errorf("bad format: terr = %v, want INVALID_ARGUMENT", terr)
+	}
+
+	_, terr = h.tools.queryRange(ctx(t), h.p, QueryRangeIn{Cluster: okCluster, Query: ""})
+	if terr == nil || terr.Code != CodeInvalidArgument {
+		t.Errorf("empty query: terr = %v, want INVALID_ARGUMENT", terr)
+	}
+
+	_, terr = h.tools.queryRange(ctx(t), h.p,
+		QueryRangeIn{Cluster: okCluster, Query: "up", Step: "not-a-duration"})
+	if terr == nil || terr.Code != CodeInvalidTime {
+		t.Errorf("bad step: terr = %v, want INVALID_TIME", terr)
+	}
+
+	_, terr = h.tools.queryRange(ctx(t), h.p,
+		QueryRangeIn{Cluster: okCluster, Query: "up", Timeout: "not-a-duration"})
+	if terr == nil || terr.Code != CodeInvalidTime {
+		t.Errorf("bad timeout: terr = %v, want INVALID_TIME", terr)
+	}
+}
+
+// TestQueryRangeBadStartAndEnd covers resolveRange's own two time-parsing
+// error returns, including str()'s use to echo the cluster in the error's
+// input even though the caller passes it through an `any` map.
+func TestQueryRangeBadStartAndEnd(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+
+	_, terr := h.tools.queryRange(ctx(t), h.p,
+		QueryRangeIn{Cluster: okCluster, Query: "up", Start: "not-a-time"})
+	if terr == nil || terr.Code != CodeInvalidTime {
+		t.Fatalf("bad start: terr = %v, want INVALID_TIME", terr)
+	}
+	if terr.Input["cluster"] != okCluster {
+		t.Errorf("bad start: input cluster = %v, want %q echoed via str()", terr.Input, okCluster)
+	}
+	if terr.Input["start"] != "not-a-time" {
+		t.Errorf("bad start: input = %v, did not echo the offending value", terr.Input)
+	}
+
+	_, terr = h.tools.queryRange(ctx(t), h.p,
+		QueryRangeIn{Cluster: okCluster, Query: "up", End: "not-a-time"})
+	if terr == nil || terr.Code != CodeInvalidTime {
+		t.Fatalf("bad end: terr = %v, want INVALID_TIME", terr)
+	}
+	if terr.Input["cluster"] != okCluster {
+		t.Errorf("bad end: input cluster = %v, want %q echoed via str()", terr.Input, okCluster)
+	}
+}
+
+// TestQueryRangeStartTooOldWithoutSpanTooLarge covers resolveRange's second
+// RANGE_TOO_LARGE branch: a short window that is nonetheless far in the past,
+// which is a different fault from TestQueryRangeTooLarge's over-wide span and
+// takes a different corrected object (only start moves; end stays put).
+func TestQueryRangeStartTooOldWithoutSpanTooLarge(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, func(o *Options) { o.MaxLookback = 24 * time.Hour })
+	_, terr := h.tools.queryRange(ctx(t), h.p, QueryRangeIn{
+		Cluster: okCluster, Query: "up", Start: "now-100h", End: "now-99h",
+	})
+	if terr == nil || terr.Code != CodeRangeTooLarge {
+		t.Fatalf("terr = %v, want RANGE_TOO_LARGE", terr)
+	}
+	if !strings.Contains(terr.Message, "in the past") {
+		t.Errorf("message = %q, want it to explain the fault is age, not span", terr.Message)
+	}
+	if terr.Corrected == nil || terr.Corrected["start"] != "now-1d" {
+		t.Errorf("corrected = %v, want start moved to now-1d", terr.Corrected)
+	}
+	if _, hasEnd := terr.Corrected["end"]; hasEnd && terr.Corrected["end"] != "now-99h" {
+		t.Errorf("corrected end = %v, want the caller's own end left alone", terr.Corrected["end"])
+	}
+}
+
+// TestQueryRangeUpstreamFailure covers the fetch failure path directly on
+// queryRange: TestUpstreamFailureMapping only ever drives it through query.
+func TestQueryRangeUpstreamFailure(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.prom.set(string(promapi.EndpointQueryRange),
+		fakeResponse{err: fmt.Errorf("x: %w", promproxy.ErrUpstream)})
+	_, terr := h.tools.queryRange(ctx(t), h.p, QueryRangeIn{Cluster: okCluster, Query: "up"})
+	if terr == nil || terr.Code != CodeUpstreamError {
+		t.Fatalf("terr = %v, want UPSTREAM_ERROR", terr)
+	}
+}
+
+// TestQueryRangeMalformedResponseBody covers a well-formed envelope with no
+// data member (DecodeQueryData) and a matrix result member that does not
+// decode as a matrix (DecodeMatrix) — two distinct malformed-payload faults.
+func TestQueryRangeMalformedResponseBody(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.prom.set(string(promapi.EndpointQueryRange), fakeResponse{
+		body: []byte(`{"status":"success"}`),
+	})
+	_, terr := h.tools.queryRange(ctx(t), h.p, QueryRangeIn{Cluster: okCluster, Query: "up"})
+	if terr == nil || terr.Code != CodeMalformedUpstream {
+		t.Fatalf("no-data body: terr = %v, want MALFORMED_UPSTREAM", terr)
+	}
+
+	h.prom.set(string(promapi.EndpointQueryRange), fakeResponse{
+		body: []byte(`{"status":"success","data":{"resultType":"matrix","result":"not-an-array"}}`),
+	})
+	_, terr = h.tools.queryRange(ctx(t), h.p, QueryRangeIn{Cluster: okCluster, Query: "up"})
+	if terr == nil || terr.Code != CodeMalformedUpstream {
+		t.Fatalf("bad matrix body: terr = %v, want MALFORMED_UPSTREAM", terr)
+	}
+}
+
+// TestQueryRangePassthroughFormatUnderCeiling covers format "json"'s success
+// path on queryRange: a payload small enough to stay under the token ceiling
+// is passed through verbatim. TestTokenCeilingAppliesToPassthrough only
+// exercises the over-ceiling branch of this same block.
+func TestQueryRangePassthroughFormatUnderCeiling(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	out, terr := h.tools.queryRange(ctx(t), h.p,
+		QueryRangeIn{Cluster: okCluster, Query: "up", Format: "json"})
+	if terr != nil {
+		t.Fatalf("queryRange: %v", terr)
+	}
+	if out.Raw == nil {
+		t.Fatal("format json returned no raw payload")
+	}
+	if out.Series != nil {
+		t.Error("passthrough also carried the compact series; the tokens are paid twice")
+	}
+}
+
 // TestQueryWrongResultType covers the two "you wanted the other tool" paths.
 func TestQueryWrongResultType(t *testing.T) {
 	t.Parallel()
@@ -873,6 +1198,56 @@ func TestQueryScalarAndString(t *testing.T) {
 	}
 }
 
+// TestQueryArgumentValidationErrors covers the query-level error returns
+// that TestValidateExpr and TestParseDuration only exercise as direct calls
+// to the pure helpers, never through the query method's own call sites.
+func TestQueryArgumentValidationErrors(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+
+	_, terr := h.tools.query(ctx(t), h.p, QueryIn{Cluster: okCluster, Query: ""})
+	if terr == nil || terr.Code != CodeInvalidArgument {
+		t.Errorf("empty query: terr = %v, want INVALID_ARGUMENT", terr)
+	}
+
+	_, terr = h.tools.query(ctx(t), h.p,
+		QueryIn{Cluster: okCluster, Query: "up", Timeout: "not-a-duration"})
+	if terr == nil || terr.Code != CodeInvalidTime {
+		t.Errorf("bad timeout: terr = %v, want INVALID_TIME", terr)
+	}
+}
+
+// TestQueryMalformedResponseBody covers a Prometheus API envelope that
+// decodes but carries no data member at all, distinct from a body that is not
+// JSON (TestMalformedUpstream) or a well-formed vector/matrix mismatch
+// (TestQueryWrongResultType).
+func TestQueryMalformedResponseBody(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.prom.set(string(promapi.EndpointQuery), fakeResponse{
+		body: []byte(`{"status":"success"}`),
+	})
+	_, terr := h.tools.query(ctx(t), h.p, QueryIn{Cluster: okCluster, Query: "up"})
+	if terr == nil || terr.Code != CodeMalformedUpstream {
+		t.Fatalf("terr = %v, want MALFORMED_UPSTREAM", terr)
+	}
+}
+
+// TestQueryMalformedScalar covers a scalar result whose value is not the
+// [timestamp, "value"] pair Prometheus documents, which is a different
+// failure than the response having no data member at all.
+func TestQueryMalformedScalar(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.prom.set(string(promapi.EndpointQuery), fakeResponse{
+		body: []byte(`{"status":"success","data":{"resultType":"scalar","result":"not-a-pair"}}`),
+	})
+	_, terr := h.tools.query(ctx(t), h.p, QueryIn{Cluster: okCluster, Query: "42"})
+	if terr == nil || terr.Code != CodeMalformedUpstream {
+		t.Fatalf("terr = %v, want MALFORMED_UPSTREAM", terr)
+	}
+}
+
 // TestQueryPassthroughFormat covers format "json".
 func TestQueryPassthroughFormat(t *testing.T) {
 	t.Parallel()
@@ -900,6 +1275,29 @@ func TestQueryPassthroughFormat(t *testing.T) {
 	}
 	if out.Rows != nil {
 		t.Error("passthrough also carried the compact rows; the tokens are paid twice")
+	}
+}
+
+// TestQueryPassthroughTokenCeiling proves format "json" cannot be used to
+// route around the hub's token ceiling on an instant query, mirroring the
+// query_range equivalent (TestTokenCeilingAppliesToPassthrough) which never
+// exercised this instant-only code path.
+func TestQueryPassthroughTokenCeiling(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, func(o *Options) { o.TokenCeiling = 200 })
+	h.prom.set(string(promapi.EndpointQuery), fakeResponse{body: syntheticVector(t, 100)})
+	out, terr := h.tools.query(ctx(t), h.p, QueryIn{Cluster: okCluster, Query: "up", Format: "json"})
+	if terr != nil {
+		t.Fatalf("query: %v", terr)
+	}
+	if out.Raw != nil {
+		t.Error("an oversized passthrough payload was returned anyway")
+	}
+	if out.Truncated == nil || out.Truncated.Reason != render.ReasonTokenCeiling {
+		t.Fatalf("truncated = %+v, want reason %q", out.Truncated, render.ReasonTokenCeiling)
+	}
+	if !strings.Contains(out.Truncated.Hint, "compact") {
+		t.Errorf("hint does not point at the cheap encoding: %q", out.Truncated.Hint)
 	}
 }
 
@@ -1244,6 +1642,25 @@ func TestLabelNamesAndValues(t *testing.T) {
 	if _, terr := h.tools.labelValues(ctx(t), h.p,
 		LabelValuesIn{Cluster: okCluster, Label: "bad label"}); terr == nil {
 		t.Error("an invalid label name was accepted into a URL path")
+	}
+}
+
+// TestLabelNamesScopedByMatchers proves a matcher list actually reaches the
+// upstream call as match[], which the unscoped calls above never exercise.
+func TestLabelNamesScopedByMatchers(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	out, terr := h.tools.labelNames(ctx(t), h.p,
+		LabelNamesIn{Cluster: okCluster, Matchers: []string{`up{job="api"}`}})
+	if terr != nil {
+		t.Fatalf("labelNames: %v", terr)
+	}
+	if len(out.Names) == 0 {
+		t.Fatal("no names returned")
+	}
+	form := h.prom.lastForm(promapi.EndpointLabels)
+	if diff := cmp.Diff([]string{`up{job="api"}`}, form["match[]"]); diff != "" {
+		t.Errorf("match[] (-want +got):\n%s", diff)
 	}
 }
 

@@ -212,12 +212,11 @@ func New(opts Options) (*Verifier, error) {
 }
 
 // Close waits for outstanding best-effort last-used writes to finish. It is
-// idempotent, always returns nil, and does not stop the verifier from being
+// idempotent and does not stop the verifier from being
 // used afterwards; it exists so a composition root can shut the store down
 // without racing a background write.
-func (v *Verifier) Close() error {
+func (v *Verifier) Close() {
 	v.touchWG.Wait()
-	return nil
 }
 
 // Verify authenticates a raw bearer token and returns the principal it

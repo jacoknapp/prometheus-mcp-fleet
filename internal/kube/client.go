@@ -281,3 +281,20 @@ func (c *Client) do(ctx context.Context, verb, method, path string, body, out an
 	}
 	return nil
 }
+
+// WithNamespace returns a copy of c scoped to ns, sharing the same HTTP client
+// and token source.
+//
+// It exists because the namespace a pod is projected into and the namespace an
+// operator configures are two different facts. Rebuilding a client with [New]
+// to change one of them would discard the API server address, the bearer token
+// file and the CA bundle that only [InCluster] knows how to find, so this is
+// the only correct way to apply a namespace override in a cluster.
+func (c *Client) WithNamespace(ns string) (*Client, error) {
+	if err := ValidateName(ns); err != nil {
+		return nil, fmt.Errorf("kube: namespace: %w", err)
+	}
+	cp := *c
+	cp.ns = ns
+	return &cp, nil
+}

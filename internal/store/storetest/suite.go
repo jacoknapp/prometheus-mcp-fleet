@@ -45,6 +45,7 @@ func RunSuite(t *testing.T, open OpenFunc) {
 		{"GetKeyReturnsCopies", testGetKeyReturnsCopies},
 		{"PutKeyRejectsDuplicate", testPutKeyRejectsDuplicate},
 		{"PutKeyValidates", testPutKeyValidates},
+		{"PutKeyIfNoUsable", testPutKeyIfNoUsable},
 		{"GetKeyNotFound", testGetKeyNotFound},
 		{"ListKeysOrdering", testListKeysOrdering},
 		{"ListKeysEmpty", testListKeysEmpty},
@@ -280,6 +281,47 @@ func testPutKeyValidates(t *testing.T, s store.Store) {
 	}
 	if len(keys) != 0 {
 		t.Errorf("rejected writes left %d keys behind", len(keys))
+	}
+}
+
+func testPutKeyIfNoUsable(t *testing.T, s store.Store) {
+	ctx := t.Context()
+	first := adminKey("bootstrap0", tBase)
+	stored, err := s.PutKeyIfNoUsable(ctx, first, tBase)
+	if err != nil || !stored {
+		t.Fatalf("first PutKeyIfNoUsable = (%v, %v), want (true, nil)", stored, err)
+	}
+
+	replacement := adminKey("bootstrap0", tBase.Add(time.Hour))
+	replacement.SecretHMAC = []byte("replacement")
+	stored, err = s.PutKeyIfNoUsable(ctx, replacement, tBase.Add(time.Hour))
+	if err != nil || stored {
+		t.Fatalf("usable PutKeyIfNoUsable = (%v, %v), want (false, nil)", stored, err)
+	}
+	got, err := s.GetKey(ctx, first.KID)
+	if err != nil || string(got.SecretHMAC) != string(first.SecretHMAC) {
+		t.Fatalf("usable key was replaced: key=%+v err=%v", got, err)
+	}
+
+	stored, err = s.PutKeyIfNoUsable(ctx, replacement, tExpires.Add(time.Second))
+	if err != nil || !stored {
+		t.Fatalf("expired PutKeyIfNoUsable = (%v, %v), want (true, nil)", stored, err)
+	}
+	got, err = s.GetKey(ctx, first.KID)
+	if err != nil || string(got.SecretHMAC) != string(replacement.SecretHMAC) {
+		t.Fatalf("expired key was not replaced: key=%+v err=%v", got, err)
+	}
+
+	if _, err := s.PutKeyIfNoUsable(ctx, nil, tBase); !errors.Is(err, store.ErrInvalid) {
+		t.Fatalf("nil PutKeyIfNoUsable error = %v, want ErrInvalid", err)
+	}
+
+	// A zero timestamp is resolved by the backend's clock. The far-future
+	// expiry keeps this assertion valid for both real-time and fixed clocks.
+	future := adminKey("bootstrap1", tBase)
+	future.ExpiresAt = time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)
+	if stored, err := s.PutKeyIfNoUsable(ctx, future, time.Time{}); err != nil || !stored {
+		t.Fatalf("zero-time PutKeyIfNoUsable = (%v, %v), want (true, nil)", stored, err)
 	}
 }
 

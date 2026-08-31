@@ -82,6 +82,14 @@ type Store interface {
 	// credential record is never a legitimate operation. Bumps the epoch.
 	PutKey(ctx context.Context, k *fleet.Key) error
 
+	// PutKeyIfNoUsable atomically stores k when its KID is absent or belongs to
+	// an unusable key at at. It returns true only when k became the stored
+	// record. This is the recovery primitive for a well-known bootstrap KID:
+	// concurrent replicas must replace an expired credential exactly once,
+	// without a read/delete/write window that can erase another replica's
+	// freshly minted key. A zero at means now. Bumps the epoch on success.
+	PutKeyIfNoUsable(ctx context.Context, k *fleet.Key, at time.Time) (bool, error)
+
 	// GetKey returns the key with the given KID, including its SecretHMAC.
 	// It returns [ErrNotFound] if there is none.
 	GetKey(ctx context.Context, kid string) (*fleet.Key, error)

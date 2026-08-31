@@ -173,7 +173,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	// paid for the goroutine, the buffers and the handshake it was meant to
 	// prevent, and it cannot tell the peer why.
 	if s.atSessionLimit() {
-		s.log.Warn("tunnel upgrade refused: session limit reached",
+		s.log.WarnContext(r.Context(), "tunnel upgrade refused: session limit reached",
 			slog.String("remote", remote),
 			slog.Int("max_sessions", s.cfg.MaxSessions))
 		w.Header().Set("Retry-After", "5")
@@ -182,7 +182,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !requestsSubprotocol(r) {
-		s.log.Warn("tunnel upgrade refused: subprotocol not requested",
+		s.log.WarnContext(r.Context(), "tunnel upgrade refused: subprotocol not requested",
 			slog.String("remote", remote))
 		http.Error(w, "this endpoint speaks the "+Subprotocol+" websocket subprotocol",
 			http.StatusBadRequest)
@@ -192,7 +192,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	select {
 	case s.pending <- struct{}{}:
 	default:
-		s.log.Warn("tunnel upgrade refused: too many handshakes in flight",
+		s.log.WarnContext(r.Context(), "tunnel upgrade refused: too many handshakes in flight",
 			slog.String("remote", remote),
 			slog.Int("max_pending_handshakes", cap(s.pending)))
 		w.Header().Set("Retry-After", "1")
@@ -210,11 +210,11 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		// Accept has already written a response.
-		s.log.Warn("tunnel upgrade failed", slog.String("remote", remote), slog.Any("err", err))
+		s.log.WarnContext(r.Context(), "tunnel upgrade failed", slog.String("remote", remote), slog.Any("err", err))
 		return
 	}
 	if ws.Subprotocol() != Subprotocol {
-		s.log.Warn("tunnel upgrade refused: subprotocol not negotiated",
+		s.log.WarnContext(r.Context(), "tunnel upgrade refused: subprotocol not negotiated",
 			slog.String("remote", remote), slog.String("subprotocol", ws.Subprotocol()))
 		_ = ws.Close(websocket.StatusPolicyViolation, ErrSubprotocol.Error())
 		return
@@ -228,7 +228,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 	id, err := s.authenticate(conn, remote)
 	if err != nil {
-		s.log.Warn("tunnel authentication failed",
+		s.log.WarnContext(connCtx, "tunnel authentication failed",
 			slog.String("remote", remote), slog.Any("err", err))
 		_ = writeMessage(conn, serverAccept{Accepted: false, Reason: rejectionReason(err)})
 		_ = conn.Close()
@@ -238,7 +238,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	// Now that the peer has proved who it is, take the slot for real. The
 	// pre-upgrade check above is a cheap early answer; this is the atomic one.
 	if !s.reserveSession() {
-		s.log.Warn("tunnel rejected: session limit reached",
+		s.log.WarnContext(connCtx, "tunnel rejected: session limit reached",
 			slog.String("remote", remote), slog.String("cluster", id.ClusterID))
 		_ = writeMessage(conn, serverAccept{Accepted: false, Reason: ErrTooManySessions.Error()})
 		_ = conn.Close()
@@ -247,7 +247,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	defer s.sessions.Add(-1)
 
 	if err := writeMessage(conn, serverAccept{Accepted: true, ClusterID: id.ClusterID}); err != nil {
-		s.log.Warn("tunnel accept could not be sent",
+		s.log.WarnContext(connCtx, "tunnel accept could not be sent",
 			slog.String("remote", remote), slog.String("cluster", id.ClusterID), slog.Any("err", err))
 		_ = conn.Close()
 		return
@@ -261,7 +261,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	offerCtx, cancelOffer := context.WithTimeout(context.WithoutCancel(r.Context()), offerTimeout)
 	defer cancelOffer()
 	if err := s.src.offer(offerCtx, &adoption{conn: &sessionConn{Conn: conn, done: done}, id: id}); err != nil {
-		s.log.Warn("tunnel could not be adopted",
+		s.log.WarnContext(connCtx, "tunnel could not be adopted",
 			slog.String("remote", remote), slog.String("cluster", id.ClusterID), slog.Any("err", err))
 		_ = conn.Close()
 		return

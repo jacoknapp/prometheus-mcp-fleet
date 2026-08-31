@@ -440,3 +440,162 @@ func TestNearestNames(t *testing.T) {
 		t.Errorf("no candidates returned %v", got)
 	}
 }
+
+// TestNearestNamesTiesAndTruncation covers the ranking's tie-break by name
+// and its cap at n, neither of which the single-close-match cases above
+// exercise: they never produce more than one candidate past the distance
+// cutoff.
+func TestNearestNamesTiesAndTruncation(t *testing.T) {
+	t.Parallel()
+	// "xat", "yat" and "zat" are all edit distance 1 from "cat": a genuine
+	// three-way tie, broken alphabetically.
+	got := nearestNames("cat", []string{"zat", "xat", "yat"}, 3)
+	want := []string{"xat", "yat", "zat"}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("tie-break (-want +got):\n%s", diff)
+	}
+	// The same three candidates capped at 2 keeps the alphabetically first
+	// two of the tie, proving len(out) > n actually truncates.
+	if got := nearestNames("cat", []string{"zat", "xat", "yat"}, 2); len(got) != 2 {
+		t.Fatalf("nearestNames capped at 2 = %v", got)
+	} else if diff := cmp.Diff([]string{"xat", "yat"}, got); diff != "" {
+		t.Errorf("capped tie-break (-want +got):\n%s", diff)
+	}
+	// "bat" (distance 1) and "cost" (distance 2) both clear the cutoff but are
+	// genuinely unequal distances, so the ranking must put the closer one
+	// first without falling into the name tie-break at all.
+	if got := nearestNames("cat", []string{"cost", "bat"}, 5); !cmp.Equal([]string{"bat", "cost"}, got) {
+		t.Errorf("unequal-distance ranking = %v, want [bat cost] (closer first)", got)
+	}
+}
+
+// TestClipRunesTo covers the rune-safe clip directly, including the
+// over-length case nearestNames only reaches with a target or candidate name
+// longer than 128 runes.
+func TestClipRunesTo(t *testing.T) {
+	t.Parallel()
+	if got := clipRunesTo("hello", 10); got != "hello" {
+		t.Errorf("clipRunesTo under the limit = %q", got)
+	}
+	if got := clipRunesTo("hello", 3); got != "hel" {
+		t.Errorf("clipRunesTo over the limit = %q", got)
+	}
+	if got := clipRunesTo("hello", 0); got != "" {
+		t.Errorf("clipRunesTo(_, 0) = %q", got)
+	}
+	// Multi-byte runes: clip by rune count, not byte count, so the result
+	// stays valid UTF-8.
+	if got := clipRunesTo("日本語メトリクス", 3); got != "日本語" {
+		t.Errorf("clipRunesTo on multi-byte runes = %q", got)
+	}
+}
+
+// TestEditDistanceEdgeCases covers the Levenshtein helper directly: empty
+// strings, equal strings and the off-by-one cases nearestNames' cutoff filter
+// never surfaces on its own.
+func TestEditDistanceEdgeCases(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		a, b string
+		want int
+	}{
+		{name: "both empty", a: "", b: "", want: 0},
+		{name: "one empty", a: "", b: "abc", want: 3},
+		{name: "other empty", a: "abc", b: "", want: 3},
+		{name: "equal", a: "abc", b: "abc", want: 0},
+		{name: "one substitution", a: "abc", b: "abd", want: 1},
+		{name: "one insertion", a: "abc", b: "abcd", want: 1},
+		{name: "one deletion", a: "abcd", b: "abc", want: 1},
+		{name: "totally different", a: "abc", b: "xyz", want: 3},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := editDistance([]rune(tc.a), []rune(tc.b)); got != tc.want {
+				t.Errorf("editDistance(%q, %q) = %d, want %d", tc.a, tc.b, got, tc.want)
+			}
+			// Symmetric: swapping the arguments must not change the answer.
+			if got := editDistance([]rune(tc.b), []rune(tc.a)); got != tc.want {
+				t.Errorf("editDistance(%q, %q) = %d, want %d (swapped)", tc.b, tc.a, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestExplainPromQLUnknownMetricNoSuggestion covers the branch of the
+// existence check where the metric does not exist and nothing in the cluster
+// is close enough to suggest — the generic "call search_metrics" advice,
+// which the near-match case in TestExplainPromQLChecksMetricExistence never
+// reaches.
+func TestExplainPromQLUnknownMetricNoSuggestion(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	out, terr := h.tools.explainPromQL(ctx(t), h.p, ExplainPromQLIn{
+		Query: "totally_unrelated_metric_xyz_zzz", Cluster: okCluster,
+	})
+	if terr != nil {
+		t.Fatalf("explainPromQL: %v", terr)
+	}
+	if diff := cmp.Diff([]string{"totally_unrelated_metric_xyz_zzz"}, out.UnknownMetrics); diff != "" {
+		t.Errorf("unknownMetrics (-want +got):\n%s", diff)
+	}
+	var found bool
+	for _, s := range out.Suggestions {
+		if strings.Contains(s, "Call search_metrics to find the right name") {
+			found = true
+			if strings.Contains(s, "Did you mean") {
+				t.Errorf("a no-match suggestion still offered a did-you-mean: %q", s)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("no generic search_metrics advice for a metric with no near match: %v",
+			out.Suggestions)
+	}
+}
+
+// TestAnalyzePromQLMatcherWhitespace covers the whitespace-skip after a
+// matcher operator, which the existing fixtures (always "label=\"value\""
+// with no interior space) never trigger.
+func TestAnalyzePromQLMatcherWhitespace(t *testing.T) {
+	t.Parallel()
+	a := analyzePromQL(`up{job=  "api"}`)
+	if !a.Valid {
+		t.Fatalf("whitespace after a matcher operator was rejected: %s", a.Message)
+	}
+	if diff := cmp.Diff([]string{"job"}, a.Labels); diff != "" {
+		t.Errorf("labels (-want +got):\n%s", diff)
+	}
+}
+
+// TestAnalyzePromQLInvalidUTF8 covers the final UTF-8 validity check, which
+// only fires once a full, structurally sound scan completes without any
+// earlier fault.
+func TestAnalyzePromQLInvalidUTF8(t *testing.T) {
+	t.Parallel()
+	a := analyzePromQL("up" + string([]byte{0xff, 0xfe}))
+	if a.Valid {
+		t.Fatal("invalid UTF-8 was accepted as a valid expression")
+	}
+	if !strings.Contains(a.Message, "not valid UTF-8") {
+		t.Errorf("message = %q, want it to name the UTF-8 fault", a.Message)
+	}
+	if a.Position != 1 {
+		t.Errorf("position = %d, want 1", a.Position)
+	}
+}
+
+// TestAnalyzePromQLEscapedQuoteInString covers scanString's backslash-escape
+// handling: without it, an escaped quote inside a double-quoted matcher value
+// would be misread as the string's terminator.
+func TestAnalyzePromQLEscapedQuoteInString(t *testing.T) {
+	t.Parallel()
+	a := analyzePromQL(`up{job="a\"b"}`)
+	if !a.Valid {
+		t.Fatalf("an escaped quote inside a string was rejected: %s", a.Message)
+	}
+	if diff := cmp.Diff([]string{"up"}, a.Metrics); diff != "" {
+		t.Errorf("metrics (-want +got):\n%s", diff)
+	}
+}

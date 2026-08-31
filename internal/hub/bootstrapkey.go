@@ -5,12 +5,10 @@ package hub
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/fleet"
-	"github.com/jacoknapp/prometheus-mcp-fleet/internal/store"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/token"
 )
 
@@ -62,22 +60,10 @@ func (h *hub) bootstrapAdminKey(ctx context.Context) error {
 		}
 	}
 
-	// An unusable record under the well-known identifier blocks the replacement
-	// this function exists to create, so clear it first. Doing so is safe
-	// precisely because the record is expired or revoked: it can no longer
-	// authenticate anything.
-	if _, err := h.store.GetKey(ctx, bootstrapKID); err == nil {
-		if derr := h.store.DeleteKey(ctx, bootstrapKID); derr != nil {
-			return fmt.Errorf("clear the unusable bootstrap admin key: %w", derr)
-		}
-	} else if !errors.Is(err, store.ErrNotFound) {
-		return fmt.Errorf("read the bootstrap admin key: %w", err)
-	}
-
-	minted, err := token.MintWithKID(fleet.ClassAdmin, bootstrapKID)
-	if err != nil {
-		return fmt.Errorf("mint the bootstrap admin key: %w", err)
-	}
+	// Both inputs are compile-time-valid and crypto/rand.Read cannot return an
+	// error on supported Go versions. MintWithKID's error is for callers with
+	// dynamic input; there is no runtime failure to handle at this call site.
+	minted, _ := token.MintWithKID(fleet.ClassAdmin, bootstrapKID)
 
 	record := &fleet.Key{
 		KID:        minted.KID,
@@ -87,20 +73,19 @@ func (h *hub) bootstrapAdminKey(ctx context.Context) error {
 		CreatedAt:  now,
 		ExpiresAt:  now.Add(h.bootstrapTTL()),
 	}
-	if err := h.store.PutKey(ctx, record); err != nil {
-		// Losing a create race with another replica is fine and expected: the
-		// winner's key is the one that counts, and ours was never revealed.
-		if errors.Is(err, store.ErrAlreadyExists) {
-			// Another replica won the race under the same well-known
-			// identifier. Its token is the one that counts and ours was never
-			// revealed, so say nothing at all.
-			h.logger.Info("another replica minted the bootstrap admin key first")
-			return nil
-		}
+	stored, err := h.store.PutKeyIfNoUsable(ctx, record, now)
+	if err != nil {
 		return fmt.Errorf("store the bootstrap admin key: %w", err)
 	}
+	if !stored {
+		// Another replica won the atomic store mutation under the same
+		// well-known identifier. Its token is the one that counts and ours was
+		// never revealed, so say nothing at all.
+		h.logger.InfoContext(ctx, "another replica minted the bootstrap admin key first")
+		return nil
+	}
 
-	h.logger.Warn("BOOTSTRAP ADMIN TOKEN — shown once, store it now",
+	h.logger.WarnContext(ctx, "BOOTSTRAP ADMIN TOKEN — shown once, store it now",
 		"token", minted.Raw.Reveal(),
 		"kid", minted.KID,
 		"expires_at", record.ExpiresAt.Format(time.RFC3339),

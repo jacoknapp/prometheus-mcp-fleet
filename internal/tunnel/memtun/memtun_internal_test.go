@@ -62,8 +62,8 @@ func TestSessionErrorAndLifecyclePaths(t *testing.T) {
 	if got := s.CloseReason(); got != "maintenance" {
 		t.Errorf("CloseReason() = %q, want maintenance", got)
 	}
-	if got := s.mapErr(nil, nil); got != nil {
-		t.Errorf("mapErr(nil) = %v, want nil", got)
+	if got := s.mapErr(context.Background(), nil); got != nil {
+		t.Errorf("mapErr(nil error) = %v, want nil", got)
 	}
 	if got := s.mapErr(context.Background(), upstreamErr); !errors.Is(got, tunnel.ErrSessionClosed) || !errors.Is(got, upstreamErr) {
 		t.Errorf("mapErr() = %v, want session-closed wrapping upstream", got)

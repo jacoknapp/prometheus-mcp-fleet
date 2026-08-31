@@ -111,8 +111,8 @@ fuzz: ## Run every fuzz target briefly.
 	done
 
 .PHONY: deadcode
-deadcode: ## Report production functions unreachable from either binary.
-	go run golang.org/x/tools/cmd/deadcode@v0.49.0 ./cmd/...
+deadcode: ## Fail on production functions unreachable from either binary unless reviewed.
+	./hack/check-deadcode.sh
 
 MUTATION_PACKAGES ?= ./...
 MUTATION_WORKERS  ?= 4
@@ -201,7 +201,13 @@ helm-unittest: ## Run helm-unittest suites.
 
 .PHONY: helm-docs
 helm-docs: ## Regenerate chart READMEs from values.yaml.
-	helm-docs --chart-search-root=charts
+	# These are helm-docs' own defaults, spelled out so this target and the
+	# `helm-docs (verify only)` job in .github/workflows/chart.yml, which passes
+	# them explicitly, cannot drift into producing different files.
+	helm-docs --chart-search-root=charts \
+		--values-file=values.yaml \
+		--output-file=README.md \
+		--template-files=README.md.gotmpl
 
 ##@ End to end
 

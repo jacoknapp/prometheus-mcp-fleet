@@ -140,6 +140,77 @@ func TestResourceFiringAlertsComplete(t *testing.T) {
 	}
 }
 
+// TestResourceFiringAlertsAlertnameTieBreak covers the sort's final
+// tie-break: two alerts on the *same* cluster with equal rank (state and
+// severity) fall back to comparing alertname. The multi-cluster fixture in
+// TestResourceFiringAlerts always resolves ties on the cluster comparison
+// first, so this branch needs alerts confined to a single cluster.
+func TestResourceFiringAlertsAlertnameTieBreak(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.prom.set(string(promapi.EndpointAlerts), fakeResponse{
+		body: []byte(`{"status":"success","data":{"alerts":[
+			{"labels":{"alertname":"ZLast","severity":"critical"},"annotations":{},
+			 "state":"firing","activeAt":"2026-08-26T10:00:00Z","value":"1"},
+			{"labels":{"alertname":"AFirst","severity":"critical"},"annotations":{},
+			 "state":"firing","activeAt":"2026-08-26T10:00:00Z","value":"1"}
+		]}}`),
+	})
+	single := principal(&fleet.Scope{
+		Role:     fleet.RoleViewer,
+		Clusters: fleet.ClusterScope{Allow: []string{okCluster}},
+		Tools:    fleet.ToolScope{Allow: []string{"*"}},
+	})
+	got, err := h.tools.readFiringAlerts(ctx(t), resourceRequest(ResourceFiringAlerts, single))
+	if err != nil {
+		t.Fatalf("readFiringAlerts: %v", err)
+	}
+	var out FleetAlertsOut
+	if err := json.Unmarshal([]byte(got.Text), &out); err != nil {
+		t.Fatalf("resource body: %v", err)
+	}
+	if len(out.Alerts) != 2 {
+		t.Fatalf("alerts = %+v, want 2 on one cluster", out.Alerts)
+	}
+	if out.Alerts[0].Alert.Alertname != "AFirst" || out.Alerts[1].Alert.Alertname != "ZLast" {
+		t.Errorf("alerts sorted as %q then %q, want the alertname tie-break to order them "+
+			"alphabetically", out.Alerts[0].Alert.Alertname, out.Alerts[1].Alert.Alertname)
+	}
+}
+
+// TestResourceFiringAlertsClusterTieBreak proves that when two alerts from
+// different clusters share both a rank (state and severity) and an
+// alertname, the cluster name breaks the tie in the stable sort — the step
+// between the rank compare and the final alertname compare.
+func TestResourceFiringAlertsClusterTieBreak(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	sameAlert := []byte(`{"status":"success","data":{"alerts":[
+		{"labels":{"alertname":"SameName","severity":"critical"},"annotations":{},
+		 "state":"firing","activeAt":"2026-08-26T10:00:00Z","value":"1"}
+	]}}`)
+	h.prom.set("eu-west-prod-1/"+string(promapi.EndpointAlerts), fakeResponse{body: sameAlert})
+	h.prom.set("us-east-prod-2/"+string(promapi.EndpointAlerts), fakeResponse{body: sameAlert})
+
+	got, err := h.tools.readFiringAlerts(ctx(t), resourceRequest(ResourceFiringAlerts, h.p))
+	if err != nil {
+		t.Fatalf("readFiringAlerts: %v", err)
+	}
+	var out FleetAlertsOut
+	if err := json.Unmarshal([]byte(got.Text), &out); err != nil {
+		t.Fatalf("resource body: %v", err)
+	}
+	var clusters []string
+	for _, a := range out.Alerts {
+		if a.Alert.Alertname == "SameName" {
+			clusters = append(clusters, a.Cluster)
+		}
+	}
+	if len(clusters) != 2 || clusters[0] != "eu-west-prod-1" || clusters[1] != "us-east-prod-2" {
+		t.Errorf("clusters = %v, want the identical-rank pair tie-broken by cluster name", clusters)
+	}
+}
+
 // TestResourceCheatsheet covers the static document.
 func TestResourceCheatsheet(t *testing.T) {
 	t.Parallel()

@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"crypto"
-	"crypto/ecdsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -400,6 +399,3 @@ func clusterIDFromCert(cert *x509.Certificate) string {
 	}
 	return strings.TrimPrefix(cert.Subject.CommonName, "spoke:")
 }
-
-// ensure ecdsa stays referenced when build tags trim this file down.
-var _ = (*ecdsa.PrivateKey)(nil)

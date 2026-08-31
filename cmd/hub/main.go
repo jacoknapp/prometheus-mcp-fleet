@@ -34,7 +34,9 @@ func mainWithExit(args []string, stderr io.Writer, exit func(int)) {
 			exit(0)
 			return
 		}
-		fmt.Fprintf(stderr, "hub: %v\n", err)
+		// Nothing useful remains if the diagnostic itself cannot be written:
+		// the process is on its way out and stderr is the only channel it has.
+		_, _ = fmt.Fprintf(stderr, "hub: %v\n", err)
 		exit(1)
 	}
 }
@@ -54,7 +56,9 @@ func runWith(
 	runHub func(context.Context, *config.Hub) error,
 ) error {
 	if len(args) > 0 && args[0] == "version" {
-		fmt.Fprintln(stdout, version.Get())
+		if _, err := fmt.Fprintln(stdout, version.Get()); err != nil {
+			return err
+		}
 		return nil
 	}
 

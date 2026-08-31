@@ -169,3 +169,29 @@ func TestMainWithExit(t *testing.T) {
 		})
 	}
 }
+
+// errWriter fails every write, standing in for a stdout that is closed or full.
+type errWriter struct{}
+
+var errWriteFailed = errors.New("write failed")
+
+func (errWriter) Write([]byte) (int, error) { return 0, errWriteFailed }
+
+// A `version` that cannot reach stdout printed nothing, so reporting success
+// would tell the caller the version was delivered when it was not.
+func TestRunWithVersionReportsWriteFailure(t *testing.T) {
+	t.Parallel()
+
+	err := runWith(
+		[]string{"version"},
+		func(string) string { return "" },
+		errWriter{},
+		func(context.Context, *config.Spoke) error {
+			t.Fatal("version started the spoke")
+			return nil
+		},
+	)
+	if !errors.Is(err, errWriteFailed) {
+		t.Fatalf("runWith(version) error = %v, want %v", err, errWriteFailed)
+	}
+}

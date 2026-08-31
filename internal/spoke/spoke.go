@@ -54,6 +54,60 @@ const renewAtFraction = 0.5
 // decision itself is cheap; the jitter is what matters.
 const renewCheckInterval = time.Hour
 
+// defaultFactsRefresh is the facts collection period when none is configured.
+const defaultFactsRefresh = 10 * time.Minute
+
+// minProbeInterval floors the readiness probe. The probe follows the facts
+// interval, but a fast facts interval must not turn a readiness check into a
+// scrape storm against the local Prometheus.
+const minProbeInterval = 15 * time.Second
+
+// maxFirstDialDelay bounds the random delay before a dialer's first
+// connection, so that a fleet-wide rollout does not arrive in one burst.
+const maxFirstDialDelay = 5 * time.Second
+
+// minConnectionLifetime is how long a tunnel must have lasted before its
+// closure is treated as an ordinary disconnect and the backoff is reset. A
+// connection that dies immediately is a symptom, not a success.
+const minConnectionLifetime = time.Minute
+
+// timings are the periods the background loops run on.
+//
+// They are derived once, in [newTimings], rather than recomputed inside each
+// loop. The derivation is a decision — the probe interval has a floor, and the
+// renewal check does not follow the facts interval at all — and a decision
+// belongs somewhere it can be read and tested on its own.
+type timings struct {
+	// facts is how often cluster facts are recollected, and also the budget
+	// for one collection: a refresh that outruns its own period is not a
+	// refresh, it is a backlog.
+	facts time.Duration
+	// probe is how often the local Prometheus is probed for readiness.
+	probe time.Duration
+	// renewCheck is how often the renewal decision is re-evaluated.
+	renewCheck time.Duration
+	// dialStagger bounds a dialer's initial random delay.
+	dialStagger time.Duration
+}
+
+// newTimings derives the loop periods from configuration.
+func newTimings(cfg *config.Spoke) timings {
+	facts := cfg.FactsRefreshInterval
+	if facts <= 0 {
+		facts = defaultFactsRefresh
+	}
+	probe := facts / 5
+	if probe < minProbeInterval {
+		probe = minProbeInterval
+	}
+	return timings{
+		facts:       facts,
+		probe:       probe,
+		renewCheck:  renewCheckInterval,
+		dialStagger: maxFirstDialDelay,
+	}
+}
+
 // Run starts the spoke and blocks until ctx is cancelled or a fatal error
 // occurs. It returns nil on a clean shutdown.
 func Run(ctx context.Context, cfg *config.Spoke) error {
@@ -63,7 +117,7 @@ func Run(ctx context.Context, cfg *config.Spoke) error {
 	}
 	build := version.Get()
 	logger = logger.With("component", "spoke", "cluster_id", cfg.ClusterID)
-	logger.Info("starting", "version", build.Version, "commit", build.Commit)
+	logger.InfoContext(ctx, "starting", "version", build.Version, "commit", build.Commit)
 
 	registry := obs.NewRegistry(build, "spoke")
 	metrics := obs.NewSpokeMetrics(registry)
@@ -84,7 +138,7 @@ func Run(ctx context.Context, cfg *config.Spoke) error {
 		flush, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		if err := shutdownTracing(flush); err != nil {
-			logger.Warn("flushing traces failed", "error", err)
+			logger.WarnContext(flush, "flushing traces failed", "error", err)
 		}
 	}()
 
@@ -94,6 +148,7 @@ func Run(ctx context.Context, cfg *config.Spoke) error {
 		metrics: metrics,
 		health:  health,
 		build:   build,
+		now:     time.Now,
 		started: time.Now(),
 	}
 	return s.run(ctx, registry)
@@ -107,6 +162,14 @@ type spoke struct {
 	health  *obs.Health
 	build   version.Build
 	started time.Time
+	// now reads the wall clock. It is injected the same way the registry and
+	// the proxy inject theirs, because two decisions in this package are about
+	// elapsed time rather than about sleeping: whether a tunnel lasted long
+	// enough to reset the backoff, and how far through its life a certificate
+	// is.
+	now func() time.Time
+	// timing holds the loop periods; see [newTimings].
+	timing timings
 
 	prom      *promclient.Client
 	facts     *clusterfacts.Collector
@@ -118,6 +181,8 @@ type spoke struct {
 }
 
 func (s *spoke) run(ctx context.Context, registry prometheusRegistry) error {
+	s.timing = newTimings(s.cfg)
+
 	admin, err := s.startAdmin(ctx, registry)
 	if err != nil {
 		return err
@@ -156,7 +221,7 @@ func (s *spoke) run(ctx context.Context, registry prometheusRegistry) error {
 	if s.store, err = newIdentityStore(s.cfg, s.logger); err != nil {
 		return fmt.Errorf("configure the identity store: %w", err)
 	}
-	s.logger.Info("identity store selected", "store", s.store.Describe())
+	s.logger.InfoContext(ctx, "identity store selected", "store", s.store.Describe())
 
 	s.enroller = &enroller{
 		apiURL:    s.cfg.HubAPIURL,
@@ -175,7 +240,7 @@ func (s *spoke) run(ctx context.Context, registry prometheusRegistry) error {
 	// must still connect and report that fact, because "cluster reachable,
 	// Prometheus down" is far more useful to an agent than silence.
 	if err := s.facts.Refresh(ctx); err != nil {
-		s.logger.Warn("initial facts refresh incomplete", "error", err)
+		s.logger.WarnContext(ctx, "initial facts refresh incomplete", "error", err)
 	}
 
 	group, gctx := errgroup.WithContext(ctx)
@@ -190,7 +255,7 @@ func (s *spoke) run(ctx context.Context, registry prometheusRegistry) error {
 	if errors.Is(err, context.Canceled) {
 		err = nil
 	}
-	s.logger.Info("shutting down")
+	s.logger.InfoContext(ctx, "shutting down")
 	s.health.StartDraining()
 	return err
 }
@@ -201,11 +266,7 @@ func (s *spoke) run(ctx context.Context, registry prometheusRegistry) error {
 // counting happens here — otherwise promfleet_spoke_facts_refresh_total is a
 // metric the charts alert on and nothing ever increments.
 func (s *spoke) runFacts(ctx context.Context) {
-	interval := s.cfg.FactsRefreshInterval
-	if interval <= 0 {
-		interval = 10 * time.Minute
-	}
-	ticker := time.NewTicker(interval)
+	ticker := time.NewTicker(s.timing.facts)
 	defer ticker.Stop()
 
 	for {
@@ -215,7 +276,7 @@ func (s *spoke) runFacts(ctx context.Context) {
 		case <-ticker.C:
 		}
 
-		refreshCtx, cancel := context.WithTimeout(ctx, interval)
+		refreshCtx, cancel := context.WithTimeout(ctx, s.timing.facts)
 		err := s.facts.Refresh(refreshCtx)
 		cancel()
 
@@ -224,7 +285,7 @@ func (s *spoke) runFacts(ctx context.Context) {
 			// A partial refresh is normal: each source fails independently and
 			// records a reason rather than blanking the rest.
 			result = "error"
-			s.logger.Warn("cluster facts refresh incomplete", "error", err)
+			s.logger.WarnContext(ctx, "cluster facts refresh incomplete", "error", err)
 		}
 		s.metrics.FactsRefreshTotal.WithLabelValues(result).Inc()
 	}
@@ -239,16 +300,16 @@ func (s *spoke) establishIdentity(ctx context.Context) error {
 	case err == nil:
 		id, lerr := loadIdentity(keyPEM, certPEM, caPEM)
 		if lerr != nil {
-			s.logger.Warn("stored identity is unusable, re-enrolling", "error", lerr)
+			s.logger.WarnContext(ctx, "stored identity is unusable, re-enrolling", "error", lerr)
 			break
 		}
-		if id.Expired(time.Now()) {
-			s.logger.Warn("stored certificate has expired, re-enrolling",
+		if id.Expired(s.now()) {
+			s.logger.WarnContext(ctx, "stored certificate has expired, re-enrolling",
 				"not_after", id.Leaf.NotAfter.Format(time.RFC3339))
 			break
 		}
 		s.setIdentity(id)
-		s.logger.Info("loaded stored identity",
+		s.logger.InfoContext(ctx, "loaded stored identity",
 			"serial", id.Leaf.SerialNumber.Text(16),
 			"not_after", id.Leaf.NotAfter.Format(time.RFC3339))
 		return nil
@@ -268,7 +329,7 @@ func (s *spoke) establishIdentity(ctx context.Context) error {
 		// Not fatal: the spoke can run on an unsaved identity, it will just
 		// need a fresh token after a restart. Failing here instead would burn
 		// the token for nothing.
-		s.logger.Error("could not persist the identity; a restart will need a new enrollment token",
+		s.logger.ErrorContext(ctx, "could not persist the identity; a restart will need a new enrollment token",
 			"error", err)
 	}
 	s.setIdentity(id)
@@ -278,7 +339,7 @@ func (s *spoke) establishIdentity(ctx context.Context) error {
 // setIdentity publishes a new identity and updates the expiry gauge.
 func (s *spoke) setIdentity(id *Identity) {
 	s.identity.Store(id)
-	s.metrics.ClientCertExpiry.Set(float64(time.Until(id.Leaf.NotAfter).Seconds()))
+	s.metrics.ClientCertExpiry.Set(id.Leaf.NotAfter.Sub(s.now()).Seconds())
 }
 
 // currentIdentity returns the identity in force.
@@ -306,24 +367,26 @@ func (s *spoke) reconnectSignal() <-chan struct{} {
 func (s *spoke) renewLoop(ctx context.Context) error {
 	// Spread the first check too; a hub restart plus a synchronised fleet is
 	// exactly the thundering herd we are avoiding.
-	timer := time.NewTimer(jitter(renewCheckInterval))
+	timer := time.NewTimer(jitter(s.timing.renewCheck))
 	defer timer.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
+			// Reported rather than swallowed, so that the one place which
+			// decides whether a cancelled context is a failure is [spoke.run].
+			return ctx.Err()
 		case <-timer.C:
 		}
-		timer.Reset(jitter(renewCheckInterval))
+		timer.Reset(jitter(s.timing.renewCheck))
 
 		id := s.currentIdentity()
-		if id == nil || !id.NeedsRenewal(time.Now(), renewAtFraction) {
+		if id == nil || !id.NeedsRenewal(s.now(), renewAtFraction) {
 			continue
 		}
 		renewed, err := s.enroller.renew(ctx, id)
 		if err != nil {
-			remaining := time.Until(id.Leaf.NotAfter)
+			remaining := id.Leaf.NotAfter.Sub(s.now())
 			level := slog.LevelWarn
 			if remaining < 24*time.Hour {
 				level = slog.LevelError
@@ -333,10 +396,10 @@ func (s *spoke) renewLoop(ctx context.Context) error {
 			continue
 		}
 		if err := s.store.Save(ctx, renewed.KeyPEM, renewed.CertPEM, renewed.CABundle); err != nil {
-			s.logger.Error("could not persist the renewed identity", "error", err)
+			s.logger.ErrorContext(ctx, "could not persist the renewed identity", "error", err)
 		}
 		s.setIdentity(renewed)
-		s.logger.Info("certificate renewed, reconnecting tunnels",
+		s.logger.InfoContext(ctx, "certificate renewed, reconnecting tunnels",
 			"not_after", renewed.Leaf.NotAfter.Format(time.RFC3339))
 		s.signalReconnect()
 	}
@@ -345,11 +408,7 @@ func (s *spoke) renewLoop(ctx context.Context) error {
 // probeLoop keeps the readiness signal for the local Prometheus current. A dead
 // Prometheus must not restart the pod, so this feeds readiness only.
 func (s *spoke) probeLoop(ctx context.Context) {
-	interval := s.cfg.FactsRefreshInterval / 5
-	if interval < 15*time.Second {
-		interval = 15 * time.Second
-	}
-	ticker := time.NewTicker(interval)
+	ticker := time.NewTicker(s.timing.probe)
 	defer ticker.Stop()
 
 	failures := 0
@@ -392,22 +451,22 @@ func (s *spoke) dialLoop(ctx context.Context, endpoint string) {
 	// be normalised will never work, so there is nothing to retry.
 	target, err := wstun.NormalizeEndpoint(endpoint)
 	if err != nil {
-		log.Error("hub endpoint is unusable", "error", err)
+		log.ErrorContext(ctx, "hub endpoint is unusable", "error", err)
 		return
 	}
 	if target != endpoint {
-		log.Info("hub endpoint normalised", "url", target)
+		log.InfoContext(ctx, "hub endpoint normalised", "url", target)
 	}
 	attempt := 0
 
 	// Stagger the very first dial so a fleet-wide rollout does not arrive at
 	// the hub in one burst.
-	if !sleepCtx(ctx, time.Duration(rand.Int64N(int64(5*time.Second)))) {
+	if !sleepCtx(ctx, time.Duration(rand.Int64N(int64(s.timing.dialStagger)))) {
 		return
 	}
 
 	for ctx.Err() == nil {
-		connected := time.Now()
+		connected := s.now()
 		reason := s.dialOnce(ctx, target, log)
 		s.metrics.TunnelUp.WithLabelValues(target).Set(0)
 		s.health.Set("tunnel", false, "no tunnel to "+target)
@@ -420,12 +479,12 @@ func (s *spoke) dialLoop(ctx context.Context, endpoint string) {
 		// Reset the backoff only after a connection that actually lasted. A
 		// connection that dies immediately must not reset the counter, or a
 		// crash-looping hub gets hammered.
-		if time.Since(connected) > time.Minute {
+		if s.now().Sub(connected) > minConnectionLifetime {
 			attempt = 0
 		}
 		delay := fullJitter(s.cfg.ReconnectMinBackoff, s.cfg.ReconnectMaxBackoff, attempt)
 		attempt++
-		log.Warn("tunnel closed, reconnecting", "reason", reason, "in", delay.Round(time.Millisecond).String())
+		log.WarnContext(ctx, "tunnel closed, reconnecting", "reason", reason, "in", delay.Round(time.Millisecond).String())
 		if !sleepCtx(ctx, delay) {
 			return
 		}
@@ -457,7 +516,13 @@ func (s *spoke) dialOnce(ctx context.Context, endpoint string, log *slog.Logger)
 	// The certificate is presented inside the connection, not in a TLS
 	// handshake: an Ingress terminates TLS and the hub would never see it.
 	// CABundle here verifies whatever answers on the hub's behalf.
-	err := wstun.Dial(dialCtx, wstun.ClientConfig{
+	//
+	// Dial reports every outcome, including an orderly close, as a
+	// *grpctun.DialError carrying a reason from a closed set, and classify
+	// believes it. There is deliberately no separate "it returned nil" branch:
+	// classify already answers "closed" for a nil error, and a second place
+	// that knows that label is a second place for it to drift.
+	return classify(wstun.Dial(dialCtx, wstun.ClientConfig{
 		URL:          endpoint,
 		Certificate:  id.Certificate,
 		CABundle:     id.CABundle,
@@ -466,11 +531,7 @@ func (s *spoke) dialOnce(ctx context.Context, endpoint string, log *slog.Logger)
 		AgentVersion: s.build.Version,
 		Logger:       log,
 		Generation:   s.started.UnixNano(),
-	}, s)
-	if err != nil {
-		return classify(err)
-	}
-	return "closed"
+	}, s))
 }
 
 // Do implements tunnel.Handler by delegating to the Prometheus client, which
@@ -497,7 +558,7 @@ func (s *spoke) startAdmin(ctx context.Context, registry prometheusRegistry) (*h
 	mux.Handle("GET /metrics", obs.MetricsHandler(registry))
 	if s.cfg.PprofEnabled {
 		mux.Handle("/debug/pprof/", obs.PprofHandler())
-		s.logger.Warn("pprof is enabled; keep this listener off the network")
+		s.logger.WarnContext(ctx, "pprof is enabled; keep this listener off the network")
 	}
 
 	srv := httpx.NewServer(httpx.ServerConfig{
@@ -509,7 +570,7 @@ func (s *spoke) startAdmin(ctx context.Context, registry prometheusRegistry) (*h
 	if err := srv.Start(ctx); err != nil {
 		return nil, fmt.Errorf("start the admin listener: %w", err)
 	}
-	s.logger.Info("admin listener ready", "addr", srv.Addr())
+	s.logger.InfoContext(ctx, "admin listener ready", "addr", srv.Addr())
 	return srv, nil
 }
 

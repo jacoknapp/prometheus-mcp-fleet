@@ -972,6 +972,17 @@ func TestCAOperationalFailures(t *testing.T) {
 		caRandomInt = origRandomInt
 	})
 
+	t.Run("leaf serial generation", func(t *testing.T) {
+		c := mustCA(t, Options{})
+		csrDER, _ := simpleCSR(t)
+		caRandomInt = func(io.Reader, *big.Int) (*big.Int, error) { return nil, boom }
+		pemBytes, leaf, err := c.IssueSpokeFromCSR(csrDER, "prod")
+		if pemBytes != nil || leaf != nil || !errors.Is(err, boom) {
+			t.Fatalf("IssueSpokeFromCSR = (%x, %v, %v), want nils and wrapped error", pemBytes, leaf, err)
+		}
+		caRandomInt = origRandomInt
+	})
+
 	t.Run("certificate signing", func(t *testing.T) {
 		c := mustCA(t, Options{})
 		caCreateCertificate = func(io.Reader, *x509.Certificate, *x509.Certificate, any, any) ([]byte, error) {

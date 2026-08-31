@@ -80,8 +80,8 @@ func TestLRUEviction(t *testing.T) {
 			}
 			c := newLRU[string, int](capacity)
 			tc.ops(c)
-			if got := c.Len(); got != len(tc.want) {
-				t.Fatalf("Len() = %d, want %d", got, len(tc.want))
+			if got := len(c.m); got != len(tc.want) {
+				t.Fatalf("cache length = %d, want %d", got, len(tc.want))
 			}
 			for _, k := range tc.want {
 				if _, ok := c.Get(k); !ok {
@@ -105,8 +105,8 @@ func TestLRUMissAndPurge(t *testing.T) {
 		c.Put(strconv.Itoa(i), i)
 	}
 	c.Purge()
-	if got := c.Len(); got != 0 {
-		t.Errorf("Len() after Purge = %d, want 0", got)
+	if got := len(c.m); got != 0 {
+		t.Errorf("cache length after Purge = %d, want 0", got)
 	}
 	// The cache must still be usable after a purge.
 	c.Put("x", 1)
@@ -154,7 +154,7 @@ func TestLRUIsConcurrencySafe(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	if got := c.Len(); got > 64 {
-		t.Errorf("Len() = %d, want at most the capacity 64", got)
+	if got := len(c.m); got > 64 {
+		t.Errorf("cache length = %d, want at most the capacity 64", got)
 	}
 }

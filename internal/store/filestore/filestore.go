@@ -239,6 +239,22 @@ func (s *Store) PutKey(ctx context.Context, k *fleet.Key) error {
 	return s.mutate(ctx, func(st *store.State) (bool, error) { return st.PutKey(k) })
 }
 
+// PutKeyIfNoUsable implements store.Store.
+func (s *Store) PutKeyIfNoUsable(
+	ctx context.Context, k *fleet.Key, at time.Time,
+) (bool, error) {
+	if at.IsZero() {
+		at = s.now()
+	}
+	var stored bool
+	err := s.mutate(ctx, func(st *store.State) (bool, error) {
+		var err error
+		stored, err = st.PutKeyIfNoUsable(k, at)
+		return stored, err
+	})
+	return stored, err
+}
+
 // GetKey implements store.Store.
 func (s *Store) GetKey(ctx context.Context, kid string) (*fleet.Key, error) {
 	s.mu.Lock()

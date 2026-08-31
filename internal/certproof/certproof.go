@@ -68,14 +68,6 @@ const RenewProtocolVersion = "renew-v1"
 // carried by the protocol version field instead.
 const domainTag = "prometheus-mcp-fleet/tunnel-auth\x00"
 
-// Transcript is the byte string both sides sign and verify.
-//
-// Every field that could be attacker-influenced is length-prefixed, so no
-// combination of values can produce the same transcript as a different
-// combination. Concatenating without lengths is the classic way to make a
-// signature cover something other than what it appears to.
-//
-// The returned slice is freshly allocated and owned by the caller.
 // MaxFieldBytes bounds a single transcript field.
 //
 // The length prefix is 32 bits, so a field of 4 GiB or more would truncate it
@@ -95,6 +87,8 @@ var ErrFieldTooLarge = errors.New("certproof: transcript field is too large")
 // combination of values can produce the same transcript as a different
 // combination. Concatenating without lengths is the classic way to make a
 // signature cover something other than what it appears to.
+//
+// The returned slice is freshly allocated and owned by the caller.
 func Transcript(nonce []byte, protocolVersion, clusterID string) ([]byte, error) {
 	fields := [][]byte{nonce, []byte(protocolVersion), []byte(clusterID)}
 	for _, f := range fields {
@@ -109,6 +103,7 @@ func Transcript(nonce []byte, protocolVersion, clusterID string) ([]byte, error)
 	buf = append(buf, domainTag...)
 	for _, f := range fields {
 		var n [4]byte
+		//nolint:gosec // G115: the loop above rejects any field longer than MaxFieldBytes (64 KiB), so len(f) always fits a uint32.
 		binary.BigEndian.PutUint32(n[:], uint32(len(f)))
 		buf = append(buf, n[:]...)
 		buf = append(buf, f...)

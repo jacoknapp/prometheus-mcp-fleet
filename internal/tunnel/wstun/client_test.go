@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/certproof"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel/grpctun"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel/tunneltest"

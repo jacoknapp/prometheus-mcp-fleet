@@ -4,6 +4,7 @@
 package spoke
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -121,6 +122,17 @@ func (c *testCA) newIdentity(t *testing.T, clusterID string) *Identity {
 	return id
 }
 
+// strictDecode is how the hub reads a request body: an unknown field is an
+// error rather than something silently ignored. It is the reason a spoke
+// cannot quietly grow a field the hub does not have, and it is repeated here
+// because a stub more forgiving than the hub is exactly what let a mismatched
+// enrollment body ship.
+func strictDecode(r io.Reader, v any) error {
+	dec := json.NewDecoder(r)
+	dec.DisallowUnknownFields()
+	return dec.Decode(v)
+}
+
 // fakeHub is the hub half of the enrollment API, recording what it received.
 //
 // It verifies the renewal proof with internal/certproof, which is the same code
@@ -203,7 +215,7 @@ func (f *fakeHub) challenge(w http.ResponseWriter, r *http.Request) {
 func (f *fakeHub) renew(w http.ResponseWriter, r *http.Request) {
 	f.note(r)
 	var req renewRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := strictDecode(r.Body, &req); err != nil {
 		http.Error(w, "bad body", http.StatusBadRequest)
 		return
 	}
@@ -247,7 +259,7 @@ func (f *fakeHub) enroll(w http.ResponseWriter, r *http.Request) {
 	f.mu.Unlock()
 
 	var req enrollRequest
-	if err := json.Unmarshal(raw, &req); err != nil {
+	if err := strictDecode(bytes.NewReader(raw), &req); err != nil {
 		http.Error(w, "bad body", http.StatusBadRequest)
 		return
 	}

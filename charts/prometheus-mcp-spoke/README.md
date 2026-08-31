@@ -1,6 +1,7 @@
+
 # prometheus-mcp-spoke
 
-![Version: 0.1.0](https://img.shields.io/badge/Version-0.1.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.1.0](https://img.shields.io/badge/AppVersion-0.1.0-informational?style=flat-square)
+![Version: 0.2.0](https://img.shields.io/badge/Version-0.2.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.1.0](https://img.shields.io/badge/AppVersion-0.1.0-informational?style=flat-square)
 
 Tiny outbound-only agent that dials the prometheus-mcp-hub over an authenticated WebSocket and proxies this cluster's Prometheus HTTP API. One namespaced Role over one Secret, or no RBAC at all in memory identity mode.
 
@@ -303,7 +304,7 @@ Kubernetes: `>=1.28.0-0`
 | autoUpdate.channelTag | string | `"stable"` | Moving OCI tag the updater resolves to a digest. It is never written into the pod spec. |
 | autoUpdate.cohort | string | `"stable"` | Release cohort. `canary` accepts a promotion immediately, `early` after 72h, `stable` after 7 days. The cohort also shifts the derived weekday so canaries always move first. |
 | autoUpdate.concurrencyPolicy | string | `"Forbid"` | `spec.concurrencyPolicy`. |
-| autoUpdate.containerSecurityContext | object | `{"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"capabilities":{"drop":["ALL"]}}` | Container security context for the update job. |
+| autoUpdate.containerSecurityContext | object | `{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"readOnlyRootFilesystem":true}` | Container security context for the update job. |
 | autoUpdate.enabled | bool | `false` | Render a CronJob that resolves `autoUpdate.channelTag` to a digest, verifies the signature and SLSA provenance with cosign, and patches this Deployment to that DIGEST. OFF BY DEFAULT. An automatic weekly rollout to 100 production clusters is a fleet-wide outage delivery mechanism. That is why it is opt-in, digest-pinned, signature-verified, staggered by a hash of the release identity and split into cohorts. Read "Automatic updates" in the README before enabling it. |
 | autoUpdate.extraEnv | list | `[]` | Extra environment variables for the update job, in raw `EnvVar` form. Proxy settings and registry credential helpers go here. |
 | autoUpdate.failedJobsHistoryLimit | int | `3` | `spec.failedJobsHistoryLimit`. |

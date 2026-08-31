@@ -244,7 +244,7 @@ func (r *Registry) OnSession(ctx context.Context, s tunnel.Session) (func(), err
 		// longer owns.
 		prev.cancel()
 		go r.closeSession(prev.session, id, ReplacedReason)
-		r.log.Warn("registry: replacing session",
+		r.log.WarnContext(ctx, "registry: replacing session",
 			"cluster", id, "old_generation", prev.generation, "new_generation", gen)
 	}
 
@@ -253,7 +253,7 @@ func (r *Registry) OnSession(ctx context.Context, s tunnel.Session) (func(), err
 	if !ident.CertNotAfter.IsZero() {
 		r.metrics.SpokeCertExpiry(id, ident.CertNotAfter)
 	}
-	r.log.Info("registry: session attached",
+	r.log.InfoContext(ctx, "registry: session attached",
 		"cluster", id, "generation", gen, "state", string(e.cluster.State),
 		"remote_addr", ident.RemoteAddr, "cert_serial", ident.CertSerial)
 
@@ -334,7 +334,7 @@ func (r *Registry) pollFacts(ctx context.Context, id string, e *entry, s tunnel.
 			// Liveness belongs to the transport's keepalive, not to us: a
 			// single failed Describe must not evict a cluster that is still
 			// answering queries.
-			r.log.Warn("registry: facts poll failed", "cluster", id, "error", err)
+			r.log.WarnContext(ctx, "registry: facts poll failed", "cluster", id, "error", err)
 			continue
 		}
 		r.applyFacts(id, e, facts)

@@ -230,6 +230,37 @@ func TestPutKeyValidation(t *testing.T) {
 	}
 }
 
+func TestPutKeyIfNoUsable(t *testing.T) {
+	t.Parallel()
+
+	s := NewState()
+	first := agentKey("bootstrap0", tBase)
+	changed, err := s.PutKeyIfNoUsable(first, tBase)
+	if err != nil || !changed {
+		t.Fatalf("first put = (%v, %v), want (true, nil)", changed, err)
+	}
+
+	replacement := agentKey("bootstrap0", tBase.Add(time.Hour))
+	replacement.SecretHMAC = []byte("replacement")
+	changed, err = s.PutKeyIfNoUsable(replacement, tBase.Add(time.Hour))
+	if err != nil || changed {
+		t.Fatalf("usable put = (%v, %v), want (false, nil)", changed, err)
+	}
+
+	changed, err = s.PutKeyIfNoUsable(replacement, tExpires.Add(time.Second))
+	if err != nil || !changed {
+		t.Fatalf("expired put = (%v, %v), want (true, nil)", changed, err)
+	}
+	got, err := s.GetKey(first.KID)
+	if err != nil || string(got.SecretHMAC) != "replacement" {
+		t.Fatalf("replacement = %+v, err %v", got, err)
+	}
+
+	if _, err := s.PutKeyIfNoUsable(nil, tBase); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("nil put error = %v, want ErrInvalid", err)
+	}
+}
+
 func TestPutKeyDeepCopiesTheCaller(t *testing.T) {
 	t.Parallel()
 	s := NewState()

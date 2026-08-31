@@ -7,7 +7,9 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -154,6 +156,40 @@ func TestNewServerAppliesDefaults(t *testing.T) {
 	}
 	if s.enrollmentEnabled {
 		t.Error("enrollment must be off unless enabled explicitly")
+	}
+}
+
+// TestMintKeyRejectsUnknownClass covers mintKey's own error path from
+// token.Mint, distinct from the CSPRNG failure token.Mint can also return:
+// since Go 1.24, crypto/rand.Read calls runtime.fatal on a reader error
+// instead of returning one, so that half of token.Mint's error surface is
+// unreachable by any test. token.ErrUnknownClass is not: every *handler* in
+// this package validates class before calling mintKey, but mintKey is an
+// unexported method in the same package, so nothing stops a test from
+// driving it directly with a class that fails fleet.KeyClass.Valid() — the
+// same technique already used above to reach handleEnroll with a nil
+// principal.
+func TestMintKeyRejectsUnknownClass(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+	s, err := newServer(Options{Store: h.store, Hasher: h.hasher, CA: h.ca, Verifier: h.verifier})
+	if err != nil {
+		t.Fatalf("newServer: %v", err)
+	}
+
+	bogus := fleet.KeyClass("bogus")
+	if bogus.Valid() {
+		t.Fatal("test setup: this class must be invalid")
+	}
+	key, raw, err := s.mintKey(t.Context(), bogus, "name", "owner", time.Hour, nil, nil)
+	if err == nil {
+		t.Fatal("mintKey accepted an unknown key class")
+	}
+	if !errors.Is(err, token.ErrUnknownClass) {
+		t.Errorf("err = %v, want it to wrap token.ErrUnknownClass", err)
+	}
+	if key != nil || raw != "" {
+		t.Errorf("mintKey returned a credential despite the error: key=%+v raw=%q", key, raw)
 	}
 }
 
@@ -514,3 +550,117 @@ func TestTokenClassSegments(t *testing.T) {
 		})
 	}
 }
+
+// TestPathKIDValidationOnMutatingRoutes proves every route that reads a
+// {kid} path segment refuses a malformed one before it ever reaches the
+// store, not just the one route ([TestListAndGetKeys]'s "malformed kid" case)
+// that already covered GET.
+func TestPathKIDValidationOnMutatingRoutes(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+
+	routes := []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{name: "revoke key", method: http.MethodDelete, path: "/admin/v1/keys/not-a-kid?reason=x"},
+		{name: "rotate key", method: http.MethodPost, path: "/admin/v1/keys/not-a-kid/rotate"},
+		{name: "revoke enrollment", method: http.MethodDelete, path: "/admin/v1/enrollments/not-a-kid"},
+	}
+	for _, tc := range routes {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			resp := h.adminDo(tc.method, tc.path, nil)
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d (%s)", resp.StatusCode, http.StatusBadRequest, decode(t, resp, nil))
+			}
+			if env := envelopeOf(t, resp); env.Error.Code != CodeInvalidRequest {
+				t.Errorf("code = %q, want %q", env.Error.Code, CodeInvalidRequest)
+			}
+		})
+	}
+}
+
+// TestListRevokedCertsNormalizesNilSlice proves a store that returns a nil
+// slice with no error -- a shape a store bug, or a store backed by a format
+// with no empty/absent distinction, could produce even when [errors.New] was
+// never called -- still answers with an explicit `"revoked":[]`, exactly as
+// TestRevokedCertListIsAlwaysAnArray already proves for the ordinary "nothing
+// revoked yet" case where the fake naturally builds an empty (not nil) slice.
+func TestListRevokedCertsNormalizesNilSlice(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+	h.store.inject(t, func(f *fakeStore) { f.revokedCertsNil = true })
+
+	body := decode(t, h.adminDo(http.MethodGet, "/admin/v1/certs/revoked", nil), nil)
+	if !strings.Contains(body, `"revoked":[]`) {
+		t.Errorf("revoked list for a nil store slice = %s, want an explicit empty array", body)
+	}
+}
+
+// TestRequestIDPrefersResponseHeader proves the correlation id in an error
+// envelope is read from the response header the request-id middleware
+// stamps, when present, rather than always falling back to the header the
+// client sent. TestRequestIDIsEchoed already pins the fallback (this
+// package's own test harness never stamps a response header, so that test
+// exercises exactly the second return); this test pins the branch that
+// prefers it, by stamping the response header itself, the way that
+// middleware -- which lives in internal/hub, outside this package -- does in
+// production.
+func TestRequestIDPrefersResponseHeader(t *testing.T) {
+	t.Parallel()
+	w := httptest.NewRecorder()
+	w.Header().Set(authnRequestIDHeader, "from-response")
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.Header.Set(authnRequestIDHeader, "from-request")
+
+	if got := requestID(w, r); got != "from-response" {
+		t.Errorf("requestID = %q, want the response header's value", got)
+	}
+}
+
+// TestWriteJSONLogsWriteFailure proves a write failure after the status and
+// headers are already on the wire -- the shape a client that hung up
+// mid-response takes -- is logged rather than silently dropped, and that it
+// cannot be reported to the caller: the status is already sent.
+func TestWriteJSONLogsWriteFailure(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+	logs := &syncBuffer{}
+	srv, err := newServer(Options{
+		Store: h.store, Hasher: h.hasher, CA: h.ca, Verifier: h.verifier,
+		Logger: slog.New(slog.NewJSONHandler(logs, nil)), Clock: h.clock.Now,
+	})
+	if err != nil {
+		t.Fatalf("newServer: %v", err)
+	}
+
+	w := newFailingResponseWriter()
+	r := httptest.NewRequest(http.MethodGet, "/admin/v1/keys/aaaaaaaaaa", nil)
+	srv.writeJSON(w, r, http.StatusOK, KeyListResponse{Keys: []KeyView{}, Count: 0})
+
+	if w.status != http.StatusOK {
+		t.Errorf("status recorded = %d, want %d", w.status, http.StatusOK)
+	}
+	if !strings.Contains(logs.String(), "write response") || !strings.Contains(logs.String(), "connection reset") {
+		t.Errorf("write failure was not logged: %s", logs.String())
+	}
+}
+
+// mintKey's own token.Mint entropy-failure branch (admin.go, inside mintKey)
+// is deliberately not exercised here. [token.Mint] routes its CSPRNG read
+// through crypto/rand.Read, and since Go 1.24 (see
+// https://go.dev/issue/66821) that function crashes the process
+// irrecoverably ("fatal error: crypto/rand: failed to read random data")
+// instead of returning an error when the underlying reader fails -- verified
+// empirically: swapping crypto/rand.Reader for a failing one and minting a
+// key takes the whole test binary down rather than reaching mintKey's error
+// branch. Combined with every call site in admin.go always passing one of
+// the three valid KeyClass values (so token.Mint's other error,
+// ErrUnknownClass, is equally unreachable from here), mintKey's
+// `if err != nil` after `token.Mint` cannot be driven from this package
+// without either modifying internal/token (out of scope for this pass) or
+// adding a test-only seam to inject a fake mint function into hubapi -- which
+// would exist purely to dodge coverage and make the production code worse.
+// See the coverage report for the fuller writeup.

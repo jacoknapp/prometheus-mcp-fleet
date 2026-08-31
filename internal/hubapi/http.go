@@ -146,8 +146,8 @@ func (s *server) security(r *http.Request, event string, attrs ...slog.Attr) {
 	all = append(all,
 		slog.String("event", event),
 		slog.String("actor", actor.String()),
-		slog.String("actorClass", string(actorClass(actor))),
-		slog.String("remoteAddr", authn.SourceAddr(r)),
+		slog.String("actor_class", string(actorClass(actor))),
+		slog.String("remote_addr", authn.SourceAddr(r)),
 	)
 	all = append(all, attrs...)
 	s.log.LogAttrs(r.Context(), slog.LevelWarn, "security event", all...)

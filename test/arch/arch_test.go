@@ -15,7 +15,6 @@ package arch
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os/exec"
 	"slices"
 	"strings"
@@ -398,6 +397,3 @@ func TestSpokeBinaryStaysSmall(t *testing.T) {
 	}
 	t.Logf("transitive packages: spoke=%d hub=%d", spoke, hub)
 }
-
-// ensure fmt stays used if the file is edited down.
-var _ = fmt.Sprintf

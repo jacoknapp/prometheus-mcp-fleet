@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -94,13 +95,9 @@ func (b *bootstrapper) prepare(ctx context.Context, cfg *config.Hub) (*ca.CA, *t
 		return nil, nil, fmt.Errorf("load or create the CA: %w", err)
 	}
 
-	pepper, err := token.LoadOrCreatePepper(cfg.PepperFile)
+	pepper, hasher, err := loadPepper(cfg.PepperFile)
 	if err != nil {
 		return nil, nil, fmt.Errorf("load or create the pepper: %w", err)
-	}
-	hasher, err := token.NewHasher(pepper)
-	if err != nil {
-		return nil, nil, fmt.Errorf("configure the hasher: %w", err)
 	}
 
 	adopted, err := b.persist(ctx, stored, cfg, pepper)
@@ -115,15 +112,29 @@ func (b *bootstrapper) prepare(ctx context.Context, cfg *config.Hub) (*ca.CA, *t
 		if authority, err = reloadAfterAdoption(cfg); err != nil {
 			return nil, nil, fmt.Errorf("reload the adopted CA: %w", err)
 		}
-		adoptedPepper, perr := token.LoadOrCreatePepper(cfg.PepperFile)
-		if perr != nil {
-			return nil, nil, fmt.Errorf("reload the adopted pepper: %w", perr)
-		}
-		if hasher, err = token.NewHasher(adoptedPepper); err != nil {
-			return nil, nil, fmt.Errorf("configure the hasher: %w", err)
+		if _, hasher, err = loadPepper(cfg.PepperFile); err != nil {
+			return nil, nil, fmt.Errorf("reload the adopted pepper: %w", err)
 		}
 	}
 	return authority, hasher, nil
+}
+
+// loadPepper reads or creates the HMAC pepper at path and keys a hasher with
+// it.
+//
+// The two are returned together on purpose: a pepper read from one place and a
+// hasher keyed from another is exactly how a fleet ends up unable to verify the
+// credentials it issued.
+func loadPepper(path string) ([]byte, *token.Hasher, error) {
+	pepper, err := token.LoadOrCreatePepper(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	// LoadOrCreatePepper guarantees at least token.MinPepperBytes, which is
+	// NewHasher's only precondition. Keep the assertion here beside the call:
+	// if either contract changes, its package tests must change with it.
+	hasher, _ := token.NewHasher(pepper)
+	return pepper, hasher, nil
 }
 
 // load reads the CA Secret. A missing Secret is not an error: it means first
@@ -135,7 +146,7 @@ func (b *bootstrapper) load(ctx context.Context) (caMaterial, error) {
 	sec, err := b.client.GetSecret(ctx, b.secret)
 	switch {
 	case errors.Is(err, kube.ErrNotFound):
-		b.logger.Info("no CA secret yet; this hub will generate one", "secret", b.secret)
+		b.logger.InfoContext(ctx, "no CA secret yet; this hub will generate one", "secret", b.secret)
 		return caMaterial{}, nil
 	case err != nil:
 		return caMaterial{}, fmt.Errorf("read CA secret %s: %w", b.secret, err)
@@ -235,7 +246,7 @@ func (b *bootstrapper) persist(
 	case errors.Is(err, kube.ErrAlreadyExists):
 		// Another replica created it between our read and our write. Its
 		// material wins; adopt it and discard ours.
-		b.logger.Warn("another replica created the CA secret first; adopting its material",
+		b.logger.WarnContext(ctx, "another replica created the CA secret first; adopting its material",
 			"secret", b.secret)
 		winner, lerr := b.load(ctx)
 		if lerr != nil {
@@ -256,7 +267,7 @@ func (b *bootstrapper) persist(
 		return false, fmt.Errorf("create CA secret %s: %w", b.secret, err)
 	}
 
-	b.logger.Info("generated and stored a new CA", "secret", b.secret)
+	b.logger.InfoContext(ctx, "generated and stored a new CA", "secret", b.secret)
 	return false, nil
 }
 
@@ -281,22 +292,27 @@ func (b *bootstrapper) complete(
 	if err != nil {
 		return false, fmt.Errorf("read CA secret %s: %w", b.secret, err)
 	}
-	if sec.Data == nil {
-		sec.Data = make(map[string][]byte, len(generated))
-	}
+	// Merge into a fresh map rather than mutating in place. GetSecret always
+	// returns an allocated map, so a nil check would be a branch that can
+	// never be taken, and writing into a nil map would panic if that ever
+	// changed; this is correct either way and costs one allocation on a path
+	// that runs at most once per boot.
+	data := make(map[string][]byte, len(sec.Data)+len(generated))
+	maps.Copy(data, sec.Data)
 
 	filled := make([]string, 0, len(generated))
 	for key, value := range generated {
-		if len(sec.Data[key]) > 0 {
+		if len(data[key]) > 0 {
 			continue // an existing value always wins
 		}
-		sec.Data[key] = value
+		data[key] = value
 		filled = append(filled, key)
 	}
 	if len(filled) == 0 {
 		return false, nil
 	}
 	slices.Sort(filled)
+	sec.Data = data
 
 	if _, err := b.client.UpdateSecret(ctx, sec); err != nil {
 		if errors.Is(err, kube.ErrConflict) {
@@ -305,7 +321,7 @@ func (b *bootstrapper) complete(
 		}
 		return false, fmt.Errorf("complete CA secret %s: %w", b.secret, err)
 	}
-	b.logger.Warn("completed a partially populated CA secret",
+	b.logger.WarnContext(ctx, "completed a partially populated CA secret",
 		"secret", b.secret, "filled", filled,
 		"note", "existing fields were left untouched")
 

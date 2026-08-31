@@ -92,18 +92,14 @@ linters:
       # log lines longer and no more correct.
       kv-only: false
       attr-only: false
-      # context is off. This service logs from config loading, bootstrap and
-      # shutdown paths where no request context exists, and mechanically
-      # converting the call sites that do have one to InfoContext/WarnContext
-      # buys no trace correlation that the handler's own span does not already
-      # carry. no-mixed-args and key-naming-case below are the rules that catch
-      # Deferred, not exempt. This rule fires only where a context IS already in
-      # scope, so the ~38 sites it flags are ones that could carry trace context
-      # into the log record — which matters, because OpenTelemetry tracing is a
-      # shipped feature. Converting them is worth doing; it is a mechanical
-      # change large enough to want its own review rather than riding along in a
-      # lint sweep. Tracked as follow-up work.
-      context: ""
+      # `scope` requires InfoContext/WarnContext/ErrorContext/DebugContext only
+      # where a context.Context is already in scope, which is exactly where the
+      # log record can pick up the active span. OpenTelemetry tracing is a
+      # shipped feature, so a line emitted inside a traced operation that drops
+      # the trace ID is a line an operator cannot correlate back to the request
+      # that produced it. Bootstrap, config-loading and shutdown paths with no
+      # context in scope are untouched: there is nothing there to carry.
+      context: scope
       static-msg: false
       key-naming-case: snake
     staticcheck:
@@ -113,21 +109,9 @@ linters:
     generated: lax
     warn-unused: true
     rules:
-      # Generated protobuf code is not ours to lint.
-      - path: ^internal/gen/
-        linters: [revive, gocritic, staticcheck, gosec, unparam, perfsprint]
-      # Tests may use long functions, sleep, and unchecked cleanup errors.
-      # Composition roots legitimately wire many dependencies in one function.
-      - path: ^internal/(hub|spoke)/
-        text: "cognitive complexity|cyclomatic"
       # The MCP tool handlers echo caller-supplied text back in errors on purpose.
       - path: ^internal/mcptools/
         linters: [perfsprint]
-      # A command-line tool printing its own version to stdout is correct; the
-      # forbidigo rule exists to stop fmt.Print being used *instead of* logging
-      # inside the server.
-      - path: ^cmd/
-        linters: [forbidigo]
       # Reading a file whose path came from configuration is the entire job of
       # a configuration-driven loader. gosec cannot distinguish it from a
       # traversal, and the paths here are operator-supplied, not caller-supplied.
@@ -165,10 +149,10 @@ linters:
       - path: ^internal/(render|mcptools)/.*_test\.go$
         linters: [staticcheck]
         text: "ST1018"
-      # These tests exist to prove that a redacting type survives every fmt
+      # This test exists to prove that a redacting type survives every fmt
       # verb. Calling String() instead of formatting with %s would skip the
       # exact dispatch path the test is there to cover.
-      - path: ^internal/(obs/secret|token/redact)_test\.go$
+      - path: ^internal/token/redact_test\.go$
         linters: [staticcheck]
         text: "S1025"
       # G101 fires on identifiers containing "Secret" or "Token". Every hit is
@@ -180,8 +164,11 @@ linters:
       # G705 traces request data into a response body. These handlers write
       # encoding/json output under an explicit application/json content type
       # with X-Content-Type-Options: nosniff, which is not an XSS sink; there
-      # is no HTML template anywhere in this service.
-      - path: ^internal/(hubapi|httpx)/
+      # is no HTML template anywhere in this service. internal/testutil is the
+      # same shape and less: FakePrometheus serves embedded JSON fixtures over
+      # an httptest listener to this module's own tests, and no browser ever
+      # sees it.
+      - path: ^internal/(hubapi|httpx|testutil)/
         linters: [gosec]
         text: "G705"
 

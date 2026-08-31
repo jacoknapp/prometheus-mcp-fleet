@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/mcpsurface"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/promapi"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/render"
 )
@@ -56,6 +57,39 @@ func TestNewValidatesOptions(t *testing.T) {
 	}
 }
 
+// TestNopMetricsIsSafeToDriveThroughRun proves the default [NopMetrics] a
+// caller gets by leaving Options.Metrics unset is actually wired into the
+// call path and safe to invoke: run() calls ToolCall and ToolDuration
+// unconditionally on every request, so a Tools built without an explicit
+// metrics sink must not panic when a real call reaches it.
+func TestNopMetricsIsSafeToDriveThroughRun(t *testing.T) {
+	t.Parallel()
+	clusters := &fakeClusters{entries: testClusters()}
+	tools, err := New(Options{
+		Prometheus: newFakeProm(t), Clusters: clusters,
+		Clock: func() time.Time { return testNow },
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, ok := tools.metrics.(NopMetrics); !ok {
+		t.Fatalf("metrics = %T, want the NopMetrics default", tools.metrics)
+	}
+
+	fn := run(tools, ToolListClusters,
+		func() *ListClustersOut { return &ListClustersOut{} }, tools.listClusters)
+	out, res, err := fn(ctx(t), request(ToolListClusters, principal(fullScope())), ListClustersIn{})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res != mcpsurface.OKResult {
+		t.Errorf("result = %v, want ok", res)
+	}
+	if out == nil {
+		t.Fatal("run returned a nil result on success")
+	}
+}
+
 // TestRegisterRejectsNil covers the composition root's entry point.
 func TestRegisterRejectsNil(t *testing.T) {
 	t.Parallel()
@@ -95,7 +129,7 @@ func TestToolErrorHelpers(t *testing.T) {
 		t.Error("errors.As did not recover the ToolError")
 	}
 
-	env := failed(e)
+	env := Envelope{Error: e}
 	if env.Error != e || env.Untrusted != "" {
 		t.Errorf("failed envelope = %+v", env)
 	}
@@ -105,6 +139,17 @@ func TestToolErrorHelpers(t *testing.T) {
 	u.setError(e)
 	if u.Untrusted != "" {
 		t.Error("the untrusted notice survived onto an error result")
+	}
+}
+
+func TestRegisteredErrorConstructorsReturnWritableEnvelopes(t *testing.T) {
+	t.Parallel()
+
+	if out := newListClustersOut(); out == nil {
+		t.Fatal("newListClustersOut returned nil")
+	}
+	if out := newExplainPromQLOut(); out == nil {
+		t.Fatal("newExplainPromQLOut returned nil")
 	}
 }
 
@@ -440,6 +485,142 @@ func TestSmallHelpers(t *testing.T) {
 	}
 	if got := plural(1, "y", "ies"); got != "y" {
 		t.Errorf("plural(1) = %q", got)
+	}
+}
+
+// TestPlural covers both branches of the singular/plural picker directly: the
+// only existing exercise of it was the n==1 case above, so n==0 and n>1 (the
+// "many" return) were unreached.
+func TestPlural(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		n         int
+		one, many string
+		want      string
+	}{
+		{n: 1, one: "y", many: "ies", want: "y"},
+		{n: 0, one: "y", many: "ies", want: "ies"},
+		{n: 2, one: "y", many: "ies", want: "ies"},
+		{n: -1, one: "y", many: "ies", want: "ies"},
+	}
+	for _, tc := range tests {
+		if got := plural(tc.n, tc.one, tc.many); got != tc.want {
+			t.Errorf("plural(%d, %q, %q) = %q, want %q", tc.n, tc.one, tc.many, got, tc.want)
+		}
+	}
+}
+
+// TestParseRelativeTrailingWhitespace covers parseRelative's own defensive
+// handling of a "now" prefix whose body trims to empty. ParseTime always
+// trims its input before calling parseRelative, so s can never actually equal
+// "now" plus trailing whitespace by the time parseRelative sees it through
+// that path — this exercises parseRelative directly, as an internal
+// function, to reach the branch on its own terms.
+func TestParseRelativeTrailingWhitespace(t *testing.T) {
+	t.Parallel()
+	now := testNow
+	got, ok, err := parseRelative("now   ", now)
+	if !ok {
+		t.Fatal("\"now   \" was not recognised as a relative form")
+	}
+	if err != nil {
+		t.Fatalf("parseRelative: %v", err)
+	}
+	if !got.Equal(now.UTC()) {
+		t.Errorf("parseRelative(\"now   \") = %v, want %v", got, now.UTC())
+	}
+}
+
+// TestClipList covers the shared-truncation folding directly: which section's
+// [render.Truncation] survives when two sections are both cut depends on
+// which had the larger overflow, and describeCluster's own fixture data never
+// produces an unequal pair, so only the "keep prev" side was reachable
+// through it.
+func TestClipList(t *testing.T) {
+	t.Parallel()
+	// No truncation: the input is returned unchanged and prev passes through.
+	kept, trunc := clipList([]string{"a", "b"}, 5, nil, "jobs", "hint")
+	if trunc != nil || len(kept) != 2 {
+		t.Fatalf("clipList with nothing to cut: kept=%v trunc=%+v", kept, trunc)
+	}
+
+	// First section cut, no prior truncation: its own Truncation is returned.
+	kept, first := clipList([]string{"a", "b", "c"}, 1, nil, "jobs", "hint")
+	if first == nil || len(kept) != 1 {
+		t.Fatalf("first cut: kept=%v trunc=%+v", kept, first)
+	}
+	if first.Selection != "jobs_first_1" {
+		t.Errorf("selection = %q", first.Selection)
+	}
+
+	// A second section cut with a *smaller* overflow than the first keeps the
+	// first section's Truncation.
+	kept2, prevKept := clipList([]string{"x", "y"}, 1, first, "prefixes", "hint2")
+	if len(kept2) != 1 {
+		t.Fatalf("second cut kept = %v", kept2)
+	}
+	if prevKept != first {
+		t.Errorf("a smaller overflow displaced the larger one: got %+v, want the jobs cut", prevKept)
+	}
+
+	// A second section cut with a *larger* overflow than the first replaces
+	// it, because the bigger gap is the one most likely to have hidden the
+	// answer.
+	bigList := []string{"1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}
+	kept3, replaced := clipList(bigList, 1, first, "namespaces", "hint3")
+	if len(kept3) != 1 {
+		t.Fatalf("third cut kept = %v", kept3)
+	}
+	if replaced == first {
+		t.Error("a larger overflow did not displace the smaller one")
+	}
+	if replaced.Selection != "namespaces_first_1" {
+		t.Errorf("selection = %q, want the larger cut's own section named", replaced.Selection)
+	}
+	if replaced.Total-replaced.Returned <= first.Total-first.Returned {
+		t.Errorf("replaced overflow (%d) is not larger than the original (%d)",
+			replaced.Total-replaced.Returned, first.Total-first.Returned)
+	}
+}
+
+// TestFirstErr covers the multi-section "keep the first failure" helper
+// directly: order matters (the first error must survive even when a later,
+// different error is passed next), which the existing runtime_info tests
+// never distinguish because only one section fails at a time in them.
+func TestFirstErr(t *testing.T) {
+	t.Parallel()
+	e1 := newError(CodeUpstreamError, "first failure", true)
+	e2 := newError(CodeQueryTimeout, "second failure", true)
+
+	if got := firstErr(nil, nil); got != nil {
+		t.Errorf("firstErr(nil, nil) = %v, want nil", got)
+	}
+	if got := firstErr(nil, e1); got != e1 {
+		t.Errorf("firstErr(nil, e1) = %v, want e1", got)
+	}
+	if got := firstErr(e1, e2); got != e1 {
+		t.Errorf("firstErr(e1, e2) = %v, want the first error retained, not the second", got)
+	}
+	if got := firstErr(e1, nil); got != e1 {
+		t.Errorf("firstErr(e1, nil) = %v, want e1 kept", got)
+	}
+}
+
+// TestJSONContentMarshalError covers jsonContent's own error path directly.
+// None of this package's resource bodies actually contain a value
+// json.Marshal can fail on, so the three call sites (readClusters,
+// readCluster, readFiringAlerts) can never reach it; jsonContent is a
+// general-purpose helper, so it keeps the branch, and it is exercised here
+// with a value manufactured to fail marshalling.
+func TestJSONContentMarshalError(t *testing.T) {
+	t.Parallel()
+	_, err := jsonContent(make(chan int))
+	if err == nil {
+		t.Fatal("jsonContent accepted a channel, which json.Marshal cannot encode")
+	}
+	code, ok := mcpsurface.ErrorCode(err)
+	if !ok || code != mcpsurface.CodeInvalidParams {
+		t.Errorf("err = %v (code %d), want CodeInvalidParams", err, code)
 	}
 }
 

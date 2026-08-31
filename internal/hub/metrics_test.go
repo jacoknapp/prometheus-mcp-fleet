@@ -4,6 +4,7 @@
 package hub
 
 import (
+	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
@@ -155,7 +156,7 @@ func metricValue(t *testing.T, r *prometheus.Registry, series string) float64 {
 func metricsText(t *testing.T, r *prometheus.Registry) string {
 	t.Helper()
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/metrics", nil)
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 	obs.MetricsHandler(r).ServeHTTP(rec, req)
 	if rec.Code != 200 {
 		t.Fatalf("metrics status = %d, want 200", rec.Code)

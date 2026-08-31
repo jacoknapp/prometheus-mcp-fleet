@@ -164,7 +164,7 @@ func (s *server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	s.security(r, EventCertIssued,
 		slog.String("cluster", clusterID),
 		slog.String("serial", serial),
-		slog.String("notAfter", cert.NotAfter.UTC().Format("2006-01-02T15:04:05Z07:00")))
+		slog.String("not_after", cert.NotAfter.UTC().Format("2006-01-02T15:04:05Z07:00")))
 	s.metrics.Enrollment(ResultIssued)
 	s.writeJSON(w, r, http.StatusCreated, EnrollResponse{
 		Certificate: string(certPEM),
@@ -322,7 +322,7 @@ func (s *server) handleRenew(w http.ResponseWriter, r *http.Request) {
 	s.security(r, EventCertRenewed,
 		slog.String("cluster", identity.ClusterID),
 		slog.String("serial", serial),
-		slog.String("previousSerial", identity.CertSerial))
+		slog.String("previous_serial", identity.CertSerial))
 	s.metrics.Enrollment(ResultIssued)
 	s.writeJSON(w, r, http.StatusCreated, EnrollResponse{
 		Certificate: string(certPEM),

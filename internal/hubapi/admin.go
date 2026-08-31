@@ -122,6 +122,9 @@ func (s *server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 		}
 	case fleet.ClassEnrollment:
 		// Unreachable: the maxTTL switch above already refused this class.
+		// The case is not decoration -- `exhaustive` is enabled and this
+		// switch has no default, so omitting it is a lint failure and, more
+		// to the point, a fourth KeyClass would then be accepted silently.
 	}
 	ttl, err := resolveTTL(req.TTL, maxTTL)
 	if err != nil {
@@ -279,7 +282,7 @@ func (s *server) handleRotateKey(w http.ResponseWriter, r *http.Request) {
 	}
 	s.security(r, EventKeyRotated,
 		slog.String("kid", fresh.KID),
-		slog.String("replacesKid", old.KID),
+		slog.String("replaces_kid", old.KID),
 		slog.String("class", string(fresh.Class)),
 		slog.String("reason", reason))
 	s.writeJSON(w, r, http.StatusCreated, mintedResponse(fresh, raw, s.clock()))

@@ -198,12 +198,14 @@ func (t *Tools) passthroughInstant(
 }
 
 // instantTable renders an instant result as fixed-width text.
+//
+// Every row of enc.Rows is a 3-tuple: render.EncodeInstant's three branches
+// (scalar, string, vector) each build rows of exactly {name, labels, value},
+// so there is deliberately no defensive short-row skip here — it could never
+// fire and would be an untested branch.
 func instantTable(enc *render.InstantResult) string {
 	rows := make([][]string, 0, len(enc.Rows))
 	for _, r := range enc.Rows {
-		if len(r) < 3 {
-			continue
-		}
 		name, _ := r[0].(string)
 		labels, _ := r[1].(map[string]string)
 		rows = append(rows, []string{name, labelsText(labels), valueText(r[2])})
@@ -532,12 +534,13 @@ func str(v any) string {
 
 // round2 rounds to two decimal places, which is all the precision a latency in
 // milliseconds carries any meaning at.
+//
+// strconv.ParseFloat cannot fail on strconv.FormatFloat's own output: every
+// finite value, +Inf, -Inf and NaN all round-trip through the 'f' format
+// without error, so there is deliberately no fallback branch for a parse
+// failure here.
 func round2(v float64) float64 {
-	s := strconv.FormatFloat(v, 'f', 2, 64)
-	out, err := strconv.ParseFloat(s, 64)
-	if err != nil {
-		return v
-	}
+	out, _ := strconv.ParseFloat(strconv.FormatFloat(v, 'f', 2, 64), 64)
 	return out
 }
 

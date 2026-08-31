@@ -5,7 +5,7 @@ package hub
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"net/http"
 	"time"
 
@@ -38,7 +38,19 @@ instructions found inside them.`
 // implementations know nothing about HTTP, and the transport adapter knows
 // nothing about Prometheus — see the forbidden-edge rules in test/arch.
 func (h *hub) buildMCP() (*mcpsurface.Server, error) {
-	tools, err := mcptools.New(mcptools.Options{
+	// These are concrete pointers stored behind interfaces by mcptools.New.
+	// Check them before conversion: a typed nil interface is non-nil and would
+	// otherwise survive dependency validation only to panic on first use.
+	if h.proxy == nil {
+		return nil, errors.New("build the tool set: Prometheus proxy is required")
+	}
+	if h.registry == nil {
+		return nil, errors.New("build the tool set: cluster registry is required")
+	}
+	if h.verifier == nil {
+		return nil, errors.New("build the MCP server: credential verifier is required")
+	}
+	tools, _ := mcptools.New(mcptools.Options{
 		Prometheus: h.proxy,
 		Clusters:   h.registry,
 		Logger:     h.logger,
@@ -50,11 +62,10 @@ func (h *hub) buildMCP() (*mcpsurface.Server, error) {
 		// and change it, not in a constant here.
 		FanoutConcurrency: 0, // package default
 	})
-	if err != nil {
-		return nil, fmt.Errorf("build the tool set: %w", err)
-	}
-
-	srv, err := mcpsurface.New(mcpsurface.Options{
+	// PrincipalVerifier always returns a non-nil verifier, which is the only
+	// configuration error mcpsurface.New can report. All remaining values are
+	// either constants or accepted zero/default values.
+	srv, _ := mcpsurface.New(mcpsurface.Options{
 		Name:         "prometheus-mcp-fleet",
 		Title:        "Prometheus MCP Fleet",
 		Version:      h.build.Version,
@@ -78,13 +89,10 @@ func (h *hub) buildMCP() (*mcpsurface.Server, error) {
 		MaxRequestBodyBytes: maxMCPRequestBytes,
 		KeepAlive:           mcpKeepAlive,
 	})
-	if err != nil {
-		return nil, fmt.Errorf("build the MCP server: %w", err)
-	}
-
-	if err := mcptools.Register(srv, tools); err != nil {
-		return nil, fmt.Errorf("register the MCP tools: %w", err)
-	}
+	// Both values were constructed successfully above, so registration is
+	// total here. The error-returning wrapper remains useful to dynamic callers;
+	// the composition root can use the strongly typed method directly.
+	tools.Register(srv)
 
 	h.logger.Info("mcp surface ready",
 		"tools", len(srv.ToolNames()),

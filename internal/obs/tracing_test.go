@@ -37,6 +37,29 @@ func (e *recordingExporter) snapshot() []sdktrace.ReadOnlySpan {
 	return append([]sdktrace.ReadOnlySpan(nil), e.spans...)
 }
 
+// realNewTraceExporter pins the production implementation of newTraceExporter,
+// captured at package-var init time before any test rebinds the seam, so the
+// real otlptracegrpc construction path can still be exercised directly.
+var realNewTraceExporter = newTraceExporter
+
+// TestNewTraceExporterConstructsClient exercises the real (non-stubbed) body
+// of newTraceExporter. grpc's client dials lazily, so building an exporter
+// for an unreachable address succeeds without a live collector; this checks
+// the exporter it hands back is usable and shuts down cleanly.
+func TestNewTraceExporterConstructsClient(t *testing.T) {
+	t.Parallel()
+	exporter, err := realNewTraceExporter(t.Context(), "127.0.0.1:4317")
+	if err != nil {
+		t.Fatalf("newTraceExporter: %v", err)
+	}
+	if exporter == nil {
+		t.Fatal("newTraceExporter returned a nil exporter")
+	}
+	if err := exporter.Shutdown(t.Context()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+}
+
 // Tracing mutates OpenTelemetry global state and the exporter constructor, so
 // these cases intentionally run in one non-parallel top-level test.
 func TestInitTracing(t *testing.T) {

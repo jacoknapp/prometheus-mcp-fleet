@@ -4,7 +4,6 @@
 package mcptools
 
 import (
-	"errors"
 	"fmt"
 
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/render"
@@ -20,14 +19,16 @@ import (
 func parseFormat(s string, allowJSON bool) (render.Format, *ToolError) {
 	f, err := render.ParseFormat(s)
 	if err != nil {
-		if errors.Is(err, render.ErrUnknownFormat) {
-			return "", newError(CodeInvalidArgument,
-				fmt.Sprintf("format %q is not one of compact, json, table",
-					render.ClipRunes(s, 32)), false).
-				WithInput(map[string]any{"format": render.ClipRunes(s, 32)}).
-				WithHint("Use compact unless a previous compact call lost detail you need.")
-		}
-		return "", newError(CodeInvalidArgument, err.Error(), false)
+		// render.ParseFormat's only error is [render.ErrUnknownFormat]: every
+		// other case in its switch returns nil. There is deliberately no
+		// generic fallback branch here for a different wrapped error, because
+		// one can never be produced and an untested branch is worse than no
+		// branch.
+		return "", newError(CodeInvalidArgument,
+			fmt.Sprintf("format %q is not one of compact, json, table",
+				render.ClipRunes(s, 32)), false).
+			WithInput(map[string]any{"format": render.ClipRunes(s, 32)}).
+			WithHint("Use compact unless a previous compact call lost detail you need.")
 	}
 	if f == render.FormatJSON && !allowJSON {
 		return "", newError(CodeInvalidArgument,

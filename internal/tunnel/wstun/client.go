@@ -122,7 +122,7 @@ func Dial(ctx context.Context, cfg ClientConfig, h tunnel.Handler) error {
 
 	// endpoint and cluster_id are already bound on the caller's logger; adding
 	// them again emitted duplicate keys in every JSON line.
-	log.Info("tunnel connected", "hub_server_id", serverID)
+	log.InfoContext(ctx, "tunnel connected", "hub_server_id", serverID)
 
 	return grpctun.ServeConn(ctx, conn, grpctun.DialerConfig{
 		Endpoint:   cfg.URL,

@@ -15,6 +15,7 @@ import (
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/fleet"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/promapi"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/promproxy"
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/render"
 )
 
 // connectedClusters returns the two clusters a fan-out can actually reach.
@@ -396,6 +397,61 @@ func TestFanoutConcurrencyAndDeadlineBounds(t *testing.T) {
 	}
 }
 
+// TestFanoutEmptyQueryRejected covers validateExpr's own call site inside
+// fanoutQuery: TestValidateExpr only unit-tests the helper directly, and
+// TestFanoutValidatesQueryOnce only ever sends a syntactically bad but
+// non-empty expression, which takes the later analyzePromQL branch instead.
+func TestFanoutEmptyQueryRejected(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	_, terr := h.tools.fanoutQuery(ctx(t), h.p, FanoutQueryIn{
+		Query: "", Clusters: connectedClusters,
+	})
+	if terr == nil || terr.Code != CodeInvalidArgument {
+		t.Fatalf("terr = %v, want INVALID_ARGUMENT for an empty query", terr)
+	}
+	if len(h.prom.calls) != 0 {
+		t.Error("an empty query still reached a cluster")
+	}
+}
+
+// TestFanoutInstantBadTime covers mode "instant"'s own time-parsing error
+// return, distinct from range mode's start/end/step parsing.
+func TestFanoutInstantBadTime(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	_, terr := h.tools.fanoutQuery(ctx(t), h.p, FanoutQueryIn{
+		Query: "up", Clusters: connectedClusters, Time: "not-a-time",
+	})
+	if terr == nil || terr.Code != CodeInvalidTime {
+		t.Fatalf("terr = %v, want INVALID_TIME", terr)
+	}
+}
+
+// TestFanoutRangeBadStartEndAndStep covers range mode's own resolveRange and
+// step-parsing error returns, neither of which TestFanoutRangeCommonStep
+// exercises since it only sends valid arguments.
+func TestFanoutRangeBadStartEndAndStep(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+
+	_, terr := h.tools.fanoutQuery(ctx(t), h.p, FanoutQueryIn{
+		Query: "up", Clusters: connectedClusters, Mode: FanoutRange,
+		Start: "now", End: "now-1h",
+	})
+	if terr == nil || terr.Code != CodeInvalidArgument {
+		t.Fatalf("inverted range: terr = %v, want INVALID_ARGUMENT", terr)
+	}
+
+	_, terr = h.tools.fanoutQuery(ctx(t), h.p, FanoutQueryIn{
+		Query: "up", Clusters: connectedClusters, Mode: FanoutRange,
+		Step: "not-a-duration",
+	})
+	if terr == nil || terr.Code != CodeInvalidTime {
+		t.Fatalf("bad step: terr = %v, want INVALID_TIME", terr)
+	}
+}
+
 // TestFanoutMaxClustersTruncates proves an over-large selection is cut
 // deterministically and the dropped clusters are named.
 func TestFanoutMaxClustersTruncates(t *testing.T) {
@@ -442,6 +498,294 @@ func TestFanoutRespectsClusterScope(t *testing.T) {
 		if c.ClusterID == "eu-west-prod-1" {
 			t.Error("an out-of-scope cluster was contacted")
 		}
+	}
+}
+
+// TestFanoutDispatchTimesOutWhileQueued proves a cluster that never even gets
+// a concurrency slot before the overall deadline is accounted as timed out,
+// not silently dropped or misreported as answered. With concurrency 1 and
+// every cluster's query held open past its own per-cluster budget, only the
+// first one or two targets ever run at all; the rest sit in dispatch's own
+// select waiting on the semaphore, and the fan-out's overall deadline expires
+// while they are still waiting on it, not while they are in flight — the
+// distinct branch from TestFanoutTimeoutIsReportedSeparately, which only
+// exercises a slow *in-flight* query.
+func TestFanoutDispatchTimesOutWhileQueued(t *testing.T) {
+	t.Parallel()
+	// "queue-a" answers instantly so the fan-out has at least one success —
+	// with zero successes, fanoutQuery collapses the whole call to a single
+	// top-level ALL_CLUSTERS_FAILED error and the per-cluster detail this test
+	// checks is never built at all (see TestFanoutAllFailed). The other four
+	// each block far longer than any per-cluster or overall budget below, so
+	// none of them ever completes on its own merits: with concurrency 1 they
+	// serialise behind "queue-a", and only one of them (whichever inherits the
+	// concurrency slot next) even starts before the overall deadline expires.
+	entries := []fleet.Cluster{
+		{ID: "queue-a", State: fleet.StateConnected, LastSeen: testNow},
+		{ID: "queue-b", State: fleet.StateConnected, LastSeen: testNow},
+		{ID: "queue-c", State: fleet.StateConnected, LastSeen: testNow},
+		{ID: "queue-d", State: fleet.StateConnected, LastSeen: testNow},
+		{ID: "queue-e", State: fleet.StateConnected, LastSeen: testNow},
+	}
+	h := newHarness(t, func(o *Options) { o.Clusters = &fakeClusters{entries: entries} })
+	h.prom.set(string(promapi.EndpointQuery), fakeResponse{delay: 10 * time.Second})
+	h.prom.set("queue-a/"+string(promapi.EndpointQuery), fakeResponse{body: fixture(t, "query.json")})
+
+	out, terr := h.tools.fanoutQuery(ctx(t), h.p, FanoutQueryIn{
+		Query:       "up",
+		Clusters:    []string{"queue-a", "queue-b", "queue-c", "queue-d", "queue-e"},
+		Concurrency: 1,
+		// Deadline under 2s pins perCluster at its 1-second floor (deadline/2
+		// would otherwise equal it exactly and tie the two clocks together).
+		// "queue-a" returns immediately; the remaining budget is nowhere near
+		// enough to serialise four 1-second-budgeted slow clusters through one
+		// concurrency slot, so at least the last of them never starts at all.
+		Deadline: "1200ms",
+	})
+	if terr != nil {
+		t.Fatalf("fanoutQuery: %v", terr)
+	}
+	if out.Coverage.OK != 1 || out.PerCluster.OK[0] != "queue-a" {
+		t.Fatalf("coverage = %+v perCluster.ok = %v, want only queue-a to answer",
+			out.Coverage, out.PerCluster.OK)
+	}
+	if out.Coverage.TimedOut != 4 {
+		t.Fatalf("coverage.timedOut = %d, want the other 4 clusters accounted as timed out; "+
+			"coverage = %+v perCluster = %+v", out.Coverage.TimedOut, out.Coverage, out.PerCluster)
+	}
+	want := []string{"queue-b", "queue-c", "queue-d", "queue-e"}
+	if diff := cmp.Diff(want, out.PerCluster.TimedOut); diff != "" {
+		// Every cluster must be named by its real ID — not merely counted —
+		// which is what proves dispatch's own queued-timeout branch filled in
+		// results[i] properly rather than leaving a zero-value result that
+		// would carry an empty cluster ID and misclassify as OK.
+		t.Errorf("perCluster.timedOut (-want +got):\n%s", diff)
+	}
+	if out.Coverage.Complete {
+		t.Error("coverage claims completeness with 4 of 5 clusters timed out")
+	}
+}
+
+// TestFanoutQueryOneMalformedBody covers queryOne's own decode failures,
+// distinct from the single-cluster query/query_range malformed-body tests:
+// this is the fan-out's own call site of DecodeQueryData, DecodeVector and
+// DecodeMatrix.
+func TestFanoutQueryOneMalformedBody(t *testing.T) {
+	t.Parallel()
+
+	// Each case breaks only eu-west-prod-1, leaving us-east-prod-2 to answer
+	// normally: fanoutQuery collapses an all-clusters failure into a single
+	// ALL_CLUSTERS_FAILED tool error with no per-cluster detail attached (see
+	// TestFanoutAllFailed), so a partial failure is the only shape that lets
+	// this test actually inspect PerCluster.Failed's code.
+	t.Run("no data member", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t)
+		h.prom.set("eu-west-prod-1/"+string(promapi.EndpointQuery),
+			fakeResponse{body: []byte(`{"status":"success"}`)})
+		out, terr := h.tools.fanoutQuery(ctx(t), h.p, FanoutQueryIn{
+			Query: "up", Clusters: connectedClusters,
+		})
+		if terr != nil {
+			t.Fatalf("fanoutQuery: %v", terr)
+		}
+		if out.Coverage.Failed != 1 || out.Coverage.OK != 1 {
+			t.Fatalf("coverage = %+v, want eu-west-prod-1 failed and us-east-prod-2 ok", out.Coverage)
+		}
+		for _, f := range out.PerCluster.Failed {
+			if f.Code != CodeMalformedUpstream {
+				t.Errorf("failure code = %q, want MALFORMED_UPSTREAM", f.Code)
+			}
+		}
+	})
+
+	t.Run("malformed vector", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t)
+		h.prom.set("eu-west-prod-1/"+string(promapi.EndpointQuery), fakeResponse{
+			body: []byte(`{"status":"success","data":{"resultType":"vector","result":"not-an-array"}}`),
+		})
+		out, terr := h.tools.fanoutQuery(ctx(t), h.p, FanoutQueryIn{
+			Query: "up", Clusters: connectedClusters,
+		})
+		if terr != nil {
+			t.Fatalf("fanoutQuery: %v", terr)
+		}
+		if out.Coverage.Failed != 1 || out.Coverage.OK != 1 {
+			t.Fatalf("coverage = %+v, want eu-west-prod-1 failed and us-east-prod-2 ok", out.Coverage)
+		}
+		for _, f := range out.PerCluster.Failed {
+			if f.Code != CodeMalformedUpstream {
+				t.Errorf("failure code = %q, want MALFORMED_UPSTREAM", f.Code)
+			}
+		}
+	})
+
+	t.Run("malformed matrix", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t)
+		h.prom.set("eu-west-prod-1/"+string(promapi.EndpointQueryRange), fakeResponse{
+			body: []byte(`{"status":"success","data":{"resultType":"matrix","result":"not-an-array"}}`),
+		})
+		out, terr := h.tools.fanoutQuery(ctx(t), h.p, FanoutQueryIn{
+			Query: "up", Clusters: connectedClusters, Mode: FanoutRange,
+			Start: "now-10m", End: "now",
+		})
+		if terr != nil {
+			t.Fatalf("fanoutQuery: %v", terr)
+		}
+		if out.Coverage.Failed != 1 || out.Coverage.OK != 1 {
+			t.Fatalf("coverage = %+v, want eu-west-prod-1 failed and us-east-prod-2 ok", out.Coverage)
+		}
+		for _, f := range out.PerCluster.Failed {
+			if f.Code != CodeMalformedUpstream {
+				t.Errorf("failure code = %q, want MALFORMED_UPSTREAM", f.Code)
+			}
+		}
+	})
+}
+
+// TestFanoutInstantTokenCeiling proves the hub's token ceiling truncates a
+// merged instant fan-out even when the per-cluster series cap alone would
+// not, mirroring the single-cluster equivalents but never previously
+// exercised for fan-out's own merge step.
+func TestFanoutInstantTokenCeiling(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, func(o *Options) { o.TokenCeiling = 300 })
+	h.prom.set(string(promapi.EndpointQuery), fakeResponse{body: syntheticVector(t, 30)})
+	out, terr := h.tools.fanoutQuery(ctx(t), h.p, FanoutQueryIn{
+		Query: "up", Clusters: connectedClusters, MaxSeriesPerCluster: 30,
+	})
+	if terr != nil {
+		t.Fatalf("fanoutQuery: %v", terr)
+	}
+	if out.Truncated == nil || out.Truncated.Reason != render.ReasonTokenCeiling {
+		t.Fatalf("truncated = %+v, want reason %q", out.Truncated, render.ReasonTokenCeiling)
+	}
+	if len(out.Rows) >= 60 {
+		t.Errorf("rows = %d, want fewer than the 60 available", len(out.Rows))
+	}
+}
+
+// TestFanoutRangePartialFailure proves mergeRange skips a failed cluster's
+// contribution rather than merging in its zero-value matrix, the range-mode
+// analogue of TestFanoutPartialFailureIsLoud which only exercises instant
+// mode.
+func TestFanoutRangePartialFailure(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.prom.set("us-east-prod-2/"+string(promapi.EndpointQueryRange), fakeResponse{
+		err: fmt.Errorf("x: %w", promproxy.ErrUpstream),
+	})
+	out, terr := h.tools.fanoutQuery(ctx(t), h.p, FanoutQueryIn{
+		Query: "up", Clusters: connectedClusters, Mode: FanoutRange,
+		Start: "now-10m", End: "now",
+	})
+	if terr != nil {
+		t.Fatalf("fanoutQuery: %v", terr)
+	}
+	if out.Coverage.OK != 1 || out.Coverage.Failed != 1 {
+		t.Fatalf("coverage = %+v", out.Coverage)
+	}
+	for _, s := range out.Series {
+		if s.Cluster == "us-east-prod-2" {
+			t.Error("the failed cluster's zero-value matrix still contributed a series")
+		}
+	}
+}
+
+// TestFanoutRangeClusterLabelCollision is mergeRange's analogue of
+// TestFanoutClusterLabelCollision, which only ever exercises mergeInstant.
+func TestFanoutRangeClusterLabelCollision(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	body, err := json.Marshal(map[string]any{
+		"status": "success",
+		"data": map[string]any{
+			"resultType": "matrix",
+			"result": []any{map[string]any{
+				"metric": map[string]string{
+					"__name__": "up", "job": "api", "cluster": "legacy-name-from-federation",
+				},
+				"values": []any{[]any{1787047200.0, "1"}},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.prom.set("eu-west-prod-1/"+string(promapi.EndpointQueryRange), fakeResponse{body: body})
+
+	out, terr := h.tools.fanoutQuery(ctx(t), h.p, FanoutQueryIn{
+		Query: "up", Clusters: []string{"eu-west-prod-1"}, Mode: FanoutRange,
+		Start: "now-10m", End: "now",
+	})
+	if terr != nil {
+		t.Fatalf("fanoutQuery: %v", terr)
+	}
+	if len(out.Series) != 1 {
+		t.Fatalf("series = %v", out.Series)
+	}
+	if out.Series[0].Labels[ClusterOriginalLabel] != "legacy-name-from-federation" {
+		t.Errorf("the original cluster label was not preserved: %v", out.Series[0].Labels)
+	}
+	if len(out.Warnings) == 0 {
+		t.Fatal("the collision was silent")
+	}
+	if !strings.Contains(out.Warnings[0], ClusterOriginalLabel) {
+		t.Errorf("warning does not name the preserved label: %q", out.Warnings[0])
+	}
+}
+
+// TestFanoutRangeMaxSeriesPerCluster is mergeRange's analogue of
+// TestFanoutMaxSeriesPerCluster, which only ever exercises mergeInstant.
+func TestFanoutRangeMaxSeriesPerCluster(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.prom.set(string(promapi.EndpointQueryRange), fakeResponse{
+		body: syntheticMatrix(t, 30, 5, testNow.Add(-10*time.Minute), time.Minute),
+	})
+	out, terr := h.tools.fanoutQuery(ctx(t), h.p, FanoutQueryIn{
+		Query: "up", Clusters: connectedClusters, Mode: FanoutRange,
+		Start: "now-10m", End: "now", MaxSeriesPerCluster: 2,
+	})
+	if terr != nil {
+		t.Fatalf("fanoutQuery: %v", terr)
+	}
+	if len(out.Series) != 4 {
+		t.Fatalf("series = %d, want 2 clusters times 2 series", len(out.Series))
+	}
+	if out.Truncated == nil {
+		t.Fatal("the per-cluster cap was silent")
+	}
+	if out.Truncated.Reason != render.ReasonMaxSeries {
+		t.Errorf("reason = %q, want %q", out.Truncated.Reason, render.ReasonMaxSeries)
+	}
+	if out.Truncated.Total != 60 {
+		t.Errorf("total = %d, want the honest 60", out.Truncated.Total)
+	}
+}
+
+// TestFanoutRangeTokenCeiling proves the hub's token ceiling truncates a
+// merged range fan-out even when the per-cluster series cap alone would not.
+func TestFanoutRangeTokenCeiling(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, func(o *Options) { o.TokenCeiling = 300 })
+	h.prom.set(string(promapi.EndpointQueryRange), fakeResponse{
+		body: syntheticMatrix(t, 30, 20, testNow.Add(-10*time.Minute), time.Minute),
+	})
+	out, terr := h.tools.fanoutQuery(ctx(t), h.p, FanoutQueryIn{
+		Query: "up", Clusters: connectedClusters, Mode: FanoutRange,
+		Start: "now-10m", End: "now", MaxSeriesPerCluster: 30,
+	})
+	if terr != nil {
+		t.Fatalf("fanoutQuery: %v", terr)
+	}
+	if out.Truncated == nil || out.Truncated.Reason != render.ReasonTokenCeiling {
+		t.Fatalf("truncated = %+v, want reason %q", out.Truncated, render.ReasonTokenCeiling)
+	}
+	if len(out.Series) >= 60 {
+		t.Errorf("series = %d, want fewer than the 60 available", len(out.Series))
 	}
 }
 

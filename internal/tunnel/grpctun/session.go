@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -91,11 +92,12 @@ func (s *session) Close(reason string) error {
 	s.closeOnce.Do(func() {
 		s.reason.Store(&reason)
 		s.cancel()
-		// grpc.ErrClientConnClosing is deprecated; a second Close reports the
-		// Canceled status code instead.
-		if err := s.cc.Close(); err != nil && status.Code(err) != codes.Canceled {
-			s.closeErr = err
-		}
+		// grpc.ClientConn.Close (v1.83.2) has exactly two outcomes: nil on the
+		// first call, or the deprecated grpc.ErrClientConnClosing — itself
+		// status.Error(codes.Canceled, ...) — on a redundant one. There is no
+		// third outcome to capture, so the error is discarded rather than
+		// stored in a closeErr field that a real ClientConn can never fill.
+		_ = s.cc.Close()
 		// The ClientConn owns the transport and normally closes the socket for
 		// us; closing again is harmless and covers the case where the
 		// connection never reached READY.
@@ -317,7 +319,11 @@ func (b *bodyReader) pull() {
 // caller must hold b.mu.
 func (b *bodyReader) absorbTrail(t *fleetv1.ResponseTrail) {
 	b.trail = tunnel.Trailer{
-		BytesTotal:      int64(t.GetBytesTotal()),
+		// BytesTotal arrives from the peer, so its range is not this side's to
+		// assume: anything above MaxInt64 would land negative and a negative
+		// byte count would then flow on into logs, metrics and the trailer a
+		// caller reads. Saturate instead.
+		BytesTotal:      int64(min(t.GetBytesTotal(), math.MaxInt64)),
 		UpstreamLatency: time.Duration(t.GetUpstreamDurationMs()) * time.Millisecond,
 		Truncated:       t.GetTruncated(),
 		Warnings:        t.GetWarnings(),

@@ -12,7 +12,9 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"slices"
 	"strings"
@@ -1213,5 +1215,240 @@ func TestPublicMuxRegistersNoCatchAll(t *testing.T) {
 	}
 	if ct := resp.Header.Get("Content-Type"); strings.HasPrefix(ct, "application/json") {
 		t.Errorf("Content-Type = %q; the public mux answered a path it does not own", ct)
+	}
+}
+
+// unitPublicServer builds a *server directly, the way [newServer]'s own
+// package does, bypassing NewPublicMux and the HTTP mux entirely. It exists
+// for the handful of tests below that call a handler method as a plain Go
+// function -- either because the case they pin can only occur if a handler
+// is ever reached without going through the middleware that normally wraps
+// it, or because they need to hand the handler a [http.ResponseWriter] whose
+// Write fails, which no real client of an httptest.Server can force
+// deterministically. logs, if non-nil, backs the server's logger.
+func (h *harness) unitPublicServer(logs *syncBuffer) *server {
+	h.t.Helper()
+	var logger *slog.Logger
+	if logs != nil {
+		logger = slog.New(slog.NewJSONHandler(logs, nil))
+	}
+	srv, err := newServer(Options{
+		Store: h.store, Hasher: h.hasher, CA: h.ca, Verifier: h.verifier,
+		Logger: logger, Metrics: h.metrics, Clock: h.clock.Now,
+		EnrollmentEnabled: true, PublicURL: "https://hub.example/mcp",
+	})
+	if err != nil {
+		h.t.Fatalf("newServer: %v", err)
+	}
+	return srv
+}
+
+// TestHandleEnrollWithNoAuthenticatedPrincipal proves handleEnroll's own
+// belt-and-suspenders check against a nil principal, calling it directly
+// rather than through POST /enroll.
+//
+// Through the wired mux this can never happen: /enroll is
+// s.enrollmentGate(s.verifier.Middleware(fleet.ClassEnrollment)(handleEnroll)),
+// and Middleware never calls the next handler except with a verified
+// principal already attached to the request context. That is exactly why
+// this has to be exercised by calling the handler directly -- it is a
+// defensive check against handleEnroll one day being reachable some other
+// way, e.g. a refactor that reuses it outside that middleware chain, and
+// proving it holds requires removing the middleware from the picture.
+func TestHandleEnrollWithNoAuthenticatedPrincipal(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+	srv := h.unitPublicServer(nil)
+
+	body, err := json.Marshal(EnrollRequest{CSR: "irrelevant: rejected before it is read"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	r := httptest.NewRequest(http.MethodPost, "/enroll", bytes.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.handleEnroll(w, r)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d (%s)", w.Code, http.StatusUnauthorized, w.Body.String())
+	}
+	var env ErrorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+	if env.Error.Code != CodeUnauthenticated {
+		t.Errorf("code = %q, want %q", env.Error.Code, CodeUnauthenticated)
+	}
+	if h.metrics.enrollments(ResultDenied) == 0 {
+		t.Error("no denied enrollment metric was recorded")
+	}
+	if strings.Contains(w.Body.String(), "BEGIN CERTIFICATE") {
+		t.Error("a certificate was returned for an unauthenticated call")
+	}
+}
+
+// TestEnrollRedemptionOfAMalformedStoredRecord proves a store that returns a
+// nil record with no error for the KID the caller just authenticated with --
+// the shape a decode bug or a torn write could take, and which every other
+// caller in this package must treat as "absent" rather than dereference --
+// is answered as an internal error rather than a panic.
+func TestEnrollRedemptionOfAMalformedStoredRecord(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+	raw, kid := h.mintEnrollmentToken("prod-eu-1")
+
+	// The verifier must authenticate before the fault is installed:
+	// injecting GetKey(nil, nil) first would deny at the middleware, never
+	// reaching handleEnroll's own lookup. See TestEnrollStoreFailures for the
+	// same warm-then-fault shape.
+	warm := h.do(h.public, http.MethodPost, "/enroll", raw, EnrollRequest{})
+	warm.Body.Close()
+	h.store.inject(t, func(f *fakeStore) { f.getNil, f.errGetKID = true, kid })
+
+	csr, _ := makeCSR(t, csrOptions{})
+	resp := h.do(h.public, http.MethodPost, "/enroll", raw, EnrollRequest{CSR: csr})
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d (%s)", resp.StatusCode, http.StatusInternalServerError, decode(t, resp, nil))
+	}
+	if h.metrics.enrollments(ResultError) == 0 {
+		t.Error("no error enrollment metric was recorded")
+	}
+	// Distinguishes this from an ordinary store error (already covered by
+	// TestEnrollStoreFailures's "get" case): handleEnroll must have taken the
+	// `err == nil` branch and substituted ErrNotFound itself.
+	if !strings.Contains(h.logs.String(), ErrNotFound.Error()) {
+		t.Errorf("the nil-record failure was not logged as %q: %s", ErrNotFound, h.logs.String())
+	}
+}
+
+// TestEnrollCAIssuanceFailureIsInternal proves that when certificate issuance
+// fails for a reason that is not the CSR's fault -- here, the CA's serial
+// draw losing its entropy source -- /enroll answers with an internal error,
+// not the CSR-was-rejected 400 a caller could not do anything about.
+//
+// Deliberately not parallel: see [withFailingRand].
+func TestEnrollCAIssuanceFailureIsInternal(t *testing.T) {
+	h := newHarness(t, nil)
+	raw, _ := h.mintEnrollmentToken("prod-eu-1")
+	csr, _ := makeCSR(t, csrOptions{})
+	withFailingRand(t)
+
+	resp := h.do(h.public, http.MethodPost, "/enroll", raw, EnrollRequest{CSR: csr})
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d (%s)", resp.StatusCode, http.StatusInternalServerError, decode(t, resp, nil))
+	}
+	env := envelopeOf(t, resp)
+	if env.Error.Code != CodeInternal {
+		t.Errorf("code = %q, want %q", env.Error.Code, CodeInternal)
+	}
+	if h.metrics.enrollments(ResultError) == 0 {
+		t.Error("no error enrollment metric was recorded")
+	}
+}
+
+// TestRenewCAIssuanceFailureIsInternal is TestEnrollCAIssuanceFailureIsInternal
+// for /renew, which reaches [ca.CA.IssueSpokeFromCSR] by a different route
+// (proof of possession rather than a bearer token) but hits the same
+// non-CSR issuance failure once it gets there.
+//
+// Deliberately not parallel: see [withFailingRand].
+func TestRenewCAIssuanceFailureIsInternal(t *testing.T) {
+	h := newHarness(t, nil)
+	id := h.issueSpoke("prod-eu-1")
+	req := h.renewRequestFor(id)
+	withFailingRand(t)
+
+	resp := h.renew(req)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d (%s)", resp.StatusCode, http.StatusInternalServerError, decode(t, resp, nil))
+	}
+	env := envelopeOf(t, resp)
+	if env.Error.Code != CodeInternal {
+		t.Errorf("code = %q, want %q", env.Error.Code, CodeInternal)
+	}
+	if h.metrics.enrollments(ResultError) == 0 {
+		t.Error("no error enrollment metric was recorded")
+	}
+}
+
+// TestPKICRLSignFailureIsInternal proves a CRL that fails to sign -- again,
+// the CA losing its entropy source -- is reported as an internal error on
+// the unauthenticated /pki/crl route.
+//
+// Deliberately not parallel: see [withFailingRand].
+func TestPKICRLSignFailureIsInternal(t *testing.T) {
+	h := newHarness(t, nil)
+	withFailingRand(t)
+
+	resp := h.do(h.public, http.MethodGet, "/pki/crl", "", nil)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d (%s)", resp.StatusCode, http.StatusInternalServerError, decode(t, resp, nil))
+	}
+	env := envelopeOf(t, resp)
+	if env.Error.Code != CodeInternal {
+		t.Errorf("code = %q, want %q", env.Error.Code, CodeInternal)
+	}
+	if !strings.Contains(h.logs.String(), "sign crl") {
+		t.Errorf("the signing failure was not logged: %s", h.logs.String())
+	}
+}
+
+// TestPKIWriteFailuresAreLoggedNotFatal covers the three unauthenticated,
+// header-then-body handlers -- /pki/bundle, /pki/crl and the protected
+// resource metadata document -- each of which has already committed a 200
+// status by the time it writes its body. A client that hangs up at exactly
+// that moment cannot be answered with an error status any more; the only
+// thing left to do is log it, which is what each of these branches does.
+// Simulating that requires a ResponseWriter whose Write fails outright, which
+// is why these call the handler directly instead of going through an
+// httptest.Server.
+func TestPKIWriteFailuresAreLoggedNotFatal(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		path    string
+		call    func(s *server, w http.ResponseWriter, r *http.Request)
+		wantLog string
+	}{
+		{
+			name:    "pki bundle",
+			path:    "/pki/bundle",
+			call:    func(s *server, w http.ResponseWriter, r *http.Request) { s.handlePKIBundle(w, r) },
+			wantLog: "write ca bundle",
+		},
+		{
+			name:    "pki crl",
+			path:    "/pki/crl",
+			call:    func(s *server, w http.ResponseWriter, r *http.Request) { s.handlePKICRL(w, r) },
+			wantLog: "write crl",
+		},
+		{
+			name:    "protected resource metadata",
+			path:    PRMPath,
+			call:    func(s *server, w http.ResponseWriter, r *http.Request) { s.handleProtectedResourceMetadata(w, r) },
+			wantLog: "write protected resource metadata",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t, nil)
+			logs := &syncBuffer{}
+			srv := h.unitPublicServer(logs)
+
+			w := newFailingResponseWriter()
+			r := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			tc.call(srv, w, r)
+
+			if w.status != http.StatusOK {
+				t.Errorf("status recorded = %d, want %d", w.status, http.StatusOK)
+			}
+			if !strings.Contains(logs.String(), tc.wantLog) {
+				t.Errorf("the write failure was not logged with %q: %s", tc.wantLog, logs.String())
+			}
+		})
 	}
 }
