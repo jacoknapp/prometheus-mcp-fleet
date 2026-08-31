@@ -564,6 +564,12 @@ jobs:
           set -euo pipefail
           printf '%s' "${GHCR_TOKEN}" \
             | helm registry login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+          # helm writes its own registry config, which cosign does not read:
+          # the chart pushed fine and then signing failed with UNAUTHORIZED.
+          # cosign uses the Docker keychain, so log in there too. The images
+          # job never hit this because it uses docker/login-action.
+          printf '%s' "${GHCR_TOKEN}" \
+            | cosign login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
 
       # A chart version may only be published once. If it already exists we
       # refuse rather than overwrite: 100 clusters resolving the same chart
