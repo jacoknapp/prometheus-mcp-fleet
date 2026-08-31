@@ -4,13 +4,18 @@
 package hub
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/store"
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel/tunneltest"
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel/wstun"
 )
 
 // revoke records a revocation with an expiry far enough out that it is still
@@ -58,6 +63,33 @@ func TestRevokedSerialsRefusesToStartWithAnUnreadableDenylist(t *testing.T) {
 	// spoke, so this is a startup failure rather than a warning.
 	if err == nil || !strings.Contains(err.Error(), "load the revocation list") {
 		t.Fatalf("error = %v, want a refusal to start", err)
+	}
+}
+
+// TestRevokedSerialsCachesForItsFullConfiguredTTL proves the cache
+// revokedSerials builds is seeded with a genuinely positive TTL (30 seconds),
+// not zero: immediately after construction a lookup must be served from
+// cache, not by re-consulting the store. An ARITHMETIC_BASE mutant turning
+// "30 * time.Second" into "30 / time.Second" collapses the TTL to 0, which --
+// since a lookup taken any measurable instant after fetching is never fresher
+// than a 0 TTL -- would make every lookup re-hit the store.
+func TestRevokedSerialsCachesForItsFullConfiguredTTL(t *testing.T) {
+	t.Parallel()
+
+	fs := &faultyStore{Store: newFileStore(t)}
+	h := &hub{store: fs}
+	isRevoked, err := h.revokedSerials(context.Background())
+	if err != nil {
+		t.Fatalf("revokedSerials: %v", err)
+	}
+	epochBefore, listBefore := fs.calls()
+
+	if isRevoked("ffffff") {
+		t.Fatal("an unrevoked serial was refused")
+	}
+	if epoch, list := fs.calls(); epoch != epochBefore || list != listBefore {
+		t.Fatalf("the store was consulted (%d,%d -> %d,%d) well inside the 30s ttl",
+			epochBefore, listBefore, epoch, list)
 	}
 }
 
@@ -254,5 +286,79 @@ func TestNewTunnelServerStartsOnAHostThatCannotNameItself(t *testing.T) {
 	// rather than the whole tunnel.
 	if _, err := h.newTunnelServer(context.Background()); err != nil {
 		t.Fatalf("newTunnelServer: %v", err)
+	}
+}
+
+// TestNewTunnelServerReportsItsHostnameOnSuccess proves the ServerHello
+// carries the real hostname when osHostname succeeds, by performing a real
+// handshake through the WebSocket tunnel and reading the spoke-side
+// "hub_server_id" log field the handshake produces.
+//
+// A CONDITIONALS_NEGATION mutant on "err != nil" (guarding the clear-on-error
+// branch) would invert it into "err == nil", wiping serverID to "" on every
+// success instead of on failure -- silently dropping this diagnostic on every
+// hub replica that can name itself, which is the common case.
+//
+// Not parallel: it swaps the package-level osHostname indirection.
+func TestNewTunnelServerReportsItsHostnameOnSuccess(t *testing.T) {
+	const clusterID = "prod"
+	const hostname = "hub-replica-7"
+
+	cfg := newHubConfig(t)
+	h, _ := newWiredHub(t, cfg)
+
+	restore := osHostname
+	osHostname = func() (string, error) { return hostname, nil }
+	t.Cleanup(func() { osHostname = restore })
+
+	h.tunnel = mustTunnelServer(t, h)
+	public := mustStartPublic(t, h)
+	listener := h.tunnel.Listener()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = h.serveTunnel(ctx, listener) }()
+	go h.registry.Run(ctx)
+
+	var logBuf bytes.Buffer
+	spokeLogger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+
+	dialed := make(chan error, 1)
+	go func() {
+		dialed <- wstun.Dial(ctx, wstun.ClientConfig{
+			URL:         "ws://" + public.Addr() + cfg.TunnelPath,
+			Certificate: issueSpokeCert(t, h, clusterID),
+			ClusterID:   clusterID,
+			Logger:      spokeLogger,
+			Generation:  time.Now().UnixNano(),
+		}, &tunneltest.EchoHandler{})
+	}()
+
+	eventually(t, 15*time.Second, "the spoke to register a routable session", func() bool {
+		_, err := h.registry.Session(clusterID)
+		return err == nil
+	})
+	cancel()
+	select {
+	case <-dialed:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the spoke never returned from Dial")
+	}
+
+	var got string
+	for line := range strings.SplitSeq(logBuf.String(), "\n") {
+		if line == "" {
+			continue
+		}
+		var rec map[string]any
+		if json.Unmarshal([]byte(line), &rec) != nil {
+			continue
+		}
+		if rec["msg"] == "tunnel connected" {
+			got, _ = rec["hub_server_id"].(string)
+		}
+	}
+	if got != hostname {
+		t.Fatalf("hub_server_id = %q, want the hostname %q reported by osHostname", got, hostname)
 	}
 }

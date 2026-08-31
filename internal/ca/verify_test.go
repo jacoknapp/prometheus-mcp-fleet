@@ -84,3 +84,37 @@ func TestVerifyChain(t *testing.T) {
 		})
 	}
 }
+
+// TestVerifyChainOffersCertificatesAfterTheLeafAsIntermediates proves that
+// VerifyChain actually populates x509.VerifyOptions.Intermediates from
+// chain[1:] when len(chain) > 1, rather than merely being unreachable code.
+//
+// The root here has MaxPathLen 0 (see ca.go), so no chain running through an
+// intermediate can ever fully verify in this fleet — but *why* it fails still
+// tells them apart. If chain[1:] reaches the verifier as an intermediate, the
+// verifier finds a path (leaf -> intermediate -> root) and rejects it
+// specifically for exceeding the path length, x509.CertificateInvalidError
+// with reason TooManyIntermediates. If the len(chain) > 1 branch is skipped
+// (as it would be under a negated or boundary-widened condition, since chain
+// here has length 2), no intermediate ever reaches the verifier, no path to
+// any root is found at all, and the error is a plain "unknown authority"
+// instead. Asserting the specific reason, not just the wrapped
+// ErrUntrustedChain sentinel both errors share, is what makes the two
+// mutants distinguishable.
+func TestVerifyChainOffersCertificatesAfterTheLeafAsIntermediates(t *testing.T) {
+	t.Parallel()
+
+	authority := mustCA(t, Options{TrustDomain: "fleet.test"})
+	leaf, intermediate := intermediateSignedSpokeCert(t, authority, "prod")
+
+	_, err := authority.VerifyChain([]*x509.Certificate{leaf, intermediate})
+	if !errors.Is(err, ErrUntrustedChain) {
+		t.Fatalf("VerifyChain() error = %v, want wrapping %v", err, ErrUntrustedChain)
+	}
+	var invalid x509.CertificateInvalidError
+	if !errors.As(err, &invalid) || invalid.Reason != x509.TooManyIntermediates {
+		t.Fatalf("VerifyChain() error = %v, want a CertificateInvalidError{Reason: TooManyIntermediates}: "+
+			"the intermediate certificate must have reached the verifier for the path length to be the "+
+			"failure reason", err)
+	}
+}

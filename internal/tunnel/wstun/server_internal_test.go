@@ -42,6 +42,10 @@ func TestRemoteAddr(t *testing.T) {
 		},
 		{name: "padded", remote: "10.0.0.1:5555", forwarded: "  198.51.100.4  ", wantResult: "198.51.100.4"},
 		{name: "empty header falls back", remote: "10.0.0.1:5555", forwarded: " , ", wantResult: "10.0.0.1:5555"},
+		// A comma at index 0 pins the ">=" vs ">" boundary on the IndexByte
+		// result: slicing to an empty prefix must still fall back to remote,
+		// not return the untrimmed raw header.
+		{name: "a leading comma falls back", remote: "10.0.0.1:5555", forwarded: ",10.0.0.1", wantResult: "10.0.0.1:5555"},
 	}
 
 	for _, tc := range tests {

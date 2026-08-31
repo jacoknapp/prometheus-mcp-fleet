@@ -211,6 +211,48 @@ func TestByteSemBlocksAndReleases(t *testing.T) {
 	}
 }
 
+// TestByteSemZeroAcquireBypassesTheQueue pins that acquire treats n <= 0 as
+// an immediate no-op even when another caller is already queued behind a
+// full budget. acquire's n <= 0 guard runs before the queue is ever
+// consulted; a version that only special-cased zero at the empty-queue fast
+// path would instead enqueue the zero-byte waiter behind the existing one and
+// leave it blocked in FIFO order until the head is granted.
+func TestByteSemZeroAcquireBypassesTheQueue(t *testing.T) {
+	t.Parallel()
+
+	s := newByteSem(100)
+	if err := s.acquire(context.Background(), 100); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	blocked := make(chan error, 1)
+	go func() { blocked <- s.acquire(context.Background(), 60) }()
+	waitQueued(t, s, 1)
+
+	done := make(chan error, 1)
+	go func() { done <- s.acquire(context.Background(), 0) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("acquire(0) with a caller already queued = %v, want nil", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("acquire(0) waited behind the queue instead of returning immediately")
+	}
+	if got := s.queued(); got != 1 {
+		t.Errorf("queued = %d, want the zero acquire to never have joined the queue", got)
+	}
+
+	s.release(100)
+	select {
+	case err := <-blocked:
+		if err != nil {
+			t.Fatalf("acquire after release: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("a released budget never reached the waiter")
+	}
+}
+
 // TestByteSemIsFIFO pins the deliberate head-of-line blocking. Letting a small
 // reservation overtake a large one starves the large one under sustained small
 // traffic, which in this system means range queries never run while instant

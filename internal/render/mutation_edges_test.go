@@ -417,3 +417,84 @@ func TestEncodeRangeFactorsLabelsAcrossEverySeries(t *testing.T) {
 			seen)
 	}
 }
+
+// Equivalent-mutant proofs.
+//
+// The boundary mutants below all failed to survive contact with an
+// exhaustive brute-force comparison (a standalone port of the mutated vs.
+// original logic run over the full cross product of representative
+// span/step/scrape-interval/max-points values, for the step.go group) or a
+// direct argument from the surrounding code. Each is left alive with its
+// reasoning recorded here rather than with a contrived test, per the "no
+// input can make original and mutant differ" bar.
+//
+//   - step.go:87 ("if span < 0") widening to "<=" only changes behaviour at
+//     span == 0, where the guarded statement is "span = 0" — already the
+//     value at that boundary. No-op either way.
+//
+//   - step.go:98 ("if step <= 0") narrowing to "<" only changes behaviour at
+//     step == 0. But step == 0 is re-tested, unmutated, at step.go:110
+//     ("if step <= 0 { step = StepLadder[0]; reason = StepReasonMaxPoints }")
+//     with step unchanged in between whenever the point-budget block did not
+//     already run (and if it did run, span > 0 forced needed > 0 = step,
+//     which itself sets reason to StepReasonMaxPoints). Every path that
+//     reaches step == 0 at line 98 reaches line 110 with reason
+//     independently reset to the same value, so line 98's own assignment is
+//     never observable.
+//
+//   - step.go:103 ("if span > 0") widening to ">=" only changes behaviour at
+//     span == 0, where needed := ceil(0/maxPoints) == 0. The guarded
+//     "if needed > step" can then only fire when step < 0, i.e. a negative
+//     UserStep — which line 98 has already flagged as StepReasonMaxPoints,
+//     and which line 110 catches identically afterwards regardless of
+//     whether this block ran. The two paths converge on the same
+//     (StepLadder[0], StepReasonMaxPoints) result.
+//
+//   - step.go:110 ("if step <= 0") narrowing to "<" only changes behaviour at
+//     step == 0. snapUp(0) already returns StepLadder[0] (0 <= every rung),
+//     so the step value converges regardless. Reason converges too: step
+//     can only be 0 at this point via a path that already set reason to
+//     StepReasonMaxPoints (see the step.go:98 entry above), so skipping the
+//     reassignment here changes nothing that has not already happened.
+//
+//   - step.go:126 ("if r.ScrapeInterval > 0 && step < r.ScrapeInterval")
+//     widening to ">=" only changes behaviour at ScrapeInterval == 0, where
+//     the second half of the AND, "step < 0", can never hold: SelectStep's
+//     contract is that step is always positive by this point. The clause
+//     added by widening the first comparison can never itself evaluate true.
+//
+//   - range.go:109 ("if total < len(in.Matrix)") is max(total, len(Matrix));
+//     widening to "<=" only changes behaviour when the two are already
+//     equal, where the assignment total = len(in.Matrix) is a no-op.
+//
+//   - range.go:185 ("p.V > r.max") tracks the maximum sample value for
+//     ranking. Widening to ">=" only changes behaviour on a tie, where
+//     reassigning r.max = p.V stores the same float64 already held. The sort
+//     key is unaffected, and no other state remembers which sample produced
+//     the maximum.
+//
+//   - range.go:230 ("stepSec <= 0 || points == 0") narrowing the first half
+//     to "<" only matters when stepSec == 0 and points > 0 (buildSeries is
+//     never reached with points > 0 and step <= 0 through the exported
+//     EncodeRange path, since EncodeRange only computes points > 0 when
+//     in.Step > 0 — the same guard). Called directly with step == 0 and
+//     points > 0, the division (p.T-startSec)/0 produces +/-Inf or NaN;
+//     converting that to int under this Go runtime yields
+//     math.MinInt64, which the very next bounds check
+//     ("idx < 0 || idx >= points") always rejects. Verified empirically on
+//     this toolchain: buildSeries's output is identical (every slot nil)
+//     whether the "stepSec <= 0" arm short-circuits the loop body or the
+//     division-then-bounds-check path does.
+//
+//   - sanitize.go:155 ("for cut > 0 && !utf8.RuneStart(s[cut])") widening to
+//     ">=" only changes behaviour at cut == 0. ClipBytes only reaches this
+//     loop after Sanitize(s), which guarantees valid UTF-8, so s[0] is
+//     always a rune-start byte and "!utf8.RuneStart(s[0])" is always false —
+//     the added iteration's body condition can never hold, so the loop still
+//     exits with cut == 0 either way.
+//
+//   - tokens.go:29 ("if n <= 0") narrowing to "<" only changes behaviour at
+//     n == 0, where falling through computes
+//     (0 + BytesPerToken - 1) / BytesPerToken. With BytesPerToken == 4 that
+//     is 3/4 == 0 under Go's truncating integer division — the same value
+//     the guarded "return 0" would have produced.

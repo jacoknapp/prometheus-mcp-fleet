@@ -235,6 +235,28 @@ func (r *errorAfterData) Read(p []byte) (int, error) {
 	return 0, r.err
 }
 
+// zeroThenData reports a legal (0, nil) read once before yielding data, then
+// io.EOF once the data is exhausted. A reader is allowed to do this per the
+// io.Reader contract, and streamBody must not mistake it for a chunk worth
+// sending.
+type zeroThenData struct {
+	calls int
+	data  []byte
+}
+
+func (r *zeroThenData) Read(p []byte) (int, error) {
+	r.calls++
+	if r.calls == 1 {
+		return 0, nil
+	}
+	if len(r.data) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
+
 func TestSpokeServerFailuresAndStreaming(t *testing.T) {
 	t.Parallel()
 
@@ -324,6 +346,44 @@ func TestSpokeServerFailuresAndStreaming(t *testing.T) {
 		sent, truncated, err := s.streamBody(stream, &errorAfterData{data: []byte("abc"), err: errFixture}, 3)
 		if sent != 3 || truncated || !errors.Is(err, errFixture) {
 			t.Errorf("streamBody = (%d, %v, %v)", sent, truncated, err)
+		}
+	})
+
+	// TestBudgetShrinksAcrossMultipleChunks distinguishes `budget - sent` from
+	// `budget + sent`: with a single small chunk both arithmetic directions
+	// agree (sent starts at 0), so the boundary only shows up once several
+	// chunks have actually been sent and the remaining budget must shrink.
+	t.Run("the remaining budget shrinks as chunks are sent, across many chunks", func(t *testing.T) {
+		stream := &fakeProxyServer{ctx: context.Background()}
+		s := &spokeServer{chunkBytes: 2}
+		body := bytes.Repeat([]byte("x"), 10)
+		sent, truncated, err := s.streamBody(stream, bytes.NewReader(body), 3)
+		if sent != 3 || !truncated || err != nil {
+			t.Fatalf("streamBody = (%d, %v, %v), want (3, true, nil): "+
+				"the budget must shrink with every chunk sent, not grow", sent, truncated, err)
+		}
+		var got []byte
+		for _, c := range stream.sent {
+			got = append(got, c.GetData()...)
+		}
+		if string(got) != "xxx" {
+			t.Errorf("bytes actually sent = %q, want exactly the 3-byte budget", got)
+		}
+	})
+
+	t.Run("a zero-byte, no-error read sends no empty chunk", func(t *testing.T) {
+		stream := &fakeProxyServer{ctx: context.Background()}
+		s := &spokeServer{chunkBytes: 4}
+		sent, truncated, err := s.streamBody(stream, &zeroThenData{data: []byte("abc")}, 16)
+		if sent != 3 || truncated || err != nil {
+			t.Fatalf("streamBody = (%d, %v, %v), want (3, false, nil)", sent, truncated, err)
+		}
+		for _, c := range stream.sent {
+			if d := c.GetData(); len(d) == 0 && c.GetKind() != nil {
+				if _, isData := c.GetKind().(*fleetv1.ProxyChunk_Data); isData {
+					t.Errorf("an empty Data chunk was sent: %+v", stream.sent)
+				}
+			}
 		}
 	})
 
@@ -554,6 +614,46 @@ func TestBodyReaderProtocolAndTerminalPaths(t *testing.T) {
 		}
 	})
 
+	// TestBodyReaderExactBudgetFitIsNotTruncated distinguishes `>` from `>=`
+	// at the oversized-chunk check: a chunk that lands exactly on the budget is
+	// a complete, untruncated response, not an overflow. The "budget spans
+	// multiple chunks" case above cannot tell the two apart, because its
+	// exact-fit chunk is immediately followed by a genuinely oversized one, so
+	// the final result (a truncated body ending "abcde") is identical whether
+	// the cutoff happens one chunk early or right on time.
+	t.Run("a chunk landing exactly on the budget is not truncated", func(t *testing.T) {
+		b := &bodyReader{
+			stream: &fakeClientStream{results: []recvResult{
+				{chunk: dataChunk("abcde")}, // received 0 -> 5, lands exactly on the budget
+				{chunk: trailChunk(&fleetv1.ResponseTrail{BytesTotal: 5})},
+				{err: io.EOF},
+			}}, budget: 5, cleanup: func() {}, release: func() {}, mapErr: func(err error) error { return err },
+		}
+		// io.ReadAll swallows a terminal io.EOF, which is exactly the outcome
+		// this test needs to tell apart from tunnel.ErrResponseTooLarge, so the
+		// body is drained by hand instead.
+		var got []byte
+		buf := make([]byte, 8)
+		var err error
+		for {
+			var n int
+			n, err = b.Read(buf)
+			got = append(got, buf[:n]...)
+			if err != nil {
+				break
+			}
+		}
+		if string(got) != "abcde" {
+			t.Errorf("body = %q, want abcde", got)
+		}
+		if !errors.Is(err, io.EOF) {
+			t.Errorf("terminal error = %v, want io.EOF: an exact fit is not an overflow", err)
+		}
+		if trail := b.Trailer(); trail.Truncated || trail.BytesTotal != 5 {
+			t.Errorf("Trailer() = %+v, want BytesTotal 5 and Truncated false", trail)
+		}
+	})
+
 	t.Run("early close", func(t *testing.T) {
 		var calls atomic.Int32
 		b := &bodyReader{stream: &fakeClientStream{}, budget: 3, cleanup: func() { calls.Add(1) }, release: func() { calls.Add(1) }, mapErr: func(err error) error { return err }}
@@ -568,6 +668,29 @@ func TestBodyReaderProtocolAndTerminalPaths(t *testing.T) {
 		}
 		if err := b.Close(); err != nil || calls.Load() != 2 {
 			t.Errorf("second Close = %v, callbacks = %d", err, calls.Load())
+		}
+	})
+
+	// TestBodyReaderCloseBeforeATrailerReportsBytesActuallyDelivered covers
+	// finish()'s fallback: closing early, after some data arrived but before
+	// any trailer, must still report how much actually reached the caller
+	// instead of leaving Trailer().BytesTotal at its zero value.
+	t.Run("close before a trailer reports bytes actually delivered", func(t *testing.T) {
+		b := &bodyReader{
+			stream: &fakeClientStream{results: []recvResult{{chunk: dataChunk("abcde")}}},
+			budget: 10, cleanup: func() {}, release: func() {}, mapErr: func(err error) error { return err },
+		}
+		buf := make([]byte, 5)
+		n, err := b.Read(buf)
+		if n != 5 || err != nil {
+			t.Fatalf("Read = (%d, %v), want (5, nil)", n, err)
+		}
+		if err := b.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		if trail := b.Trailer(); trail.BytesTotal != 5 {
+			t.Errorf("Trailer().BytesTotal = %d, want 5: the fallback must report bytes actually "+
+				"delivered when Close happened before any trailer arrived", trail.BytesTotal)
 		}
 	})
 }
@@ -674,6 +797,79 @@ func TestServeConnValidationAndDefaults(t *testing.T) {
 	err := ServeConn(ctx, local, DialerConfig{Endpoint: "hub", MaxChunkBytes: defaultChunkBytes + 1}, h)
 	if dialReason(err) != ReasonContextCancelled || !errors.Is(err, context.Canceled) {
 		t.Errorf("ServeConn(cancelled) = %v", err)
+	}
+}
+
+// TestServeConnUsesTheConfiguredLogger proves cfg.Logger is not silently
+// discarded: ServeConn's own lifecycle line must reach the caller's Logger,
+// not a default one built regardless of what was configured. Nothing in this
+// package ever read the DialerConfig.Logger a caller supplied, which made a
+// configured Logger dead configuration; this pins the fix.
+func TestServeConnUsesTheConfiguredLogger(t *testing.T) {
+	t.Parallel()
+
+	local, peer := net.Pipe()
+	defer peer.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	h := handlerFuncs{
+		do: func(context.Context, *tunnel.Request) (*tunnel.Response, error) {
+			return &tunnel.Response{Body: io.NopCloser(strings.NewReader(""))}, nil
+		},
+		describe: func(context.Context, string) (tunnel.Facts, error) { return tunnel.Facts{}, nil },
+	}
+	if err := ServeConn(ctx, local, DialerConfig{Endpoint: "hub-configured", Logger: logger}, h); dialReason(err) != ReasonContextCancelled {
+		t.Fatalf("ServeConn(cancelled) = %v", err)
+	}
+	if !strings.Contains(buf.String(), "hub-configured") {
+		t.Errorf("the configured Logger recorded nothing about this call (got %q); "+
+			"ServeConn must not fall back to a default logger when one was supplied", buf.String())
+	}
+}
+
+// TestServeConnEndsWithConnClosedWhenNotCancelled drives ServeConn's other
+// terminal branch: an uncancelled context whose underlying connection simply
+// dies. Every other ServeConn test tears down via context cancellation, which
+// left this path — and the "spoke tunnel connection closed" log line in it —
+// unexercised.
+func TestServeConnEndsWithConnClosedWhenNotCancelled(t *testing.T) {
+	t.Parallel()
+
+	local, peer := net.Pipe()
+	h := handlerFuncs{
+		do: func(context.Context, *tunnel.Request) (*tunnel.Response, error) {
+			return &tunnel.Response{Body: io.NopCloser(strings.NewReader(""))}, nil
+		},
+		describe: func(context.Context, string) (tunnel.Facts, error) { return tunnel.Facts{}, nil },
+	}
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+
+	done := make(chan error, 1)
+	go func() {
+		done <- ServeConn(context.Background(), local, DialerConfig{Endpoint: "hub", Logger: logger}, h)
+	}()
+
+	// Give the gRPC server a moment to start reading on the wrapped
+	// connection, then kill the peer so the notify wrapper observes the
+	// failure instead of a context cancellation.
+	time.Sleep(50 * time.Millisecond)
+	_ = peer.Close()
+
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("ServeConn did not return after the connection died")
+	}
+	if dialReason(err) != ReasonConnClosed {
+		t.Fatalf("ServeConn() = %v, want ReasonConnClosed", err)
+	}
+	if !strings.Contains(buf.String(), "spoke tunnel connection closed") {
+		t.Errorf("the configured Logger did not record the connection closing (got %q)", buf.String())
 	}
 }
 

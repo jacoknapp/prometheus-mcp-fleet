@@ -227,6 +227,26 @@ func TestSleepCtxReportsWhetherItSlept(t *testing.T) {
 			t.Error("sleepCtx(-1s) on a cancelled context reported a completed sleep")
 		}
 	})
+
+	// A CONDITIONALS_BOUNDARY mutant narrowing "d <= 0" to "d < 0" leaves d == 0
+	// on the timer path instead of the short-circuit. That is not merely
+	// slower: with the context already cancelled, select{} on a closed
+	// ctx.Done() and an already (or about to be) fired zero-duration timer
+	// picks a ready case pseudo-randomly, so the mutant reports "completed"
+	// roughly half the time instead of always reporting cancellation. One call
+	// only has even odds of catching that; repeating it drives the chance of a
+	// false pass to effectively zero while costing the real (deterministic)
+	// implementation nothing.
+	t.Run("a cancelled context with exactly a zero duration never reports completion", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		for i := range 200 {
+			if sleepCtx(ctx, 0) {
+				t.Fatalf("sleepCtx(cancelled, 0) reported a completed sleep on trial %d", i)
+			}
+		}
+	})
 }
 
 // TestClassifyBelievesTheTransport pins that a reason the transport already

@@ -312,6 +312,92 @@ func TestServerShutdownGraceExpires(t *testing.T) {
 	}
 }
 
+// TestServerShutdownZeroGraceAppliesNoOverride pins that shutdownGrace == 0
+// leaves an already-deadline-less context untouched. NewServer clamps
+// ShutdownGrace to always be positive (see TestNewServerDefaults), so this
+// reaches into the unexported field directly to exercise Shutdown's own
+// boundary check: s.shutdownGrace > 0 vs a widened >= 0. At exactly zero, the
+// widened form would still wrap the caller's context in
+// context.WithTimeout(ctx, 0), a deadline that has already passed the instant
+// it is created, aborting a slow-but-finishing handler instead of leaving the
+// context alone as documented.
+func TestServerShutdownZeroGraceAppliesNoOverride(t *testing.T) {
+	t.Parallel()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	s := startTestServer(t, ServerConfig{
+		Name: "no-grace-override",
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			close(entered)
+			<-release
+			_, _ = io.WriteString(w, "done")
+		}),
+	})
+	s.shutdownGrace = 0
+
+	go func() {
+		resp, err := http.Get("http://" + s.Addr() + "/slow") //nolint:noctx // local test request
+		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+		}
+	}()
+	<-entered
+	time.AfterFunc(50*time.Millisecond, func() { close(release) })
+
+	// context.Background carries no deadline of its own, so a zero grace
+	// must fall through untouched rather than manufacturing an already-
+	// expired one.
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown() = %v, want nil: a zero grace must not impose a deadline of its own", err)
+	}
+}
+
+// TestServerStartLogsTLSState pins that the "listener started" log line
+// reports the server's actual TLS state in both directions, not a constant or
+// an inverted reading of s.tlsConfig != nil.
+func TestServerStartLogsTLSState(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		tls     bool
+		wantTLS bool
+	}{
+		{name: "plaintext listener reports tls false", tls: false, wantTLS: false},
+		{name: "tls listener reports tls true", tls: true, wantTLS: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			logger, buf := newTestLogger()
+			cfg := ServerConfig{Name: "tls-state", Logger: logger}
+			if tc.tls {
+				tlsCfg, _ := newTestTLS(t)
+				cfg.TLS = tlsCfg
+			}
+			startTestServer(t, cfg)
+
+			var found bool
+			for _, rec := range logLines(t, buf) {
+				if rec["msg"] != "listener started" {
+					continue
+				}
+				found = true
+				if got := rec["tls"]; got != tc.wantTLS {
+					t.Errorf(`"listener started" tls = %v, want %v`, got, tc.wantTLS)
+				}
+			}
+			if !found {
+				t.Fatal(`no "listener started" log record found`)
+			}
+		})
+	}
+}
+
 func TestServerTLS(t *testing.T) {
 	t.Parallel()
 

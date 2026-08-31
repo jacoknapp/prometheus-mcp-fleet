@@ -64,6 +64,16 @@ func TestResolve(t *testing.T) {
 			ok:   false,
 			want: Build{Version: "dev", Date: "yesterday", GoVersion: runtime.Version(), Platform: platform()},
 		},
+		{
+			// bi.GoVersion is empty here, unlike every other case above (the
+			// bi helper always stamps "go1.27.0"), so this is the only case
+			// that can tell "copy bi.GoVersion over" apart from "leave the
+			// runtime.Version() default alone".
+			name: "build info with no go version keeps the runtime default",
+			info: &debug.BuildInfo{Settings: []debug.BuildSetting{set("vcs.revision", "abc1234def")}},
+			ok:   true,
+			want: Build{Version: "dev", Commit: "abc1234def", GoVersion: runtime.Version(), Platform: platform()},
+		},
 	}
 
 	for _, tc := range tests {
@@ -109,6 +119,18 @@ func TestBuildString(t *testing.T) {
 			name: "nothing known",
 			b:    Build{},
 			want: "dev",
+		},
+		{
+			// The '+' sits at index 0, so rev is the empty string and suffix
+			// is the entire commit. shortCommit must not then re-truncate
+			// that suffix: only rev, which is already empty here, is subject
+			// to the length cap. A version that instead cut the whole commit
+			// down to shortCommitLen characters (treating index 0 as "not
+			// found") would print a shortened dirty marker instead of the
+			// value verbatim.
+			name: "a commit that is entirely a marker is never truncated",
+			b:    Build{Version: "dev", Commit: "+abcdefghij", Platform: "linux/amd64"},
+			want: "dev (commit +abcdefghij, linux/amd64)",
 		},
 	}
 

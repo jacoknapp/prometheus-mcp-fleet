@@ -549,6 +549,45 @@ func TestSessionIdentityComesFromTheCertificate(t *testing.T) {
 	}
 }
 
+// TestSessionCountReturnsToZeroAfterClose proves the slot a session held is
+// actually released, not merely that it was claimed: reserveSession's
+// increment is tested directly elsewhere, but nothing else pins the deferred
+// decrement in serveHTTP that undoes it once the tunnel ends.
+func TestSessionCountReturnsToZeroAfterClose(t *testing.T) {
+	t.Parallel()
+
+	hub := newHarness(t, nil)
+	errCh, cancel := hub.dial(t, hub.ca.issue(t, "prod"), "prod", &tunneltest.EchoHandler{})
+
+	var sess tunnel.Session
+	select {
+	case sess = <-hub.sessions:
+	case err := <-errCh:
+		cancel()
+		t.Fatalf("Dial returned before a session was established: %v", err)
+	case <-time.After(20 * time.Second):
+		cancel()
+		t.Fatal("no session within 20s")
+	}
+	if got := hub.server.sessions.Load(); got != 1 {
+		t.Fatalf("sessions.Load() = %d, want 1 after one spoke attached", got)
+	}
+
+	if err := sess.Close("test"); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	cancel()
+	<-errCh
+
+	deadline := time.Now().Add(10 * time.Second)
+	for hub.server.sessions.Load() != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := hub.server.sessions.Load(); got != 0 {
+		t.Errorf("sessions.Load() = %d after the session closed, want 0: the slot was never released", got)
+	}
+}
+
 // TestServerRejectsBadConfig covers the constructor's own guards.
 func TestServerRejectsBadConfig(t *testing.T) {
 	t.Parallel()

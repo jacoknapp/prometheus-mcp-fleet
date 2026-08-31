@@ -203,6 +203,131 @@ func TestAlertsTokenCeilingEscalatesTruncation(t *testing.T) {
 	}
 }
 
+// TestAlertRankFullOrdering builds one alert for every (state, severity)
+// bucket alertRank distinguishes, submits them out of rank order, and asserts
+// the exact resulting alertname sequence. This pins both the sign of the
+// alertRank(a) - alertRank(b) comparison (a subtraction, negation or
+// arithmetic-base mutation there scrambles the order) and the exact +1/+2
+// offsets alertRank adds for warning and other severities.
+func TestAlertRankFullOrdering(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	mk := func(name, state, severity string) map[string]any {
+		labels := map[string]string{"alertname": name}
+		if severity != "" {
+			labels["severity"] = severity
+		}
+		return map[string]any{
+			"labels": labels, "annotations": map[string]string{},
+			"state": state, "activeAt": "2026-08-29T10:00:00Z", "value": "1",
+		}
+	}
+	// Deliberately submitted scrambled: worst-rank first, best-rank last.
+	body, err := json.Marshal(map[string]any{
+		"status": "success",
+		"data": map[string]any{"alerts": []any{
+			mk("PendingOther", "pending", "info"),
+			mk("PendingWarning", "pending", "warning"),
+			mk("PendingCritical", "pending", "critical"),
+			mk("FiringOther", "firing", "info"),
+			mk("FiringWarning", "firing", "warning"),
+			mk("FiringCritical", "firing", "critical"),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	h.prom.set(string(promapi.EndpointAlerts), fakeResponse{body: body})
+
+	out, terr := h.tools.alerts(ctx(t), h.p, AlertsIn{Cluster: okCluster, State: AlertAll, Limit: 300})
+	if terr != nil {
+		t.Fatalf("alerts: %v", terr)
+	}
+	want := []string{
+		"FiringCritical", "FiringWarning", "FiringOther",
+		"PendingCritical", "PendingWarning", "PendingOther",
+	}
+	if len(out.Alerts) != len(want) {
+		t.Fatalf("got %d alerts, want %d: %+v", len(out.Alerts), len(want), out.Alerts)
+	}
+	var got []string
+	for _, a := range out.Alerts {
+		got = append(got, a.Alertname)
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("alert order = %v, want %v", got, want)
+	}
+}
+
+// TestAlertRankValues pins alertRank's exact integer output for every
+// state/severity combination, including the default-severity +2 offset.
+func TestAlertRankValues(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		state    string
+		severity string
+		want     int
+	}{
+		{"firing critical", AlertFiring, "critical", 0},
+		{"firing warning", AlertFiring, "warning", 1},
+		{"firing other", AlertFiring, "info", 2},
+		{"pending critical", AlertPending, "critical", 10},
+		{"pending warning", AlertPending, "warning", 11},
+		{"pending other", AlertPending, "info", 12},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := alertRank(AlertInfo{State: tc.state, Severity: tc.severity})
+			if got != tc.want {
+				t.Errorf("alertRank(%q, %q) = %d, want %d", tc.state, tc.severity, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestConvertAlertLabelsAndAnnotationsBoundary pins the exact len(...) > 0
+// boundary convertAlert uses to decide whether Labels/Annotations is nil or
+// populated: one case sits with the collection empty after filtering, the
+// other with exactly one surviving entry.
+func TestConvertAlertLabelsAndAnnotationsBoundary(t *testing.T) {
+	t.Parallel()
+
+	// Labels boundary: after alertname/severity are removed, nothing is left.
+	bare := convertAlert(upstreamAlert{
+		Labels: map[string]string{"alertname": "X", "severity": "warning"},
+	}, false)
+	if bare.Labels != nil {
+		t.Errorf("Labels = %v, want nil with none left after alertname/severity removal", bare.Labels)
+	}
+
+	// Labels boundary: exactly one label survives.
+	withOne := convertAlert(upstreamAlert{
+		Labels: map[string]string{"alertname": "X", "severity": "warning", "pod": "p1"},
+	}, false)
+	if len(withOne.Labels) != 1 || withOne.Labels["pod"] != "p1" {
+		t.Errorf("Labels = %v, want exactly {pod: p1}", withOne.Labels)
+	}
+
+	// Annotations boundary: every annotation is filtered out (one has an
+	// invalid label-name key, the other sanitises to empty).
+	noAnn := convertAlert(upstreamAlert{
+		Annotations: map[string]string{"1bad": "value", "empty": ""},
+	}, true)
+	if noAnn.Annotations != nil {
+		t.Errorf("Annotations = %v, want nil when every entry is filtered out", noAnn.Annotations)
+	}
+
+	// Annotations boundary: exactly one annotation survives.
+	oneAnn := convertAlert(upstreamAlert{
+		Annotations: map[string]string{"summary": "ok", "1bad": "value"},
+	}, true)
+	if len(oneAnn.Annotations) != 1 || oneAnn.Annotations["summary"] != "ok" {
+		t.Errorf("Annotations = %v, want exactly {summary: ok}", oneAnn.Annotations)
+	}
+}
+
 // TestRulesInvalidFormat covers rules' own argument-validation error.
 func TestRulesInvalidFormat(t *testing.T) {
 	t.Parallel()

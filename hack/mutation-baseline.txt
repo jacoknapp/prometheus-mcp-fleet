@@ -4,60 +4,54 @@
 # Minimum Gremlins test efficacy per package, in percent. Read by
 # hack/mutation.sh, which fails a package scoring below its entry.
 #
-# THESE ARE CONSERVATIVE FLOORS, NOT FINISHED WORK, AND NOT THE MEASURED SCORE.
+# Each entry is the measured score floored to a whole percent and reduced by 3.
+# That margin is the tool's measured reproducibility, not padding: efficacy is
+# killed/(killed+lived), and a mutant that merely runs slowly is recorded as
+# TIMED OUT, leaving the numerator without leaving the denominator, so the score
+# moves with machine load. internal/hub scored 92.93 / 90.54 / 89.71 across
+# three runs of identical source. A baseline set to the best of those fails on
+# any differently loaded machine, and a flaky gate teaches people to ignore it.
 #
-# Each entry is the score from the first full sweep, floored to a whole percent
-# and then reduced by 3. The margin is not padding -- it is the measured
-# reproducibility of the tool. Efficacy is killed/(killed+lived), and a mutant
-# that merely runs slowly is recorded as TIMED OUT rather than killed, so it
-# leaves the numerator without leaving the denominator. How many mutants land
-# in that bucket depends on how loaded the machine is. internal/hub, with the
-# source unchanged, scored:
+# Where a package sits below 100 the reason is recorded beside it. An
+# equivalent mutant -- one that changes the source without changing anything a
+# test could observe -- is a legitimate reason to stop. A test written to
+# satisfy the tool rather than to describe the software is not.
 #
-#     92.93%  (8 workers, no memory cap)    1 timed out
-#     90.54%  (4 workers, no memory cap)   26 timed out
-#     89.71%  (4 workers, 8G memory cap)   32 timed out
+# The dominant equivalence class here: widening a boundary by one lands on a
+# value where the guarded action is already idempotent. Clamping x to L when x
+# already equals L, slicing a string to its own length, truncating a slice to
+# its current length. No observable output differs, so no test can kill it.
 #
-# A baseline set to the best of those would fail on any differently loaded
-# machine, and a flaky gate teaches people to ignore the job. Three points
-# covers the swing observed; a package that drops further has genuinely lost
-# test strength.
-#
-# A package below 100 here has NOT had its survivors classified yet -- that
-# work is per-package and ongoing. When you finish one, raise its number and
-# record beside it the reason it stopped where it did. An equivalent mutant no
-# test can kill is a legitimate reason; a test written to satisfy the tool
-# rather than to describe the software is not.
-#
-# Lowering an entry needs a reason in the commit message.
+# Raising an entry is a normal part of adding tests. Lowering one needs a
+# reason in the commit message.
 cmd/hub                     97   # measured 100.00
 cmd/spoke                   97   # measured 100.00
 internal/authn              93   # measured 96.92
-internal/ca                 90   # measured 93.90
-internal/certproof          80   # measured 83.33
-internal/clusterfacts       78   # measured 81.82
-internal/config             80   # measured 83.77
+internal/ca                 95   # measured 98.78
+internal/certproof          80   # measured 83.33; 2 equivalent: make([]byte,0,a+b+c) capacity hints; append grows regardless
+internal/clusterfacts       90   # measured 93.94; 10 equivalent: sentinels overwritten unconditionally later in the same function
+internal/config             95   # measured 98.70
 internal/fleet              97   # measured 100.00
-internal/httpx              87   # measured 90.48
-internal/hub                89   # measured 92.93
+internal/httpx              97   # measured 100.00
+internal/hub                94   # measured 97.00; 2 equivalent (capacity hint, cert-expiry tie needs an injectable clock), 1 unkillable
 internal/hubapi             97   # measured 100.00
-internal/kube               89   # measured 92.96
-internal/mcpsurface         90   # measured 93.55
-internal/mcptools           80   # measured 83.95
+internal/kube               95   # measured 98.59; 1 unobservable: dialer KeepAlive inside a discarded closure, no exported hook
+internal/mcpsurface         93   # measured 96.77; 2 equivalent: guarded nil-to-nil passthrough assignment
+internal/mcptools           87   # measured 90.00; 77 remaining; 10 proven equivalent, rest newly exposed by added coverage
 internal/obs                97   # measured 100.00
 internal/promapi            94   # measured 97.62
-internal/promclient         75   # measured 78.38
-internal/promproxy          93   # measured 96.55
-internal/registry           85   # measured 88.16
-internal/render             91   # measured 94.24
-internal/spoke              83   # measured 86.99
-internal/store              85   # measured 88.79
-internal/store/filestore    93   # measured 96.30
-internal/store/secretstore  73   # measured 76.19
-internal/testutil           66   # measured 69.05
+internal/promclient         90   # measured 93.86; 5 equivalent (min-assign no-ops), 2 impractical: dialer timeouts in a discarded closure
+internal/promproxy          94   # measured 97.62
+internal/registry           90   # measured 93.42; 5 equivalent: s[:n] at len n is a no-op; levenshtein arg swap only picks the smaller row
+internal/render             91   # measured 94.76; 10 equivalent: boundaries already excluded by a redundant guard in the same function
+internal/spoke              93   # measured 96.58; 5 equivalent: if x<L {x=L} is a no-op exactly at L
+internal/store              96   # measured 99.07
+internal/store/filestore    97   # measured 100.00
+internal/store/secretstore  94   # measured 97.62; 1 equivalent: backoff cap assigns maxBackoff either way at the tie
+internal/testutil           89   # measured 92.86
 internal/token              97   # measured 100.00
-internal/tunnel             78   # measured 81.04
-internal/tunnel/grpctun     74   # measured 77.78
-internal/tunnel/memtun      72   # measured 75.00
-internal/tunnel/wstun       84   # measured 87.34
-internal/version            87   # measured 90.00
+internal/tunnel             95   # measured 98.35
+internal/tunnel/grpctun     94   # measured 97.00
+internal/tunnel/memtun      93   # measured 96.97
+internal/tunnel/wstun       97   # measured 100.00
+internal/version            93   # measured 96.67

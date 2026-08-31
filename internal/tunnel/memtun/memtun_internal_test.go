@@ -186,6 +186,31 @@ func TestCancelledDoClosesALateHandlerResponse(t *testing.T) {
 	}
 }
 
+// writerFunc adapts a function to io.Writer.
+type writerFunc func(p []byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
+// zeroThenData reports a legal (0, nil) read once before yielding data, then
+// io.EOF once the data is exhausted.
+type zeroThenData struct {
+	calls int
+	data  []byte
+}
+
+func (r *zeroThenData) Read(p []byte) (int, error) {
+	r.calls++
+	if r.calls == 1 {
+		return 0, nil
+	}
+	if len(r.data) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
+
 type dataThenError struct {
 	data []byte
 	err  error
@@ -212,6 +237,25 @@ func TestCopyAndPumpReportReaderFailures(t *testing.T) {
 		}
 	})
 
+	// A reader is allowed by the io.Reader contract to return (0, nil), and
+	// copyBudgeted must not mistake that for a chunk worth writing out.
+	t.Run("a zero-byte, no-error read produces no empty write", func(t *testing.T) {
+		var writes [][]byte
+		w := writerFunc(func(p []byte) (int, error) {
+			writes = append(writes, append([]byte(nil), p...))
+			return len(p), nil
+		})
+		sent, truncated, err := copyBudgeted(w, &zeroThenData{data: []byte("abc")}, 16)
+		if sent != 3 || truncated || err != nil {
+			t.Fatalf("copyBudgeted = (%d, %v, %v), want (3, false, nil)", sent, truncated, err)
+		}
+		for _, p := range writes {
+			if len(p) == 0 {
+				t.Errorf("an empty Write occurred: %v", writes)
+			}
+		}
+	})
+
 	t.Run("pump exposes an incomplete response", func(t *testing.T) {
 		h := testHandler{
 			do: func(context.Context, *tunnel.Request) (*tunnel.Response, error) {
@@ -233,4 +277,35 @@ func TestCopyAndPumpReportReaderFailures(t *testing.T) {
 			t.Errorf("Trailer = %+v, want 3 bytes and ErrUpstream", trail)
 		}
 	})
+}
+
+// TestBodyReaderDoesNotFinishOnASuccessfulRead proves a Read that reports no
+// error leaves the body live: Trailer's zero-value contract holds only while
+// finished is false, so latching it early on an ordinary in-progress read
+// would let a caller observe a "done" trailer for a response that is not.
+func TestBodyReaderDoesNotFinishOnASuccessfulRead(t *testing.T) {
+	t.Parallel()
+
+	pr, pw := io.Pipe()
+	b := &bodyReader{pr: pr, cleanup: func() {}, release: func() {}}
+	t.Cleanup(func() { _ = pw.Close() })
+
+	writeDone := make(chan struct{})
+	go func() {
+		defer close(writeDone)
+		_, _ = pw.Write([]byte("hello"))
+	}()
+
+	buf := make([]byte, 5)
+	n, err := b.Read(buf)
+	if n != 5 || err != nil {
+		t.Fatalf("Read = (%d, %v), want (5, nil)", n, err)
+	}
+	if b.finished {
+		t.Error("finished = true after a successful read that reported no error")
+	}
+	if trail := b.Trailer(); trail.BytesTotal != 0 || trail.Truncated || trail.Err != nil || len(trail.Warnings) != 0 {
+		t.Errorf("Trailer() = %+v, want the zero value while the body is still live", trail)
+	}
+	<-writeDone
 }

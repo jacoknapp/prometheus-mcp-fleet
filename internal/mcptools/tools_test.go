@@ -624,6 +624,40 @@ func TestDescribeClusterKeepsLargerSectionOverflow(t *testing.T) {
 	}
 }
 
+// TestDescribeClusterStaleBoundary pins the age > StaleFactsAfter boundary:
+// facts exactly StaleFactsAfter old must not be reported stale, only facts
+// strictly older than that.
+func TestDescribeClusterStaleBoundary(t *testing.T) {
+	t.Parallel()
+	atBoundary := testClusters()
+	pastBoundary := testClusters()
+	for i := range atBoundary {
+		if atBoundary[i].ID != okCluster {
+			continue
+		}
+		atBoundary[i].LastSeen = testNow.Add(-StaleFactsAfter)
+		pastBoundary[i].LastSeen = testNow.Add(-StaleFactsAfter - time.Nanosecond)
+	}
+
+	hAt := newHarness(t, func(o *Options) { o.Clusters = &fakeClusters{entries: atBoundary} })
+	outAt, terr := hAt.tools.describeCluster(ctx(t), hAt.p, DescribeClusterIn{Cluster: okCluster})
+	if terr != nil {
+		t.Fatalf("describeCluster: %v", terr)
+	}
+	if outAt.Stale {
+		t.Errorf("Stale = true at age exactly StaleFactsAfter, want false")
+	}
+
+	hPast := newHarness(t, func(o *Options) { o.Clusters = &fakeClusters{entries: pastBoundary} })
+	outPast, terr := hPast.tools.describeCluster(ctx(t), hPast.p, DescribeClusterIn{Cluster: okCluster})
+	if terr != nil {
+		t.Fatalf("describeCluster: %v", terr)
+	}
+	if !outPast.Stale || outPast.StaleNotice == "" {
+		t.Errorf("Stale = %v at age StaleFactsAfter+1ns, want true with a notice", outPast.Stale)
+	}
+}
+
 // TestQueryInstant covers the columnar instant encoding and the time forms.
 func TestQueryInstant(t *testing.T) {
 	t.Parallel()
@@ -1921,6 +1955,22 @@ func TestRules(t *testing.T) {
 	}
 	if len(one.Rules) != 1 || one.Rules[0].Name != "KubePodCrashLooping" {
 		t.Errorf("ruleName filter = %+v", one.Rules)
+	}
+	// Pins the *1000 conversion from seconds to milliseconds for both the
+	// rule's own evaluationTime (0.002101s) and its group's (0.004112s): an
+	// ARITHMETIC_BASE mutation turning * into / or + would land far from
+	// these values.
+	if one.Rules[0].EvalMillis != 2.1 {
+		t.Errorf("rule EvalMillis = %v, want 2.1 (0.002101s * 1000, rounded)", one.Rules[0].EvalMillis)
+	}
+	var appsGroup *RuleGroupInfo
+	for i := range out.Groups {
+		if out.Groups[i].Name == "kubernetes-apps" {
+			appsGroup = &out.Groups[i]
+		}
+	}
+	if appsGroup == nil || appsGroup.EvalMillis != 4.11 {
+		t.Errorf("kubernetes-apps group EvalMillis = %+v, want 4.11 (0.004112s * 1000, rounded)", appsGroup)
 	}
 
 	if _, terr := h.tools.rules(ctx(t), h.p,

@@ -386,6 +386,67 @@ func TestExplainPromQLSkipsCheckGracefully(t *testing.T) {
 	}
 }
 
+// TestExplainPromQLByteLimitBoundary pins the len(q) > MaxPromQLBytes
+// boundary: an expression of exactly MaxPromQLBytes must reach the structural
+// analyzer rather than being rejected on length, and only MaxPromQLBytes+1
+// must produce the byte-limit message.
+func TestExplainPromQLByteLimitBoundary(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+
+	atLimit, terr := h.tools.explainPromQL(ctx(t), h.p,
+		ExplainPromQLIn{Query: strings.Repeat("a", MaxPromQLBytes)})
+	if terr != nil {
+		t.Fatalf("explainPromQL: %v", terr)
+	}
+	if strings.Contains(atLimit.Message, "byte limit") {
+		t.Errorf("message = %q, an expression of exactly MaxPromQLBytes was rejected on length",
+			atLimit.Message)
+	}
+
+	overLimit, terr := h.tools.explainPromQL(ctx(t), h.p,
+		ExplainPromQLIn{Query: strings.Repeat("a", MaxPromQLBytes+1)})
+	if terr != nil {
+		t.Fatalf("explainPromQL: %v", terr)
+	}
+	if !strings.Contains(overLimit.Message, "byte limit") {
+		t.Errorf("message = %q, want the byte-limit rejection at MaxPromQLBytes+1", overLimit.Message)
+	}
+}
+
+// TestSummarizeAnalysisBoundaries pins the len(...) > 0 / Subqueries > 0
+// boundaries in summarizeAnalysis directly: each part of the summary must be
+// absent with zero of a kind and present starting at exactly one.
+func TestSummarizeAnalysisBoundaries(t *testing.T) {
+	t.Parallel()
+
+	none := summarizeAnalysis(promQLAnalysis{Valid: true})
+	if strings.Contains(none, "function") || strings.Contains(none, "aggregation") ||
+		strings.Contains(none, "range window") || strings.Contains(none, "subquer") {
+		t.Errorf("summary = %q, want none of the optional parts with nothing to report", none)
+	}
+
+	withFunc := summarizeAnalysis(promQLAnalysis{Valid: true, Functions: []string{"rate"}})
+	if !strings.Contains(withFunc, "functions rate") {
+		t.Errorf("summary = %q, want it to mention the one function", withFunc)
+	}
+
+	withAgg := summarizeAnalysis(promQLAnalysis{Valid: true, Aggregations: []string{"sum"}})
+	if !strings.Contains(withAgg, "aggregations sum") {
+		t.Errorf("summary = %q, want it to mention the one aggregation", withAgg)
+	}
+
+	withWindow := summarizeAnalysis(promQLAnalysis{Valid: true, RangeWindows: []string{"5m"}})
+	if !strings.Contains(withWindow, "range windows 5m") {
+		t.Errorf("summary = %q, want it to mention the one range window", withWindow)
+	}
+
+	withSubquery := summarizeAnalysis(promQLAnalysis{Valid: true, Subqueries: 1})
+	if !strings.Contains(withSubquery, "1 subquery") {
+		t.Errorf("summary = %q, want it to mention the one subquery", withSubquery)
+	}
+}
+
 // TestExplainPromQLNoClusterSaysSo covers the no-cluster notice.
 func TestExplainPromQLNoClusterSaysSo(t *testing.T) {
 	t.Parallel()
@@ -396,6 +457,26 @@ func TestExplainPromQLNoClusterSaysSo(t *testing.T) {
 	}
 	if !strings.Contains(out.CheckSkipped, "No cluster") {
 		t.Errorf("checkSkipped = %q", out.CheckSkipped)
+	}
+}
+
+// TestExplainPromQLNoClusterNoMetricsSaysNothing pins the len(a.Metrics) > 0
+// boundary that gates the no-cluster notice: a constant expression names no
+// metric at all, so there is nothing an existence check could have verified,
+// and the notice must stay silent rather than tell the caller to pass
+// cluster for no reason.
+func TestExplainPromQLNoClusterNoMetricsSaysNothing(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	out, terr := h.tools.explainPromQL(ctx(t), h.p, ExplainPromQLIn{Query: "1 + 1"})
+	if terr != nil {
+		t.Fatalf("explainPromQL: %v", terr)
+	}
+	if len(out.MetricsReferenced) != 0 {
+		t.Fatalf("metricsReferenced = %v, want none for a constant expression", out.MetricsReferenced)
+	}
+	if out.CheckSkipped != "" {
+		t.Errorf("checkSkipped = %q, want empty with no metrics to check", out.CheckSkipped)
 	}
 }
 

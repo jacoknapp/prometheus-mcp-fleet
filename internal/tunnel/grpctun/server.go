@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"log/slog"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -31,7 +30,6 @@ type spokeServer struct {
 	h          tunnel.Handler
 	generation int64
 	chunkBytes int
-	log        *slog.Logger
 }
 
 // Describe implements fleetv1.SpokeServiceServer.

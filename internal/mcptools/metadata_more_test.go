@@ -41,6 +41,59 @@ func TestSearchMetricsArgumentValidation(t *testing.T) {
 	}
 }
 
+// TestSearchMetricsPatternLengthBoundary pins the len(pattern) > 200 boundary:
+// a pattern of exactly 200 bytes must be accepted (only 201+ is refused).
+func TestSearchMetricsPatternLengthBoundary(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	_, terr := h.tools.searchMetrics(ctx(t), h.p,
+		SearchMetricsIn{Cluster: okCluster, Pattern: strings.Repeat("x", 200)})
+	if terr != nil {
+		t.Fatalf("a 200-byte pattern was rejected: %v", terr)
+	}
+}
+
+// TestSearchMetricsMetadataJoinSkippedWhenNoMatches pins the
+// len(out.Metrics) > 0 boundary directly: withMetadata must not issue the
+// enrichment call at all when nothing matched, and must issue it once
+// something did.
+func TestSearchMetricsMetadataJoinSkippedWhenNoMatches(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+
+	none, terr := h.tools.searchMetrics(ctx(t), h.p,
+		SearchMetricsIn{Cluster: okCluster, Pattern: "no-such-metric-exists", WithMetadata: true})
+	if terr != nil {
+		t.Fatalf("searchMetrics: %v", terr)
+	}
+	if none.Total != 0 {
+		t.Fatalf("total = %d, want 0 matches", none.Total)
+	}
+	for _, c := range h.prom.calls {
+		if c.Endpoint == promapi.EndpointMetadata {
+			t.Fatal("metadataOf was called despite zero matches")
+		}
+	}
+
+	one, terr := h.tools.searchMetrics(ctx(t), h.p,
+		SearchMetricsIn{Cluster: okCluster, Pattern: "up", WithMetadata: true})
+	if terr != nil {
+		t.Fatalf("searchMetrics: %v", terr)
+	}
+	if one.Total == 0 {
+		t.Fatal("want at least one match for pattern \"up\"")
+	}
+	var sawMetadataCall bool
+	for _, c := range h.prom.calls {
+		if c.Endpoint == promapi.EndpointMetadata {
+			sawMetadataCall = true
+		}
+	}
+	if !sawMetadataCall {
+		t.Error("metadataOf was not called despite at least one match")
+	}
+}
+
 // TestSearchMetricsPropagatesNameListFailure proves the metric-name lookup
 // search_metrics depends on is not the same best-effort enrichment as
 // withMetadata: if the hub cannot list names at all, the search fails rather

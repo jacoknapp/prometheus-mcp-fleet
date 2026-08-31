@@ -4,6 +4,7 @@
 package wstun
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/ed25519"
@@ -12,9 +13,11 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/binary"
 	"encoding/pem"
 	"errors"
 	"io"
+	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
@@ -382,6 +385,49 @@ func TestDialHandshakeClassification(t *testing.T) {
 	})
 }
 
+// TestDialUsesTheConfiguredLogger proves cfg.Logger is not silently discarded:
+// Dial's own "tunnel connected" line must reach the caller's Logger, not a
+// default one built regardless of what was configured.
+func TestDialUsesTheConfiguredLogger(t *testing.T) {
+	t.Parallel()
+
+	hub := newHarness(t, nil)
+	cert := hub.ca.issue(t, "prod")
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- Dial(ctx, ClientConfig{
+			URL:         hub.wsURL(),
+			Certificate: cert,
+			ClusterID:   "prod",
+			Logger:      logger,
+			HTTPClient:  hub.http.Client(),
+			Generation:  1,
+		}, &tunneltest.EchoHandler{})
+	}()
+
+	select {
+	case <-hub.sessions:
+	case err := <-done:
+		cancel()
+		t.Fatalf("Dial returned before a session was established: %v", err)
+	case <-time.After(20 * time.Second):
+		cancel()
+		t.Fatal("no session within 20s")
+	}
+	cancel()
+	<-done
+
+	if !strings.Contains(buf.String(), "tunnel connected") {
+		t.Errorf("the configured Logger recorded nothing about the connection (got %q); "+
+			"Dial must not fall back to a default logger when one was supplied", buf.String())
+	}
+}
+
 // TestSignerFor covers the two ways a spoke can have no usable key.
 func TestSignerFor(t *testing.T) {
 	t.Parallel()
@@ -435,6 +481,24 @@ func TestHTTPClient(t *testing.T) {
 	if tr.ForceAttemptHTTP2 {
 		t.Error("HTTP/2 is attempted; an RFC 6455 upgrade needs HTTP/1.1")
 	}
+	if tr.TLSHandshakeTimeout != 10*time.Second {
+		t.Errorf("TLSHandshakeTimeout = %s, want 10s", tr.TLSHandshakeTimeout)
+	}
+
+	t.Run("no bundle uses the system pool without error", func(t *testing.T) {
+		t.Parallel()
+		client, err := (ClientConfig{}).httpClient()
+		if err != nil {
+			t.Fatalf("httpClient() error = %v, want nil when no CABundle is configured", err)
+		}
+		tr, ok := client.Transport.(*http.Transport)
+		if !ok {
+			t.Fatalf("Transport is %T, want *http.Transport", client.Transport)
+		}
+		if tr.TLSClientConfig.RootCAs != nil {
+			t.Error("RootCAs is set despite no CABundle being configured; want the system pool (nil)")
+		}
+	})
 }
 
 // TestUpgradeReason pins the classification a reconnect metric is labelled
@@ -487,6 +551,21 @@ func TestUpgradeReason(t *testing.T) {
 				t.Errorf("upgradeReason() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestUpgradeCauseUsesTheActualRequestPath proves the hint names the tunnel
+// path that was actually dialled, not always DefaultPath. Every existing
+// TestUpgradeFailureHints fixture happens to dial DefaultPath itself, so a
+// custom path parsed from the target is indistinguishable from one that fell
+// back to the default unless a genuinely different path is used here.
+func TestUpgradeCauseUsesTheActualRequestPath(t *testing.T) {
+	t.Parallel()
+
+	resp := &http.Response{StatusCode: http.StatusNotFound}
+	got := upgradeCause("wss://hub.example.com/pmf/tunnel", resp, errors.New("boom"))
+	if !strings.Contains(got.Error(), "/pmf/tunnel") {
+		t.Errorf("upgradeCause() = %v, want it to name the actual tunnel path /pmf/tunnel", got)
 	}
 }
 
@@ -635,6 +714,50 @@ func TestHandshakeMessageFraming(t *testing.T) {
 			t.Errorf("writeMessage() = %v after %d writes, want body-write failure", err, w.writes)
 		}
 	})
+
+	// A message whose encoded length is exactly maxHandshakeBytes is legal;
+	// only strictly larger is refused. The oversized fixture above marshals to
+	// well past the cap, so it cannot tell ">" from ">=" at the boundary.
+	t.Run("write allows a message exactly at the cap", func(t *testing.T) {
+		t.Parallel()
+		if err := writeMessage(io.Discard, fixedSizeJSONString(maxHandshakeBytes)); err != nil {
+			t.Errorf("writeMessage() at exactly the cap = %v, want nil", err)
+		}
+	})
+
+	// The mirror image on the read side: a declared size exactly at the cap
+	// must be accepted, not just one under it.
+	t.Run("read allows a declared size exactly at the cap", func(t *testing.T) {
+		t.Parallel()
+		payload, err := fixedSizeJSONString(maxHandshakeBytes).MarshalJSON()
+		if err != nil {
+			t.Fatalf("MarshalJSON: %v", err)
+		}
+		if len(payload) != maxHandshakeBytes {
+			t.Fatalf("constructed payload is %d bytes, want %d", len(payload), maxHandshakeBytes)
+		}
+		var lenPrefix [4]byte
+		binary.BigEndian.PutUint32(lenPrefix[:], uint32(len(payload)))
+		wire := append(lenPrefix[:], payload...)
+		var out string
+		if err := readMessage(bytes.NewReader(wire), &out); err != nil {
+			t.Errorf("readMessage() at exactly the cap = %v, want nil", err)
+		}
+	})
+}
+
+// fixedSizeJSONString marshals to a JSON string literal of exactly n bytes
+// (n-2 filler characters plus the two quotes), so a handshake framing test can
+// pin the byte-cap boundary exactly rather than merely "comfortably over it".
+type fixedSizeJSONString int
+
+func (n fixedSizeJSONString) MarshalJSON() ([]byte, error) {
+	inner := int(n) - 2
+	out := make([]byte, 0, n)
+	out = append(out, '"')
+	out = append(out, bytes.Repeat([]byte("a"), inner)...)
+	out = append(out, '"')
+	return out, nil
 }
 
 // --- helpers -------------------------------------------------------------

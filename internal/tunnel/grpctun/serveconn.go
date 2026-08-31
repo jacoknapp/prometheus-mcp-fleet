@@ -80,7 +80,6 @@ func ServeConn(ctx context.Context, conn net.Conn, cfg DialerConfig, h tunnel.Ha
 		h:          h,
 		generation: cfg.Generation,
 		chunkBytes: chunk,
-		log:        log,
 	})
 
 	serveErr := make(chan error, 1)
@@ -105,11 +104,16 @@ func ServeConn(ctx context.Context, conn net.Conn, cfg DialerConfig, h tunnel.Ha
 
 	switch {
 	case cancelled:
+		log.InfoContext(ctx, "spoke tunnel stopped: context cancelled",
+			slog.String("endpoint", cfg.Endpoint))
 		return dialErr(cfg.Endpoint, ReasonContextCancelled, ctx.Err())
 	default:
 		// Serve returned because the one-shot listener's second Accept woke up,
 		// which only happens when the connection died. The notify wrapper always
 		// records that failure before waking Accept.
-		return dialErr(cfg.Endpoint, ReasonConnClosed, errors.New(nc.DeathReason()))
+		reason := nc.DeathReason()
+		log.WarnContext(ctx, "spoke tunnel connection closed",
+			slog.String("endpoint", cfg.Endpoint), slog.String("reason", reason))
+		return dialErr(cfg.Endpoint, ReasonConnClosed, errors.New(reason))
 	}
 }

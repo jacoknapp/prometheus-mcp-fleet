@@ -730,6 +730,31 @@ func TestCAMaterialEmptinessAndCompleteness(t *testing.T) {
 	}
 }
 
+// TestCAMaterialCompleteRequiresEveryField isolates each field of complete's
+// three-way AND: with the other two fields present, missing any single one
+// alone must make it incomplete. len(x) > 0 mutated to len(x) >= 0 would make
+// that field's check always true (a length is never negative), silently
+// dropping it from the requirement.
+func TestCAMaterialCompleteRequiresEveryField(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		m    caMaterial
+	}{
+		{"missing cert", caMaterial{keyPEM: []byte("k"), pepper: []byte("p")}},
+		{"missing key", caMaterial{certPEM: []byte("c"), pepper: []byte("p")}},
+		{"missing pepper", caMaterial{certPEM: []byte("c"), keyPEM: []byte("k")}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if tc.m.complete() {
+				t.Errorf("complete() = true for %+v, want false: every field is required", tc.m)
+			}
+		})
+	}
+}
+
 func TestReloadAfterAdoptionUsesTheConfiguredTrustDomain(t *testing.T) {
 	t.Parallel()
 

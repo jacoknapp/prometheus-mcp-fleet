@@ -4,6 +4,7 @@
 package mcpsurface
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -489,6 +490,33 @@ func TestCrossOriginProtection(t *testing.T) {
 					rec.Code, tc.wantStatus, rec.Body.String())
 			}
 		})
+	}
+}
+
+// TestCrossOriginProtectionLogsOnlyRejectedOrigins pins that the "ignoring
+// untrusted origin" warning fires exactly when AddTrustedOrigin fails, not
+// its negation. TestCrossOriginProtection already exercises a valid and an
+// unparseable TrustedOrigins entry, but with the logger discarded: the
+// warning has no effect on cop's registered origins or on any HTTP status, so
+// nothing there can tell a correctly gated log line apart from one gated on
+// success instead of failure. This captures the log output directly.
+func TestCrossOriginProtectionLogsOnlyRejectedOrigins(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	s := newTestServer(t, func(o *Options) {
+		o.DisableCrossOriginProtection = false
+		o.Logger = slog.New(slog.NewTextHandler(&buf, nil))
+		o.TrustedOrigins = []string{"https://console.example", "::not a url::"}
+	})
+	s.Handler() // building the handler is what walks TrustedOrigins.
+
+	out := buf.String()
+	if !strings.Contains(out, "ignoring untrusted origin") || !strings.Contains(out, "not a url") {
+		t.Errorf("log output = %q, want a warning naming the unparseable origin", out)
+	}
+	if strings.Contains(out, "console.example") {
+		t.Errorf("log output = %q, want no warning for the valid, accepted origin", out)
 	}
 }
 

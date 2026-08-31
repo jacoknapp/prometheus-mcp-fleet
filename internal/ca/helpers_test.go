@@ -89,6 +89,53 @@ func certWithoutIdentity(t *testing.T, c *CA) *x509.Certificate {
 	return leaf
 }
 
+// intermediateSignedSpokeCert mints a fresh intermediate CA certificate
+// (itself signed by authority) and then uses that intermediate, not
+// authority, to sign a spoke leaf for clusterID. The leaf's issuer is
+// therefore the intermediate rather than the root.
+//
+// authority's root has MaxPathLen 0 (see ca.go), so a chain running through
+// this intermediate can never fully verify in this fleet. The pair exists to
+// let a test tell apart *why* verification fails: whether the intermediate
+// reached the verifier as an offered intermediate (and was rejected only for
+// exceeding the path length) or never reached it at all (no path to any root
+// found).
+func intermediateSignedSpokeCert(t *testing.T, authority *CA, clusterID string) (leaf, intermediate *x509.Certificate) {
+	t.Helper()
+	interKey := newKey(t)
+	_, interCert, err := authority.sign(&x509.Certificate{
+		Subject:               pkix.Name{CommonName: "intermediate"},
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}, interKey.Public(), DefaultSpokeCertTTL)
+	if err != nil {
+		t.Fatalf("sign intermediate: %v", err)
+	}
+
+	leafKey := newKey(t)
+	now := authority.now()
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "spoke:" + clusterID},
+		URIs:                  []*url.URL{authority.SpokeURI(clusterID)},
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		BasicConstraintsValid: true,
+		NotBefore:             now.Add(-time.Minute),
+		NotAfter:              now.Add(time.Hour),
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, interCert, leafKey.Public(), interKey)
+	if err != nil {
+		t.Fatalf("create leaf signed by intermediate: %v", err)
+	}
+	leaf, err = x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parse leaf signed by intermediate: %v", err)
+	}
+	return leaf, interCert
+}
+
 func issuedSpokeCert(t *testing.T, c *CA, clusterID string) *x509.Certificate {
 	t.Helper()
 	key := newKey(t)

@@ -1280,6 +1280,27 @@ func TestGetJSON(t *testing.T) {
 			t.Fatalf("GetJSON() error = %v, want ErrTooLarge", err)
 		}
 	})
+
+	// "exactly at the cap" pins the boundary of fetch's byte-cap check from
+	// the accepting side: a body padded to precisely MaxResponseBytes must
+	// decode cleanly, not be refused as too large. The "oversize body" case
+	// above already proves one-over-cap is refused; together they bound the
+	// comparison on both sides.
+	t.Run("exactly at the cap", func(t *testing.T) {
+		t.Parallel()
+		const cap = 2048
+		fake := testutil.NewFakePrometheus(t, testutil.FakeOptions{BodySize: cap})
+		c := newClient(t, fake.URL, func(cfg *promclient.Config) { cfg.MaxResponseBytes = cap })
+		var env struct {
+			Status string `json:"status"`
+		}
+		if err := c.GetJSON(t.Context(), promapi.EndpointFlags, nil, &env); err != nil {
+			t.Fatalf("GetJSON() error = %v, want a body padded to exactly the cap to decode cleanly", err)
+		}
+		if env.Status != "success" {
+			t.Fatalf("decoded status = %q, want success", env.Status)
+		}
+	})
 }
 
 func TestTLSConfiguration(t *testing.T) {

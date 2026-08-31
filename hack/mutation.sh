@@ -86,8 +86,11 @@ export GOCACHE="${cachedir}"
 if command -v fuser >/dev/null 2>&1; then
 	for stale in /tmp/gremlins-*; do
 		[[ -d "${stale}" ]] || continue
+		# Never fatal: this runs under `set -e`, and rm can legitimately fail on
+		# a directory another process is still writing into. Failing to tidy up
+		# is not a reason to abandon the sweep -- it aborted a full run once.
 		if ! fuser -s "${stale}" 2>/dev/null; then
-			rm -rf "${stale}"
+			rm -rf "${stale}" 2>/dev/null || true
 		fi
 	done
 fi

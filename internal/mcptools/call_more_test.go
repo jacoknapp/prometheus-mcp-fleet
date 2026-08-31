@@ -4,9 +4,14 @@
 package mcptools
 
 import (
+	"net/url"
 	"testing"
+	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/promapi"
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/promproxy"
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/render"
 )
 
 // TestClassifyUpstreamEmptyMessageAndPlainDefault covers two edges of
@@ -29,6 +34,45 @@ func TestClassifyUpstreamEmptyMessageAndPlainDefault(t *testing.T) {
 	}
 	if terr.Message == "" {
 		t.Error("no message was synthesised for an upstream error with no error text")
+	}
+}
+
+// TestClassifyUpstreamMatchersBoundary pins the len(m) > 0 boundary that
+// decides whether classifyUpstream echoes a "matchers" input: zero match[]
+// values must leave it absent, and exactly one must set it.
+func TestClassifyUpstreamMatchersBoundary(t *testing.T) {
+	t.Parallel()
+	env := &render.APIResponse{Status: "error", ErrorType: "bad_data", Error: "bad matcher"}
+
+	none := classifyUpstream(promproxy.Call{ClusterID: "c1", Form: url.Values{}}, env, 400, kindSelector)
+	if _, ok := none.Input["matchers"]; ok {
+		t.Errorf("Input = %v, want no \"matchers\" key with zero match[] values", none.Input)
+	}
+
+	one := classifyUpstream(promproxy.Call{
+		ClusterID: "c1", Form: url.Values{"match[]": {`up{job="api"}`}},
+	}, env, 400, kindSelector)
+	got, ok := one.Input["matchers"]
+	if !ok {
+		t.Fatalf("Input = %v, want a \"matchers\" key with one match[] value", one.Input)
+	}
+	if diff := cmp.Diff([]string{`up{job="api"}`}, got); diff != "" {
+		t.Errorf("matchers (-want +got):\n%s", diff)
+	}
+}
+
+// TestEffectiveTimeoutZeroBoundary pins the want <= 0 boundary: exactly zero
+// must fall back to the default, while any positive duration (even a
+// nanosecond) must pass through unchanged.
+func TestEffectiveTimeoutZeroBoundary(t *testing.T) {
+	t.Parallel()
+	const def = 30 * time.Second
+
+	if got := effectiveTimeout(0, def); got != def {
+		t.Errorf("effectiveTimeout(0, ...) = %v, want the default %v", got, def)
+	}
+	if got := effectiveTimeout(time.Nanosecond, def); got != time.Nanosecond {
+		t.Errorf("effectiveTimeout(1ns, ...) = %v, want 1ns passed through", got)
 	}
 }
 

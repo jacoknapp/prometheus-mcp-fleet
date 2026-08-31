@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/jsonschema-go/jsonschema"
 )
 
 // constrainedIn exercises every property kind [Constraint] can narrow.
@@ -188,6 +189,46 @@ func TestNoConstraintsIsANoOp(t *testing.T) {
 	c, _ := json.Marshal(zero)
 	if diff := cmp.Diff(string(a), string(c)); diff != "" {
 		t.Errorf("a zero Constraint changed the schema (-nil +zero):\n%s", diff)
+	}
+}
+
+// TestApplyConstraintZeroValueLeavesSliceFieldsNil pins that applying a
+// Constraint whose Enum (or Examples) is unset never gives the schema's Enum
+// (or Examples) an empty-but-non-nil value.
+//
+// jsonschema.Schema documents nil and []any{} as meaningfully different:
+// nil means no constraint, but an empty slice vacuously rejects every
+// instance. TestNoConstraintsIsANoOp already pins the zero-Constraint case
+// through JSON, but Enum and Examples both marshal with "omitempty", which
+// drops an empty slice exactly like a nil one -- so that round trip cannot
+// tell a correct "left untouched" apart from a version that ran
+// s.Enum = make([]any, len(c.Enum)) (or the Examples assignment)
+// unconditionally, regardless of len(c.Enum)/len(c.Examples). This asserts
+// the pre-marshal struct field directly, where the two are distinguishable.
+func TestApplyConstraintZeroValueLeavesSliceFieldsNil(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		get  func(*jsonschema.Schema) []any
+	}{
+		{name: "enum", get: func(s *jsonschema.Schema) []any { return s.Enum }},
+		{name: "examples", get: func(s *jsonschema.Schema) []any { return s.Examples }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := &jsonschema.Schema{Type: "string"}
+			// Description is set so this exercises the same applyConstraint
+			// call a real, non-empty Constraint that simply doesn't mention
+			// this field makes -- not an early return for an all-zero value.
+			if err := applyConstraint(s, Constraint{Description: "unrelated"}); err != nil {
+				t.Fatalf("applyConstraint: %v", err)
+			}
+			if got := tc.get(s); got != nil {
+				t.Errorf("%s = %#v, want nil", tc.name, got)
+			}
+		})
 	}
 }
 

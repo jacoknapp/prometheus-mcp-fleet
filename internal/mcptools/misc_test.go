@@ -5,6 +5,7 @@ package mcptools
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -54,6 +55,20 @@ func TestNewValidatesOptions(t *testing.T) {
 	if clamped.fanoutConcurrency != MaxFanoutConcurrency {
 		t.Errorf("fanoutConcurrency = %d, want %d",
 			clamped.fanoutConcurrency, MaxFanoutConcurrency)
+	}
+
+	// Exactly at the ceiling must pass through unchanged: only strictly above
+	// it gets clamped.
+	atCeiling, err := New(Options{
+		Prometheus: &fakeProm{}, Clusters: &fakeClusters{},
+		FanoutConcurrency: MaxFanoutConcurrency,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if atCeiling.fanoutConcurrency != MaxFanoutConcurrency {
+		t.Errorf("fanoutConcurrency = %d, want the ceiling %d left untouched",
+			atCeiling.fanoutConcurrency, MaxFanoutConcurrency)
 	}
 }
 
@@ -176,6 +191,15 @@ func TestPromqlCaret(t *testing.T) {
 		{
 			name: "past the end clamps", query: "up", message: "at char 99: x",
 			wantLen: 3,
+		},
+		{
+			// Pins the len(query)+1 clamp bound itself (not just that clamping
+			// happens): col 2 sits below len(query)+1 (3) so it must pass
+			// through unclamped, at 2 rather than being pulled to 3. An
+			// ARITHMETIC_BASE mutation of the bound to len(query)-1 (1) would
+			// wrongly clamp this to len(query)+1's *unmutated* 3.
+			name: "below the clamp bound is untouched", query: "up", message: "at char 2: x",
+			wantLen: 2,
 		},
 	}
 	for _, tc := range tests {
@@ -457,6 +481,11 @@ func TestSmallHelpers(t *testing.T) {
 	if got := dedupe(nil); got != nil {
 		t.Errorf("dedupe(nil) = %v", got)
 	}
+	// Pins the len(s) < 2 boundary: exactly two elements must still be
+	// deduplicated when they are equal, not passed through unchanged.
+	if diff := cmp.Diff([]string{"a"}, dedupe([]string{"a", "a"})); diff != "" {
+		t.Errorf("dedupe of two equal elements (-want +got):\n%s", diff)
+	}
 	if !matchesSelector(map[string]string{"a": "1"}, nil) {
 		t.Error("an empty selector must match everything")
 	}
@@ -482,6 +511,15 @@ func TestSmallHelpers(t *testing.T) {
 	}
 	if got := maxZero(-1); got != 0 {
 		t.Errorf("maxZero(-1) = %d", got)
+	}
+	// Pins the v <= 0 boundary: zero itself must still map to 0 (a spoke that
+	// truly has no metric names is different from -1's "could not collect",
+	// but both render the same to an agent), while 1 must pass through.
+	if got := maxZero(0); got != 0 {
+		t.Errorf("maxZero(0) = %d, want 0", got)
+	}
+	if got := maxZero(1); got != 1 {
+		t.Errorf("maxZero(1) = %d, want 1", got)
 	}
 	if got := plural(1, "y", "ies"); got != "y" {
 		t.Errorf("plural(1) = %q", got)
@@ -580,6 +618,49 @@ func TestClipList(t *testing.T) {
 	if replaced.Total-replaced.Returned <= first.Total-first.Returned {
 		t.Errorf("replaced overflow (%d) is not larger than the original (%d)",
 			replaced.Total-replaced.Returned, first.Total-first.Returned)
+	}
+}
+
+// TestClipListOverflowTieAndAsymmetricCounts covers two edges of the
+// trunc.Total-trunc.Returned > prev.Total-prev.Returned comparison that
+// TestClipList's own numbers happen not to distinguish: an exact tie (which
+// pins the ">" boundary against ">=") and a case where prev's Total and
+// Returned are far enough apart that prev.Total-prev.Returned and
+// prev.Total+prev.Returned pick different winners (which pins the "-" against
+// a "+" on prev's side of the comparison).
+func TestClipListOverflowTieAndAsymmetricCounts(t *testing.T) {
+	t.Parallel()
+
+	// Tie: prev has overflow 2 (4 items, topN 2), the new cut also has
+	// overflow 2 (6 items, topN 4). A strictly-greater comparison must keep
+	// prev; ">=" would wrongly replace it.
+	_, prev := clipList([]string{"a", "b", "c", "d"}, 2, nil, "jobs", "hint")
+	if prev == nil || prev.Total-prev.Returned != 2 {
+		t.Fatalf("prev = %+v, want overflow 2", prev)
+	}
+	_, tied := clipList([]string{"1", "2", "3", "4", "5", "6"}, 4, prev, "prefixes", "hint2")
+	if tied != prev {
+		t.Errorf("a tied overflow displaced prev: got %+v, want the original jobs cut %+v", tied, prev)
+	}
+
+	// Asymmetric: prev has a small overflow (1) but a large Returned (9), so
+	// prev.Total-prev.Returned (1) and prev.Total+prev.Returned (19) send the
+	// comparison different ways once the new cut's overflow (2) is checked
+	// against them.
+	bigPrevList := make([]string, 10)
+	for i := range bigPrevList {
+		bigPrevList[i] = fmt.Sprint(i)
+	}
+	_, asymPrev := clipList(bigPrevList, 9, nil, "jobs", "hint")
+	if asymPrev == nil || asymPrev.Total-asymPrev.Returned != 1 {
+		t.Fatalf("asymPrev = %+v, want overflow 1", asymPrev)
+	}
+	_, asymNew := clipList([]string{"a", "b", "c", "d", "e"}, 3, asymPrev, "namespaces", "hint2")
+	if asymNew == asymPrev {
+		t.Errorf("an overflow of 2 did not displace prev's overflow of 1: got %+v", asymNew)
+	}
+	if asymNew.Selection != "namespaces_first_3" {
+		t.Errorf("selection = %q, want the larger cut's own section named", asymNew.Selection)
 	}
 }
 

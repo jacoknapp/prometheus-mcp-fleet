@@ -194,6 +194,9 @@ func TestMigrationHook(t *testing.T) {
 		if !errors.Is(err, sentinel) {
 			t.Fatalf("migrateTo error = %v, want the step's own error", err)
 		}
+		if !strings.Contains(err.Error(), "migrate schema 1 to 2") {
+			t.Errorf("error %q does not name the step (from 1 to 2)", err)
+		}
 		if s.SchemaVersion != 1 {
 			t.Errorf("SchemaVersion = %d after a failed step, want it left at 1", s.SchemaVersion)
 		}

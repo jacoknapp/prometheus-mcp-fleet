@@ -388,6 +388,70 @@ func TestFakeFaultInjection(t *testing.T) {
 	})
 }
 
+// TestFakeNoWarningsMeansNoWarningsMember pins the other side of the
+// "warnings" subtest above: with no Warnings configured, the envelope must
+// carry no "warnings" member at all, not a present-but-null one. json.Marshal
+// of a nil []string produces the JSON literal null, so a decorate that
+// injected it unconditionally instead of only when len(Warnings) > 0 would
+// still pass a test that only decodes into a []string field (nil and never
+// set from JSON null are indistinguishable that way); this checks for the
+// member's presence in the raw envelope instead.
+func TestFakeNoWarningsMeansNoWarningsMember(t *testing.T) {
+	t.Parallel()
+	f := testutil.NewFakePrometheus(t, testutil.FakeOptions{})
+	_, body := get(t, f, "/api/v1/query?query=up")
+	var env map[string]any
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if v, ok := env["warnings"]; ok {
+		t.Errorf(`envelope has a "warnings" member (%v), want none injected`, v)
+	}
+}
+
+// TestFakeBodySizePadsToExactlyTheRequestedSize pins the padding arithmetic:
+// the fixture is grown by exactly BodySize-len(body) bytes, landing the final
+// body at exactly BodySize. TestFakeFaultInjection's "oversize body" subtest
+// only checks "at least", which a padding amount inflated by a sign or
+// operator slip (adding instead of subtracting the two lengths, or the same
+// slip in the "p" repeat count) would still satisfy.
+func TestFakeBodySizePadsToExactlyTheRequestedSize(t *testing.T) {
+	t.Parallel()
+	f := testutil.NewFakePrometheus(t, testutil.FakeOptions{BodySize: 40_000})
+	_, body := get(t, f, "/api/v1/status/flags")
+	if len(body) != 40_000 {
+		t.Fatalf("body is %d bytes, want exactly 40000", len(body))
+	}
+	var env map[string]any
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatalf("padded body is not JSON: %v", err)
+	}
+}
+
+// TestFakeBodySizeExactlyAtPaddingOverheadAddsNoPadding pins the boundary of
+// decorate's inner guard, "pad > overhead": a pad exactly equal to the
+// wrapper's own overhead (the bytes `,"_padding":""` costs before a single
+// "p" filler character is added) leaves nothing to add and must add no
+// padding at all, which is the only case distinguishing "pad > overhead" from
+// the off-by-one "pad >= overhead".
+func TestFakeBodySizeExactlyAtPaddingOverheadAddsNoPadding(t *testing.T) {
+	t.Parallel()
+	base := testutil.NewFakePrometheus(t, testutil.FakeOptions{})
+	_, baseBody := get(t, base, "/api/v1/status/flags")
+
+	const overhead = len(`,"_padding":""`)
+	f := testutil.NewFakePrometheus(t, testutil.FakeOptions{BodySize: len(baseBody) + overhead})
+	_, body := get(t, f, "/api/v1/status/flags")
+
+	if len(body) != len(baseBody) {
+		t.Fatalf("body is %d bytes, want %d: a pad exactly equal to the wrapper overhead must add nothing",
+			len(body), len(baseBody))
+	}
+	if strings.Contains(string(body), "_padding") {
+		t.Errorf("body = %s, want no _padding member", body)
+	}
+}
+
 func TestFakeCloseIsIdempotent(t *testing.T) {
 	t.Parallel()
 	f := testutil.NewFakePrometheus(t, testutil.FakeOptions{})

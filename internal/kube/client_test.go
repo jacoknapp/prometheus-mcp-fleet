@@ -10,6 +10,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -82,6 +83,50 @@ func TestNewTrimsTrailingSlash(t *testing.T) {
 	}
 	if want := "https://api:443"; c.base != want {
 		t.Errorf("base = %q, want %q", c.base, want)
+	}
+}
+
+// TestNewDefaultsANilLoggerRatherThanKeepingNil proves New substitutes a
+// discard logger when Config.Logger is left nil, rather than storing the nil
+// pointer verbatim. A CONDITIONALS_NEGATION mutant on "log == nil" would
+// invert the guard so a nil Config.Logger stays nil; the token source later
+// calls Warn on it after a transient stat/read failure on an already-cached
+// token, which is a nil-pointer panic rather than a log line for the common
+// case of a caller that never configured a logger at all.
+func TestNewDefaultsANilLoggerRatherThanKeepingNil(t *testing.T) {
+	t.Parallel()
+
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	writeTokenFile(t, tokenFile, "v1", time.Now().UnixNano())
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeSecret(t, w, http.StatusOK, &wireSecret{Metadata: wireMeta{Name: "state"}})
+	}))
+	t.Cleanup(srv.Close)
+
+	c, err := New(Config{
+		APIServerURL: srv.URL,
+		Namespace:    testNamespace,
+		TokenFile:    tokenFile,
+		HTTPClient:   srv.Client(),
+		// Logger deliberately left unset.
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := c.GetSecret(t.Context(), "state"); err != nil {
+		t.Fatalf("initial GetSecret: %v", err)
+	}
+
+	// Force the cached token to be treated as stale, then remove the file so
+	// the next stat fails. get() must fall back to the cached token and log a
+	// warning through c.tokens.log -- which panics if that field is nil.
+	c.tokens.checked = time.Time{}
+	if err := os.Remove(tokenFile); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if _, err := c.GetSecret(t.Context(), "state"); err != nil {
+		t.Fatalf("GetSecret after the token file vanished: %v, want the cached token to still work", err)
 	}
 }
 
@@ -193,6 +238,45 @@ func TestDoRequestFailure(t *testing.T) {
 		}
 	})
 
+	t.Run("a response body exactly at the byte limit is accepted", func(t *testing.T) {
+		t.Parallel()
+		// A CONDITIONALS_BOUNDARY mutant widening "len(raw) > c.maxBytes" to
+		// ">=" would reject a response landing exactly on the configured
+		// limit, one byte before it is actually oversized.
+		raw, err := json.Marshal(&wireSecret{
+			APIVersion: "v1", Kind: "Secret",
+			Metadata: wireMeta{Name: "state"},
+		})
+		if err != nil {
+			t.Fatalf("marshal fixture: %v", err)
+		}
+		c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(raw)
+		})
+		c.maxBytes = int64(len(raw))
+		if _, err := c.GetSecret(t.Context(), "state"); err != nil {
+			t.Errorf("GetSecret with a response exactly at maxBytes = %v, want success", err)
+		}
+	})
+
+	t.Run("status 299 is the top of the success range", func(t *testing.T) {
+		t.Parallel()
+		// A CONDITIONALS_BOUNDARY mutant widening "resp.StatusCode > 299" to
+		// ">=" would reject 299 itself as a failure.
+		c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(299)
+			_ = json.NewEncoder(w).Encode(&wireSecret{
+				APIVersion: "v1", Kind: "Secret",
+				Metadata: wireMeta{Name: "state"},
+			})
+		})
+		if _, err := c.GetSecret(t.Context(), "state"); err != nil {
+			t.Errorf("GetSecret with status 299 = %v, want it treated as success", err)
+		}
+	})
+
 	t.Run("unencodable request body", func(t *testing.T) {
 		t.Parallel()
 		c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
@@ -265,6 +349,36 @@ func TestRequestHeaders(t *testing.T) {
 		if got.Get(header) != want {
 			t.Errorf("%s = %q, want %q", header, got.Get(header), want)
 		}
+	}
+}
+
+// TestContentTypeIsSetOnlyWhenThereIsABody proves the Content-Type header
+// tracks whether the request carries a JSON body, in both directions: present
+// on a write (which has one) and absent on a read (which does not). A
+// CONDITIONALS_NEGATION mutant on "body != nil" would invert this exactly --
+// setting the header on every bodyless GET and omitting it from every write
+// that needs it to be parsed as JSON.
+func TestContentTypeIsSetOnlyWhenThereIsABody(t *testing.T) {
+	t.Parallel()
+
+	var got http.Header
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		writeSecret(t, w, http.StatusOK, &wireSecret{Metadata: wireMeta{Name: "state"}})
+	})
+
+	if _, err := c.CreateSecret(t.Context(), &Secret{Name: "state"}); err != nil {
+		t.Fatalf("CreateSecret: %v", err)
+	}
+	if ct := got.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type on a request with a body = %q, want application/json", ct)
+	}
+
+	if _, err := c.GetSecret(t.Context(), "state"); err != nil {
+		t.Fatalf("GetSecret: %v", err)
+	}
+	if ct := got.Get("Content-Type"); ct != "" {
+		t.Errorf("Content-Type on a bodyless request = %q, want it absent", ct)
 	}
 }
 

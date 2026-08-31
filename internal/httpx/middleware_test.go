@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 )
@@ -338,6 +339,41 @@ func TestAccessLogLevelByStatusClass(t *testing.T) {
 	}
 }
 
+// TestAccessLogDurationIsMillisecondsNotMicroseconds pins the arithmetic that
+// converts elapsed.Microseconds() into the logged duration_ms: dividing, not
+// multiplying, by 1000.0. TestAccessLogLevelByStatusClass only checks that
+// duration_ms decodes as a number, which a handler that returns instantly
+// cannot tell apart from a mismeasured unit conversion since both round to
+// something tiny. Sleeping a known, coarse amount in the handler and bounding
+// the result well below what a x1000 (instead of /1000) conversion would
+// produce (a factor of a million) makes the two arithmetically distinguishable
+// without pinning an exact, scheduler-dependent duration.
+func TestAccessLogDurationIsMillisecondsNotMicroseconds(t *testing.T) {
+	t.Parallel()
+
+	const sleep = 50 * time.Millisecond
+	logger, buf := newTestLogger()
+	h := Chain(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(sleep)
+		w.WriteHeader(http.StatusOK)
+	}), AccessLog(logger))
+
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+
+	rec := lastLine(t, buf)
+	got, ok := rec["duration_ms"].(float64)
+	if !ok {
+		t.Fatalf("duration_ms = %v, want a number", rec["duration_ms"])
+	}
+	// The handler alone took 50ms; duration_ms in milliseconds must land in
+	// the tens, generously bounded for scheduler jitter. Multiplying instead
+	// of dividing by 1000 would report roughly 50,000,000.
+	if got < float64(sleep.Milliseconds())/2 || got > 5000 {
+		t.Errorf("duration_ms = %v, want roughly %v (elapsed milliseconds, not microseconds*1000)",
+			got, sleep.Milliseconds())
+	}
+}
+
 // TestAccessLogNeverLeaksSecrets is the assertion that matters most in this
 // package: a bearer token, a session cookie and a PromQL expression carrying a
 // customer identifier must not reach the log aggregator.
@@ -497,6 +533,12 @@ func TestMaxBody(t *testing.T) {
 		wantReadErr   bool
 	}{
 		{name: "under the limit passes", limit: 64, body: "small", declareLength: true, wantStatus: http.StatusOK},
+		{
+			// A declared length exactly equal to the limit is not "above"
+			// it: the body fits and must pass, which is the only case
+			// distinguishing ">" from the off-by-one ">=".
+			name: "declared length equal to the limit passes", limit: 5, body: "exact", declareLength: true, wantStatus: http.StatusOK,
+		},
 		{name: "declared oversize is refused up front", limit: 4, body: "far too long", declareLength: true, wantStatus: http.StatusRequestEntityTooLarge},
 		{name: "undeclared oversize fails on read", limit: 4, body: "far too long", declareLength: false, wantStatus: http.StatusOK, wantReadErr: true},
 		{name: "zero limit is a pass-through", limit: 0, body: "anything at all", declareLength: true, wantStatus: http.StatusOK},

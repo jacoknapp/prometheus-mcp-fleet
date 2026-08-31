@@ -651,3 +651,47 @@ func valuesOf(v promclient.Vector) []float64 {
 	}
 	return out
 }
+
+// Equivalent-mutant proofs.
+//
+// Each of the following was confirmed empirically (single mutation applied
+// by hand, full package suite re-run, no failure) as well as by the
+// structural argument recorded next to it. None is a "could not think of a
+// test" shrug: each identifies the specific reason no input can make
+// original and mutant diverge.
+//
+//   - sources.go:73 ("ActiveSeries: -1, MetricNames: -1" in the
+//     fleet.PrometheusInfo literal collectAll seeds) — INVERT_NEGATIVES and
+//     ARITHMETIC_BASE both turn one of these into +1. Both fields are
+//     unconditionally overwritten later in the same function before it
+//     returns: ActiveSeries by "prom.ActiveSeries = tsdb.activeSeries" a few
+//     lines down with no guard, and MetricNames by whichever arm of the
+//     LabelValues(__name__) if/else runs. Every path reassigns both fields,
+//     so the seed value is never the one observed.
+//
+//   - sources.go:312 ("else if n > 0") widening to ">=" only changes
+//     behaviour at n == 0, where the guarded "info.NodeCount = n" would
+//     assign 0 — already NodeCount's zero value. The only later read,
+//     "info.NodeCount > 0", is false either way.
+//
+//   - sources.go:368 ("if n < 0 || ...") narrowing to "<=" only changes
+//     behaviour at n == 0. The guarded arm returns (0, nil); falling through
+//     instead computes int32(0), nil — the same pair.
+//
+//   - sources.go:633 ("return counts[prefixes[i]] > counts[prefixes[j]]")
+//     inside topPrefixes' sort.Slice comparator only runs once the caller has
+//     already tested "counts[prefixes[i]] != counts[prefixes[j]]" one line
+//     above. Widening to ">=" only changes behaviour when the two counts are
+//     equal, which the guard has already excluded.
+//
+//   - sources.go:635 ("return prefixes[i] < prefixes[j]") is the tie-break
+//     reached only when the two counts are equal; prefixes is built from a
+//     map's keys, so prefixes[i] and prefixes[j] are always distinct strings
+//     for i != j. Widening to "<=" only changes behaviour when the operands
+//     are equal, which cannot happen.
+//
+//   - sources.go:644 ("len(prefixes) > topN") and sources.go:677
+//     ("len(out) > topN"), both truncating a slice to its first topN
+//     elements: widening to ">=" only changes behaviour when the length is
+//     already exactly topN, where "prefixes[:topN]" (or "out[:topN]") is the
+//     same slice the variable already held.

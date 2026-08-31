@@ -115,6 +115,35 @@ func TestFanoutTimeoutIsReportedSeparately(t *testing.T) {
 	}
 }
 
+// TestFanoutPerClusterBudgetIsHalfTheOverallDeadline proves the per-cluster
+// sub-deadline is deadline/2, distinct from the overall deadline itself. The
+// overall deadline (3s) is set well above the 1s floor so deadline/2 (1.5s)
+// governs, and the delay (2s) is chosen strictly between the two: a slow
+// cluster must be cut off by its own 1.5s budget, not run all the way to the
+// 3s overall one. An ARITHMETIC_BASE mutation of "/" (for example to "*")
+// would let this cluster's own budget balloon past the overall deadline, so
+// it would instead be bounded by — and survive within — the 3s overall
+// deadline and wrongly report OK.
+func TestFanoutPerClusterBudgetIsHalfTheOverallDeadline(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.prom.set("us-east-prod-2/"+string(promapi.EndpointQuery),
+		fakeResponse{delay: 2 * time.Second})
+	out, terr := h.tools.fanoutQuery(ctx(t), h.p, FanoutQueryIn{
+		Query: "up", Clusters: connectedClusters, Deadline: "3s",
+	})
+	if terr != nil {
+		t.Fatalf("fanoutQuery: %v", terr)
+	}
+	if out.Coverage.TimedOut != 1 || out.Coverage.OK != 1 {
+		t.Fatalf("coverage = %+v, want the 2s-delayed cluster cut off by its 1.5s "+
+			"per-cluster budget well before the 3s overall deadline", out.Coverage)
+	}
+	if diff := cmp.Diff([]string{"us-east-prod-2"}, out.PerCluster.TimedOut); diff != "" {
+		t.Errorf("timedOut (-want +got):\n%s", diff)
+	}
+}
+
 // TestFanoutOnErrorFail covers the all-or-nothing policy.
 func TestFanoutOnErrorFail(t *testing.T) {
 	t.Parallel()
@@ -129,6 +158,41 @@ func TestFanoutOnErrorFail(t *testing.T) {
 	}
 	if !strings.Contains(terr.Hint, "partial") {
 		t.Errorf("hint does not offer the partial policy: %q", terr.Hint)
+	}
+}
+
+// TestFanoutOnErrorFailMessageCountsFailedPlusTimedOut proves the "N of M
+// clusters did not answer" count in the onError=fail message is the *sum* of
+// failed and timed-out clusters, not just one of them: two clusters fail
+// outright and a third times out, so a count of only Failed (2), only
+// TimedOut (1) or their product (2) would each diverge from the correct sum
+// (3), which is what an ARITHMETIC_BASE mutation of the "+" would produce.
+func TestFanoutOnErrorFailMessageCountsFailedPlusTimedOut(t *testing.T) {
+	t.Parallel()
+	entries := []fleet.Cluster{
+		{ID: "fail-a", State: fleet.StateConnected, LastSeen: testNow},
+		{ID: "fail-b", State: fleet.StateConnected, LastSeen: testNow},
+		{ID: "slow-a", State: fleet.StateConnected, LastSeen: testNow},
+	}
+	h := newHarness(t, func(o *Options) { o.Clusters = &fakeClusters{entries: entries} })
+	h.prom.set("fail-a/"+string(promapi.EndpointQuery),
+		fakeResponse{err: fmt.Errorf("x: %w", promproxy.ErrUpstream)})
+	h.prom.set("fail-b/"+string(promapi.EndpointQuery),
+		fakeResponse{err: fmt.Errorf("x: %w", promproxy.ErrUpstream)})
+	h.prom.set("slow-a/"+string(promapi.EndpointQuery), fakeResponse{delay: 2 * time.Second})
+
+	_, terr := h.tools.fanoutQuery(ctx(t), h.p, FanoutQueryIn{
+		Query:       "up",
+		Clusters:    []string{"fail-a", "fail-b", "slow-a"},
+		OnError:     OnErrorFail,
+		Deadline:    "200ms",
+		Concurrency: 3,
+	})
+	if terr == nil || terr.Code != CodeAllClustersFailed {
+		t.Fatalf("terr = %v, want ALL_CLUSTERS_FAILED", terr)
+	}
+	if !strings.Contains(terr.Message, "3 of 3 clusters did not answer") {
+		t.Errorf("message = %q, want it to count 2 failed + 1 timed out = 3 of 3", terr.Message)
 	}
 }
 
@@ -223,6 +287,14 @@ func TestFanoutNoSelectorTooBroad(t *testing.T) {
 		terr.Code == CodeNoSelectorTooBroad {
 		t.Error("a four-cluster fleet was refused as too broad")
 	}
+
+	// Pins the len(visible) > maxClusters boundary: the fixture fleet has
+	// exactly 4 clusters, so maxClusters 4 must be accepted (equal, not
+	// over), while a ">=" mutation would refuse it.
+	if _, terr := h.tools.fanoutQuery(ctx(t), h.p,
+		FanoutQueryIn{Query: "up", MaxClusters: 4}); terr != nil && terr.Code == CodeNoSelectorTooBroad {
+		t.Error("a four-cluster fleet was refused with maxClusters exactly 4")
+	}
 }
 
 // TestFanoutNoClustersMatched covers an empty selection.
@@ -294,6 +366,31 @@ func TestFanoutValidatesQueryOnce(t *testing.T) {
 	}
 }
 
+// TestFanoutValidationCaretClampBound pins the exact caret length fanoutQuery
+// builds from a hub-side parse error, distinct from TestFanoutValidatesQueryOnce
+// which only checks a caret is present at all. "up]" fails at char 3 (one past
+// "up"), which equals len(query): min(position, len(query)+1) must return the
+// unclamped position (3), not len(query)-1 (2) that an ARITHMETIC_BASE
+// mutation of the "+1" bound would produce, and the caret string's length
+// (col-1 spaces plus the "^") must be exactly that position, not position+1
+// or position-2 that a mutation of the trailing "col-1" would produce.
+func TestFanoutValidationCaretClampBound(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	_, terr := h.tools.fanoutQuery(ctx(t), h.p, FanoutQueryIn{
+		Query: "up]", Clusters: connectedClusters,
+	})
+	if terr == nil || terr.Code != CodePromQLParse {
+		t.Fatalf("terr = %v, want PROMQL_PARSE", terr)
+	}
+	if len(terr.Caret) != 3 {
+		t.Fatalf("caret = %q (%d chars), want 3", terr.Caret, len(terr.Caret))
+	}
+	if terr.Caret != "  ^" {
+		t.Errorf("caret = %q, want two leading spaces then a caret", terr.Caret)
+	}
+}
+
 // TestFanoutRangeCommonStep proves every cluster is put on one step and one
 // aligned start, which is what makes the rows comparable.
 func TestFanoutRangeCommonStep(t *testing.T) {
@@ -336,6 +433,77 @@ func TestFanoutRangeCommonStep(t *testing.T) {
 	}
 }
 
+// TestFanoutRangeStartFloorsToStepBoundary pins the exact floor-alignment
+// arithmetic, distinct from TestFanoutRangeCommonStep's own alignment check:
+// that test's "now-10m"/"now" bounds are already second-aligned (testNow has
+// zero seconds), so start%step is already 0 there and an ARITHMETIC_BASE
+// mutation turning "start.Unix() - start.Unix()%step" into
+// "start.Unix() + start.Unix()%step" would be a no-op and go undetected. Here
+// the requested start (11:50:07) is deliberately 7 seconds off the 30s step
+// grid, so the two formulas floor to different seconds and only the correct
+// one lands on :50:00.
+func TestFanoutRangeStartFloorsToStepBoundary(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	wantStart, err := time.Parse(time.RFC3339, "2026-08-29T11:50:00Z")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	out, terr := h.tools.fanoutQuery(ctx(t), h.p, FanoutQueryIn{
+		Query: "up", Clusters: connectedClusters, Mode: FanoutRange,
+		Start: "2026-08-29T11:50:07Z", End: "2026-08-29T12:00:07Z", MaxSeriesPerCluster: 5,
+	})
+	if terr != nil {
+		t.Fatalf("fanoutQuery: %v", terr)
+	}
+	if out.StepSeconds != 30 {
+		t.Fatalf("stepSeconds = %v, want 30 (test assumes the same common step as "+
+			"TestFanoutRangeCommonStep)", out.StepSeconds)
+	}
+	if out.Start != wantStart.Unix() {
+		t.Errorf("start = %d (%s), want %d (%s), the requested start floored down to "+
+			"the 30s grid, not up past it and not left unaligned",
+			out.Start, time.Unix(out.Start, 0).UTC(), wantStart.Unix(), wantStart)
+	}
+}
+
+// TestCommonStepSharedSuffixBoundary pins the len(targets) > 1 boundary
+// directly: the "; common step across N clusters" suffix must be absent for
+// exactly one target and present starting at exactly two.
+//
+// commonStep's own "step > best" tie-break (deciding which cluster's
+// Downsampled struct is kept when two clusters compute the identical step) is
+// deliberately not covered here: AppliedStep is always overwritten to the
+// winning value regardless of source, RequestedStep depends only on the
+// userStep argument shared by every candidate, and Reason is a deterministic
+// function of (span, maxPoints, scrapeInterval) — two candidates can only tie
+// on the numeric step if that whole function agrees, in which case Reason is
+// identical too. So no test can observe which of two tied candidates "won";
+// a CONDITIONALS_BOUNDARY mutation of that comparison to ">=" is equivalent.
+func TestCommonStepSharedSuffixBoundary(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	start := testNow.Add(-10 * time.Minute)
+	end := testNow
+	one := []fleet.Cluster{
+		{ID: "c1", Prometheus: fleet.PrometheusInfo{ScrapeInterval: "30s"}},
+	}
+	two := []fleet.Cluster{
+		{ID: "c1", Prometheus: fleet.PrometheusInfo{ScrapeInterval: "30s"}},
+		{ID: "c2", Prometheus: fleet.PrometheusInfo{ScrapeInterval: "30s"}},
+	}
+
+	_, oneDown := h.tools.commonStep(one, start, end, 0)
+	if strings.Contains(oneDown.Reason, "common step across") {
+		t.Errorf("reason = %q, want no shared-step suffix for a single cluster", oneDown.Reason)
+	}
+
+	_, twoDown := h.tools.commonStep(two, start, end, 0)
+	if !strings.Contains(twoDown.Reason, "common step across 2 clusters") {
+		t.Errorf("reason = %q, want the shared-step suffix for two clusters", twoDown.Reason)
+	}
+}
+
 // TestFanoutMaxSeriesPerCluster proves the per-cluster cap is applied and
 // reported.
 func TestFanoutMaxSeriesPerCluster(t *testing.T) {
@@ -361,6 +529,33 @@ func TestFanoutMaxSeriesPerCluster(t *testing.T) {
 	}
 	if !strings.Contains(out.Truncated.Hint, "Aggregate") {
 		t.Errorf("hint = %q", out.Truncated.Hint)
+	}
+}
+
+// TestFanoutInstantExactMaxSeriesIsNotTruncated pins the total > len(rows)
+// boundary in mergeInstant: each connected cluster contributes exactly
+// maxSeriesPerCluster series, so nothing was actually dropped and Truncated
+// must stay nil. A ">=" mutation would wrongly mark this truncated.
+func TestFanoutInstantExactMaxSeriesIsNotTruncated(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.prom.set(string(promapi.EndpointQuery), fakeResponse{
+		body: syntheticVector(t, 2),
+	})
+	out, terr := h.tools.fanoutQuery(ctx(t), h.p, FanoutQueryIn{
+		Query: "up", Clusters: connectedClusters, MaxSeriesPerCluster: 2,
+	})
+	if terr != nil {
+		t.Fatalf("fanoutQuery: %v", terr)
+	}
+	if len(out.Rows) != 4 {
+		t.Fatalf("rows = %d, want 2 clusters times 2 series", len(out.Rows))
+	}
+	if out.Total != 4 {
+		t.Fatalf("total = %d, want 4 (nothing was dropped)", out.Total)
+	}
+	if out.Truncated != nil {
+		t.Errorf("truncated = %+v, want nil when every series was returned", out.Truncated)
 	}
 }
 
@@ -472,6 +667,27 @@ func TestFanoutMaxClustersTruncates(t *testing.T) {
 	}
 	if out.PerCluster.OK[0] != "eu-west-prod-1" {
 		t.Errorf("selection is not deterministic by name: %v", out.PerCluster.OK)
+	}
+}
+
+// TestFanoutMaxClustersExactCountIsNotTruncated pins the len(targets) >
+// maxClusters boundary: a selection that matches maxClusters exactly must not
+// drop anything, only a selection strictly larger than it may.
+func TestFanoutMaxClustersExactCountIsNotTruncated(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	out, terr := h.tools.fanoutQuery(ctx(t), h.p, FanoutQueryIn{
+		Query: "up", LabelSelector: map[string]string{"env": "prod"}, MaxClusters: 2,
+	})
+	if terr != nil {
+		t.Fatalf("fanoutQuery: %v", terr)
+	}
+	if out.Coverage.Requested != 2 || out.Coverage.OK != 2 {
+		t.Fatalf("coverage = %+v, want both prod clusters queried with none dropped", out.Coverage)
+	}
+	if len(out.PerCluster.Failed) != 0 {
+		t.Errorf("perCluster.failed = %+v, want nothing dropped when the count exactly "+
+			"equals maxClusters", out.PerCluster.Failed)
 	}
 }
 
@@ -763,6 +979,76 @@ func TestFanoutRangeMaxSeriesPerCluster(t *testing.T) {
 	}
 	if out.Truncated.Total != 60 {
 		t.Errorf("total = %d, want the honest 60", out.Truncated.Total)
+	}
+}
+
+// TestFanoutRangeExactMaxSeriesIsNotTruncated is mergeRange's analogue of
+// TestFanoutInstantExactMaxSeriesIsNotTruncated: it pins the total >
+// len(series) boundary directly, since every connected cluster contributes
+// exactly maxSeriesPerCluster series and nothing was actually dropped.
+func TestFanoutRangeExactMaxSeriesIsNotTruncated(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.prom.set(string(promapi.EndpointQueryRange), fakeResponse{
+		body: syntheticMatrix(t, 2, 5, testNow.Add(-10*time.Minute), time.Minute),
+	})
+	out, terr := h.tools.fanoutQuery(ctx(t), h.p, FanoutQueryIn{
+		Query: "up", Clusters: connectedClusters, Mode: FanoutRange,
+		Start: "now-10m", End: "now", MaxSeriesPerCluster: 2,
+	})
+	if terr != nil {
+		t.Fatalf("fanoutQuery: %v", terr)
+	}
+	if len(out.Series) != 4 {
+		t.Fatalf("series = %d, want 2 clusters times 2 series", len(out.Series))
+	}
+	if out.Total != 4 {
+		t.Fatalf("total = %d, want 4 (nothing was dropped)", out.Total)
+	}
+	if out.Truncated != nil {
+		t.Errorf("truncated = %+v, want nil when every series was returned", out.Truncated)
+	}
+}
+
+// TestMergeRangePointsBoundaries pins the "span >= 0 && step > 0" guard in
+// mergeRange directly: a zero-length span (start == end) must still compute
+// exactly 1 point, and a zero step must leave Points at 0 rather than
+// dividing by it.
+func TestMergeRangePointsBoundaries(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+
+	// span == 0 exactly: the boundary itself. A ">" mutation of "span >= 0"
+	// would exclude this case and leave Points at 0 instead of 1.
+	zeroSpan := &FanoutQueryOut{}
+	h.tools.mergeRange(zeroSpan, nil, testNow, testNow, time.Minute, 5)
+	if zeroSpan.Points != 1 {
+		t.Errorf("Points = %d, want 1 for a zero-length span", zeroSpan.Points)
+	}
+
+	// step == 0: must not attempt span/step. A ">=" mutation of "step > 0"
+	// would try to divide by zero and panic.
+	zeroStep := &FanoutQueryOut{}
+	h.tools.mergeRange(zeroStep, nil, testNow, testNow.Add(10*time.Minute), 0, 5)
+	if zeroStep.Points != 0 {
+		t.Errorf("Points = %d, want 0 when step is zero", zeroStep.Points)
+	}
+}
+
+// TestAccountCoverageZeroRequestedIsNotComplete pins the cov.Requested > 0
+// boundary in accountCoverage directly: with nothing selected at all, OK and
+// Requested are both 0, and "0 == 0" alone must not read as complete. This
+// state cannot be reached through fanoutQuery itself — selectClusters always
+// refuses an empty selection before accountCoverage is ever called — so it is
+// exercised here as a direct call to the unexported method, the only way to
+// reach it.
+func TestAccountCoverageZeroRequestedIsNotComplete(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	out := &FanoutQueryOut{}
+	h.tools.accountCoverage(out, nil, nil, nil)
+	if out.Coverage.Complete {
+		t.Errorf("coverage = %+v, want Complete false with nothing requested", out.Coverage)
 	}
 }
 

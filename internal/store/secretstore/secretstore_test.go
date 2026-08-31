@@ -4,14 +4,19 @@
 package secretstore_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/google/go-cmp/cmp"
 
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/fleet"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/kube"
@@ -76,6 +81,7 @@ func TestOpen(t *testing.T) {
 		{"no client", secretstore.Options{}, "kubernetes client is required"},
 		{"bad secret name", secretstore.Options{Client: client, SecretName: "Not A Name"}, "secret name"},
 		{"zero attempts is the default", secretstore.Options{Client: client, MaxAttempts: 0}, ""},
+		{"one attempt is the minimum allowed", secretstore.Options{Client: client, MaxAttempts: 1}, ""},
 		{"negative attempts", secretstore.Options{Client: client, MaxAttempts: -1}, "max attempts"},
 	}
 	for _, tc := range tests {
@@ -319,6 +325,74 @@ func TestRetriesAreBounded(t *testing.T) {
 	}
 	if _, _, _, conflicts := api.counts(); conflicts != 3 {
 		t.Errorf("conflicts = %d, want exactly the 3 permitted attempts", conflicts)
+	}
+}
+
+// TestMutateFirstAttemptUsesCache proves the first attempt of a mutation
+// consults the read cache rather than forcing an API round trip. mutate loads
+// with fresh=attempt>0, so attempt 0 must pass fresh=false. A mutant that
+// widens or negates that comparison makes even the first attempt force a
+// fresh read, which this catches as an extra GET.
+func TestMutateFirstAttemptUsesCache(t *testing.T) {
+	t.Parallel()
+	now := tBase
+	api, s := newStore(t, secretstore.Options{
+		CacheTTL: 10 * time.Second,
+		Clock:    func() time.Time { return now },
+	})
+	// Populate the cache and let the create/read settle.
+	if _, err := s.Epoch(t.Context()); err != nil {
+		t.Fatalf("Epoch: %v", err)
+	}
+	getsBefore, _, _, _ := api.counts()
+	if err := s.PutKey(t.Context(), agentKey("agent0001")); err != nil {
+		t.Fatalf("PutKey: %v", err)
+	}
+	if getsAfter, _, _, _ := api.counts(); getsAfter != getsBefore {
+		t.Errorf("GET calls during an uncontested PutKey = %d, want 0: the first mutate attempt must use the fresh cache",
+			getsAfter-getsBefore)
+	}
+}
+
+// TestConflictLogsOneBasedAttemptNumber proves the retry log's "attempt"
+// field is attempt+1 (one-based, matching what an operator reading the log
+// expects: "attempt 1" for the first try). An ARITHMETIC_BASE mutant turning
+// that into attempt-1 would log -1 on the very first conflict.
+func TestConflictLogsOneBasedAttemptNumber(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	api, s := newStore(t, secretstore.Options{MaxAttempts: 3, Logger: logger})
+	api.seed(secretstore.DefaultSecretName, map[string][]byte{
+		secretstore.DefaultKey: []byte(`{"schemaVersion":1,"epoch":1}`),
+	})
+	// A writer that always loses, so every one of the 3 permitted attempts logs
+	// a conflict.
+	api.beforeWrite = func() {
+		api.seed(secretstore.DefaultSecretName, map[string][]byte{
+			secretstore.DefaultKey: []byte(`{"schemaVersion":1,"epoch":1}`),
+		})
+	}
+	err := s.PutKey(t.Context(), agentKey("agent0001"))
+	if !errors.Is(err, kube.ErrConflict) {
+		t.Fatalf("PutKey error = %v, want a wrapped kube.ErrConflict", err)
+	}
+
+	var attempts []int
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var rec struct {
+			Attempt int `json:"attempt"`
+		}
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("unmarshal log line %q: %v", line, err)
+		}
+		attempts = append(attempts, rec.Attempt)
+	}
+	if diff := cmp.Diff([]int{1, 2, 3}, attempts); diff != "" {
+		t.Errorf("logged attempt numbers differ (-want +got):\n%s", diff)
 	}
 }
 
