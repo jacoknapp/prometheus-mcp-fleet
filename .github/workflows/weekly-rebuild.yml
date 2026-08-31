@@ -50,6 +50,10 @@ concurrency:
 
 env:
   IMAGE_NAMESPACE: ghcr.io/${{ github.repository }}
+  # QEMU emulator image, pinned by digest and pre-pulled with backoff before
+  # setup-qemu-action runs. See the pre-pull step for why.
+  # renovate: datasource=docker depName=tonistiigi/binfmt
+  BINFMT_IMAGE: "tonistiigi/binfmt:qemu-v9.2.2@sha256:1b804311fe87047a4c96d38b4b3ef6f62fca8cd125265917a9e3dc3c996c39e6"
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -211,8 +215,33 @@ jobs:
           ref: ${{ needs.plan.outputs.tag }}
           persist-credentials: false
 
+      # setup-qemu-action pulls tonistiigi/binfmt from Docker Hub, which is the
+      # one unauthenticated Docker Hub fetch left in this job. A transient
+      # refusal there failed the v0.1.0 release outright ("error pulling image
+      # configuration: download failed after attempts=6 ... connection
+      # refused") even though nothing was wrong with the code. Pre-pull it with
+      # backoff so a blip costs seconds instead of a release, and pin it by
+      # digest for the same reason the base images are pinned: an emulator that
+      # silently changes underneath a reproducible build is not reproducible.
+      - name: Pre-pull binfmt (retry on Docker Hub flake)
+        env:
+          BINFMT: ${{ env.BINFMT_IMAGE }}
+        run: |
+          set -uo pipefail
+          for attempt in 1 2 3 4 5; do
+            if docker pull "${BINFMT}"; then
+              exit 0
+            fi
+            echo "binfmt pull failed (attempt ${attempt}); retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+          echo "::error::could not pull ${BINFMT} after 5 attempts"
+          exit 1
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          image: ${{ env.BINFMT_IMAGE }}
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
