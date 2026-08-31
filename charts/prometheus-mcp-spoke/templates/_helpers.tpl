@@ -319,8 +319,26 @@ watching.
 {{- define "prometheus-mcp-spoke.validate" -}}
 
 {{/* ---- one spoke, one identity ---- */}}
-{{- if ne (int .Values.replicaCount) 1 -}}
-{{- fail (printf "prometheus-mcp-spoke: replicaCount is %d. A spoke's identity is ONE X.509 certificate bound to ONE cluster ID: two pods would renew over each other in the same identity Secret and each would deregister the other's tunnel at the hub. Scale the hub, never the spoke." (int .Values.replicaCount)) -}}
+{{/*
+Several spoke pods per cluster are supported and are the default.
+
+The hub pools sessions per cluster rather than letting a new one displace the
+last, so siblings do not deregister each other. They share ONE identity Secret
+and therefore one certificate: pods that start together converge on whatever
+the Secret ends up holding, and at renewal the first pod to renew writes it back
+while the rest adopt it instead of minting competitors.
+
+That sharing is what `identity.backend: secret` is for, so it is the only
+backend that supports more than one pod. `memory` gives each pod its own
+identity and re-enrols on every restart, which multiplies enrollments by pod
+count for no benefit. `file` writes to an emptyDir, so it behaves like `memory`
+while looking durable.
+*/}}
+{{- if lt (int .Values.replicaCount) 1 -}}
+{{- fail (printf "prometheus-mcp-spoke: replicaCount is %d; it must be at least 1." (int .Values.replicaCount)) -}}
+{{- end -}}
+{{- if and (gt (int .Values.replicaCount) 1) (ne .Values.identity.backend "secret") -}}
+{{- fail (printf "prometheus-mcp-spoke: replicaCount is %d with identity.backend=%s. Several pods of one cluster share a certificate through the identity Secret, so they need identity.backend=secret. %q gives every pod its own identity and re-enrols each on restart, which multiplies enrollments by pod count and leaves the pool renewing several certificates instead of rotating one." (int .Values.replicaCount) .Values.identity.backend .Values.identity.backend) -}}
 {{- end -}}
 
 {{/* ---- cluster identity ---- */}}

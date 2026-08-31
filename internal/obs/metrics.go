@@ -157,6 +157,23 @@ func NewHubMetrics(r prometheus.Registerer) *HubMetrics {
 //
 // All fields are safe for concurrent use.
 type SpokeMetrics struct {
+	// HubReplicas is how many hub replicas the hub behind an endpoint says are
+	// running, as learned on the last handshake. Zero means the hub does not
+	// know, and the spoke then keeps a single tunnel to that endpoint.
+	//
+	// Cardinality: one series per configured hub endpoint, typically one.
+	HubReplicas *prometheus.GaugeVec
+	// TunnelsCovered is how many DISTINCT hub replicas behind an endpoint this
+	// spoke currently holds a tunnel to.
+	//
+	// Alert on TunnelsCovered < HubReplicas. A tunnel terminates on exactly one
+	// replica and the hub does not forward between replicas, so a spoke short
+	// of full coverage has a proportional share of its tool calls answered
+	// "cluster not connected" -- an intermittent failure that is painful to
+	// diagnose after the fact and trivial to see here.
+	//
+	// Cardinality: one series per configured hub endpoint, typically one.
+	TunnelsCovered *prometheus.GaugeVec
 	// TunnelUp is 1 while the tunnel to a hub endpoint is established.
 	TunnelUp *prometheus.GaugeVec
 	// TunnelReconnectsTotal counts reconnects by reason.
@@ -180,6 +197,14 @@ type SpokeMetrics struct {
 func NewSpokeMetrics(r prometheus.Registerer) *SpokeMetrics {
 	f := promauto.With(r)
 	return &SpokeMetrics{
+		HubReplicas: f.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: Namespace, Subsystem: SubsystemSpoke, Name: "hub_replicas",
+			Help: "Hub replicas the hub behind this endpoint reports, or 0 if unknown.",
+		}, []string{"endpoint"}),
+		TunnelsCovered: f.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: Namespace, Subsystem: SubsystemSpoke, Name: "tunnels_covered",
+			Help: "Distinct hub replicas behind this endpoint that this spoke holds a tunnel to.",
+		}, []string{"endpoint"}),
 		TunnelUp: f.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: Namespace, Subsystem: SubsystemSpoke, Name: "tunnel_up",
 			Help: "1 while the tunnel to the hub endpoint is established, 0 otherwise.",

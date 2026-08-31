@@ -23,15 +23,23 @@ spec:
   replicas: {{ .Values.replicaCount }}
   revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
   strategy:
-    # Recreate, NOT RollingUpdate. A spoke's identity is one X.509 certificate
-    # bound to one cluster ID, held in one Secret. During a rolling update the
-    # old and the new pod would both hold that identity: they would renew over
-    # each other in the Secret, and the hub -- which keys a tunnel by the cluster
-    # ID in the certificate URI SAN -- would see each new tunnel deregister the
-    # other's. Two spokes sharing one cluster ID fight. The brief gap Recreate
-    # costs is the correct trade; the hub simply reports this cluster
-    # disconnected for a few seconds and agents get an explicit tool error.
-    type: Recreate
+    # RollingUpdate. This used to be Recreate, because two pods sharing one
+    # cluster ID fought: each new tunnel deregistered the other's at the hub,
+    # and both renewed over the same identity Secret. Neither is true now. The
+    # hub keeps a POOL of sessions per cluster keyed by a per-pod InstanceID, so
+    # siblings coexist; and a pod that finds a sibling has already renewed
+    # adopts that certificate instead of minting a competing one.
+    #
+    # So an upgrade no longer needs a gap where the cluster is missing from the
+    # fleet: the old pod keeps serving until the new one has enrolled and
+    # connected. Recreate would waste the availability the pool exists to give.
+    type: RollingUpdate
+    rollingUpdate:
+      # Never drop below full strength during an upgrade, and add at most one
+      # pod at a time so a hundred clusters upgrading together do not each add
+      # three tunnels to the hub at once.
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       {{- include "prometheus-mcp-spoke.selectorLabels" . | nindent 6 }}

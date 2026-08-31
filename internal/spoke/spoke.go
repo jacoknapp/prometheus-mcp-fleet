@@ -19,6 +19,8 @@ package spoke
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -66,6 +68,15 @@ const minProbeInterval = 15 * time.Second
 // connection, so that a fleet-wide rollout does not arrive in one burst.
 const maxFirstDialDelay = 5 * time.Second
 
+// defaultCoverageInterval is how often an endpoint supervisor looks for hub
+// replicas it has no tunnel to yet.
+//
+// The replica count arrives on a handshake, so a spoke that connected before a
+// hub scale-up learns about the new replica only when something reconnects.
+// Ten seconds keeps the gap short without making a quiet fleet busy: the work
+// per tick is comparing two integers.
+const defaultCoverageInterval = 10 * time.Second
+
 // minConnectionLifetime is how long a tunnel must have lasted before its
 // closure is treated as an ordinary disconnect and the backoff is reset. A
 // connection that dies immediately is a symptom, not a success.
@@ -88,6 +99,9 @@ type timings struct {
 	renewCheck time.Duration
 	// dialStagger bounds a dialer's initial random delay.
 	dialStagger time.Duration
+	// coverageInterval is how often an endpoint supervisor re-checks whether
+	// the hub has advertised more replicas than it has dialers for.
+	coverageInterval time.Duration
 }
 
 // newTimings derives the loop periods from configuration.
@@ -101,10 +115,11 @@ func newTimings(cfg *config.Spoke) timings {
 		probe = minProbeInterval
 	}
 	return timings{
-		facts:       facts,
-		probe:       probe,
-		renewCheck:  renewCheckInterval,
-		dialStagger: maxFirstDialDelay,
+		facts:            facts,
+		probe:            probe,
+		renewCheck:       renewCheckInterval,
+		dialStagger:      maxFirstDialDelay,
+		coverageInterval: defaultCoverageInterval,
 	}
 }
 
@@ -143,13 +158,14 @@ func Run(ctx context.Context, cfg *config.Spoke) error {
 	}()
 
 	s := &spoke{
-		cfg:     cfg,
-		logger:  logger,
-		metrics: metrics,
-		health:  health,
-		build:   build,
-		now:     time.Now,
-		started: time.Now(),
+		cfg:        cfg,
+		logger:     logger,
+		metrics:    metrics,
+		health:     health,
+		build:      build,
+		now:        time.Now,
+		started:    time.Now(),
+		instanceID: spokeInstanceID(),
 	}
 	return s.run(ctx, registry)
 }
@@ -162,6 +178,15 @@ type spoke struct {
 	health  *obs.Health
 	build   version.Build
 	started time.Time
+	// identityUnpersisted marks a certificate this pod is using but failed to
+	// write to the shared store, so the renewal loop keeps trying to converge
+	// the pool onto one certificate instead of leaving two in play.
+	identityUnpersisted atomic.Bool
+	// instanceID distinguishes this pod from its siblings in the same cluster,
+	// so a cluster can run several spokes for its own availability and the hub
+	// can pool them instead of treating each connection as a reconnect of the
+	// last. See [tunnel.Identity.InstanceID]; it authenticates nothing.
+	instanceID string
 	// now reads the wall clock. It is injected the same way the registry and
 	// the proxy inject theirs, because two decisions in this package are about
 	// elapsed time rather than about sleeping: whether a tunnel lasted long
@@ -248,7 +273,7 @@ func (s *spoke) run(ctx context.Context, registry prometheusRegistry) error {
 	group.Go(func() error { return s.renewLoop(gctx) })
 	group.Go(func() error { s.probeLoop(gctx); return nil })
 	for _, endpoint := range s.cfg.HubEndpoints {
-		group.Go(func() error { s.dialLoop(gctx, endpoint); return nil })
+		group.Go(func() error { s.superviseEndpoint(gctx, endpoint); return nil })
 	}
 
 	err = group.Wait()
@@ -327,13 +352,42 @@ func (s *spoke) establishIdentity(ctx context.Context) error {
 	}
 	if err := s.store.Save(ctx, id.KeyPEM, id.CertPEM, id.CABundle); err != nil {
 		// Not fatal: the spoke can run on an unsaved identity, it will just
-		// need a fresh token after a restart. Failing here instead would burn
-		// the token for nothing.
-		s.logger.ErrorContext(ctx, "could not persist the identity; a restart will need a new enrollment token",
+		// need to enrol again after a restart. Failing here instead would
+		// redeem the token for nothing.
+		s.logger.ErrorContext(ctx, "could not persist the identity; a restart will need to enrol again",
 			"error", err)
+	}
+
+	// Converge on whatever the Secret ended up holding.
+	//
+	// Several pods of one cluster share this Secret, and pods that start
+	// together all find it empty and all enrol, so the last writer wins. Every
+	// certificate involved is valid and bound to this cluster, so nothing is
+	// broken either way -- but a pool where each pod holds a different one
+	// renews three certificates instead of rotating one, and makes the stored
+	// identity mean less than it should. Re-reading here settles the pool on a
+	// single certificate at startup rather than at the first renewal.
+	if stored := s.storedIdentity(ctx); stored != nil {
+		id = stored
 	}
 	s.setIdentity(id)
 	return nil
+}
+
+// storedIdentity returns the identity currently in the store, or nil when there
+// is nothing usable there. Unlike adoptStoredIdentity it does not compare
+// against what is already in memory: the caller is establishing an identity
+// rather than deciding whether to replace one.
+func (s *spoke) storedIdentity(ctx context.Context) *Identity {
+	key, cert, ca, err := s.store.Load(ctx)
+	if err != nil {
+		return nil
+	}
+	stored, err := loadIdentity(key, cert, ca)
+	if err != nil || stored.Expired(s.now()) {
+		return nil
+	}
+	return stored
 }
 
 // setIdentity publishes a new identity and updates the expiry gauge.
@@ -381,9 +435,48 @@ func (s *spoke) renewLoop(ctx context.Context) error {
 		timer.Reset(jitter(s.timing.renewCheck))
 
 		id := s.currentIdentity()
-		if id == nil || !id.NeedsRenewal(s.now(), renewAtFraction) {
+		if id == nil {
 			continue
 		}
+		// An identity this pod minted but could not store is not settled: a
+		// sibling won the write, so the Secret holds a different certificate
+		// and the pool has two. Keep looking until one of them sticks, rather
+		// than waiting out half a certificate lifetime for the next renewal to
+		// notice. Both certificates are valid meanwhile, so this is
+		// convergence, not repair.
+		if s.identityUnpersisted.Load() {
+			if adopted := s.adoptStoredIdentity(ctx); adopted != nil {
+				s.setIdentity(adopted)
+				s.identityUnpersisted.Store(false)
+				s.logger.InfoContext(ctx, "adopted the certificate stored by another pod of this cluster",
+					"not_after", adopted.Leaf.NotAfter.Format(time.RFC3339))
+				s.signalReconnect()
+				continue
+			}
+			if err := s.store.Save(ctx, id.KeyPEM, id.CertPEM, id.CABundle); err == nil {
+				s.identityUnpersisted.Store(false)
+				s.logger.InfoContext(ctx, "persisted the identity that had failed to save")
+			}
+		}
+		if !id.NeedsRenewal(s.now(), renewAtFraction) {
+			continue
+		}
+
+		// A sibling pod sharing this cluster's identity Secret may have renewed
+		// already. Several pods per cluster is a supported topology, and they
+		// all hold the same certificate from the same Secret, so they all reach
+		// the renewal threshold within a jitter window of each other. Without
+		// this check each would mint its own certificate and write it over the
+		// others, and the fleet would churn identities every renewal instead of
+		// rotating one. Re-read first and adopt what is there.
+		if adopted := s.adoptStoredIdentity(ctx); adopted != nil {
+			s.setIdentity(adopted)
+			s.logger.InfoContext(ctx, "adopted a certificate renewed by another pod of this cluster",
+				"not_after", adopted.Leaf.NotAfter.Format(time.RFC3339))
+			s.signalReconnect()
+			continue
+		}
+
 		renewed, err := s.enroller.renew(ctx, id)
 		if err != nil {
 			remaining := id.Leaf.NotAfter.Sub(s.now())
@@ -396,7 +489,23 @@ func (s *spoke) renewLoop(ctx context.Context) error {
 			continue
 		}
 		if err := s.store.Save(ctx, renewed.KeyPEM, renewed.CertPEM, renewed.CABundle); err != nil {
-			s.logger.ErrorContext(ctx, "could not persist the renewed identity", "error", err)
+			// Losing this write to a sibling is a normal outcome, not a
+			// failure: the store updates under compare-and-swap, so a conflict
+			// means another pod renewed first. Adopt theirs rather than run on
+			// a certificate no longer in the Secret, which would diverge the
+			// pool and make the next renewal race again.
+			s.logger.WarnContext(ctx, "could not persist the renewed identity", "error", err)
+			if adopted := s.adoptStoredIdentity(ctx); adopted != nil {
+				s.setIdentity(adopted)
+				s.logger.InfoContext(ctx, "adopted the certificate already stored by another pod",
+					"not_after", adopted.Leaf.NotAfter.Format(time.RFC3339))
+				s.signalReconnect()
+				continue
+			}
+			// Nothing to adopt yet. Run on the new certificate -- it is valid
+			// and this pod holds its key -- but remember that the Secret does
+			// not have it, so the check above keeps trying to settle the pool.
+			s.identityUnpersisted.Store(true)
 		}
 		s.setIdentity(renewed)
 		s.logger.InfoContext(ctx, "certificate renewed, reconnecting tunnels",
@@ -443,7 +552,39 @@ func (s *spoke) probeLoop(ctx context.Context) {
 // jitter. Full jitter rather than plain exponential backoff because with ~100
 // spokes, synchronised retry against a restarting hub is a self-inflicted
 // denial of service.
-func (s *spoke) dialLoop(ctx context.Context, endpoint string) {
+// superviseEndpoint keeps enough dial loops running against one endpoint to
+// hold a tunnel to every hub replica behind it.
+//
+// It starts with one. The first handshake reports how many replicas exist (see
+// wstun.HubInfo), and the pool grows to match. It never shrinks below one, and
+// it does not shrink on a scale-down either: a surplus dialer finds every
+// replica already covered, becomes a harmless redundant tunnel, and costs a few
+// KiB until the process restarts. Tearing dialers down on a transient count
+// change would be more code and more risk than the memory is worth.
+func (s *spoke) superviseEndpoint(ctx context.Context, endpoint string) {
+	cov := newCoverage()
+	var wg sync.WaitGroup
+	running := 0
+
+	for ctx.Err() == nil {
+		for want := cov.dialers(); running < want; running++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				s.dialLoop(ctx, endpoint, cov)
+			}()
+		}
+		// Re-check periodically rather than on a signal: the replica count
+		// arrives on a handshake that may be minutes away on a quiet fleet, and
+		// a poll this cheap is not worth the plumbing to avoid.
+		if !sleepCtx(ctx, s.timing.coverageInterval) {
+			break
+		}
+	}
+	wg.Wait()
+}
+
+func (s *spoke) dialLoop(ctx context.Context, endpoint string, cov *coverage) {
 	log := s.logger.With("endpoint", endpoint)
 
 	// Normalise once, so the log line and the error an operator sees name a
@@ -467,7 +608,7 @@ func (s *spoke) dialLoop(ctx context.Context, endpoint string) {
 
 	for ctx.Err() == nil {
 		connected := s.now()
-		reason := s.dialOnce(ctx, target, log)
+		reason := s.dialOnce(ctx, target, log, cov)
 		s.metrics.TunnelUp.WithLabelValues(target).Set(0)
 		s.health.Set("tunnel", false, "no tunnel to "+target)
 
@@ -492,7 +633,7 @@ func (s *spoke) dialLoop(ctx context.Context, endpoint string) {
 }
 
 // dialOnce runs a single connection to exhaustion and returns why it ended.
-func (s *spoke) dialOnce(ctx context.Context, endpoint string, log *slog.Logger) string {
+func (s *spoke) dialOnce(ctx context.Context, endpoint string, log *slog.Logger, cov *coverage) string {
 	id := s.currentIdentity()
 	if id == nil {
 		return "no-identity"
@@ -502,6 +643,20 @@ func (s *spoke) dialOnce(ctx context.Context, endpoint string, log *slog.Logger)
 	// certificate rather than waiting out the old one.
 	dialCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	// joined names the replica this connection registered against, so the
+	// deferred leave runs whether the tunnel ended cleanly, was cancelled, or
+	// never connected at all. Dial calls OnConnected synchronously before it
+	// serves and returns only once the connection is over, so this is written
+	// and read on the same goroutine.
+	joined := ""
+	defer func() {
+		if joined != "" && cov != nil {
+			cov.leave(joined)
+			covered, _ := cov.state()
+			s.metrics.TunnelsCovered.WithLabelValues(endpoint).Set(float64(covered))
+		}
+	}()
 	go func() {
 		select {
 		case <-s.reconnectSignal():
@@ -522,6 +677,10 @@ func (s *spoke) dialOnce(ctx context.Context, endpoint string, log *slog.Logger)
 	// believes it. There is deliberately no separate "it returned nil" branch:
 	// classify already answers "closed" for a nil error, and a second place
 	// that knows that label is a second place for it to drift.
+	// serverID is captured by OnConnected and read after Dial returns, so the
+	// tunnel can be deregistered from coverage under the replica it was
+	// actually on. Dial calls OnConnected synchronously before serving and
+	// returns only after the connection ends, so there is no concurrent access.
 	return classify(wstun.Dial(dialCtx, wstun.ClientConfig{
 		URL:          endpoint,
 		Certificate:  id.Certificate,
@@ -530,7 +689,30 @@ func (s *spoke) dialOnce(ctx context.Context, endpoint string, log *slog.Logger)
 		ClusterID:    s.cfg.ClusterID,
 		AgentVersion: s.build.Version,
 		Logger:       log,
+		InstanceID:   s.instanceID,
 		Generation:   s.started.UnixNano(),
+		OnConnected: func(hub wstun.HubInfo) {
+			s.metrics.HubReplicas.WithLabelValues(endpoint).Set(float64(hub.Replicas))
+			if cov == nil {
+				return
+			}
+			duplicate := cov.join(hub.ServerID, hub.Replicas)
+			joined = hub.ServerID
+			covered, want := cov.state()
+			s.metrics.TunnelsCovered.WithLabelValues(endpoint).Set(float64(covered))
+			if duplicate {
+				// Two tunnels to one replica while another has none is the one
+				// state this design must not settle into, and the load
+				// balancer chose it, not us. Drop this connection so the retry
+				// gets another roll of the dice.
+				log.InfoContext(dialCtx, "redundant tunnel to an already-covered hub replica; redialing for an uncovered one",
+					"hub_server_id", hub.ServerID, "covered", covered, "replicas", want)
+				cancel()
+				return
+			}
+			log.InfoContext(dialCtx, "hub replica covered",
+				"hub_server_id", hub.ServerID, "covered", covered, "replicas", want)
+		},
 	}, s))
 }
 
@@ -605,4 +787,67 @@ func labelsWithSDLC(labels map[string]string, sdlc string) map[string]string {
 	}
 	merged["sdlc"] = sdlc
 	return merged
+}
+
+// osHostname is indirected so the "this host cannot name itself" path is
+// testable, the same way the hub does it.
+var osHostname = os.Hostname
+
+// spokeInstanceID names this pod for the hub's session pool.
+//
+// The pod hostname is ideal: stable for the pod's life, distinct between
+// siblings, and meaningful in a log. Where it is unavailable a random value
+// still keeps two pods in separate slots, which is the property that matters —
+// an empty value would make every anonymous pod collide into one slot and
+// evict each other, which is exactly the bug this field exists to prevent.
+func spokeInstanceID() string {
+	if host, err := osHostname(); err == nil && host != "" {
+		return host
+	}
+	// crypto/rand.Read never returns an error: since Go 1.24 (this module
+	// requires go 1.25, per go.mod) a failed read crashes the process
+	// irrecoverably instead of returning one to the caller -- see
+	// https://pkg.go.dev/crypto/rand#Read and https://go.dev/issue/66821. The
+	// previous "cannot generate one, fall back to empty" branch here was dead
+	// code that could never execute under this toolchain, so it is removed
+	// rather than tested around.
+	var b [8]byte
+	_, _ = cryptorand.Read(b[:])
+	return "spoke-" + hex.EncodeToString(b[:])
+}
+
+// adoptStoredIdentity re-reads the identity store and returns what it holds,
+// but only if that certificate is genuinely newer than the one in memory and
+// does not itself need renewing.
+//
+// This is what lets several spoke pods share one cluster identity. They read
+// the same Secret, so they hold the same certificate and reach the renewal
+// threshold together; the first to renew writes it back, and the rest find it
+// here and adopt it instead of minting competing certificates.
+//
+// Returns nil when there is nothing worth adopting, which is the common case on
+// a single-pod cluster and costs one read of a Secret per renewal check.
+func (s *spoke) adoptStoredIdentity(ctx context.Context) *Identity {
+	key, cert, ca, err := s.store.Load(ctx)
+	if err != nil {
+		// Nothing stored, or the store is unreachable. Either way the caller
+		// should go on and renew: a failed read must not stop a certificate
+		// that is genuinely expiring from being replaced.
+		return nil
+	}
+	stored, err := loadIdentity(key, cert, ca)
+	if err != nil {
+		s.logger.WarnContext(ctx, "stored identity is unusable; renewing instead", "error", err)
+		return nil
+	}
+	if stored.NeedsRenewal(s.now(), renewAtFraction) {
+		// A sibling has not renewed yet, or wrote something no fresher than
+		// what this pod already has.
+		return nil
+	}
+	if current := s.currentIdentity(); current != nil &&
+		!stored.Leaf.NotAfter.After(current.Leaf.NotAfter) {
+		return nil
+	}
+	return stored
 }

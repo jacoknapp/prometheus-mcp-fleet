@@ -70,6 +70,19 @@ func newFakeSession(id string, gen int64) *fakeSession {
 	}
 }
 
+// newFakeSessionInstance returns a session for cluster id at generation gen,
+// self-reporting InstanceID instance — simulating one pod of a multi-pod
+// spoke. It also gives the pod its own certificate serial, matching a real
+// deployment where every pod holds a distinct leaf certificate for the same
+// cluster URI SAN, so the two ways of computing a slot key never accidentally
+// agree in a test that means to keep them independent.
+func newFakeSessionInstance(id string, gen int64, instance string) *fakeSession {
+	s := newFakeSession(id, gen)
+	s.ident.InstanceID = instance
+	s.ident.CertSerial = "serial-" + id + "-" + instance
+	return s
+}
+
 func (f *fakeSession) Identity() tunnel.Identity { return f.ident }
 
 func (f *fakeSession) Generation() int64 { return f.gen }
@@ -154,19 +167,21 @@ func (c *testClock) Advance(d time.Duration) {
 // countingMetrics records every Metrics call. It is safe for concurrent use
 // because the registry calls it from session goroutines.
 type countingMetrics struct {
-	mu               sync.Mutex
-	connected        map[string]bool
-	connectedCalls   int
-	spokesConnected  []int
-	certExpiry       map[string]time.Time
-	identityMismatch map[string]int
+	mu                 sync.Mutex
+	connected          map[string]bool
+	connectedCalls     int
+	spokesConnected    []int
+	certExpiry         map[string]time.Time
+	identityMismatch   map[string]int
+	sessionsPerCluster map[string]int
 }
 
 func newCountingMetrics() *countingMetrics {
 	return &countingMetrics{
-		connected:        map[string]bool{},
-		certExpiry:       map[string]time.Time{},
-		identityMismatch: map[string]int{},
+		connected:          map[string]bool{},
+		certExpiry:         map[string]time.Time{},
+		identityMismatch:   map[string]int{},
+		sessionsPerCluster: map[string]int{},
 	}
 }
 
@@ -193,6 +208,13 @@ func (m *countingMetrics) IdentityMismatch(id string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.identityMismatch[id]++
+}
+
+// SessionsPerCluster implements [SessionsGauge].
+func (m *countingMetrics) SessionsPerCluster(id string, n int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sessionsPerCluster[id] = n
 }
 
 func (m *countingMetrics) mismatches(id string) int {
@@ -223,7 +245,15 @@ func (m *countingMetrics) lastSpokesConnected() (int, bool) {
 	return m.spokesConnected[len(m.spokesConnected)-1], true
 }
 
+// sessions returns the last value reported for cluster id's pool size.
+func (m *countingMetrics) sessions(id string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.sessionsPerCluster[id]
+}
+
 var _ Metrics = (*countingMetrics)(nil)
+var _ SessionsGauge = (*countingMetrics)(nil)
 var _ tunnel.Session = (*fakeSession)(nil)
 
 // mustNew builds a registry and fails the test if the options are rejected.

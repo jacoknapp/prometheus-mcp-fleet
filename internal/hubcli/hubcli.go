@@ -77,15 +77,16 @@ func enrollCreate(ctx context.Context, args []string, getenv func(string) string
 	fs := flag.NewFlagSet("hub enroll create", flag.ContinueOnError)
 	fs.SetOutput(stdout)
 	var (
-		cluster  = fs.String("cluster", "", "cluster ID the token is bound to (required)")
-		labels   = fs.String("labels", "", "comma-separated k=v labels stamped on the cluster")
-		name     = fs.String("name", "", "operator label for the token itself")
-		owner    = fs.String("owner", "", "free-form contact information")
-		ttl      = fs.Duration("ttl", 0, "token lifetime; zero means the hub's default")
-		reusable = fs.Bool("reusable", false,
-			"allow the token to be redeemed more than once, for the same cluster. "+
-				"Required for GitOps, where the credential is reconciled from git rather "+
-				"than handed over once, and a rebuilt cluster must re-enrol unattended")
+		cluster   = fs.String("cluster", "", "cluster ID the token is bound to (required)")
+		labels    = fs.String("labels", "", "comma-separated k=v labels stamped on the cluster")
+		name      = fs.String("name", "", "operator label for the token itself")
+		owner     = fs.String("owner", "", "free-form contact information")
+		ttl       = fs.Duration("ttl", 0, "token lifetime; zero means the hub's default")
+		singleUse = fs.Bool("single-use", false,
+			"burn the token on first redemption. Off by default: a single-use token cannot be "+
+				"committed to git, cannot survive a cluster rebuild, and cannot serve several "+
+				"spoke pods that start together, so in practice it works only for a human "+
+				"installing one cluster by hand and watching it")
 		maxRedemptions = fs.Int("max-redemptions", 0, "cap a reusable token; zero means no cap")
 		quiet          = fs.Bool("quiet", false, "print only the token, for scripting")
 		adminURL       = fs.String("admin-url", "", "admin API base URL; defaults to $PMF_ADMIN_URL or "+DefaultAdminURL)
@@ -106,7 +107,7 @@ func enrollCreate(ctx context.Context, args []string, getenv func(string) string
 		Labels:         parsed,
 		Name:           *name,
 		Owner:          *owner,
-		Reusable:       *reusable,
+		Reusable:       !*singleUse,
 		MaxRedemptions: *maxRedemptions,
 	}
 	if *ttl > 0 {

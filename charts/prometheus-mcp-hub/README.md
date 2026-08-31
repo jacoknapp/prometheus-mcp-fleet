@@ -482,11 +482,13 @@ Kubernetes: `>=1.28.0-0`
 | networkPolicy.mcp.namespaceSelector | object | `{"matchLabels":{"kubernetes.io/metadata.name":"ingress-nginx"}}` | `namespaceSelector` for clients allowed to reach the MCP port. |
 | networkPolicy.mcp.podSelector | object | `{}` | `podSelector` for clients allowed to reach the MCP port. Empty selects every pod in the selected namespaces. |
 | nodeSelector | object | `{}` | `spec.template.spec.nodeSelector`. |
+| peerDiscovery.domain | string | `""` | `PMF_PEER_DISCOVERY_DOMAIN`. Empty derives `<fullname>-peers.<namespace>.svc` from the headless Service above. Set it only to point at a Service this chart does not render. |
+| peerDiscovery.enabled | bool | `true` | Render the headless Service the hub resolves to count its replicas. Leave on for `replicaCount > 1`; harmless at 1. |
 | podAnnotations | object | `{}` | Annotations for the hub pods. |
-| podDisruptionBudget.enabled | bool | `true` | Render a PodDisruptionBudget. It is force-disabled whenever `replicaCount < 2`: `minAvailable: 1` on a single-replica workload blocks every node drain forever. |
-| podDisruptionBudget.maxUnavailable | string | `""` | `spec.maxUnavailable`. Empty means unset. |
-| podDisruptionBudget.minAvailable | int | `1` | `spec.minAvailable`. Mutually exclusive with `maxUnavailable`. |
-| podDisruptionBudget.unhealthyPodEvictionPolicy | string | `""` | `spec.unhealthyPodEvictionPolicy` (Kubernetes >= 1.27). `AlwaysAllow` lets a broken pod be evicted. |
+| podDisruptionBudget.enabled | bool | `true` | Render a PodDisruptionBudget. It is force-disabled whenever `replicaCount < 2`: a budget on a single-replica workload blocks every node drain forever. |
+| podDisruptionBudget.maxUnavailable | string | `"50%"` | `spec.maxUnavailable`. `50%` keeps at least half the replicas serving during a voluntary disruption: at 3 replicas one node may drain at a time. A percentage rather than a count so it stays correct if you change `replicaCount`. |
+| podDisruptionBudget.minAvailable | string | `""` | `spec.minAvailable`. Mutually exclusive with `maxUnavailable`, which is set below and wins. |
+| podDisruptionBudget.unhealthyPodEvictionPolicy | string | `"AlwaysAllow"` | `spec.unhealthyPodEvictionPolicy` (Kubernetes >= 1.27). `AlwaysAllow` means a pod that is not Ready — crashlooping, stuck pulling, wedged — does NOT consume the budget and can always be evicted. The default, `IfHealthyBudget`, does the opposite: broken pods are protected, so a node with a crashlooping hub on it cannot be drained until someone fixes the pod. That is the wrong way round for a workload whose whole point is to be replaceable. |
 | podLabels | object | `{}` | Extra labels for the hub pods. |
 | podSecurityContext.fsGroup | int | `65532` | Supplemental filesystem group. Set to `null` on OpenShift. |
 | podSecurityContext.runAsGroup | int | `65532` | Pod GID. Set to `null` on OpenShift. |
@@ -505,7 +507,7 @@ Kubernetes: `>=1.28.0-0`
 | readinessProbe.periodSeconds | int | `10` | Probe period. |
 | readinessProbe.successThreshold | int | `1` | Success threshold. |
 | readinessProbe.timeoutSeconds | int | `3` | Probe timeout. |
-| replicaCount | int | `1` | Number of hub replicas. Read before raising above 1: a spoke tunnel is pinned to exactly one replica and there is deliberately no hub-to-hub forwarding (BUILD_SPEC 1.11). Credential state is shared because it lives in one Secret, but tunnels are not. Real HA needs every replica individually addressable from outside the cluster and every spoke configured with all N addresses in `hub.endpoints`. |
+| replicaCount | int | `3` | Number of hub replicas. Read before raising above 1: a spoke tunnel is pinned to exactly one replica and there is deliberately no hub-to-hub forwarding (BUILD_SPEC 1.11). Credential state is shared because it lives in one Secret, but tunnels are not. Real HA needs every replica individually addressable from outside the cluster and every spoke configured with all N addresses in `hub.endpoints`. |
 | resources.limits.memory | string | `"1Gi"` | Memory limit. Also the source of `GOMEMLIMIT`. |
 | resources.requests.cpu | string | `"250m"` | CPU request. |
 | resources.requests.memory | string | `"256Mi"` | Memory request. |

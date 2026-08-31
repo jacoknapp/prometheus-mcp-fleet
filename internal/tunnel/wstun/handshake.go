@@ -58,8 +58,24 @@ type serverHello struct {
 	Nonce []byte `json:"nonce"`
 	// ProtocolVersion is the hub's handshake version.
 	ProtocolVersion string `json:"protocolVersion"`
-	// ServerID identifies the accepting hub replica, for spoke-side logging.
+	// ServerID identifies the accepting hub replica. It is the pod's hostname,
+	// so it is stable for the life of a replica and distinct between replicas.
+	//
+	// It began as a diagnostic and is now load-bearing for HA: a tunnel
+	// terminates on exactly one replica and there is no hub-to-hub forwarding,
+	// so a spoke must hold a tunnel to EVERY replica or a fraction of tool
+	// calls find no session. Behind a single Ingress hostname the spoke cannot
+	// address replicas individually, so it discovers them instead — it dials
+	// repeatedly and uses this field to tell which replica it landed on.
 	ServerID string `json:"serverId,omitempty"`
+	// Replicas is how many hub replicas the accepting hub believes are running.
+	//
+	// It is what tells the spoke when to stop dialing: coverage is complete
+	// once it holds one tunnel per distinct ServerID and that count equals this
+	// number. Zero means the hub cannot discover its own peers, in which case
+	// the spoke keeps exactly one tunnel per configured endpoint, which is the
+	// behaviour that predates this field.
+	Replicas int `json:"replicas,omitempty"`
 }
 
 // clientAuth is the spoke's response.
@@ -76,6 +92,17 @@ type clientAuth struct {
 	ClusterID string `json:"clusterId"`
 	// AgentVersion is reported for diagnostics only.
 	AgentVersion string `json:"agentVersion,omitempty"`
+	// InstanceID distinguishes one spoke POD from another within the same
+	// cluster. It is the pod hostname, falling back to a random value.
+	//
+	// A cluster may run more than one spoke for its own availability, and those
+	// pods share a cluster ID by definition -- that is what makes them the same
+	// cluster -- and may share a certificate too, if they share the identity
+	// Secret. Without a per-pod identifier the hub cannot tell a second pod
+	// from a reconnect of the first, and would keep replacing one with the
+	// other. It is advisory and authenticates nothing: it partitions sessions
+	// that have ALREADY been authenticated by the certificate.
+	InstanceID string `json:"instanceId,omitempty"`
 	// ProtocolVersion is the spoke's handshake version.
 	ProtocolVersion string `json:"protocolVersion"`
 }

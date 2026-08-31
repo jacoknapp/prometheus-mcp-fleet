@@ -25,7 +25,7 @@ tests:
       - hasDocuments:
           count: 0
 
-  - it: renders the PDB at two replicas
+  - it: renders the PDB at two replicas, with the chart's defaults
     set:
       replicaCount: 2
     asserts:
@@ -33,12 +33,34 @@ tests:
           count: 1
       - isKind:
           of: PodDisruptionBudget
+      # The chart default is maxUnavailable, not minAvailable: a percentage
+      # stays correct when replicaCount changes, where a count does not.
       - equal:
+          path: spec.maxUnavailable
+          value: 50%
+      - notExists:
           path: spec.minAvailable
-          value: 1
+      # A pod that is not Ready must not consume the budget, or a node with a
+      # crashlooping hub on it cannot be drained until somebody fixes the pod.
+      - equal:
+          path: spec.unhealthyPodEvictionPolicy
+          value: AlwaysAllow
       - equal:
           path: spec.selector.matchLabels["app.kubernetes.io/name"]
           value: prometheus-mcp-hub
+
+  - it: still supports minAvailable when maxUnavailable is cleared
+    set:
+      replicaCount: 3
+      podDisruptionBudget:
+        minAvailable: 2
+        maxUnavailable: ""
+    asserts:
+      - equal:
+          path: spec.minAvailable
+          value: 2
+      - notExists:
+          path: spec.maxUnavailable
 
   - it: stays absent at two replicas when explicitly disabled
     set:

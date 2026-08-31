@@ -42,6 +42,49 @@ func entryCount(r *Registry) int {
 	return len(r.entries)
 }
 
+// poolSize reports how many live slots cluster id's entry currently holds. 0
+// for a cluster with no entry at all.
+func poolSize(r *Registry, id string) int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	e, ok := r.entries[id]
+	if !ok {
+		return 0
+	}
+	return len(e.slots)
+}
+
+// onlySlot returns the one slot in cluster id's pool, failing the test if
+// there is not exactly one. Most of the pre-pooling tests attach a single
+// fakeSession per cluster, which (via its deterministic CertSerial) always
+// lands in one slot, so this lets them keep asserting on internal session
+// state without caring about the pool machinery.
+func onlySlot(t *testing.T, r *Registry, id string) *slot {
+	t.Helper()
+	_, sl := soleSlot(t, r, id)
+	return sl
+}
+
+// soleSlot is like onlySlot but also returns the slot's key, for a test that
+// needs to call an id/key-addressed method such as [Registry.applyFacts]
+// directly.
+func soleSlot(t *testing.T, r *Registry, id string) (string, *slot) {
+	t.Helper()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	e, ok := r.entries[id]
+	if !ok {
+		t.Fatalf("no entry for cluster %s", id)
+	}
+	if len(e.slots) != 1 {
+		t.Fatalf("cluster %s has %d slots, want exactly 1", id, len(e.slots))
+	}
+	for k, sl := range e.slots {
+		return k, sl
+	}
+	panic("unreachable")
+}
+
 func TestNewDefaultsAndValidation(t *testing.T) {
 	t.Parallel()
 
@@ -209,9 +252,7 @@ func TestOnSessionDescribesBeforeDeciding(t *testing.T) {
 
 		attach(t, r, s)
 
-		r.mu.RLock()
-		gen := r.entries["prod-eu"].generation
-		r.mu.RUnlock()
+		gen := onlySlot(t, r, "prod-eu").generation
 		if gen != 777 {
 			t.Errorf("generation = %d, want 777 from the Describe payload", gen)
 		}
@@ -267,9 +308,7 @@ func TestGenerationCAS(t *testing.T) {
 				}
 			}
 
-			r.mu.RLock()
-			gen := r.entries["prod-eu"].generation
-			r.mu.RUnlock()
+			gen := onlySlot(t, r, "prod-eu").generation
 			if gen != tc.wantLiveGen {
 				t.Errorf("live generation = %d, want %d", gen, tc.wantLiveGen)
 			}
@@ -320,11 +359,9 @@ func TestGenerationCASRace(t *testing.T) {
 		close(start)
 		wg.Wait()
 
-		r.mu.RLock()
-		e := r.entries["prod-eu"]
-		gen := e.generation
-		live := e.session
-		r.mu.RUnlock()
+		sl := onlySlot(t, r, "prod-eu")
+		gen := sl.generation
+		live := sl.session
 
 		if gen != 200 {
 			t.Fatalf("iteration %d: live generation = %d, want the newer 200", i, gen)
@@ -970,18 +1007,16 @@ func TestFactsPolling(t *testing.T) {
 		})
 	})
 
-	t.Run("facts for a replaced entry are discarded", func(t *testing.T) {
+	t.Run("facts for a replaced slot are discarded", func(t *testing.T) {
 		t.Parallel()
 		r := mustNew(t, Options{FactsPollInterval: time.Hour})
 		old := newFakeSession("prod-eu", 100)
 		attach(t, r, old)
-		r.mu.RLock()
-		stale := r.entries["prod-eu"]
-		r.mu.RUnlock()
+		key, stale := soleSlot(t, r, "prod-eu")
 
 		attach(t, r, newFakeSession("prod-eu", 200))
 
-		r.applyFacts("prod-eu", stale, tunnel.Facts{
+		r.applyFacts("prod-eu", key, stale, tunnel.Facts{
 			Fingerprint: "zombie",
 			Changed:     true,
 			Cluster:     fleet.Cluster{DisplayName: "resurrected"},
@@ -989,7 +1024,7 @@ func TestFactsPolling(t *testing.T) {
 
 		c, _ := r.Cluster("prod-eu")
 		if c.DisplayName == "resurrected" {
-			t.Error("a displaced session's facts were applied to its successor's entry")
+			t.Error("a displaced session's facts were applied to its successor's slot")
 		}
 	})
 }
@@ -1295,9 +1330,340 @@ func TestPollFactsStopsWhenRegistryCloses(t *testing.T) {
 	close(r.done)
 	s := newFakeSession("prod", 1)
 	r.wg.Add(1)
-	r.pollFacts(context.Background(), "prod", &entry{}, s)
+	r.pollFacts(context.Background(), "prod", "key", &slot{}, s)
 	r.wg.Wait()
 	if got := s.describes(); len(got) != 0 {
 		t.Errorf("pollFacts called Describe after registry close: %v", got)
 	}
+}
+
+// TestSiblingPods exercises a cluster running more than one spoke pod for its
+// own availability: [Registry] must pool their sessions rather than evicting
+// one every time the other reconnects, since every operation a spoke serves
+// is a read-only, idempotent Prometheus query and siblings are interchangeable.
+func TestSiblingPods(t *testing.T) {
+	t.Parallel()
+
+	t.Run("two sibling pods coexist", func(t *testing.T) {
+		t.Parallel()
+		metrics := newCountingMetrics()
+		r := mustNew(t, Options{FactsPollInterval: time.Hour, Metrics: metrics})
+		a := newFakeSessionInstance("prod-eu", 100, "pod-a")
+		b := newFakeSessionInstance("prod-eu", 100, "pod-b")
+
+		attach(t, r, a)
+		attach(t, r, b)
+
+		if got := poolSize(r, "prod-eu"); got != 2 {
+			t.Fatalf("poolSize = %d, want 2: a second pod must join the pool, not evict the first", got)
+		}
+		// ConnectedCount is a cluster count, not a session count: two pods
+		// backing one cluster still count as one connected cluster.
+		if got := r.ConnectedCount(); got != 1 {
+			t.Errorf("ConnectedCount = %d, want 1", got)
+		}
+		if got := metrics.sessions("prod-eu"); got != 2 {
+			t.Errorf("SessionsPerCluster = %d, want 2", got)
+		}
+		if got := a.closes(); len(got) != 0 {
+			t.Errorf("pod-a was closed %v; a sibling joining must never evict it", got)
+		}
+		if got := b.closes(); len(got) != 0 {
+			t.Errorf("pod-b was closed %v; a sibling joining must never evict itself", got)
+		}
+	})
+
+	t.Run("same pod reconnecting still replaces", func(t *testing.T) {
+		t.Parallel()
+		r := mustNew(t, Options{FactsPollInterval: time.Hour})
+		old := newFakeSessionInstance("prod-eu", 100, "pod-a")
+		attach(t, r, old)
+		newer := newFakeSessionInstance("prod-eu", 200, "pod-a")
+		attach(t, r, newer)
+
+		if got := poolSize(r, "prod-eu"); got != 1 {
+			t.Fatalf("poolSize = %d, want 1: a reconnect of the same pod must replace, not add", got)
+		}
+		waitFor(t, "the displaced session to be closed", func() bool {
+			return len(old.closes()) == 1
+		})
+		if got := old.closes(); !cmp.Equal(got, []string{ReplacedReason}) {
+			t.Errorf("close reasons = %v, want [%s]", got, ReplacedReason)
+		}
+		s, err := r.Session("prod-eu")
+		if err != nil {
+			t.Fatalf("Session: %v", err)
+		}
+		if s != tunnel.Session(newer) {
+			t.Error("the live session is not the reconnected pod's newer generation")
+		}
+	})
+
+	t.Run("generation guard is scoped to one pod's slot", func(t *testing.T) {
+		t.Parallel()
+		r := mustNew(t, Options{FactsPollInterval: time.Hour})
+		a := newFakeSessionInstance("prod-eu", 200, "pod-a")
+		b := newFakeSessionInstance("prod-eu", 50, "pod-b")
+		attach(t, r, a)
+		attach(t, r, b)
+
+		staleA := newFakeSessionInstance("prod-eu", 100, "pod-a")
+		_, err := r.OnSession(context.Background(), staleA)
+		if !errors.Is(err, ErrStaleGeneration) {
+			t.Fatalf("OnSession(stale pod-a) error = %v, want ErrStaleGeneration", err)
+		}
+
+		if got := poolSize(r, "prod-eu"); got != 2 {
+			t.Errorf("poolSize = %d, want 2: a rejected reconnect must not disturb the pool", got)
+		}
+		if got := a.closes(); len(got) != 0 {
+			t.Errorf("pod-a (the live, higher-generation slot) was closed %v", got)
+		}
+		if got := b.closes(); len(got) != 0 {
+			t.Errorf("pod-b (an unrelated sibling) was closed %v by pod-a's generation guard", got)
+		}
+	})
+
+	t.Run("round robin distributes across the pool", func(t *testing.T) {
+		t.Parallel()
+		r := mustNew(t, Options{FactsPollInterval: time.Hour})
+		pods := []*fakeSession{
+			newFakeSessionInstance("prod-eu", 100, "pod-a"),
+			newFakeSessionInstance("prod-eu", 100, "pod-b"),
+			newFakeSessionInstance("prod-eu", 100, "pod-c"),
+		}
+		for _, p := range pods {
+			attach(t, r, p)
+		}
+
+		counts := map[tunnel.Session]int{}
+		const rounds = 3
+		for range rounds * len(pods) {
+			s, err := r.Session("prod-eu")
+			if err != nil {
+				t.Fatalf("Session: %v", err)
+			}
+			counts[s]++
+		}
+		if got := len(counts); got != len(pods) {
+			t.Fatalf("Session returned %d distinct pods, want %d: not every pod got picked", got, len(pods))
+		}
+		for _, p := range pods {
+			if got := counts[tunnel.Session(p)]; got != rounds {
+				t.Errorf("pod got %d of %d calls, want an even %d-way split", got, rounds*len(pods), rounds)
+			}
+		}
+	})
+
+	t.Run("a session whose poller ended but is not yet released is skipped", func(t *testing.T) {
+		t.Parallel()
+		r := mustNew(t, Options{FactsPollInterval: time.Hour})
+		dead := newFakeSessionInstance("prod-eu", 100, "pod-a")
+		live := newFakeSessionInstance("prod-eu", 100, "pod-b")
+		attach(t, r, dead)
+		attach(t, r, live)
+
+		// The session ends without its release() being called yet, exactly
+		// the race window a transport's own teardown can leave open.
+		if err := dead.Close("gone"); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		if got := poolSize(r, "prod-eu"); got != 2 {
+			t.Fatalf("poolSize = %d, want 2: the dead session is still in the pool until release runs", got)
+		}
+
+		for range 5 {
+			s, err := r.Session("prod-eu")
+			if err != nil {
+				t.Fatalf("Session: %v", err)
+			}
+			if s != tunnel.Session(live) {
+				t.Fatal("Session returned a session whose poller has already ended")
+			}
+		}
+	})
+
+	t.Run("merged facts: freshest wins, LastSeen newest, ConnectedSince oldest", func(t *testing.T) {
+		t.Parallel()
+		clock := newTestClock()
+		r := mustNew(t, Options{FactsPollInterval: time.Hour, Clock: clock.Now})
+
+		a := newFakeSessionInstance("prod-eu", 100, "pod-a")
+		a.facts.Cluster.DisplayName = "stale-name"
+		attach(t, r, a)
+		firstConnectedSince := clock.Now()
+
+		clock.Advance(time.Minute)
+		b := newFakeSessionInstance("prod-eu", 100, "pod-b")
+		b.facts.Cluster.DisplayName = "fresh-name"
+		attach(t, r, b)
+		secondConnectedSince := clock.Now()
+
+		c, ok := r.Cluster("prod-eu")
+		if !ok {
+			t.Fatal("Cluster not found")
+		}
+		if c.DisplayName != "fresh-name" {
+			t.Errorf("DisplayName = %q, want the most recently refreshed pod's facts", c.DisplayName)
+		}
+		if !c.LastSeen.Equal(secondConnectedSince) {
+			t.Errorf("LastSeen = %s, want the newest across sessions %s", c.LastSeen, secondConnectedSince)
+		}
+		if !c.ConnectedSince.Equal(firstConnectedSince) {
+			t.Errorf("ConnectedSince = %s, want the oldest live session's %s (pod-a's restart should not "+
+				"make the cluster look freshly reconnected)", c.ConnectedSince, firstConnectedSince)
+		}
+	})
+
+	t.Run("degraded only when every live pod is unreachable", func(t *testing.T) {
+		t.Parallel()
+		r := mustNew(t, Options{FactsPollInterval: time.Hour})
+		healthy := newFakeSessionInstance("prod-eu", 100, "pod-a")
+		unhealthy := newFakeSessionInstance("prod-eu", 100, "pod-b")
+		unhealthy.facts.Cluster.Prometheus = fleet.PrometheusInfo{
+			Reachable: false, UnreachableReason: "dial tcp: refused",
+		}
+		attach(t, r, healthy)
+		attach(t, r, unhealthy)
+
+		c, _ := r.Cluster("prod-eu")
+		if c.State != fleet.StateConnected {
+			t.Errorf("state = %q, want connected: one healthy pod is enough", c.State)
+		}
+
+		bothDown := mustNew(t, Options{FactsPollInterval: time.Hour})
+		x := newFakeSessionInstance("prod-eu", 100, "pod-a")
+		x.facts.Cluster.Prometheus = fleet.PrometheusInfo{Reachable: false, UnreachableReason: "refused"}
+		y := newFakeSessionInstance("prod-eu", 100, "pod-b")
+		y.facts.Cluster.Prometheus = fleet.PrometheusInfo{Reachable: false, UnreachableReason: "timeout"}
+		attach(t, bothDown, x)
+		attach(t, bothDown, y)
+
+		c2, _ := bothDown.Cluster("prod-eu")
+		if c2.State != fleet.StateDegraded {
+			t.Errorf("state = %q, want degraded: every live pod is unreachable", c2.State)
+		}
+	})
+
+	t.Run("the grace window starts only when the last pod leaves", func(t *testing.T) {
+		t.Parallel()
+		clock := newTestClock()
+		metrics := newCountingMetrics()
+		r := mustNew(t, Options{
+			FactsPollInterval: time.Hour,
+			DisconnectGrace:   time.Minute,
+			Clock:             clock.Now,
+			Metrics:           metrics,
+		})
+		a := newFakeSessionInstance("prod-eu", 100, "pod-a")
+		b := newFakeSessionInstance("prod-eu", 100, "pod-b")
+		releaseA := attach(t, r, a)
+		releaseB := attach(t, r, b)
+
+		releaseA()
+
+		if c, ok := r.Cluster("prod-eu"); !ok || c.State != fleet.StateConnected {
+			t.Errorf("Cluster = %+v, %v; want still connected via the remaining sibling", c, ok)
+		}
+		if got := r.ConnectedCount(); got != 1 {
+			t.Errorf("ConnectedCount = %d, want 1: a sibling is still live", got)
+		}
+		if got := metrics.sessions("prod-eu"); got != 1 {
+			t.Errorf("SessionsPerCluster = %d, want 1 after one of two pods left", got)
+		}
+
+		clock.Advance(90 * time.Second) // past the grace window, but the cluster never entered it
+		if c, ok := r.Cluster("prod-eu"); !ok || c.State != fleet.StateConnected {
+			t.Errorf("Cluster = %+v, %v; a cluster with a live sibling must never be evicted by grace", c, ok)
+		}
+
+		releaseB()
+		if c, ok := r.Cluster("prod-eu"); !ok || c.State != fleet.StateDisconnected {
+			t.Errorf("Cluster = %+v, %v; want disconnected once the last pod leaves", c, ok)
+		}
+		if got := metrics.sessions("prod-eu"); got != 0 {
+			t.Errorf("SessionsPerCluster = %d, want 0 once every pod has left", got)
+		}
+
+		clock.Advance(time.Minute + time.Nanosecond)
+		if _, ok := r.Cluster("prod-eu"); ok {
+			t.Error("entry still present past the grace window measured from the last pod's departure")
+		}
+	})
+
+	t.Run("two anonymous pods never collide into one slot", func(t *testing.T) {
+		t.Parallel()
+		r := mustNew(t, Options{FactsPollInterval: time.Hour})
+		a := newFakeSession("prod-eu", 100)
+		a.ident.CertSerial = "" // neither InstanceID nor CertSerial: fully anonymous
+		b := newFakeSession("prod-eu", 100)
+		b.ident.CertSerial = ""
+
+		attach(t, r, a)
+		attach(t, r, b)
+
+		if got := poolSize(r, "prod-eu"); got != 2 {
+			t.Fatalf("poolSize = %d, want 2: two anonymous sessions must not share a slot", got)
+		}
+		if got := a.closes(); len(got) != 0 {
+			t.Errorf("first anonymous session was closed %v", got)
+		}
+		if got := b.closes(); len(got) != 0 {
+			t.Errorf("second anonymous session was closed %v", got)
+		}
+	})
+
+	t.Run("a pool whose every session has ended reports not-connected, not unknown", func(t *testing.T) {
+		t.Parallel()
+		r := mustNew(t, Options{FactsPollInterval: time.Hour})
+		a := newFakeSessionInstance("prod-eu", 100, "pod-a")
+		b := newFakeSessionInstance("prod-eu", 100, "pod-b")
+		attach(t, r, a)
+		attach(t, r, b)
+
+		// Both sessions end without release() running yet, so the pool still
+		// has two entries but neither is usable.
+		if err := a.Close("gone"); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		if err := b.Close("gone"); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+
+		_, err := r.Session("prod-eu")
+		if !errors.Is(err, tunnel.ErrNotConnected) {
+			t.Errorf("Session error = %v, want tunnel.ErrNotConnected", err)
+		}
+		if errors.Is(err, ErrUnknownCluster) {
+			t.Errorf("Session error = %v, must not report unknown: the entry is still present", err)
+		}
+	})
+
+	t.Run("Close reports each cluster's gauges once regardless of pool size", func(t *testing.T) {
+		t.Parallel()
+		metrics := newCountingMetrics()
+		r := mustNew(t, Options{FactsPollInterval: time.Hour, Metrics: metrics})
+		a := newFakeSessionInstance("prod-eu", 100, "pod-a")
+		b := newFakeSessionInstance("prod-eu", 100, "pod-b")
+		attach(t, r, a)
+		attach(t, r, b)
+
+		before := metrics.connectedCalls
+		r.Close("hub-shutdown")
+
+		// Two OnSession calls already contributed two SpokeConnected(true)
+		// calls; Close must add exactly one more SpokeConnected(false) for
+		// prod-eu, not one per session in its pool.
+		if got := metrics.connectedCalls - before; got != 1 {
+			t.Errorf("SpokeConnected calls made by Close = %d, want exactly 1 for the one cluster", got)
+		}
+		if got := metrics.sessions("prod-eu"); got != 0 {
+			t.Errorf("SessionsPerCluster after Close = %d, want 0", got)
+		}
+		for _, s := range []*fakeSession{a, b} {
+			if got := s.closes(); !cmp.Equal(got, []string{"hub-shutdown"}) {
+				t.Errorf("close reasons = %v, want [hub-shutdown]", got)
+			}
+		}
+	})
 }

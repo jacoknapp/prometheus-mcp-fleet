@@ -121,6 +121,17 @@ type Hub struct {
 	CAKeyFile string
 	// TrustDomain is the authority component of spoke certificate URI SANs.
 	TrustDomain string
+	// PeerDiscoveryDomain is a headless Service FQDN that resolves to one
+	// address per running hub replica.
+	//
+	// It exists so multi-replica HA works behind ONE Ingress hostname. A tunnel
+	// terminates on exactly one replica and there is deliberately no
+	// hub-to-hub forwarding, so a spoke must hold a tunnel to every replica or
+	// a share of tool calls find no session. The hub counts the addresses here
+	// and tells each spoke how many replicas to expect; the spoke then dials
+	// the same hostname until it has seen them all. Empty disables discovery,
+	// and a spoke keeps one tunnel per configured endpoint.
+	PeerDiscoveryDomain string
 
 	// SpokeCertTTL is the lifetime of an issued spoke client certificate.
 	SpokeCertTTL time.Duration
@@ -209,6 +220,8 @@ func LoadHub(args []string, getenv func(string) string) (*Hub, error) {
 	l.str(&c.CACertFile, "ca-cert-file", "", "internal CA certificate; empty self-initialises in <data-dir>")
 	l.str(&c.CAKeyFile, "ca-key-file", "", "internal CA private key; empty self-initialises in <data-dir>")
 	l.str(&c.TrustDomain, "trust-domain", DefaultTrustDomain, "trust domain in spoke certificate URI SANs")
+	l.str(&c.PeerDiscoveryDomain, "peer-discovery-domain", "",
+		"headless Service FQDN resolving to one address per hub replica; enables multi-replica HA behind one hostname")
 
 	l.duration(&c.SpokeCertTTL, "spoke-cert-ttl", 336*time.Hour, "lifetime of an issued spoke client certificate")
 	l.duration(&c.EnrollmentTokenTTL, "enrollment-token-ttl", 15*time.Minute, "lifetime of a single-use enrollment token")

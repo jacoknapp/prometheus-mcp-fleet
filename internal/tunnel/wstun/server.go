@@ -64,6 +64,13 @@ type ServerConfig struct {
 	// cap is applied before the WebSocket upgrade, so a spoke over the limit
 	// gets a 503 it can act on rather than a connection that dies later.
 	MaxSessions int
+	// Replicas reports how many hub replicas are currently running, for the
+	// ServerHello. It is a func because replicas come and go under a rolling
+	// update or an autoscaler, and a spoke that learned a stale count would
+	// either stop dialing short of full coverage or dial forever. Nil or a
+	// non-positive result advertises nothing, and a spoke then keeps one tunnel
+	// per configured endpoint.
+	Replicas func() int
 	// ServerID identifies this hub replica in the ServerHello, for spoke-side
 	// logging. Empty is fine.
 	ServerID string
@@ -286,6 +293,11 @@ func (s *Server) authenticate(conn net.Conn, remote string) (tunnel.Identity, er
 		return tunnel.Identity{}, fmt.Errorf("%w: generate nonce: %w", ErrHandshakeFailed, err)
 	}
 	hello := serverHello{Nonce: nonce, ProtocolVersion: ProtocolVersion, ServerID: s.cfg.ServerID}
+	if s.cfg.Replicas != nil {
+		if n := s.cfg.Replicas(); n > 0 {
+			hello.Replicas = n
+		}
+	}
 	if err := writeMessage(conn, hello); err != nil {
 		return tunnel.Identity{}, fmt.Errorf("%w: %w", ErrHandshakeFailed, err)
 	}
@@ -322,6 +334,9 @@ func (s *Server) authenticate(conn net.Conn, remote string) (tunnel.Identity, er
 	}
 	if id.CertNotAfter.IsZero() {
 		id.CertNotAfter = leaf.NotAfter
+	}
+	if auth.InstanceID != "" {
+		id.InstanceID = auth.InstanceID
 	}
 	if s.cfg.IsRevoked != nil && s.cfg.IsRevoked(id.CertSerial) {
 		return tunnel.Identity{}, fmt.Errorf("%w: serial %s", ErrRevoked, id.CertSerial)

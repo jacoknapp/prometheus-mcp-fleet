@@ -6,16 +6,31 @@
 //
 // # Responsibility
 //
-// The registry is the only place that decides which [tunnel.Session] is the
-// live one for a cluster. Spokes reconnect constantly — rollouts, node drains,
-// network blips — and two sessions for the same cluster can be in flight at
-// once. The registry resolves that with a generation compare-and-swap keyed on
-// the spoke's process start time, so a stale reconnect racing a fresh one
-// always loses, and it loses the same way every time.
+// The registry is the only place that decides which [tunnel.Session] pool
+// serves a cluster. A cluster runs one spoke pod by convention, but every
+// operation a spoke serves is a read-only, idempotent Prometheus query, so a
+// cluster may run several pods for its own availability and their sessions
+// are interchangeable. The registry holds one pool per cluster keyed by pod
+// identity rather than a single session, so siblings coexist instead of
+// continually evicting each other. There is deliberately no leader election
+// among them: nothing they serve needs serialising, and an election would add
+// split-brain risk, lease RBAC and failover latency for no benefit.
+//
+// What has not changed is reconnect resolution *within* a pod's own slot.
+// Spokes reconnect constantly — rollouts, node drains, network blips — and two
+// sessions for the same pod can be in flight at once. The registry resolves
+// that with a generation compare-and-swap keyed on the spoke's process start
+// time, so a stale reconnect racing a fresh one always loses, and it loses the
+// same way every time.
 //
 // It is also the boundary at which self-reported data stops being trusted for
 // identity: a cluster's ID comes from the verified client certificate and
-// nothing a spoke says at runtime can change it.
+// nothing a spoke says at runtime can change it. The pod identity used to pick
+// a slot ([tunnel.Identity.InstanceID], falling back to CertSerial) is also
+// self-reported, but it authenticates nothing — it only decides which slot a
+// session occupies inside a cluster it is already authorized for by
+// certificate. A spoke that lied about it could at worst displace its own
+// sibling's session.
 //
 // # No persistence, by design
 //
@@ -26,9 +41,12 @@
 // never connected simply does not appear, which is the truth and is better
 // than showing a stale entry an agent would then try to query.
 //
-// A cluster whose tunnel has just dropped is *not* forgotten immediately. It
-// lingers as [fleet.StateDisconnected] with its last known facts and
-// [fleet.Cluster.LastSeen] for [Options.DisconnectGrace] (default
+// A cluster whose last live session has just dropped is *not* forgotten
+// immediately — the grace window is scoped to the cluster's whole pool, not to
+// any one pod, so a cluster with even one remaining sibling is never treated
+// as disconnected. Only once every pod is gone does it linger, as
+// [fleet.StateDisconnected] with its last known facts and
+// [fleet.Cluster.LastSeen], for [Options.DisconnectGrace] (default
 // [DefaultDisconnectGrace]), so that an agent asking about a cluster that fell
 // over thirty seconds ago is told "disconnected, last seen 30s ago" rather
 // than "no such cluster". Once the grace window elapses the entry is dropped

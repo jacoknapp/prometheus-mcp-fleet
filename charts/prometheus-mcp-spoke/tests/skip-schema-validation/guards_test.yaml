@@ -123,9 +123,14 @@ tests:
       - failedTemplate:
           errorPattern: "hub.apiUrl is required and has no default"
 
-  - it: refuses more than one replica
+  # Several spoke pods per cluster are supported and are the default. They
+  # share one certificate through the identity Secret, so the backends that
+  # give each pod its own identity are the ones refused.
+  - it: refuses several replicas on the memory backend, where each pod would enrol separately
     set:
       replicaCount: 2
+      identity:
+        backend: memory
       cluster:
         id: prod-us-east-1
         sdlc: prod
@@ -135,4 +140,52 @@ tests:
         apiUrl: https://hub.example.com
     asserts:
       - failedTemplate:
-          errorPattern: "Scale the hub, never the spoke"
+          errorPattern: "identity.backend=memory"
+
+  - it: refuses several replicas on the file backend, which only looks durable
+    set:
+      replicaCount: 2
+      identity:
+        backend: file
+      cluster:
+        id: prod-us-east-1
+        sdlc: prod
+      hub:
+        endpoints:
+          - wss://hub.example.com/tunnel
+        apiUrl: https://hub.example.com
+    asserts:
+      - failedTemplate:
+          errorPattern: "identity.backend=file"
+
+  - it: allows several replicas on the shared identity Secret
+    set:
+      replicaCount: 3
+      identity:
+        backend: secret
+      cluster:
+        id: prod-us-east-1
+        sdlc: prod
+      hub:
+        endpoints:
+          - wss://hub.example.com/tunnel
+        apiUrl: https://hub.example.com
+    template: templates/deployment.yaml
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 3
+
+  - it: refuses fewer than one replica
+    set:
+      replicaCount: 0
+      cluster:
+        id: prod-us-east-1
+        sdlc: prod
+      hub:
+        endpoints:
+          - wss://hub.example.com/tunnel
+        apiUrl: https://hub.example.com
+    asserts:
+      - failedTemplate:
+          errorPattern: "must be at least 1"

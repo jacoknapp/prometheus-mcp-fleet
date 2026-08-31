@@ -306,49 +306,49 @@ func TestEnrollCreateRequestBody(t *testing.T) {
 		{
 			name: "minimal",
 			args: []string{"--cluster=prod-eu-1"},
-			want: hubapi.CreateEnrollmentRequest{ClusterID: "prod-eu-1"},
+			want: hubapi.CreateEnrollmentRequest{ClusterID: "prod-eu-1", Reusable: true},
 		},
 		{
 			name: "labels parsed into a map",
 			args: []string{"--cluster=prod-eu-1", "--labels=env=prod,zone=eu-west-1"},
 			want: hubapi.CreateEnrollmentRequest{
-				ClusterID: "prod-eu-1",
-				Labels:    map[string]string{"env": "prod", "zone": "eu-west-1"},
+				ClusterID: "prod-eu-1", Reusable: true,
+				Labels: map[string]string{"env": "prod", "zone": "eu-west-1"},
 			},
 		},
 		{
 			name: "a stray empty entry between commas is skipped",
 			args: []string{"--cluster=prod-eu-1", "--labels=env=prod,,zone=eu-west-1,"},
 			want: hubapi.CreateEnrollmentRequest{
-				ClusterID: "prod-eu-1",
-				Labels:    map[string]string{"env": "prod", "zone": "eu-west-1"},
+				ClusterID: "prod-eu-1", Reusable: true,
+				Labels: map[string]string{"env": "prod", "zone": "eu-west-1"},
 			},
 		},
 		{
 			name: "name and owner",
 			args: []string{"--cluster=prod-eu-1", "--name=bootstrap", "--owner=sre@example.com"},
 			want: hubapi.CreateEnrollmentRequest{
-				ClusterID: "prod-eu-1", Name: "bootstrap", Owner: "sre@example.com",
+				ClusterID: "prod-eu-1", Reusable: true, Name: "bootstrap", Owner: "sre@example.com",
 			},
 		},
 		{
 			name: "ttl above zero is sent",
 			args: []string{"--cluster=prod-eu-1", "--ttl=1h"},
-			want: hubapi.CreateEnrollmentRequest{ClusterID: "prod-eu-1", TTL: fleet.Duration(time.Hour)},
+			want: hubapi.CreateEnrollmentRequest{ClusterID: "prod-eu-1", Reusable: true, TTL: fleet.Duration(time.Hour)},
 		},
 		{
 			name: "zero ttl is omitted, meaning the hub default",
 			args: []string{"--cluster=prod-eu-1", "--ttl=0s"},
-			want: hubapi.CreateEnrollmentRequest{ClusterID: "prod-eu-1"},
+			want: hubapi.CreateEnrollmentRequest{ClusterID: "prod-eu-1", Reusable: true},
 		},
 		{
 			name: "reusable with no cap",
-			args: []string{"--cluster=prod-eu-1", "--reusable"},
+			args: []string{"--cluster=prod-eu-1"},
 			want: hubapi.CreateEnrollmentRequest{ClusterID: "prod-eu-1", Reusable: true},
 		},
 		{
 			name: "reusable with a cap",
-			args: []string{"--cluster=prod-eu-1", "--reusable", "--max-redemptions=5"},
+			args: []string{"--cluster=prod-eu-1", "--max-redemptions=5"},
 			want: hubapi.CreateEnrollmentRequest{ClusterID: "prod-eu-1", Reusable: true, MaxRedemptions: 5},
 		},
 	}
@@ -1077,7 +1077,7 @@ func TestEnrollCreateOverRealServer(t *testing.T) {
 
 	var stdout bytes.Buffer
 	err := Run(context.Background(),
-		[]string{"enroll", "create", "--cluster=prod-eu-1", "--reusable", "--max-redemptions=3", "--quiet"},
+		[]string{"enroll", "create", "--cluster=prod-eu-1", "--max-redemptions=3", "--quiet"},
 		env(map[string]string{"PMF_ADMIN_TOKEN": "real-token", "PMF_ADMIN_URL": srv.URL}),
 		&stdout, nil)
 	if err != nil {

@@ -37,17 +37,25 @@ tests:
       - notExists:
           path: spec.serviceName
 
-  - it: uses Recreate, because two spokes sharing one cluster ID would fight over one identity
+  # This asserted Recreate until the hub learned to pool sessions per cluster
+  # and pods learned to adopt a sibling's renewed certificate. With those in
+  # place a rolling update no longer makes two pods fight, and Recreate would
+  # throw away the availability three pods exist to provide.
+  - it: rolls updates without dropping below full strength
     template: templates/deployment.yaml
     asserts:
       - equal:
           path: spec.strategy.type
-          value: Recreate
-      - notExists:
-          path: spec.strategy.rollingUpdate
+          value: RollingUpdate
+      - equal:
+          path: spec.strategy.rollingUpdate.maxUnavailable
+          value: 0
+      - equal:
+          path: spec.strategy.rollingUpdate.maxSurge
+          value: 1
       - equal:
           path: spec.replicas
-          value: 1
+          value: 3
 
   - it: probes /healthz for startup and liveness and /readyz for readiness, all on admin
     template: templates/deployment.yaml

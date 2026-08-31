@@ -44,6 +44,16 @@ type Identity struct {
 	CertNotAfter time.Time
 	// RemoteAddr is the observed peer address, for audit logs only.
 	RemoteAddr string
+	// InstanceID distinguishes one spoke pod from another inside the same
+	// cluster, so a cluster can run several for its own availability and the
+	// hub can treat them as an interchangeable pool rather than as repeated
+	// reconnections of one pod.
+	//
+	// It is self-reported and authenticates nothing. Authority comes from the
+	// certificate: ClusterID decides what a session may serve, and this only
+	// decides which slot it occupies within that cluster. A spoke that lied
+	// about it could at worst displace its own sibling's session.
+	InstanceID string
 }
 
 // Request is one allow-listed HTTP call to a spoke's Prometheus.

@@ -36,7 +36,33 @@ imagePullSecrets: []
 # deliberately no hub-to-hub forwarding (BUILD_SPEC 1.11). Credential state is shared because it
 # lives in one Secret, but tunnels are not. Real HA needs every replica individually addressable
 # from outside the cluster and every spoke configured with all N addresses in `hub.endpoints`.
-replicaCount: 1
+replicaCount: 3
+# ^ Three, not one. A spoke holds a tunnel to every replica and the hub advertises how
+# many exist (see peerDiscovery below), so a rolling update never drops agent access:
+# the surviving replicas keep live tunnels throughout. Three tolerates losing one while
+# still leaving two, and the cost is small — a tunnel is a few KiB, so 100 spokes across
+# 3 replicas is ~300 tunnels fleet-wide.
+#
+# Set 1 for a lab, or where the Ingress cannot have session affinity disabled. A single
+# replica is still a reasonable production choice: when the hub is down, monitoring is
+# not — Prometheus and Alertmanager carry on and only AI agent access pauses.
+
+# Peer discovery makes multi-replica HA work behind a SINGLE Ingress hostname.
+#
+# A spoke tunnel terminates on exactly one replica and the hub does not forward
+# between replicas, so every replica needs a tunnel to every spoke. The hub counts
+# its own replicas by resolving the headless Service below and tells each spoke how
+# many to expect; the spoke then dials the same hostname until it has reached them
+# all. Without this, HA needs one external hostname per replica, configured into
+# every spoke.
+#
+# Requires that your Ingress does NOT use session affinity: a load balancer that
+# pins a client to one backend prevents a spoke from ever reaching the others.
+peerDiscovery:
+  # -- Render the headless Service the hub resolves to count its replicas. Leave on for `replicaCount > 1`; harmless at 1.
+  enabled: true
+  # -- `PMF_PEER_DISCOVERY_DOMAIN`. Empty derives `<fullname>-peers.<namespace>.svc` from the headless Service above. Set it only to point at a Service this chart does not render.
+  domain: ""
 # -- Number of old ReplicaSets retained.
 revisionHistoryLimit: 10
 
@@ -308,14 +334,14 @@ certManager:
       rotationPolicy: Always
 
 podDisruptionBudget:
-  # -- Render a PodDisruptionBudget. It is force-disabled whenever `replicaCount < 2`: `minAvailable: 1` on a single-replica workload blocks every node drain forever.
+  # -- Render a PodDisruptionBudget. It is force-disabled whenever `replicaCount < 2`: a budget on a single-replica workload blocks every node drain forever.
   enabled: true
-  # -- `spec.minAvailable`. Mutually exclusive with `maxUnavailable`.
-  minAvailable: 1
-  # -- `spec.maxUnavailable`. Empty means unset.
-  maxUnavailable: ""
-  # -- `spec.unhealthyPodEvictionPolicy` (Kubernetes >= 1.27). `AlwaysAllow` lets a broken pod be evicted.
-  unhealthyPodEvictionPolicy: ""
+  # -- `spec.minAvailable`. Mutually exclusive with `maxUnavailable`, which is set below and wins.
+  minAvailable: ""
+  # -- `spec.maxUnavailable`. `50%` keeps at least half the replicas serving during a voluntary disruption: at 3 replicas one node may drain at a time. A percentage rather than a count so it stays correct if you change `replicaCount`.
+  maxUnavailable: 50%
+  # -- `spec.unhealthyPodEvictionPolicy` (Kubernetes >= 1.27). `AlwaysAllow` means a pod that is not Ready — crashlooping, stuck pulling, wedged — does NOT consume the budget and can always be evicted. The default, `IfHealthyBudget`, does the opposite: broken pods are protected, so a node with a crashlooping hub on it cannot be drained until someone fixes the pod. That is the wrong way round for a workload whose whole point is to be replaceable.
+  unhealthyPodEvictionPolicy: AlwaysAllow
 
 networkPolicy:
   # -- Render a NetworkPolicy. On by default: the hub terminates connections from outside the cluster and holds a CA.

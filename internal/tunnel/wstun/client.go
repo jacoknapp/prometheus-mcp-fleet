@@ -59,6 +59,33 @@ type ClientConfig struct {
 	// Generation is the spoke process start time in Unix nanoseconds, which is
 	// how the hub resolves reconnect races.
 	Generation int64
+
+	// InstanceID distinguishes this spoke pod from its siblings in the same
+	// cluster, so several may run for availability without the hub mistaking
+	// one for a reconnect of another. Empty is fine for a single-pod spoke.
+	InstanceID string
+
+	// OnConnected is called once per connection, immediately after a
+	// successful handshake and before the tunnel starts serving.
+	//
+	// It is how a spoke discovers which hub replica it reached and how many
+	// exist. Behind a single Ingress hostname those are not knowable any other
+	// way: the load balancer chooses, and the spoke has to hold a tunnel to
+	// every replica because a tunnel terminates on exactly one and the hub does
+	// not forward between them. Optional.
+	OnConnected func(HubInfo)
+}
+
+// HubInfo is what a spoke learns about the hub replica that accepted it.
+type HubInfo struct {
+	// ServerID is the accepting replica's stable identifier, its pod hostname.
+	// Two connections reporting the same value reached the same replica.
+	ServerID string
+	// Replicas is how many replicas the hub believes are running, or zero when
+	// it cannot tell. Zero means "do not try to cover the fleet": the spoke
+	// keeps one tunnel per configured endpoint, which is what it did before
+	// this existed.
+	Replicas int
 }
 
 // Dial connects to one hub endpoint, proves this spoke's identity, and then
@@ -111,7 +138,7 @@ func Dial(ctx context.Context, cfg ClientConfig, h tunnel.Handler) error {
 	defer cancelConn()
 	conn := websocket.NetConn(connCtx, ws, websocket.MessageBinary)
 
-	serverID, err := clientHandshake(conn, cfg, signer)
+	hub, err := clientHandshake(conn, cfg, signer)
 	if err != nil {
 		_ = conn.Close()
 		if ctx.Err() != nil {
@@ -122,7 +149,11 @@ func Dial(ctx context.Context, cfg ClientConfig, h tunnel.Handler) error {
 
 	// endpoint and cluster_id are already bound on the caller's logger; adding
 	// them again emitted duplicate keys in every JSON line.
-	log.InfoContext(ctx, "tunnel connected", "hub_server_id", serverID)
+	log.InfoContext(ctx, "tunnel connected",
+		"hub_server_id", hub.ServerID, "hub_replicas", hub.Replicas)
+	if cfg.OnConnected != nil {
+		cfg.OnConnected(hub)
+	}
 
 	return grpctun.ServeConn(ctx, conn, grpctun.DialerConfig{
 		Endpoint:   cfg.URL,
@@ -134,57 +165,58 @@ func Dial(ctx context.Context, cfg ClientConfig, h tunnel.Handler) error {
 
 // clientHandshake performs the spoke half of the exchange and reports the hub
 // replica that accepted it.
-func clientHandshake(conn net.Conn, cfg ClientConfig, signer crypto.Signer) (serverID string, err error) {
+func clientHandshake(conn net.Conn, cfg ClientConfig, signer crypto.Signer) (hi HubInfo, err error) {
 	if err := conn.SetDeadline(time.Now().Add(handshakeTimeout)); err != nil {
-		return "", fmt.Errorf("%w: set handshake deadline: %w", ErrHandshakeFailed, err)
+		return HubInfo{}, fmt.Errorf("%w: set handshake deadline: %w", ErrHandshakeFailed, err)
 	}
 
 	var hello serverHello
 	if err := readMessage(conn, &hello); err != nil {
-		return "", err
+		return HubInfo{}, err
 	}
 	if !compatibleVersion(hello.ProtocolVersion) {
-		return "", fmt.Errorf("%w: hub speaks %q, spoke speaks %q",
+		return HubInfo{}, fmt.Errorf("%w: hub speaks %q, spoke speaks %q",
 			ErrProtocolVersion, hello.ProtocolVersion, ProtocolVersion)
 	}
 	if len(hello.Nonce) != nonceLen {
-		return "", fmt.Errorf("%w: hub nonce is %d bytes, want %d",
+		return HubInfo{}, fmt.Errorf("%w: hub nonce is %d bytes, want %d",
 			ErrHandshakeFailed, len(hello.Nonce), nonceLen)
 	}
 
 	sig, err := certproof.Sign(signer, hello.Nonce, ProtocolVersion, cfg.ClusterID)
 	if err != nil {
-		return "", fmt.Errorf("%w: %w", ErrHandshakeFailed, err)
+		return HubInfo{}, fmt.Errorf("%w: %w", ErrHandshakeFailed, err)
 	}
 	auth := clientAuth{
 		Chain:           cfg.Certificate.Certificate,
 		Signature:       sig,
 		ClusterID:       cfg.ClusterID,
 		AgentVersion:    cfg.AgentVersion,
+		InstanceID:      cfg.InstanceID,
 		ProtocolVersion: ProtocolVersion,
 	}
 	if err := writeMessage(conn, auth); err != nil {
-		return "", fmt.Errorf("%w: %w", ErrHandshakeFailed, err)
+		return HubInfo{}, fmt.Errorf("%w: %w", ErrHandshakeFailed, err)
 	}
 
 	var accept serverAccept
 	if err := readMessage(conn, &accept); err != nil {
-		return "", err
+		return HubInfo{}, err
 	}
 	if !accept.Accepted {
-		return "", fmt.Errorf("%w: the hub refused this spoke: %s", ErrHandshakeFailed, accept.Reason)
+		return HubInfo{}, fmt.Errorf("%w: the hub refused this spoke: %s", ErrHandshakeFailed, accept.Reason)
 	}
 	if accept.ClusterID != "" && accept.ClusterID != cfg.ClusterID {
-		return "", fmt.Errorf("%w: hub derived %q from the certificate, spoke is configured as %q",
+		return HubInfo{}, fmt.Errorf("%w: hub derived %q from the certificate, spoke is configured as %q",
 			ErrClusterMismatch, accept.ClusterID, cfg.ClusterID)
 	}
 
 	// A tunnel carries no deadline: it is legitimately quiet for long stretches,
 	// and HTTP/2 pings are what prove it is alive.
 	if err := conn.SetDeadline(time.Time{}); err != nil {
-		return "", fmt.Errorf("%w: clear handshake deadline: %w", ErrHandshakeFailed, err)
+		return HubInfo{}, fmt.Errorf("%w: clear handshake deadline: %w", ErrHandshakeFailed, err)
 	}
-	return hello.ServerID, nil
+	return HubInfo{ServerID: hello.ServerID, Replicas: hello.Replicas}, nil
 }
 
 // NormalizeEndpoint turns an operator-supplied hub endpoint into the WebSocket

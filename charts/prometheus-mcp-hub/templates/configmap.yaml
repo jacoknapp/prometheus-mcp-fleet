@@ -66,6 +66,10 @@ data:
   {{- end }}
   {{- end }}
   PMF_TRUST_DOMAIN: {{ .Values.config.trustDomain | quote }}
+  {{- if .Values.peerDiscovery.enabled }}
+  {{- $peers := .Values.peerDiscovery.domain | default (printf "%s-peers.%s.svc" (include "prometheus-mcp-hub.fullname" .) .Release.Namespace) }}
+  PMF_PEER_DISCOVERY_DOMAIN: {{ $peers | quote }}
+  {{- end }}
   PMF_SPOKE_CERT_TTL: {{ .Values.config.spokeCertTTL | quote }}
   PMF_ENROLLMENT_TOKEN_TTL: {{ .Values.config.enrollmentTokenTTL | quote }}
   PMF_RENEW_GRACE: {{ .Values.config.renewGrace | quote }}

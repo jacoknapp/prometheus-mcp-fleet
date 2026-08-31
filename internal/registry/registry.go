@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/fleet"
@@ -61,19 +62,50 @@ type Options struct {
 	Clock func() time.Time
 }
 
-// entry is the registry's internal state for one cluster. It is never handed
-// out: every read path copies out of it under the read lock.
+// entry is the registry's internal state for one cluster: a pool of sessions,
+// one per spoke pod. It is never handed out: every read path copies out of it
+// under the read lock.
+//
+// A cluster runs one pod by convention, but every Prometheus query a spoke
+// serves is read-only and idempotent, so a cluster may run several pods for
+// its own availability and the registry treats them as an interchangeable
+// pool rather than as one pod repeatedly reconnecting. There is deliberately
+// no leader election among siblings: nothing they serve needs serialising,
+// and an election would add split-brain risk, lease RBAC and failover
+// latency for no benefit.
 type entry struct {
-	cluster     fleet.Cluster
+	// slots holds one session per spoke pod, keyed by [Registry.slotKey]. The
+	// same key reconnecting is resolved by the existing generation guard
+	// (recorded per slot); a different key is a sibling and gets a slot of
+	// its own rather than displacing anything.
+	slots map[string]*slot
+	// rr is a round-robin cursor across slots, advanced by
+	// [Registry.pickLocked]. It is atomic so that the hot Session() path needs
+	// only the registry's read lock, matching every other read method.
+	rr atomic.Uint64
+	// lastCluster is the merged public view frozen at the moment the last
+	// live slot left the pool. It is what the read paths serve, via
+	// [Registry.presentLocked] and [Registry.mergedLocked], while slots is
+	// empty and the entry is still inside its disconnect grace window.
+	lastCluster fleet.Cluster
+}
+
+// slot is the registry's state for one session: one spoke pod's tunnel within
+// a cluster's entry.
+type slot struct {
 	session     tunnel.Session
 	generation  int64
 	fingerprint string
 	// certSerial is the serial of the certificate that admitted this session.
-	// It is written once, before the entry is published, and read-only after,
+	// It is written once, before the slot is published, and read-only after,
 	// so it needs no lock.
 	certSerial string
 	// cancel stops this session's facts poller.
 	cancel context.CancelFunc
+	// facts is this pod's own view of the cluster: its last Describe folded
+	// onto its certificate identity. [Registry.mergedLocked] combines every
+	// live slot's facts into the entry's public [fleet.Cluster].
+	facts fleet.Cluster
 }
 
 // Registry is the hub's in-memory view of the fleet. Create one with [New].
@@ -90,6 +122,11 @@ type Registry struct {
 	mu      sync.RWMutex
 	entries map[string]*entry
 	closed  bool
+
+	// anonSeq mints a unique slot key for a session whose identity carries
+	// neither InstanceID nor CertSerial, so that two such anonymous sessions
+	// never collide into the same slot and evict each other.
+	anonSeq atomic.Uint64
 
 	// done is closed by Close and stops every facts poller.
 	done chan struct{}
@@ -149,24 +186,33 @@ func New(opts Options) (*Registry, error) {
 	return r, nil
 }
 
-// OnSession implements [tunnel.SessionHandler]. It admits a session as the
-// live tunnel for its certificate's cluster and returns a release function the
+// OnSession implements [tunnel.SessionHandler]. It admits a session into its
+// certificate's cluster's session pool and returns a release function the
 // transport must call once the session ends.
 //
 // The session is Described before any decision is taken, because
 // [tunnel.Session.Generation] reports 0 until the first Describe and the
 // generation is what resolves the reconnect race. A session whose Describe
 // fails is rejected with [ErrRejectedSession] rather than admitted
-// unidentified: an entry with no facts is worse than no entry, since an agent
+// unidentified: a slot with no facts is worse than no slot, since an agent
 // would route a query to it.
 //
-// When a session already exists for the cluster, the newcomer wins only if its
-// generation is greater than or equal to the incumbent's. On a win the
-// incumbent is closed with reason [ReplacedReason]; on a loss the newcomer is
-// rejected with [ErrStaleGeneration] and the transport should hang up. Equal
-// generations resolve in favour of the newcomer because a spoke that
-// re-dialled without restarting is by definition the one that believes its old
-// connection is dead.
+// Which slot in the cluster's pool the session occupies is decided by
+// [Registry.slotKey], derived from the certificate-authorized ClusterID plus
+// the self-reported [tunnel.Identity.InstanceID] (or, absent that,
+// [tunnel.Identity.CertSerial]) — never from anything that could steer it
+// into colliding with, or evicting, an unrelated pod's slot.
+//
+// When a slot with that key already exists, the newcomer wins only if its
+// generation is greater than or equal to the incumbent's — this is the same
+// reconnect race as before, now scoped to one slot instead of the whole
+// cluster. On a win the incumbent is closed with reason [ReplacedReason]; on a
+// loss the newcomer is rejected with [ErrStaleGeneration] and the transport
+// should hang up. Equal generations resolve in favour of the newcomer because
+// a spoke that re-dialled without restarting is by definition the one that
+// believes its old connection is dead. A session whose key names no existing
+// slot is a sibling pod: it is simply added to the pool alongside whatever is
+// already there, never displacing it.
 //
 // ctx is used only for the admission Describe. The facts poller runs on a
 // context derived from it with [context.WithoutCancel], so the poller's
@@ -203,16 +249,17 @@ func (r *Registry) OnSession(ctx context.Context, s tunnel.Session) (func(), err
 		gen = facts.Generation
 	}
 
+	key := r.slotKey(ident)
 	cluster := r.clusterFrom(id, ident, facts.Cluster)
 
 	pctx, pcancel := context.WithCancel(context.WithoutCancel(ctx))
-	e := &entry{
-		cluster:     cluster,
+	sl := &slot{
 		session:     s,
 		generation:  gen,
 		fingerprint: facts.Fingerprint,
 		certSerial:  ident.CertSerial,
 		cancel:      pcancel,
+		facts:       cluster,
 	}
 
 	r.mu.Lock()
@@ -221,26 +268,33 @@ func (r *Registry) OnSession(ctx context.Context, s tunnel.Session) (func(), err
 		pcancel()
 		return nil, fmt.Errorf("%w: %w", ErrRejectedSession, ErrClosed)
 	}
-	prev := r.entries[id]
-	if prev != nil && prev.session != nil && gen < prev.generation {
+	e, ok := r.entries[id]
+	if !ok {
+		e = &entry{slots: make(map[string]*slot, 1)}
+		r.entries[id] = e
+	}
+	prev := e.slots[key]
+	if prev != nil && gen < prev.generation {
 		r.mu.Unlock()
 		pcancel()
 		return nil, fmt.Errorf("%w: cluster %s generation %d < %d",
 			ErrStaleGeneration, id, gen, prev.generation)
 	}
-	// A reconnect inside the grace window keeps nothing from the old entry:
-	// the fresh Describe is authoritative and the identity is re-derived from
-	// the certificate.
-	r.entries[id] = e
+	// A reconnect inside the grace window (or a fresh sibling joining an
+	// existing pool) keeps nothing from any prior occupant of this slot: the
+	// fresh Describe is authoritative and the identity is re-derived from the
+	// certificate.
+	e.slots[key] = sl
 	// Registering the poller under the same lock Close takes is what makes
 	// Close's WaitGroup.Wait safe: an Add either precedes it or is refused.
 	r.wg.Add(1)
 	n := r.connectedLocked()
+	poolSize := len(e.slots)
 	r.mu.Unlock()
 
-	if prev != nil && prev.session != nil {
+	if prev != nil {
 		// Drain and close the displaced session outside the lock. Cancelling
-		// its poller first means it cannot resurrect facts for the entry it no
+		// its poller first means it cannot resurrect facts for the slot it no
 		// longer owns.
 		prev.cancel()
 		go r.closeSession(prev.session, id, ReplacedReason)
@@ -250,16 +304,40 @@ func (r *Registry) OnSession(ctx context.Context, s tunnel.Session) (func(), err
 
 	r.metrics.SpokeConnected(id, true)
 	r.metrics.SpokesConnected(n)
+	r.reportSessions(id, poolSize)
 	if !ident.CertNotAfter.IsZero() {
 		r.metrics.SpokeCertExpiry(id, ident.CertNotAfter)
 	}
 	r.log.InfoContext(ctx, "registry: session attached",
-		"cluster", id, "generation", gen, "state", string(e.cluster.State),
-		"remote_addr", ident.RemoteAddr, "cert_serial", ident.CertSerial)
+		"cluster", id, "generation", gen, "state", string(cluster.State),
+		"pool_size", poolSize, "remote_addr", ident.RemoteAddr, "cert_serial", ident.CertSerial)
 
-	go r.pollFacts(pctx, id, e, s)
+	go r.pollFacts(pctx, id, key, sl, s)
 
-	return sync.OnceFunc(func() { r.release(id, e) }), nil
+	return sync.OnceFunc(func() { r.release(id, key, sl) }), nil
+}
+
+// slotKey identifies which pod a session occupies within its cluster's pool.
+// The same key returning is a reconnect of the same pod, subject to the
+// generation guard; a different key is a sibling and gets a slot of its own.
+//
+// [tunnel.Identity.InstanceID] is preferred, since it is the pod's own
+// self-reported identity. [tunnel.Identity.CertSerial] is the fallback for a
+// spoke that leaves it empty, so a single-pod spoke still gets exactly one
+// stable slot across reconnects. If both are empty the session is anonymous
+// and is given a slot manufactured from a monotonic counter, so that two
+// anonymous pods can never collide into the same slot and permanently evict
+// each other — they simply cannot be recognised as the same pod on reconnect
+// either, which is the correct, conservative behaviour for an identity the
+// spoke did not provide.
+func (r *Registry) slotKey(ident tunnel.Identity) string {
+	if ident.InstanceID != "" {
+		return "instance:" + ident.InstanceID
+	}
+	if ident.CertSerial != "" {
+		return "cert:" + ident.CertSerial
+	}
+	return fmt.Sprintf("anon:%d", r.anonSeq.Add(1))
 }
 
 // clusterFrom folds a Describe payload onto the certificate identity. The
@@ -308,7 +386,7 @@ func connectedState(c fleet.Cluster) fleet.ClusterState {
 
 // pollFacts refreshes one session's facts until the session or the registry
 // ends. See the package doc for why this is one goroutine per session.
-func (r *Registry) pollFacts(ctx context.Context, id string, e *entry, s tunnel.Session) {
+func (r *Registry) pollFacts(ctx context.Context, id, key string, sl *slot, s tunnel.Session) {
 	defer r.wg.Done()
 	t := time.NewTicker(r.pollInterval)
 	defer t.Stop()
@@ -324,7 +402,7 @@ func (r *Registry) pollFacts(ctx context.Context, id string, e *entry, s tunnel.
 		}
 
 		r.mu.RLock()
-		fp := e.fingerprint
+		fp := sl.fingerprint
 		r.mu.RUnlock()
 
 		cctx, cancel := context.WithTimeout(ctx, r.pollTimeout)
@@ -337,69 +415,83 @@ func (r *Registry) pollFacts(ctx context.Context, id string, e *entry, s tunnel.
 			r.log.WarnContext(ctx, "registry: facts poll failed", "cluster", id, "error", err)
 			continue
 		}
-		r.applyFacts(id, e, facts)
+		r.applyFacts(id, key, sl, facts)
 	}
 }
 
-// applyFacts merges a Describe reply into the entry, if the entry is still the
-// live one for its cluster.
-func (r *Registry) applyFacts(id string, e *entry, facts tunnel.Facts) {
+// applyFacts merges a Describe reply into sl, if sl is still the slot
+// registered under key for cluster id — i.e. it has not been displaced by a
+// newer generation of the same pod.
+func (r *Registry) applyFacts(id, key string, sl *slot, facts tunnel.Facts) {
 	if facts.Changed {
-		r.noteReportedID(id, facts.Cluster.ID, e.certSerial)
+		r.noteReportedID(id, facts.Cluster.ID, sl.certSerial)
 	}
 	now := r.now()
 	r.mu.Lock()
-	if r.entries[id] != e || e.session == nil {
+	e, ok := r.entries[id]
+	if !ok || e.slots[key] != sl {
 		r.mu.Unlock()
 		return
 	}
-	e.cluster.LastSeen = now
+	sl.facts.LastSeen = now
 	if !facts.Changed {
 		r.mu.Unlock()
 		return
 	}
-	certNotAfter := e.cluster.CertNotAfter
-	connectedSince := e.cluster.ConnectedSince
+	certNotAfter := sl.facts.CertNotAfter
+	connectedSince := sl.facts.ConnectedSince
 	c := copyCluster(facts.Cluster)
 	c.ID = id
 	c.CertNotAfter = certNotAfter
 	c.ConnectedSince = connectedSince
 	c.LastSeen = now
 	c.State = connectedState(c)
-	e.cluster = c
-	e.fingerprint = facts.Fingerprint
+	sl.facts = c
+	sl.fingerprint = facts.Fingerprint
 	r.mu.Unlock()
 
 	r.log.Debug("registry: facts refreshed",
 		"cluster", id, "fingerprint", facts.Fingerprint, "state", string(c.State))
 }
 
-// release detaches a session. It is idempotent and is a no-op when the entry
-// has already been replaced by a newer session, so a slow release from a
-// displaced connection can never evict its successor.
-func (r *Registry) release(id string, e *entry) {
-	e.cancel()
+// release detaches one slot from its cluster's pool. It is idempotent and is a
+// no-op when the slot has already been displaced by a newer generation of the
+// same pod, so a slow release from a displaced connection can never evict its
+// successor.
+//
+// Emptying the last slot in the pool is what starts the disconnect grace
+// window (or, with the window disabled, forgets the cluster immediately): a
+// sibling that is still connected is left untouched, so a cluster with any
+// live pod is never treated as disconnected.
+func (r *Registry) release(id, key string, sl *slot) {
+	sl.cancel()
 
 	now := r.now()
 	r.mu.Lock()
-	cur, ok := r.entries[id]
-	if !ok || cur != e {
+	e, ok := r.entries[id]
+	if !ok || e.slots[key] != sl {
 		r.mu.Unlock()
 		return
 	}
-	e.session = nil
-	e.cluster.State = fleet.StateDisconnected
-	e.cluster.LastSeen = now
-	e.cluster.ConnectedSince = time.Time{}
-	if r.grace == 0 {
-		delete(r.entries, id)
+	delete(e.slots, key)
+	poolSize := len(e.slots)
+	if poolSize == 0 {
+		last := copyCluster(sl.facts)
+		last.State = fleet.StateDisconnected
+		last.LastSeen = now
+		last.ConnectedSince = time.Time{}
+		e.lastCluster = last
+		if r.grace == 0 {
+			delete(r.entries, id)
+		}
 	}
 	n := r.connectedLocked()
 	r.mu.Unlock()
 
-	r.metrics.SpokeConnected(id, false)
+	r.metrics.SpokeConnected(id, poolSize > 0)
 	r.metrics.SpokesConnected(n)
-	r.log.Info("registry: session detached", "cluster", id, "generation", e.generation)
+	r.reportSessions(id, poolSize)
+	r.log.Info("registry: session detached", "cluster", id, "generation", sl.generation, "pool_size", poolSize)
 }
 
 // closeSession closes s, logging rather than propagating the error: nothing
@@ -411,7 +503,9 @@ func (r *Registry) closeSession(s tunnel.Session, id, reason string) {
 	}
 }
 
-// Session returns the live tunnel for a cluster.
+// Session returns one live tunnel for a cluster, round-robin across its pool
+// of pods so load spreads over every one it is running rather than always
+// landing on the same pod.
 //
 // The error is deliberately layered. It always satisfies
 // errors.Is(err, [tunnel.ErrNotConnected]), so a caller that only wants to
@@ -428,7 +522,7 @@ func (r *Registry) Session(clusterID string) (tunnel.Session, error) {
 	live := ok && r.presentLocked(e, now)
 	var s tunnel.Session
 	if live {
-		s = e.session
+		s = r.pickLocked(e)
 	}
 	r.mu.RUnlock()
 
@@ -442,7 +536,40 @@ func (r *Registry) Session(clusterID string) (tunnel.Session, error) {
 	return s, nil
 }
 
-// Cluster returns a copy of one cluster's registry entry. The second result is
+// pickLocked returns one live session from e's pool, round-robin across
+// slots. Callers must hold at least the read lock.
+//
+// A slot whose session has already ended but has not yet been released — the
+// transport calls the release function asynchronously from its own teardown,
+// so there is a window where a dead session is still in the pool — is skipped
+// rather than returned: round-robin visits every other slot first, so one
+// dead sibling never starves a healthy one, and only an entirely dead pool
+// yields nil, same as an empty one.
+func (r *Registry) pickLocked(e *entry) tunnel.Session {
+	if len(e.slots) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(e.slots))
+	for k := range e.slots {
+		keys = append(keys, k)
+	}
+	// Sorting gives round-robin a stable visiting order; map iteration order
+	// would make "round-robin" meaningless from one call to the next.
+	slices.Sort(keys)
+	start := int(e.rr.Add(1) - 1)
+	for i := range keys {
+		s := e.slots[keys[(start+i)%len(keys)]].session
+		select {
+		case <-s.Done():
+			continue
+		default:
+			return s
+		}
+	}
+	return nil
+}
+
+// Cluster returns the merged public view of one cluster. The second result is
 // false for a cluster that has never connected or whose disconnect grace
 // window has elapsed.
 func (r *Registry) Cluster(clusterID string) (fleet.Cluster, bool) {
@@ -453,7 +580,57 @@ func (r *Registry) Cluster(clusterID string) (fleet.Cluster, bool) {
 	if !ok || !r.presentLocked(e, now) {
 		return fleet.Cluster{}, false
 	}
-	return copyCluster(e.cluster), true
+	return r.mergedLocked(clusterID, e), true
+}
+
+// mergedLocked returns entry e's public view for cluster id: while any slot is
+// live, one [fleet.Cluster] merged from every live session's facts; once the
+// last slot has left, the snapshot frozen for the disconnect grace window.
+// Callers must hold at least the read lock.
+//
+// The merge exists so that a cluster running several pods for its own
+// availability reads as one healthy cluster rather than as flapping copies of
+// itself:
+//
+//   - LastSeen is the newest across sessions.
+//   - ConnectedSince is the oldest live session's, so restarting one pod does
+//     not make an already-stable cluster look freshly reconnected.
+//   - The rest of the reported facts (DisplayName, Labels, Prometheus, ...)
+//     come from whichever session refreshed most recently.
+//   - The cluster is [fleet.StateConnected] as long as any live session's
+//     Prometheus is reachable, and only [fleet.StateDegraded] when every one
+//     of them reports it is not.
+func (r *Registry) mergedLocked(id string, e *entry) fleet.Cluster {
+	if len(e.slots) == 0 {
+		return copyCluster(e.lastCluster)
+	}
+	var freshest *slot
+	var lastSeen, connectedSince time.Time
+	anyReachable := false
+	for _, sl := range e.slots {
+		if freshest == nil || sl.facts.LastSeen.After(freshest.facts.LastSeen) {
+			freshest = sl
+		}
+		if sl.facts.LastSeen.After(lastSeen) {
+			lastSeen = sl.facts.LastSeen
+		}
+		if connectedSince.IsZero() || sl.facts.ConnectedSince.Before(connectedSince) {
+			connectedSince = sl.facts.ConnectedSince
+		}
+		if sl.facts.Prometheus.Reachable {
+			anyReachable = true
+		}
+	}
+	c := copyCluster(freshest.facts)
+	c.ID = id
+	c.LastSeen = lastSeen
+	c.ConnectedSince = connectedSince
+	if anyReachable {
+		c.State = fleet.StateConnected
+	} else {
+		c.State = fleet.StateDegraded
+	}
+	return c
 }
 
 // List returns every cluster the registry knows about, ordered by ID. The
@@ -482,11 +659,11 @@ func (r *Registry) filter(keep func(fleet.Cluster) bool) []fleet.Cluster {
 	now := r.now()
 	r.mu.RLock()
 	out := make([]fleet.Cluster, 0, len(r.entries))
-	for _, e := range r.entries {
+	for id, e := range r.entries {
 		if !r.presentLocked(e, now) {
 			continue
 		}
-		c := copyCluster(e.cluster)
+		c := r.mergedLocked(id, e)
 		if keep != nil && !keep(c) {
 			continue
 		}
@@ -499,19 +676,22 @@ func (r *Registry) filter(keep func(fleet.Cluster) bool) []fleet.Cluster {
 	return out
 }
 
-// ConnectedCount reports how many clusters currently hold a live tunnel.
-// Degraded clusters count: the tunnel is up, only their Prometheus is not.
+// ConnectedCount reports how many clusters currently hold at least one live
+// tunnel. This counts clusters, not sessions, so a cluster running several
+// pods for its own availability still counts once. Degraded clusters count:
+// some tunnel is up, only its Prometheus is not.
 func (r *Registry) ConnectedCount() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.connectedLocked()
 }
 
-// connectedLocked counts live sessions. Callers hold at least the read lock.
+// connectedLocked counts clusters with at least one live slot in their pool.
+// Callers hold at least the read lock.
 func (r *Registry) connectedLocked() int {
 	n := 0
 	for _, e := range r.entries {
-		if e.session != nil {
+		if len(e.slots) > 0 {
 			n++
 		}
 	}
@@ -519,14 +699,15 @@ func (r *Registry) connectedLocked() int {
 }
 
 // presentLocked reports whether an entry should still be visible: it either
-// holds a live session, or its disconnect grace window has not yet elapsed.
-// Read paths apply this rather than relying on the sweeper so that visibility
-// is exact even if [Registry.Run] is never started.
+// holds at least one live slot, or its disconnect grace window has not yet
+// elapsed since the last one left. Read paths apply this rather than relying
+// on the sweeper so that visibility is exact even if [Registry.Run] is never
+// started.
 func (r *Registry) presentLocked(e *entry, now time.Time) bool {
-	if e.session != nil {
+	if len(e.slots) > 0 {
 		return true
 	}
-	return now.Sub(e.cluster.LastSeen) <= r.grace
+	return now.Sub(e.lastCluster.LastSeen) <= r.grace
 }
 
 // Run drives eviction of entries whose disconnect grace window has elapsed,
@@ -577,11 +758,15 @@ func (r *Registry) Close(reason string) {
 		return
 	}
 	r.closed = true
-	sessions := make(map[string]tunnel.Session, len(r.entries))
+	type target struct {
+		id string
+		s  tunnel.Session
+	}
+	var targets []target
 	for id, e := range r.entries {
-		e.cancel()
-		if e.session != nil {
-			sessions[id] = e.session
+		for _, sl := range e.slots {
+			sl.cancel()
+			targets = append(targets, target{id, sl.session})
 		}
 	}
 	r.entries = make(map[string]*entry)
@@ -589,21 +774,37 @@ func (r *Registry) Close(reason string) {
 	r.mu.Unlock()
 
 	var wg sync.WaitGroup
-	for id, s := range sessions {
+	for _, tg := range targets {
 		wg.Add(1)
-		go func() {
+		go func(tg target) {
 			defer wg.Done()
-			r.closeSession(s, id, reason)
-		}()
+			r.closeSession(tg.s, tg.id, reason)
+		}(tg)
 	}
 	wg.Wait()
 	r.wg.Wait()
 
-	for id := range sessions {
-		r.metrics.SpokeConnected(id, false)
+	seen := make(map[string]bool, len(targets))
+	for _, tg := range targets {
+		if seen[tg.id] {
+			continue
+		}
+		seen[tg.id] = true
+		r.metrics.SpokeConnected(tg.id, false)
+		r.reportSessions(tg.id, 0)
 	}
 	r.metrics.SpokesConnected(0)
-	r.log.Info("registry: closed", "reason", reason, "sessions", len(sessions))
+	r.log.Info("registry: closed", "reason", reason, "sessions", len(targets))
+}
+
+// reportSessions notifies an optional [SessionsGauge] implementation of one
+// cluster's current pool size. It is a no-op for [NopMetrics] and for any
+// [Metrics] implementation that predates pooling and so does not implement
+// the extension.
+func (r *Registry) reportSessions(id string, n int) {
+	if g, ok := r.metrics.(SessionsGauge); ok {
+		g.SessionsPerCluster(id, n)
+	}
 }
 
 // copyCluster deep-copies the maps and slices reachable from a cluster so that

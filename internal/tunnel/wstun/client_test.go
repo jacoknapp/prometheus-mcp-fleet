@@ -229,8 +229,8 @@ func TestClientHandshake(t *testing.T) {
 			if err != nil {
 				t.Fatalf("clientHandshake() error = %v", err)
 			}
-			if id != tc.wantID {
-				t.Errorf("server id = %q, want %q", id, tc.wantID)
+			if id.ServerID != tc.wantID {
+				t.Errorf("server id = %q, want %q", id.ServerID, tc.wantID)
 			}
 		})
 	}
@@ -388,6 +388,75 @@ func TestDialHandshakeClassification(t *testing.T) {
 // TestDialUsesTheConfiguredLogger proves cfg.Logger is not silently discarded:
 // Dial's own "tunnel connected" line must reach the caller's Logger, not a
 // default one built regardless of what was configured.
+// TestDialInvokesOnConnected covers the two shapes of ClientConfig.OnConnected:
+// nil, which Dial must tolerate, and a supplied callback, which must run with
+// the hub's HubInfo after a successful handshake and before the tunnel starts
+// serving.
+func TestDialInvokesOnConnected(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nil is tolerated", func(t *testing.T) {
+		t.Parallel()
+
+		hub := newHarness(t, nil)
+		cert := hub.ca.issue(t, "prod")
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			done <- Dial(ctx, ClientConfig{
+				URL: hub.wsURL(), Certificate: cert, ClusterID: "prod",
+				Logger: quiet(), HTTPClient: hub.http.Client(), Generation: 1,
+			}, &tunneltest.EchoHandler{})
+		}()
+
+		select {
+		case <-hub.sessions:
+		case err := <-done:
+			cancel()
+			t.Fatalf("Dial returned before a session was established: %v", err)
+		case <-time.After(20 * time.Second):
+			cancel()
+			t.Fatal("no session within 20s")
+		}
+		cancel()
+		<-done
+	})
+
+	t.Run("a supplied callback receives the hub's identity before serving starts", func(t *testing.T) {
+		t.Parallel()
+
+		hub := newHarness(t, func(cfg *ServerConfig) { cfg.Replicas = func() int { return 4 } })
+		cert := hub.ca.issue(t, "prod")
+
+		infoCh := make(chan HubInfo, 1)
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			done <- Dial(ctx, ClientConfig{
+				URL: hub.wsURL(), Certificate: cert, ClusterID: "prod",
+				Logger: quiet(), HTTPClient: hub.http.Client(), Generation: 1,
+				OnConnected: func(hi HubInfo) { infoCh <- hi },
+			}, &tunneltest.EchoHandler{})
+		}()
+
+		select {
+		case got := <-infoCh:
+			if got.ServerID != "hub-test-0" || got.Replicas != 4 {
+				t.Errorf("HubInfo = %+v, want ServerID hub-test-0 and Replicas 4", got)
+			}
+		case err := <-done:
+			cancel()
+			t.Fatalf("Dial returned before OnConnected fired: %v", err)
+		case <-time.After(20 * time.Second):
+			cancel()
+			t.Fatal("OnConnected was never called")
+		}
+		cancel()
+		<-done
+	})
+}
+
 func TestDialUsesTheConfiguredLogger(t *testing.T) {
 	t.Parallel()
 

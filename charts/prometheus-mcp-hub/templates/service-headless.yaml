@@ -1,0 +1,37 @@
+{{- if .Values.peerDiscovery.enabled }}
+{{/*
+A headless Service exists so the hub can count its own replicas.
+
+Multi-replica HA needs every replica to hold a tunnel to every spoke, because a
+tunnel terminates on exactly one replica and there is deliberately no
+hub-to-hub forwarding. Behind a single Ingress hostname a spoke cannot address
+replicas individually, so the hub tells it how many to expect and the spoke
+dials until it has seen them all.
+
+DNS is how the count is discovered: a headless Service publishes one A record
+per ready pod, which needs no RBAC and no Kubernetes API client. Counting
+EndpointSlices instead would mean new cluster permissions on every install for
+a number DNS already publishes.
+
+publishNotReadyAddresses is deliberately false. A replica that is not ready is
+not accepting tunnels, so counting it would make spokes hunt for a replica they
+can never reach.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "prometheus-mcp-hub.fullname" . }}-peers
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "prometheus-mcp-hub.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: false
+  selector:
+    {{- include "prometheus-mcp-hub.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: mcp
+      port: {{ .Values.ports.mcp }}
+      targetPort: mcp
+      protocol: TCP
+{{- end }}

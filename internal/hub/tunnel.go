@@ -51,12 +51,18 @@ func (h *hub) newTunnelServer(ctx context.Context) (*wstun.Server, error) {
 		serverID = ""
 	}
 
+	// Peer discovery is what makes replicas: N work behind a single Ingress
+	// hostname; see peerCounter. Nil-safe: an empty domain reports zero, which
+	// advertises nothing.
+	peers := newPeerCounter(h.cfg.PeerDiscoveryDomain, h.logger)
+
 	srv, err := wstun.NewServer(wstun.ServerConfig{
 		Verify:      h.authority.VerifyChain,
 		IsRevoked:   revoked,
 		Logger:      h.logger,
 		MaxSessions: h.cfg.MaxSpokes,
 		ServerID:    serverID,
+		Replicas:    peers.Count,
 		Path:        h.cfg.TunnelPath,
 	})
 	if err != nil {

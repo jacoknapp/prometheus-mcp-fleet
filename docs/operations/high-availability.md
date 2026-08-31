@@ -5,10 +5,20 @@ SPDX-License-Identifier: Apache-2.0
 
 # High availability
 
-The short version: **the default is one hub replica, and that is a deliberate
-recommendation rather than a limitation we forgot to lift.** Running more than
-one requires real ingress work, and doing it half-way is worse than not doing it
-at all.
+The short version: **the hub defaults to three replicas behind a single Ingress
+hostname, and a cluster may run several spoke pods.** Neither needs per-replica
+ingress work.
+
+A hub replica set works behind a **single Ingress hostname**: the hub counts its
+own replicas and tells each spoke how many to expect, and the spoke dials that
+one hostname until it has reached them all. A cluster may also run **several
+spoke pods**, which the hub pools.
+
+> **Upgrading from an earlier release?** This used to require a distinct
+> external hostname per hub replica, configured into every spoke, and it
+> refused more than one spoke pod outright. Both restrictions are gone. The
+> per-hostname setup still works and is still the most predictable option if
+> you already have it.
 
 ## What is and is not shared
 
@@ -27,14 +37,38 @@ spoke whose tunnel terminates on replica A has nowhere to go, and there is
 deliberately no hub-to-hub forwarding
 ([ADR-0013](../adr/0013-no-hub-peer-forwarding.md)).
 
-**Consequence: `replicas: 3` behind a single Service does not work.** Two thirds
-of tool calls would return "cluster not connected" for any given cluster. The
-chart does not stop you, but the README says so and this document exists so that
-nobody discovers it from an intermittent production error.
+That last row is why a spoke must hold a tunnel to **every** replica. If it
+holds two of three, a third of tool calls for that cluster find no session.
+
+**This is now handled automatically.** The hub resolves a headless Service to
+count its own replicas and advertises that number in the tunnel handshake, along
+with a `ServerID` naming the replica that answered. The spoke keeps dialing the
+same hostname until it has seen every distinct `ServerID`, then maintains one
+tunnel per replica. No per-replica DNS, no forwarding hop, no leader election.
+
+```yaml
+# hub values — this is the default, shown for clarity
+replicaCount: 3
+peerDiscovery:
+  enabled: true      # renders the headless Service the hub resolves
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 50%
+  # A pod that is not Ready does NOT consume the budget. Without this a node
+  # carrying a crashlooping hub cannot be drained until somebody fixes the pod,
+  # which is backwards for a workload whose whole point is replaceability.
+  unhealthyPodEvictionPolicy: AlwaysAllow
+```
+
+**The one requirement: your Ingress must not use session affinity.** A load
+balancer that pins a client to one backend prevents a spoke from ever reaching
+the others, and the spoke would dial forever without completing coverage. Watch
+`promfleet_spoke_tunnels_covered` against `promfleet_spoke_hub_replicas`; if
+coverage never reaches the replica count, affinity is the first thing to check.
 
 ## The single-replica case
 
-This is the right default for most fleets, and the reason is worth stating.
+No longer the default, but still a legitimate choice, and the reason is worth stating.
 
 **When the hub is down, monitoring is not.** Prometheus and Alertmanager in
 every monitored cluster carry on exactly as before. What is lost is *AI agent
@@ -48,8 +82,11 @@ their own jittered backoff. Expect the fleet view to be complete within a few
 seconds of readiness.
 
 ```yaml
-replicas: 1          # the default
+replicaCount: 1      # not the default; the default is 3
 ```
+
+Choose it for a lab, or where the Ingress cannot have session affinity
+disabled.
 
 ## Multi-replica, done properly
 
@@ -77,10 +114,13 @@ flowchart LR
     LB --> H2
 ```
 
-### What this requires
+### Addressing each replica explicitly
 
-**Each replica must be individually addressable from outside the cluster.** This
-is the part people underestimate. You need:
+Automatic discovery is the default and needs none of this. Per-replica
+addressing remains supported and is the more predictable option behind a load
+balancer you do not control — notably one whose affinity you cannot disable. To
+use it, list every replica in `hub.endpoints`; the spoke keeps one tunnel per
+configured endpoint and discovery has nothing left to find. You need:
 
 1. A distinct external hostname per replica, each routed by the Ingress to that
    replica's pod. Since the tunnel is now ordinary HTTP
@@ -121,13 +161,60 @@ With every spoke dialling every replica, a rolling update is transparent: the
 surviving replicas still hold live tunnels throughout. This is the main
 operational reason to go multi-replica, more so than availability.
 
+## Spoke-side availability
+
+A cluster may run more than one spoke pod. Every operation a spoke serves is a
+read-only, idempotent Prometheus query, so sibling pods are interchangeable: the
+hub keeps a pool of sessions per cluster and any of them can answer. Losing one
+is invisible, and a rolling spoke upgrade never drops the cluster out of the
+fleet view.
+
+There is deliberately **no leader election**. Nothing a spoke does needs
+serialising, so an election would buy split-brain risk, lease RBAC and failover
+latency in exchange for nothing.
+
+```yaml
+# spoke values — this is the default
+replicaCount: 3
+identity:
+  backend: secret     # required above 1; the pods share one certificate
+```
+
+The pods **share one certificate**, held in the cluster's identity Secret. That
+is what `identity.backend: secret` means and why it is the only backend that
+supports more than one pod:
+
+- **At startup** every pod reads the Secret. Pods that come up together on a
+  fresh cluster all find it empty and all enrol, so the last writer wins — and
+  the others then re-read and adopt what is there, so the pool settles on one
+  certificate immediately rather than at the first renewal.
+- **At renewal** they all reach the threshold within a jitter window of each
+  other. Before renewing, a pod re-reads the Secret; if a sibling has already
+  renewed, it adopts that certificate and reconnects instead of minting a
+  competing one. A pod that loses the write race does the same.
+
+`memory` and `file` are refused above one replica because they give every pod
+its own identity: enrollments multiply by pod count and the pool renews several
+certificates instead of rotating one. `file` is worse than it looks —
+`config.dataDir` is an emptyDir, so it behaves like `memory` while appearing
+durable.
+
+Rolling updates are ordinary `RollingUpdate` with `maxUnavailable: 0`, so the
+old pod keeps serving until the new one has connected. This used to be
+`Recreate`, because two pods sharing a cluster ID fought; they no longer do.
+
+Pods are told apart by an `InstanceID` (the pod hostname) sent in the handshake.
+It authenticates nothing — the certificate still decides what a session may
+serve — it only decides which slot a session occupies within its own cluster.
+
 ## Choosing
 
 | You want | Do this |
 |---|---|
-| Simplicity, and can tolerate seconds of agent downtime on upgrade | `replicas: 1`. This is most people |
-| Transparent rolling upgrades and no single point of failure for agent access | Multi-replica with per-replica external addressing, as above |
-| Multi-replica without the ingress work | Not supported. Pick one of the two above |
+| Simplicity, and can tolerate seconds of agent downtime on upgrade | `replicaCount: 1` on the hub. A deliberate downgrade from the default |
+| Transparent rolling hub upgrades, no single point of failure for agent access | `replicaCount: 3` on the hub with `peerDiscovery.enabled`, behind one hostname, affinity off |
+| A monitored cluster that must not lose agent visibility when one pod restarts | `replicaCount: 2+` on that spoke with `identity.backend: memory` and a reusable token |
+| Multi-replica behind a load balancer whose affinity you cannot disable | Per-replica hostnames in `hub.endpoints`, as above |
 
 If you are unsure, take one replica. A single hub that restarts in a few seconds
 is honestly better than three whose addressing was set up incorrectly.

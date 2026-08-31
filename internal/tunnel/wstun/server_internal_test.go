@@ -385,6 +385,31 @@ func TestAuthenticateOverAPipe(t *testing.T) {
 		}
 	})
 
+	t.Run("instance id is carried from the ClientAuth into the identity", func(t *testing.T) {
+		t.Parallel()
+		hub, peer := net.Pipe()
+		t.Cleanup(func() { _ = hub.Close(); _ = peer.Close() })
+
+		cert := ca.issue(t, "prod")
+		go func() {
+			var hello serverHello
+			if err := readMessage(peer, &hello); err != nil {
+				return
+			}
+			auth := signedAuth(t, cert, hello.Nonce, "prod")
+			auth.InstanceID = "spoke-7f9c8d"
+			_ = writeMessage(peer, auth)
+		}()
+
+		id, err := srv.authenticate(hub, "10.0.0.1:1")
+		if err != nil {
+			t.Fatalf("authenticate: %v", err)
+		}
+		if id.InstanceID != "spoke-7f9c8d" {
+			t.Errorf("InstanceID = %q, want it carried from the ClientAuth", id.InstanceID)
+		}
+	})
+
 	t.Run("verifier that reports no serial still yields an auditable identity", func(t *testing.T) {
 		t.Parallel()
 
@@ -420,6 +445,62 @@ func TestAuthenticateOverAPipe(t *testing.T) {
 			t.Errorf("identity = %+v, want the serial and expiry filled in from the leaf", id)
 		}
 	})
+}
+
+// TestAuthenticateReportsReplicasInTheServerHello covers ServerConfig.Replicas:
+// nil advertises nothing, a func returning zero advertises nothing either (a
+// hub that cannot count its own peers must not tell a spoke to stop dialing
+// for full coverage), and a positive count is carried into the ServerHello.
+func TestAuthenticateReportsReplicasInTheServerHello(t *testing.T) {
+	t.Parallel()
+
+	ca := newTestCA(t)
+	cert := ca.issue(t, "prod")
+
+	tests := []struct {
+		name     string
+		replicas func() int
+		want     int
+	}{
+		{name: "nil advertises nothing", replicas: nil, want: 0},
+		{name: "a func returning zero advertises nothing", replicas: func() int { return 0 }, want: 0},
+		{name: "a positive count is carried through", replicas: func() int { return 3 }, want: 3},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv, err := NewServer(ServerConfig{Verify: ca.verify, Logger: quiet(), Replicas: tc.replicas})
+			if err != nil {
+				t.Fatalf("NewServer: %v", err)
+			}
+
+			hub, peer := net.Pipe()
+			t.Cleanup(func() { _ = hub.Close(); _ = peer.Close() })
+
+			helloCh := make(chan serverHello, 1)
+			go func() {
+				var hello serverHello
+				if err := readMessage(peer, &hello); err != nil {
+					return
+				}
+				helloCh <- hello
+				_ = writeMessage(peer, signedAuth(t, cert, hello.Nonce, "prod"))
+			}()
+
+			if _, err := srv.authenticate(hub, "10.0.0.1:1"); err != nil {
+				t.Fatalf("authenticate: %v", err)
+			}
+			select {
+			case hello := <-helloCh:
+				if hello.Replicas != tc.want {
+					t.Errorf("ServerHello.Replicas = %d, want %d", hello.Replicas, tc.want)
+				}
+			default:
+				t.Fatal("the hello was never read on the peer side")
+			}
+		})
+	}
 }
 
 // TestServeHTTPRareRefusals covers the upgrade and atomic-cap failures that do

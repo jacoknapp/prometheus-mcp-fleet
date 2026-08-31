@@ -1,3 +1,7 @@
+# memory identity keeps no certificate across restarts, so it is single-pod by
+# nature: each pod would enrol separately. Pinned to 1 explicitly now that the
+# chart default is 3.
+replicaCount: 1
 # Copyright The prometheus-mcp-fleet Authors.
 # SPDX-License-Identifier: Apache-2.0
 #

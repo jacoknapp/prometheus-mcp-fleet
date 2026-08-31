@@ -11,7 +11,7 @@ Every spoke lives in a **different cluster** and is installed as its **own Helm
 release** from the `prometheus-mcp-spoke` chart. There is no shared install, no
 umbrella chart, and nothing in the spoke chart references the hub's release. The
 only thing a spoke knows about the hub is an address, a trust bundle and a
-single-use token.
+reusable enrollment token.
 
 ## Contents
 
@@ -34,7 +34,7 @@ sequenceDiagram
     participant Spoke as Spoke (cluster N)
 
     Op->>Hub: POST /admin/v1/enrollments {clusterId, labels}
-    Note over Hub: pmf_enr_… · 15 min · single use · bound to one clusterId
+    Note over Hub: pmf_enr_… · reusable by default · bound to one clusterId
     Hub-->>Op: token (shown once)
     Op->>Spoke: helm install, token in a Secret
 
@@ -153,7 +153,28 @@ while read -r id env region; do
 done < clusters.tsv
 ```
 
-### GitOps: reusable tokens
+### Tokens are reusable by default
+
+`hub enroll create` mints a **reusable** token unless you pass `--single-use`.
+That is the default because single use does not survive contact with anything
+except a human installing one cluster by hand and watching it finish:
+
+- it cannot be committed to git, because it expires long before the commit
+  merges and syncs;
+- it cannot survive a cluster rebuild, because it was burned months ago;
+- it cannot serve several spoke pods that start together on a fresh cluster,
+  because they all enrol at once.
+
+A reusable token gives up less than it appears to. It is still bound to exactly
+one cluster, so a leak buys one cluster's identity and not the fleet's; it still
+expires; it is still revocable; it can be capped with `--max-redemptions`; and
+the hub still ignores what the CSR asks for and mints its own subject and SAN.
+
+Once a cluster has enrolled, the token is largely idle: the certificate lives in
+that cluster's identity Secret and is renewed with the certificate itself, not
+the token. It matters again on a rebuild, when the Secret is gone.
+
+### GitOps
 
 The loop above is an *imperative* rollout: something mints a token and pushes it
 into a cluster within fifteen minutes. A GitOps rollout has no such moment. Argo
@@ -176,7 +197,6 @@ expires; it is still revocable; and the hub still ignores what the CSR asks for.
 hub enroll create \
   --cluster prod-eu-west-1 \
   --labels env=prod,region=eu-west-1 \
-  --reusable \
   --max-redemptions 10 \
   --ttl 8760h \
   --quiet

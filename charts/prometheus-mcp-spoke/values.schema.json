@@ -75,10 +75,9 @@
       }
     },
     "replicaCount": {
-      "description": "Number of spoke replicas. This must be exactly 1 and the chart refuses to render anything else: a spoke's identity is one X.509 certificate bound to one cluster ID, and two pods would renew over each other in the same Secret and each deregister the other's tunnel at the hub.",
+      "description": "Number of spoke replicas. Above 1 requires identity.backend=memory, enforced by the chart: sibling pods must not share one identity Secret.",
       "type": "integer",
-      "minimum": 1,
-      "maximum": 1
+      "minimum": 1
     },
     "revisionHistoryLimit": {
       "description": "Number of old ReplicaSets retained.",

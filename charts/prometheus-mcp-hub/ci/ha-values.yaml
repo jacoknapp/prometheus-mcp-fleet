@@ -9,7 +9,11 @@
 replicaCount: 2
 podDisruptionBudget:
   enabled: true
+  # Keeps the minAvailable branch of the template covered now that the chart
+  # default is maxUnavailable: 50%. The two are mutually exclusive and the
+  # chart refuses both, so this must clear the default explicitly.
   minAvailable: 1
+  maxUnavailable: ""
   unhealthyPodEvictionPolicy: AlwaysAllow
 topologySpreadConstraints:
   - maxSkew: 1

@@ -905,7 +905,7 @@ func TestDialOnceRefusesWithoutAnIdentity(t *testing.T) {
 	t.Parallel()
 
 	s, logs := newTestSpoke(t, newStubClock(), nil)
-	if got := s.dialOnce(t.Context(), "wss://hub.test/tunnel", quiet()); got != "no-identity" {
+	if got := s.dialOnce(t.Context(), "wss://hub.test/tunnel", quiet(), newCoverage()); got != "no-identity" {
 		t.Errorf("dialOnce with no identity = %q, want no-identity", got)
 	}
 	if got := logs.metric(t, "promfleet_spoke_tunnel_up", "endpoint=wss://hub.test/tunnel"); got != 0 {
@@ -937,7 +937,7 @@ func TestDialOnceServesTheHubOverARealTunnel(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	reason := make(chan string, 1)
-	go func() { reason <- s.dialOnce(ctx, hub.url, quiet()) }()
+	go func() { reason <- s.dialOnce(ctx, hub.url, quiet(), newCoverage()) }()
 
 	session := hub.awaitSession(t)
 	if got := session.Identity().ClusterID; got != "prod-eu-1" {
@@ -1009,7 +1009,7 @@ func TestDialOnceDropsTheTunnelOnAReconnectSignal(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	reason := make(chan string, 1)
-	go func() { reason <- s.dialOnce(ctx, hub.url, quiet()) }()
+	go func() { reason <- s.dialOnce(ctx, hub.url, quiet(), newCoverage()) }()
 
 	session := hub.awaitSession(t)
 	s.signalReconnect()
@@ -1039,7 +1039,7 @@ func TestDialOnceClassifiesAFailedDial(t *testing.T) {
 	s, _ := newTestSpoke(t, clock, &config.Spoke{ClusterID: "prod-eu-1"})
 	s.setIdentity(ca.identityOver(t, "prod-eu-1", clock.Now().Add(-time.Hour), clock.Now().Add(24*time.Hour)))
 
-	got := s.dialOnce(t.Context(), "ws://"+deadAddr(t)+"/tunnel", quiet())
+	got := s.dialOnce(t.Context(), "ws://"+deadAddr(t)+"/tunnel", quiet(), newCoverage())
 	if got != "dial" {
 		t.Errorf("dialOnce against nothing = %q, want dial", got)
 	}
@@ -1053,7 +1053,7 @@ func TestDialLoopStopsOnAnEndpointItCannotUse(t *testing.T) {
 
 	s, logs := newTestSpoke(t, newStubClock(), nil)
 	done := make(chan struct{})
-	go func() { defer close(done); s.dialLoop(context.Background(), "ftp://hub.test/tunnel") }()
+	go func() { defer close(done); s.dialLoop(context.Background(), "ftp://hub.test/tunnel", newCoverage()) }()
 
 	select {
 	case <-done:
@@ -1082,7 +1082,7 @@ func TestDialLoopNormalisesTheEndpoint(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { defer close(done); s.dialLoop(ctx, deadAddr(t)) }()
+	go func() { defer close(done); s.dialLoop(ctx, deadAddr(t), newCoverage()) }()
 
 	eventually(t, "the normalised endpoint to be logged", func() bool {
 		return logs.has("hub endpoint normalised")
@@ -1106,7 +1106,7 @@ func TestDialLoopStopsDuringTheOpeningStagger(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { defer close(done); s.dialLoop(ctx, "ws://hub.test/tunnel") }()
+	go func() { defer close(done); s.dialLoop(ctx, "ws://hub.test/tunnel", newCoverage()) }()
 	time.Sleep(10 * time.Millisecond)
 	cancel()
 
@@ -1137,7 +1137,7 @@ func TestDialLoopStopsDuringTheBackoff(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { defer close(done); s.dialLoop(ctx, "ws://"+deadAddr(t)+"/tunnel") }()
+	go func() { defer close(done); s.dialLoop(ctx, "ws://"+deadAddr(t)+"/tunnel", newCoverage()) }()
 
 	// The line is logged immediately before the sleep starts.
 	eventually(t, "the loop to reach its backoff", func() bool {
@@ -1172,7 +1172,7 @@ func TestDialLoopReconnectsAndCounts(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { defer close(done); s.dialLoop(ctx, hub.url) }()
+	go func() { defer close(done); s.dialLoop(ctx, hub.url, newCoverage()) }()
 
 	// Hang up on the spoke twice: the loop has to come back both times.
 	for i := range 2 {
@@ -1225,7 +1225,7 @@ func TestDialLoopResetsBackoffOnlyAfterAConnectionThatLasted(t *testing.T) {
 	endpoint := "ws://" + deadAddr(t) + "/tunnel"
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { defer close(done); s.dialLoop(ctx, endpoint) }()
+	go func() { defer close(done); s.dialLoop(ctx, endpoint, newCoverage()) }()
 
 	// Phase one: the clock does not move, so no connection ever "lasts" and
 	// the window keeps doubling.
@@ -1277,7 +1277,7 @@ func TestDialLoopDoesNotResetBackoffAtExactlyTheThreshold(t *testing.T) {
 	endpoint := "ws://" + deadAddr(t) + "/tunnel"
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { defer close(done); s.dialLoop(ctx, endpoint) }()
+	go func() { defer close(done); s.dialLoop(ctx, endpoint, newCoverage()) }()
 	defer func() {
 		cancel()
 		<-done

@@ -1502,6 +1502,21 @@
       "items": {
         "type": "object"
       }
+    },
+    "peerDiscovery": {
+      "description": "Headless-Service peer discovery, which lets multi-replica HA work behind one Ingress hostname.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "description": "Render the headless Service the hub resolves to count its replicas.",
+          "type": "boolean"
+        },
+        "domain": {
+          "description": "PMF_PEER_DISCOVERY_DOMAIN. Empty derives it from the rendered headless Service.",
+          "type": "string"
+        }
+      }
     }
   }
 }

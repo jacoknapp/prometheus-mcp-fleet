@@ -33,9 +33,32 @@ type Metrics interface {
 	IdentityMismatch(clusterID string)
 }
 
+// SessionsGauge is an optional extension of [Metrics]. An implementation that
+// also satisfies it is additionally given a per-cluster count of live
+// sessions, which lets an operator see that a cluster is running more than one
+// spoke pod.
+//
+// It is deliberately not a method on [Metrics] itself: adding it there would
+// break every existing implementation (the hub's composition root included),
+// where growing the pool from one session to several changes nothing about
+// the narrow set of gauges those layers were built to satisfy. The registry
+// checks for it with a type assertion and simply does not report it when
+// absent.
+//
+// Suggested mapping: promfleet_hub_spoke_sessions{cluster}. Cardinality is
+// bounded by pods per cluster (a handful at most, for a spoke's own
+// availability) times the number of clusters — the same "few hundred" fleet
+// bound the package doc gives for facts-polling goroutines.
+type SessionsGauge interface {
+	// SessionsPerCluster records how many live sessions one cluster currently
+	// holds.
+	SessionsPerCluster(clusterID string, n int)
+}
+
 // NopMetrics implements [Metrics] and discards everything. It is the default
 // when [Options.Metrics] is nil, so tests and the file-backed dev path need no
-// metrics wiring.
+// metrics wiring. It does not implement [SessionsGauge]; the registry treats
+// that as "not offered" rather than calling a no-op.
 type NopMetrics struct{}
 
 // SpokeConnected implements [Metrics].

@@ -31,11 +31,15 @@ image:
 # -- Image pull secrets for a private registry.
 imagePullSecrets: []
 
-# -- Number of spoke replicas. This must stay 1 and the chart refuses to render anything else.
-# A spoke's identity is one X.509 certificate bound to one cluster ID. Two pods sharing that
-# identity would renew over each other in the same Secret and each would deregister the other's
-# tunnel at the hub. Scale the hub, never the spoke.
-replicaCount: 1
+# -- Number of spoke replicas. Three by default: every query a spoke serves is a read-only,
+# idempotent Prometheus call, so sibling pods are interchangeable, the hub pools them, and
+# losing one is invisible to an agent. There is deliberately no leader election — nothing
+# needs serialising, and an election would add split-brain risk and failover latency for no
+# gain.
+#
+# The pods share one certificate through the identity Secret, so above 1 requires
+# `identity.backend: secret` (the default) and the chart refuses anything else.
+replicaCount: 3
 # -- Number of old ReplicaSets retained.
 revisionHistoryLimit: 5
 
@@ -58,11 +62,11 @@ identity:
   # `secret` (default) writes them to a Secret in this namespace, so a pod restart reuses the
   # existing certificate. It costs exactly one `Role` with `get,create,update` on that one
   # Secret by name — see the "RBAC" section of the README.
+  # It is also what lets several pods of this cluster share ONE certificate: they read the
+  # same Secret, and at renewal whichever pod goes first writes it back while the rest adopt
+  # it instead of minting competitors. `replicaCount > 1` therefore requires this backend.
   # `memory` needs NO RBAC at all, but the key is lost on every restart, so the spoke
-  # re-enrolls each time and therefore needs a REUSABLE enrollment token (mint it with
-  # `hub enroll create --reusable`). That is strictly weaker: a reusable token is a standing
-  # credential that mints cluster identities, though only ever for the one cluster it is
-  # bound to, and it can be capped with `--max-redemptions` and revoked.
+  # re-enrolls each time and is limited to a single pod.
   # `file` writes under `config.dataDir`, which is the `/tmp` emptyDir, so in a pod it behaves
   # like `memory` while looking durable. It exists for running the binary outside Kubernetes.
   backend: secret
@@ -148,7 +152,7 @@ hub:
   allowInsecure: false
 
 enrollment:
-  # -- A `pmf_enr_` enrollment token, rendered into a Secret by this chart. Convenient, but it puts the token into the Helm release values, which are stored in a Secret in this namespace and show up in `helm get values`. `enrollment.existingSecret` is better. For GitOps the token must be REUSABLE (`hub enroll create --reusable`): a single-use token cannot survive being reconciled from git, and a rebuilt cluster would find it burned.
+  # -- A `pmf_enr_` enrollment token, rendered into a Secret by this chart. Convenient, but it puts the token into the Helm release values, which are stored in a Secret in this namespace and show up in `helm get values`. `enrollment.existingSecret` is better. Tokens are reusable unless minted with `--single-use`; a single-use token cannot survive being reconciled from git, cannot outlive a cluster rebuild, and cannot serve several pods that start together.
   token: ""
   # -- Name of an existing Secret holding the enrollment token. Preferred over `enrollment.token`. The chart never creates it.
   existingSecret: ""

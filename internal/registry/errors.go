@@ -21,8 +21,8 @@ var (
 	// The transport should close the connection.
 	ErrRejectedSession = errors.New("registry: session rejected")
 	// ErrStaleGeneration reports a session whose generation is older than the
-	// one already registered for that cluster. It is the losing side of the
-	// reconnect race and wraps [ErrRejectedSession].
+	// one already registered for that pod's slot in that cluster. It is the
+	// losing side of the reconnect race and wraps [ErrRejectedSession].
 	ErrStaleGeneration = fmt.Errorf("%w: stale generation", ErrRejectedSession)
 	// ErrClosed reports use of a registry that has been closed.
 	ErrClosed = errors.New("registry: closed")

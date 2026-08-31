@@ -71,6 +71,7 @@ tests:
   - it: renders NO RBAC AT ALL in memory identity mode
     template: templates/rbac.yaml
     set:
+      replicaCount: 1
       identity:
         backend: memory
     asserts:
@@ -80,6 +81,7 @@ tests:
   - it: does not project a service account token in memory identity mode either
     template: templates/serviceaccount.yaml
     set:
+      replicaCount: 1
       identity:
         backend: memory
     asserts:
@@ -98,6 +100,7 @@ tests:
     template: templates/configmap.yaml
     documentIndex: 0
     set:
+      replicaCount: 1
       identity:
         backend: memory
     asserts:
@@ -110,6 +113,7 @@ tests:
   - it: renders no RBAC in file identity mode either
     template: templates/rbac.yaml
     set:
+      replicaCount: 1
       identity:
         backend: file
     asserts:
