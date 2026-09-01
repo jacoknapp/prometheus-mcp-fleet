@@ -93,9 +93,10 @@ Service (`service.admin.enabled: true` by default) so kubelet probes and a
 scrapers in the `monitoring` namespace, not by loopback binding. Running the
 subcommand via `kubectl exec` still doesn't add any new network exposure of
 its own. It still needs an admin credential of its own: mount one as a file
-(the chart has no built-in option for this — wire it up yourself with
-`extraVolumes`/`extraVolumeMounts` against a Secret you create) and pass
-`--admin-token-file`, or set `PMF_ADMIN_TOKEN` in the pod's environment. Prefer
+(`adminToken.existingSecret` on the hub chart does exactly this, mounting the
+Secret you name at `/var/run/pmf/admin-token`; `adminToken.key` and
+`adminToken.mountPath` move it) and pass `--admin-token-file`, or set
+`PMF_ADMIN_TOKEN` in the pod's environment. Prefer
 the file. There is no way to set an environment variable on a `kubectl exec`
 without putting it in the argument list, where it lands in the node's process
 table.

@@ -80,12 +80,35 @@ Every admin route, including the one that mints keys, requires a valid admin
 bearer token — there is no bypass for `kubectl exec`. So losing this token
 **before** minting a replacement with it is not casually recoverable: without
 any usable admin credential you cannot authenticate a call to mint another
-one. Recovery then means waiting for this bootstrap credential to expire (tied
-to `--agent-key-ttl`, 90 days by default) and restarting the hub, which mints
+one. Recovery then means waiting for this bootstrap credential to expire
+(`--admin-key-ttl`, 90 days by default) and restarting the hub, which mints
 a fresh one only once none of the stored admin keys are still usable. Keep
 this one, and mint a properly scoped replacement with it soon after — see
 [step 4](#4-mint-an-agent-key) for the `hub keys create` invocation and pass
 `--class admin`.
+
+**Now put it where the hub can read it.** Every admin command below passes
+`--admin-token-file`, and that file only exists in the pod when the chart is
+told which Secret holds it. Passing the token as a `kubectl exec` argument
+instead would put a live admin credential in the node's process table, which
+is why the file is the documented path:
+
+```bash
+kubectl -n prometheus-mcp-hub create secret generic pmf-admin \
+  --from-literal=admin-token="$PMF_ADMIN_TOKEN"
+
+helm upgrade pmf-hub oci://ghcr.io/jacoknapp/charts/prometheus-mcp-hub \
+  --namespace prometheus-mcp-hub --reuse-values \
+  --set adminToken.existingSecret=pmf-admin
+```
+
+The chart mounts it at `/var/run/pmf/admin-token`
+(`adminToken.key` and `adminToken.mountPath` move it). Wait for the rollout to
+finish before step 4, or the exec lands on a pod that predates the mount:
+
+```bash
+kubectl -n prometheus-mcp-hub rollout status deploy/pmf-hub
+```
 
 ## 3. Export the CA bundle
 
@@ -184,17 +207,19 @@ helm install pmf-spoke oci://ghcr.io/jacoknapp/charts/prometheus-mcp-spoke \
 `fullnameOverride=pmf-spoke` is the same fix as for the hub above — without it
 the Deployment renders as `pmf-spoke-prometheus-mcp-spoke`, not `pmf-spoke`,
 breaking the `deploy/pmf-spoke` command below. `cluster.labels` is a **list**
-of `{name, value}` entries, not a map. Every one of `cluster.id`,
-`cluster.sdlc`, `hub.endpoints`, `hub.apiUrl` and `prometheus.url` differs per
-cluster and has **no default**. A default that happened to work in one place
-would be a trap in the other ninety-nine.
+of `{name, value}` entries, not a map. `cluster.id`, `cluster.sdlc`,
+`hub.endpoints` and `hub.apiUrl` differ per cluster and have **no default** —
+a default that happened to work in one place would be a trap in the other
+ninety-nine. `prometheus.url` does default, to
+`http://prometheus-operated.monitoring.svc:9090`, which is where the
+Prometheus Operator puts it; set it anyway if yours lives elsewhere.
 
 Verify:
 
 ```bash
 kubectl -n prometheus-mcp logs deploy/pmf-spoke | grep -E 'certificate|tunnel'
-# obtained client certificate  cluster_id=prod-us-east-1 not_after=…
-# tunnel established           endpoint=wss://pmf.example.com/tunnel
+# obtained client certificate  cluster_id=prod-us-east-1 serial=… not_after=…
+# tunnel connected             hub_server_id=pmf-hub-… hub_replicas=3
 ```
 
 Now repeat for `prod-eu-west-1`, and so on.
@@ -220,9 +245,10 @@ Ask it *"which prod clusters have firing alerts?"* It should call
 
 - [ ] **Scope every agent key** to the clusters and tools it actually needs.
 - [ ] **Back up the hub's CA Secret**, and test the restore. Losing it means
-      re-enrolling every cluster. The chart names it `<release>-ca`
-      (`state.caSecretName` overrides it) — with `fullnameOverride=pmf-hub` set
-      above, that's `pmf-hub-ca`, not the binary's own unprefixed default of
+      re-enrolling every cluster. The chart names it `<fullname>-ca`, where
+      the fullname is what `fullnameOverride` sets (`state.caSecretName`
+      overrides the whole thing) — with `fullnameOverride=pmf-hub` set above,
+      that's `pmf-hub-ca`, not the binary's own unprefixed default of
       `prometheus-mcp-fleet-ca`, which only applies outside this chart.
       ```bash
       kubectl -n prometheus-mcp-hub get secret pmf-hub-ca -o yaml > ca-backup.yaml
