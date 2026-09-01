@@ -234,8 +234,8 @@ func NormaliseSDLC(s string) string {
 	b.Grow(len(s))
 	lastHyphen := false
 	for _, r := range s {
-		switch {
-		case r == ' ' || r == '\t' || r == '_' || r == '-':
+		switch r {
+		case ' ', '\t', '_', '-':
 			// Collapse separators rather than emitting "pre--prod", and never
 			// start with one.
 			if b.Len() > 0 && !lastHyphen {

@@ -1282,3 +1282,57 @@ func closableBareSession(t *testing.T, conn net.Conn) *session {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &session{identity: tunnel.Identity{ClusterID: "prod"}, cc: cc, conn: newNotifyConn(conn), log: discardLogger(), ctx: ctx, cancel: cancel, done: make(chan struct{})}
 }
+
+// TestReserveCountsTheWaitGroupUnderTheSameLock pins the ordering that makes
+// Shutdown safe: the closed check, the slot claim and the WaitGroup Add are
+// one critical section, so once Shutdown has marked the listener closed no
+// further Add can begin. Split across two locks -- claim here, count there --
+// the accept loop could take the counter from zero to one while Shutdown was
+// already inside Wait, which is the concurrent Add and Wait the race
+// detector reports.
+func TestReserveCountsTheWaitGroupUnderTheSameLock(t *testing.T) {
+	t.Parallel()
+
+	src := &fakeSource{addr: "fixture", accept: func(context.Context) (net.Conn, tunnel.Identity, error) {
+		return nil, tunnel.Identity{}, errFixture
+	}}
+	got, err := NewSourceListener(src, ListenerConfig{})
+	if err != nil {
+		t.Fatalf("NewSourceListener: %v", err)
+	}
+	l := got.(*listener)
+
+	if !l.reserve() {
+		t.Fatal("an open listener refused a slot")
+	}
+	// The Add really happened: a Wait must not return until the matching
+	// Done does. Anything else means the slot and the counter disagree.
+	waited := make(chan struct{})
+	go func() { l.wg.Wait(); close(waited) }()
+	select {
+	case <-waited:
+		t.Fatal("Wait returned while a reserved slot was outstanding; reserve did not count it")
+	case <-time.After(50 * time.Millisecond):
+	}
+	l.release()
+	l.wg.Done()
+	select {
+	case <-waited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Wait did not return after the reserved slot was given back")
+	}
+
+	// Closed refuses, and refusing must not count: a Done that never comes
+	// would hang Shutdown for its whole timeout.
+	l.stopAccepting()
+	if l.reserve() {
+		t.Fatal("a closed listener handed out a slot; Shutdown could then wait on a counter still going up")
+	}
+	done := make(chan struct{})
+	go func() { l.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a refused reserve left the WaitGroup counted")
+	}
+}

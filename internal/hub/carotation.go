@@ -42,6 +42,9 @@ const (
 	// secretKeyRotationPhase is the phase name; secretKeyRotationSince is when
 	// it was entered, RFC 3339 in UTC.
 	secretKeyRotationPhase = "ca-rotation.phase"
+	// #nosec G101 -- a key NAME inside the Secret, not a credential. The
+	// secretKey* prefix names the map key these constants index; the values
+	// they point at are what is sensitive, and none of those is in source.
 	secretKeyRotationSince = "ca-rotation.since"
 	// secretKeyRotationHoldout is the last time ANY replica saw a live session
 	// still admitted by the outgoing root. It is how a per-replica observation

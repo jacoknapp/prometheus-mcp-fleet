@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"math/rand/v2"
 	"net/http"
 	"os"
@@ -283,7 +284,7 @@ func (s *spoke) run(ctx context.Context, registry prometheusRegistry) error {
 		// precedence over anything derived from PromQL.
 		KubernetesVersion:    s.cfg.ClusterK8sVersion,
 		KubernetesClusterUID: s.cfg.ClusterK8sUID,
-		KubernetesNodeCount:  int32(s.cfg.ClusterK8sNodes),
+		KubernetesNodeCount:  clampInt32(s.cfg.ClusterK8sNodes),
 		AgentVersion:         s.build.Version,
 		ProtocolVersion:      protocolVersion,
 		StartedAt:            s.started,
@@ -529,6 +530,21 @@ func (s *spoke) publishTunnelSignals(endpoint string, cov *coverage) {
 
 // tunnelComponent names an endpoint's health component.
 func tunnelComponent(endpoint string) string { return "tunnel:" + endpoint }
+
+// clampInt32 narrows an operator-supplied node count into the wire field's
+// width. The value comes from --cluster-k8s-nodes, so it is whatever somebody
+// typed; a bare conversion would wrap a large one into a negative node count
+// and report a cluster with -2 nodes.
+func clampInt32(n int) int32 {
+	switch {
+	case n < 0:
+		return 0
+	case n > math.MaxInt32:
+		return math.MaxInt32
+	default:
+		return int32(n)
+	}
+}
 
 // assertOwnCluster refuses an identity whose certificate names a different
 // cluster than this pod is configured for. The mismatch has exactly one

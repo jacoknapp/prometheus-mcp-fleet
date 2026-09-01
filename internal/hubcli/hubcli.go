@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -266,6 +267,9 @@ func resolveURL(flagValue string, getenv func(string) string) string {
 func adminToken(file string, getenv func(string) string) func() (string, error) {
 	return func() (string, error) {
 		if file != "" {
+			// #nosec G304 -- reading a path the operator named on their own
+			// command line is the entire feature (--admin-token-file), and
+			// this runs as that operator with their own privileges.
 			raw, err := os.ReadFile(file)
 			if err != nil {
 				return "", fmt.Errorf("read admin token file: %w", err)
@@ -351,7 +355,7 @@ func report(stdout io.Writer, out hubapi.MintedKeyResponse, quiet bool) error {
 		if e.Reusable {
 			limit := "unlimited"
 			if e.MaxRedemptions > 0 {
-				limit = fmt.Sprintf("%d", e.MaxRedemptions)
+				limit = strconv.Itoa(e.MaxRedemptions)
 			}
 			fmt.Fprintf(&b, "reusable: yes (redemptions: %s)\n", limit)
 		}

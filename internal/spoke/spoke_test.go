@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -2143,4 +2144,31 @@ func newFacts(t *testing.T, client *promclient.Client) *clusterfacts.Collector {
 		t.Fatalf("clusterfacts.New: %v", err)
 	}
 	return c
+}
+
+// TestClampInt32 pins the narrowing of an operator-supplied node count into
+// the wire field's width. The value comes from --cluster-k8s-nodes, so it is
+// whatever somebody typed, and a bare conversion would wrap a large one into
+// a cluster reporting a negative number of nodes.
+func TestClampInt32(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		in   int
+		want int32
+	}{
+		{"a plain count passes through", 42, 42},
+		{"zero is zero", 0, 0},
+		{"the largest representable count is kept", math.MaxInt32, math.MaxInt32},
+		{"one past it saturates rather than wrapping negative", math.MaxInt32 + 1, math.MaxInt32},
+		{"a negative count floors at zero", -2, 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := clampInt32(tc.in); got != tc.want {
+				t.Errorf("clampInt32(%d) = %d, want %d", tc.in, got, tc.want)
+			}
+		})
+	}
 }

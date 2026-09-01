@@ -546,7 +546,7 @@ func validInstanceID(v string) error {
 	}
 	for _, r := range v {
 		if r < 0x21 || r > 0x7e {
-			return fmt.Errorf("contains a byte outside printable ASCII")
+			return errors.New("contains a byte outside printable ASCII")
 		}
 	}
 	return nil

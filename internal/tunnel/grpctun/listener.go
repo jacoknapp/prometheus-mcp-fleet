@@ -168,7 +168,6 @@ func (l *listener) Serve(ctx context.Context, h tunnel.SessionHandler) error {
 			_ = conn.Close()
 			continue
 		}
-		l.wg.Add(1)
 		go func() {
 			defer l.wg.Done()
 			l.attach(ctx, conn, id, h)
@@ -353,6 +352,22 @@ func (l *listener) reserve() bool {
 		return false
 	}
 	l.active++
+	// Counted HERE, in the same critical section as the closed check, and
+	// that is what makes the WaitGroup safe rather than merely lucky.
+	// Shutdown sets closed under this mutex before it waits, so once it is
+	// waiting no further Add can begin, and every Add that will ever happen
+	// already has. Counting after this lock was released instead left a
+	// window -- a few microseconds between claiming the slot and starting
+	// the goroutine -- in which the accept loop could take the counter from
+	// zero to one while Shutdown was already inside Wait. That is concurrent
+	// Add and Wait, which Go's WaitGroup contract forbids; it survived a
+	// long time because the window is so narrow that only CI's parallelism
+	// ever hit it.
+	//
+	// The other two Add sites need no such care: both run inside a goroutine
+	// this one already counted, so the counter cannot be zero underneath
+	// them.
+	l.wg.Add(1)
 	return true
 }
 

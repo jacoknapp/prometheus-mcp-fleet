@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"math"
 	"slices"
 	"strings"
 	"sync"
@@ -735,7 +736,12 @@ func (r *Registry) pickLocked(e *entry) tunnel.Session {
 	// Sorting gives round-robin a stable visiting order; map iteration order
 	// would make "round-robin" meaningless from one call to the next.
 	slices.Sort(keys)
-	start := int(e.rr.Add(1) - 1)
+	// Masked to the positive int range before the conversion: the counter is
+	// a free-running uint64 that will wrap after ~1.8e19 selections, and a
+	// bare conversion would go negative on a 64-bit int at that point. The
+	// value is only ever used modulo the slot count, so masking costs
+	// nothing and removes the overflow.
+	start := int((e.rr.Add(1) - 1) & math.MaxInt32)
 	for i := range keys {
 		s := e.slots[keys[(start+i)%len(keys)]].session
 		select {
@@ -855,10 +861,6 @@ func (r *Registry) filter(keep func(fleet.Cluster) bool) []fleet.Cluster {
 	return out
 }
 
-// ConnectedCount reports how many clusters currently hold at least one live
-// tunnel. This counts clusters, not sessions, so a cluster running several
-// pods for its own availability still counts once. Degraded clusters count:
-// some tunnel is up, only its Prometheus is not.
 // LiveCertSerials reports the certificate serial of every session currently
 // attached to this replica, as a set.
 //
@@ -884,6 +886,10 @@ func (r *Registry) LiveCertSerials() map[string]bool {
 	return out
 }
 
+// ConnectedCount reports how many clusters currently hold at least one live
+// tunnel. This counts clusters, not sessions, so a cluster running several
+// pods for its own availability still counts once. Degraded clusters count:
+// some tunnel is up, only its Prometheus is not.
 func (r *Registry) ConnectedCount() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
