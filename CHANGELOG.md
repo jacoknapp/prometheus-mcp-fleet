@@ -12,6 +12,28 @@ lockstep.
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-09-01
+
+### Fixed
+
+- **A data race in the tunnel listener.** It claimed a session slot under its
+  mutex and counted the servicing goroutine separately, after that lock was
+  released. In between, `Shutdown` could mark the listener closed and enter
+  `wg.Wait`, so the accept loop took the WaitGroup from zero to one while a
+  wait was already running -- concurrent `Add` and `Wait`, which Go's contract
+  forbids. The hub runs exactly that shape (`Serve` in a run group, `Shutdown`
+  on context cancel), so it was reachable in production. The closed check, the
+  slot claim and the `Add` are now one critical section.
+- State pruning is jittered by ±20%, so replicas started together do not wake
+  in lockstep every interval. Multi-replica pruning needs no leader and is now
+  covered by a test that drives four replicas at one Secret simultaneously.
+- An unchecked `uint64`→`int` conversion on the session round-robin counter,
+  which goes negative when the counter wraps, and an unchecked `int`→`int32`
+  on the operator-supplied node count, which reported a negative node count
+  rather than saturating.
+- Import grouping across ten files, which had been failing the lint gate and
+  masking every other finding in that job behind it.
+
 ## [0.8.1] - 2026-09-01
 
 ### Added
