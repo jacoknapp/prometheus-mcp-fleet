@@ -108,16 +108,6 @@ Next steps
   3. Watch spokes attach:
        kubectl -n {{ include "prometheus-mcp-hub.namespace" . }} logs deploy/{{ include "prometheus-mcp-hub.fullname" . }} -f
 
-{{- if .Values.autoUpdate.enabled }}
-
-AUTO-UPDATE IS ENABLED ON THE HUB.
-  Schedule: {{ include "prometheus-mcp-hub.autoUpdate.schedule" . }} (cohort {{ .Values.autoUpdate.cohort }}, minimum soak {{ include "prometheus-mcp-hub.autoUpdate.minAgeHours" . }}h)
-  An automatic weekly rollout across a fleet is a fleet-wide outage delivery
-  mechanism, and the hub is the single point of failure for every agent. The job
-  only ever applies a digest whose cosign signature AND SLSA provenance verified,
-  and it rolls back a failed rollout - but consider leaving autoUpdate.enabled=false
-  on the hub and updating it deliberately.
-{{- end }}
 
 {{- if .Values.config.pprofEnabled }}
 

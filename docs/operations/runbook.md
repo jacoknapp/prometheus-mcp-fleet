@@ -25,8 +25,6 @@ than that warrants.
 - [PrometheusMCPHubProxyErrorRatioHigh](#prometheusmcphubproxyerrorratiohigh)
 - [PrometheusMCPHubRestartLoop](#prometheusmcphubrestartloop)
 - [PrometheusMCPHubStateSecretLarge](#prometheusmcphubstatesecretlarge)
-- [PrometheusMCPAutoUpdateFailed](#prometheusmcpautoupdatefailed)
-- [PrometheusMCPAutoUpdateStale](#prometheusmcpautoupdatestale)
 - [PrometheusMCPHubSpokeCertExpiringSoon](#prometheusmcphubspokecertexpiringsoon)
 - [PrometheusMCPSpokeDown](#prometheusmcpspokedown)
 - [PrometheusMCPSpokePrometheusDown](#prometheusmcpspokeprometheusdown)
@@ -257,61 +255,7 @@ serials whose `notAfter` has passed. If you genuinely need more records than
 that, the state backend needs to change — open an issue rather than raising the
 ceiling.
 
-## PrometheusMCPAutoUpdateFailed
 
-The in-cluster updater refused to proceed or rolled back. This alert firing is
-the system **working**: it verifies a cosign signature and SLSA provenance
-before patching, and refuses on failure.
-
-```bash
-kubectl -n <ns> logs job/<release>-autoupdate-<id>
-```
-
-| Message | Meaning | Action |
-|---|---|---|
-| `cosign verify` failed | The image is unsigned or not signed by this repository's identity | **Do not bypass.** Verify what is in the registry |
-| `verify-attestation` failed | No SLSA provenance | Same |
-| `rollout status` timed out, `rollout undo` ran | The new image is bad | The cluster is back on the previous digest. Stop promoting, investigate |
-
-If several clusters report this at once, the release is bad. **Stop approving
-promotions** — that freezes the whole fleet with no code change, and is the
-intended kill switch ([ADR-0011](../adr/0011-auto-update-is-opt-in.md)).
-
-## PrometheusMCPAutoUpdateStale
-
-No auto-update job has **succeeded** within
-`metrics.prometheusRule.thresholds.autoUpdateStaleSeconds` (16 days by default,
-which clears two weekly windows plus a day of slack).
-
-This is the complement of the alert above, and the more dangerous of the two.
-A job that fails is loud. A schedule that stopped is silent: the workload keeps
-running the digest it last received, keeps passing every health check, and
-quietly stops collecting the CVE rebuilds auto-update exists to deliver. Nothing
-is broken, which is exactly why nobody notices.
-
-```bash
-# Is the schedule suspended?
-kubectl -n <ns> get cronjob <release>-autoupdate -o jsonpath='{.spec.suspend}{"\n"}'
-
-# When did it last succeed, and has it ever?
-kubectl -n <ns> get cronjob <release>-autoupdate \
-  -o jsonpath='{.status.lastSuccessfulTime}{"\n"}'
-
-# Did any run get created at all?
-kubectl -n <ns> get jobs -l job-name --sort-by=.metadata.creationTimestamp | tail
-```
-
-| Finding | Meaning | Action |
-|---|---|---|
-| `suspend: true` | Somebody paused it, possibly during an incident and never resumed | Resume it, or turn the alert off deliberately |
-| No jobs created at all | The schedule never fires — a bad cron expression, or a controller that cannot create Jobs | Check `kubectl -n <ns> describe cronjob` events |
-| Jobs exist but none succeeded | Every run failed; `PrometheusMCPAutoUpdateFailed` should also be firing | Work that alert instead — this one is a symptom |
-| `lastSuccessfulTime` is empty on a new install | The first window has not arrived yet | Nothing to do; the alert does not fire in this state, because a CronJob that has never succeeded reports no series |
-
-If auto-update was turned off on purpose, set
-`metrics.prometheusRule.rules.autoUpdateStale: false` rather than leaving an
-alert firing forever — a permanently red alert trains people to ignore the
-board.
 
 ## PrometheusMCPHubSpokeCertExpiringSoon
 

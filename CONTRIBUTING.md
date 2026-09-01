@@ -153,4 +153,3 @@ spoke images, and packages both charts, and its GitHub Release notes are
 grouped from the Conventional Commit history since the last tag (`feat:`,
 `fix:`, breaking `!`, and so on). Publishing does **not** promote — moving the
 `stable` tag is a separate, human-approved workflow, and it is the fleet-wide
-kill switch. See [ADR-0011](docs/adr/0011-auto-update-is-opt-in.md).

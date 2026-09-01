@@ -263,43 +263,8 @@ the alerts compare them directly and never subtract `time()`.
 Alerts shipped: `PrometheusMCPHubDown`, `PrometheusMCPSpokesDisconnected`,
 `PrometheusMCPHubCACertExpiringSoon`, `PrometheusMCPHubSpokeCertExpiringSoon`,
 `PrometheusMCPHubProxyErrorRatioHigh`, `PrometheusMCPHubRestartLoop` (needs
-kube-state-metrics) and `PrometheusMCPAutoUpdateFailed` (only when auto-update is on).
+kube-state-metrics).
 
-## Automatic updates
-
-**`autoUpdate.enabled` is `false`, and on the hub it should usually stay that way.**
-
-Say the quiet part out loud: an automatic weekly rollout to a fleet of production clusters
-is a fleet-wide outage delivery mechanism. One bad image, and every cluster applies it
-unattended, on a schedule, while nobody is watching. The hub makes that worse, because it
-is the single point of failure for every agent's access to every cluster.
-
-That is exactly why the path, when you do enable it, is built the way it is:
-
-* **Off by default.** Nothing renders at all while `autoUpdate.enabled` is false.
-* **Digest-pinned.** The job resolves the moving `autoUpdate.channelTag` to a digest and
-  patches the workload to `repo@sha256:...`. A tag is never written into the pod spec, so
-  the running workload cannot move underneath you between reconciliations.
-* **Signature- and provenance-verified.** Both `cosign verify` and
-  `cosign verify-attestation --type slsaprovenance` must pass, against a pinned OIDC issuer
-  and a narrow `--certificate-identity-regexp`. `set -e` means either failure aborts the
-  job before anything is patched. The chart refuses to render a `.*` identity regexp.
-* **Staggered.** With no `autoUpdate.schedule`, the schedule is derived from
-  `adler32(release/namespace)`: minute `h%60`, hour `2 + h%4`, weekday `(h + cohortShift)%7`.
-  A hundred clusters therefore spread across a whole week instead of pulling one new digest
-  in the same minute. Set `autoUpdate.identity` when many clusters share a release name.
-* **Cohorted.** `canary` accepts a promotion immediately, `early` after 72h, `stable` after
-  7 days, and the cohort also shifts the weekday so canaries always move first. An
-  unparseable image timestamp fails closed.
-* **Rolled back.** On a failed `kubectl rollout status` the job runs `kubectl rollout undo`
-  and exits non-zero, which raises `PrometheusMCPAutoUpdateFailed`.
-* **Scoped.** Its `Role` is namespaced and restricted by `resourceNames` to exactly the one
-  Deployment this release owns. `list`/`watch` are namespace-scoped only because a
-  collection request carries no resource name for RBAC to match; they grant no mutation.
-
-`autoUpdate.image` must provide a POSIX shell plus `kubectl`, `cosign`, `crane` and `jq` —
-the hub image is distroless and has none of them. The job aborts with a named error if a
-tool is missing.
 
 ## Bootstrapping with your own CA
 

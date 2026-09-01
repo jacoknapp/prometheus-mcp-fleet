@@ -148,63 +148,6 @@ spec:
               every spoke tunnel and every in-flight agent request.
             runbook_url: {{ $runbook }}prometheusmcphubrestartloop
         {{- end }}
-        {{- if and .Values.autoUpdate.enabled .Values.metrics.prometheusRule.rules.autoUpdateFailed }}
-        - alert: PrometheusMCPAutoUpdateFailed
-          expr: >-
-            kube_job_status_failed{namespace="{{ $ns }}",
-            job_name=~"{{ include "prometheus-mcp-hub.autoUpdateName" . }}-.*"} > 0
-          for: 15m
-          labels:
-            severity: warning
-            {{- with .Values.metrics.prometheusRule.additionalRuleLabels }}
-            {{- toYaml . | nindent 12 }}
-            {{- end }}
-          annotations:
-            summary: The hub auto-update job failed
-            description: >-
-              {{ printf "{{ $labels.job_name }}" }} failed. Either the cosign signature
-              or the SLSA provenance verification refused the new digest, or the rollout
-              was rolled back. The workload is still on its previous digest; nothing was
-              applied unverified.
-            runbook_url: {{ $runbook }}prometheusmcpautoupdatefailed
-        {{- end }}
-        {{- if and .Values.autoUpdate.enabled .Values.metrics.prometheusRule.rules.autoUpdateStale }}
-        {{/*
-        The complement of AutoUpdateFailed. A failing job is loud; a CronJob
-        that was suspended, lost its RBAC, or never got scheduled is silent, and
-        the workload quietly stops receiving the rebuilds this feature exists to
-        deliver. Alerting on the last SUCCESS rather than on failures is what
-        catches "nothing has run at all".
-
-        kube_cronjob_status_last_successful_time is a unix timestamp, so the
-        expression is an age. A CronJob that has never succeeded reports no
-        series at all rather than zero, which is why this does not fire on a
-        fresh install before the first window -- deliberately, since alerting
-        immediately after install would be noise for a week.
-        */}}
-        - alert: PrometheusMCPAutoUpdateStale
-          expr: >-
-            time() - max(kube_cronjob_status_last_successful_time{namespace="{{ $ns }}",
-            cronjob="{{ include "prometheus-mcp-hub.autoUpdateName" . }}"})
-            > {{ .Values.metrics.prometheusRule.thresholds.autoUpdateStaleSeconds }}
-          for: 1h
-          labels:
-            severity: warning
-            {{- with .Values.metrics.prometheusRule.additionalRuleLabels }}
-            {{- toYaml . | nindent 12 }}
-            {{- end }}
-          annotations:
-            summary: The hub auto-update has not run successfully in too long
-            description: >-
-              No auto-update job has succeeded for
-              {{ printf "{{ $value | humanizeDuration }}" }}. The workload is
-              still running whatever digest it last received, and is no longer
-              picking up rebuilt images, so any CVE fixed since then is
-              unapplied. Check whether the CronJob is suspended, whether its
-              ServiceAccount still has patch on the Deployment, and whether the
-              schedule fires at all.
-            runbook_url: {{ $runbook }}prometheusmcpautoupdatestale
-        {{- end }}
     {{- with .Values.metrics.prometheusRule.additionalGroups }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

@@ -3,10 +3,11 @@
 #
 # THE FLEET-WIDE KILL SWITCH.
 #
-# ~100 production clusters follow the `stable` OCI tag (directly, or through
-# the chart's opt-in auto-update CronJob, which resolves `stable` to a digest
-# and cosign-verifies it before patching anything). Moving `stable` is the only
-# action in this repository that can reach all of them. Therefore:
+# ~100 production clusters follow the `stable` OCI tag through whatever delivery
+# mechanism their operator runs. Nothing in a cluster acts on it automatically —
+# the in-cluster updater was removed — but moving `stable` is still the one
+# action in this repository that changes what every one of them resolves to.
+# Therefore:
 #
 #   * `release.yml` publishes but never promotes.
 #   * `weekly-rebuild.yml` publishes but never promotes.

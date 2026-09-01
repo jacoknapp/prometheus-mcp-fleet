@@ -254,43 +254,7 @@ the alerts compare them directly and never subtract `time()`.
 Alerts shipped: `PrometheusMCPHubDown`, `PrometheusMCPSpokesDisconnected`,
 `PrometheusMCPHubCACertExpiringSoon`, `PrometheusMCPHubSpokeCertExpiringSoon`,
 `PrometheusMCPHubProxyErrorRatioHigh`, `PrometheusMCPHubRestartLoop` (needs
-kube-state-metrics) and `PrometheusMCPAutoUpdateFailed` (only when auto-update is on).
-
-## Automatic updates
-
-**`autoUpdate.enabled` is `false`, and on the hub it should usually stay that way.**
-
-Say the quiet part out loud: an automatic weekly rollout to a fleet of production clusters
-is a fleet-wide outage delivery mechanism. One bad image, and every cluster applies it
-unattended, on a schedule, while nobody is watching. The hub makes that worse, because it
-is the single point of failure for every agent's access to every cluster.
-
-That is exactly why the path, when you do enable it, is built the way it is:
-
-* **Off by default.** Nothing renders at all while `autoUpdate.enabled` is false.
-* **Digest-pinned.** The job resolves the moving `autoUpdate.channelTag` to a digest and
-  patches the workload to `repo@sha256:...`. A tag is never written into the pod spec, so
-  the running workload cannot move underneath you between reconciliations.
-* **Signature- and provenance-verified.** Both `cosign verify` and
-  `cosign verify-attestation --type slsaprovenance` must pass, against a pinned OIDC issuer
-  and a narrow `--certificate-identity-regexp`. `set -e` means either failure aborts the
-  job before anything is patched. The chart refuses to render a `.*` identity regexp.
-* **Staggered.** With no `autoUpdate.schedule`, the schedule is derived from
-  `adler32(release/namespace)`: minute `h%60`, hour `2 + h%4`, weekday `(h + cohortShift)%7`.
-  A hundred clusters therefore spread across a whole week instead of pulling one new digest
-  in the same minute. Set `autoUpdate.identity` when many clusters share a release name.
-* **Cohorted.** `canary` accepts a promotion immediately, `early` after 72h, `stable` after
-  7 days, and the cohort also shifts the weekday so canaries always move first. An
-  unparseable image timestamp fails closed.
-* **Rolled back.** On a failed `kubectl rollout status` the job runs `kubectl rollout undo`
-  and exits non-zero, which raises `PrometheusMCPAutoUpdateFailed`.
-* **Scoped.** Its `Role` is namespaced and restricted by `resourceNames` to exactly the one
-  Deployment this release owns. `list`/`watch` are namespace-scoped only because a
-  collection request carries no resource name for RBAC to match; they grant no mutation.
-
-`autoUpdate.image` must provide a POSIX shell plus `kubectl`, `cosign`, `crane` and `jq` —
-the hub image is distroless and has none of them. The job aborts with a named error if a
-tool is missing.
+kube-state-metrics).
 
 ## Bootstrapping with your own CA
 
@@ -327,38 +291,6 @@ Kubernetes: `>=1.28.0-0`
 | adminToken.key | string | `"admin-token"` | Key inside `adminToken.existingSecret` holding the token. The default makes the mounted file `/var/run/pmf/admin-token`, which is the path the documentation passes to `--admin-token-file`. |
 | adminToken.mountPath | string | `"/var/run/pmf"` | Directory the Secret is mounted at. The file is `<mountPath>/<key>`, which is what `--admin-token-file` should point at. |
 | affinity | object | `{}` | `spec.template.spec.affinity`. |
-| autoUpdate.activeDeadlineSeconds | int | `900` | `activeDeadlineSeconds` of the update Job. |
-| autoUpdate.backoffLimit | int | `0` | `backoffLimit` of the update Job. 0 — a failed verified rollout must not be retried blindly. |
-| autoUpdate.certificateIdentityRegexp | string | `"^https://github\\.com/jacoknapp/prometheus-mcp-fleet/\\.github/workflows/.+@refs/tags/v.+$"` | Regex the signing certificate's SAN identity must match. Narrow, never `.*`. |
-| autoUpdate.certificateOidcIssuer | string | `"https://token.actions.githubusercontent.com"` | OIDC issuer that must have signed the image. |
-| autoUpdate.channelTag | string | `"stable"` | Moving OCI tag the updater resolves to a digest. It is never written into the pod spec. |
-| autoUpdate.cohort | string | `"stable"` | Release cohort. `canary` accepts a promotion immediately, `early` after 72h, `stable` after 7 days. The cohort also shifts the derived weekday so canaries always move first. |
-| autoUpdate.concurrencyPolicy | string | `"Forbid"` | `spec.concurrencyPolicy`. |
-| autoUpdate.containerSecurityContext | object | `{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"readOnlyRootFilesystem":true}` | Container security context for the update job. |
-| autoUpdate.enabled | bool | `false` | Render a CronJob that resolves `autoUpdate.channelTag` to a digest, verifies the signature and SLSA provenance with cosign, and patches this Deployment to that DIGEST. OFF BY DEFAULT AND DISCOURAGED ON THE HUB. An unattended weekly rollout across a fleet is a fleet-wide outage delivery mechanism, and the hub is the single point of failure for every agent. Read "Automatic updates" in the README before enabling. |
-| autoUpdate.extraEnv | list | `[]` | Extra environment variables for the update job, in raw `EnvVar` form. Proxy settings and registry credential helpers go here. |
-| autoUpdate.failedJobsHistoryLimit | int | `3` | `spec.failedJobsHistoryLimit`. |
-| autoUpdate.identity | string | `""` | Extra string mixed into the stagger hash. Empty means release name plus namespace. Set it to your cluster identity when many clusters share a release name. |
-| autoUpdate.image.digest | string | `""` | Digest of the updater image. Strongly recommended: this image is handed write access to your workload. |
-| autoUpdate.image.pullPolicy | string | `"IfNotPresent"` | Pull policy for the updater image. |
-| autoUpdate.image.registry | string | `"ghcr.io"` | Registry of the updater image. |
-| autoUpdate.image.repository | string | `"jacoknapp/prometheus-mcp-fleet/updater"` | Repository of the updater image. It MUST provide a POSIX shell plus `kubectl`, `cosign`, `crane` and `jq`; the hub and spoke images are distroless and have no shell. The job aborts if a tool is missing. Point this at your own internal image if you will not consume ours. |
-| autoUpdate.image.tag | string | `""` | Tag of the updater image. Empty means `.Chart.AppVersion`. |
-| autoUpdate.nodeSelector | object | `{}` | Node selector for the update job. |
-| autoUpdate.pinned | bool | `false` | Refuse to patch anything. Set alongside an explicit `image.digest` to freeze the workload while keeping the CronJob's verification output. |
-| autoUpdate.podSecurityContext | object | `{"runAsNonRoot":true,"seccompProfile":{"type":"RuntimeDefault"}}` | Pod security context for the update job. Deliberately does not pin a UID, because the updater image is not ours to make assumptions about. |
-| autoUpdate.rekorURL | string | `""` | Rekor transparency log URL. Empty uses cosign's default public instance. |
-| autoUpdate.resources.limits.memory | string | `"512Mi"` | Memory limit for the update job. |
-| autoUpdate.resources.requests.cpu | string | `"50m"` | CPU request for the update job. |
-| autoUpdate.resources.requests.memory | string | `"128Mi"` | Memory request for the update job. |
-| autoUpdate.rolloutTimeout | string | `"5m"` | `kubectl rollout status` timeout. On expiry the job runs `kubectl rollout undo`. |
-| autoUpdate.schedule | string | `""` | Explicit cron schedule. Empty derives one from a hash of the release identity so a fleet spreads across a whole week instead of updating simultaneously. |
-| autoUpdate.scratchSizeLimit | string | `"512Mi"` | `sizeLimit` of the writable scratch emptyDir the updater needs for cosign and crane caches. |
-| autoUpdate.startingDeadlineSeconds | int | `600` | `spec.startingDeadlineSeconds`. |
-| autoUpdate.successfulJobsHistoryLimit | int | `3` | `spec.successfulJobsHistoryLimit`. |
-| autoUpdate.timeZone | string | `""` | IANA time zone for the schedule (Kubernetes >= 1.27). Empty means the kube-controller-manager's zone. |
-| autoUpdate.tolerations | list | `[]` | Tolerations for the update job. |
-| autoUpdate.ttlSecondsAfterFinished | string | `""` | `ttlSecondsAfterFinished` of the update Job. Empty means unset. |
 | bootstrap.caCertKey | string | `""` | Key inside `bootstrap.existingSecret` holding the PEM CA certificate. Empty leaves `PMF_CA_CERT_FILE` unset. Must be set together with `bootstrap.caKeyKey`. |
 | bootstrap.caKeyKey | string | `""` | Key inside `bootstrap.existingSecret` holding the PEM CA private key. Empty leaves `PMF_CA_KEY_FILE` unset. |
 | bootstrap.existingSecret | string | `""` | Name of an existing Secret holding operator-supplied bootstrap material (HMAC pepper and/or CA keypair) to adopt instead of letting the hub self-generate. Mounted read-only; the chart never creates this Secret, so no key material is ever stored in Helm release values. |
@@ -443,8 +375,6 @@ Kubernetes: `>=1.28.0-0`
 | metrics.prometheusRule.enabled | bool | `false` | Render a Prometheus Operator `PrometheusRule`. Requires the `monitoring.coreos.com/v1` CRDs. |
 | metrics.prometheusRule.labels | object | `{}` | Extra labels. Must match your Prometheus' `ruleSelector`. |
 | metrics.prometheusRule.namespace | string | `""` | Namespace for the PrometheusRule. Empty means the release namespace. |
-| metrics.prometheusRule.rules.autoUpdateFailed | bool | `true` | `PrometheusMCPAutoUpdateFailed` — the auto-update CronJob failed. Requires kube-state-metrics. Only rendered when `autoUpdate.enabled` is true. |
-| metrics.prometheusRule.rules.autoUpdateStale | bool | `true` | `PrometheusMCPAutoUpdateStale` — no auto-update job has SUCCEEDED within `thresholds.autoUpdateStaleSeconds`. Requires kube-state-metrics. Only rendered when `autoUpdate.enabled` is true. This is the complement of `autoUpdateFailed`: a job that fails is loud, whereas a CronJob that was suspended, lost its RBAC, or was never scheduled fails silently, and the workload simply stops receiving the CVE rebuilds auto-update exists to deliver. |
 | metrics.prometheusRule.rules.caCertExpiringSoon | bool | `true` | `PrometheusMCPHubCACertExpiringSoon` — `promfleet_hub_ca_cert_expiry_seconds` below `thresholds.caCertExpirySeconds`. |
 | metrics.prometheusRule.rules.hubDown | bool | `true` | `PrometheusMCPHubDown` — no hub instance is being scraped successfully. |
 | metrics.prometheusRule.rules.proxyErrorRatioHigh | bool | `true` | `PrometheusMCPHubProxyErrorRatioHigh` — 5xx ratio of proxied Prometheus requests above `thresholds.proxyErrorRatio`. |
@@ -453,7 +383,6 @@ Kubernetes: `>=1.28.0-0`
 | metrics.prometheusRule.rules.spokesDisconnected | bool | `true` | `PrometheusMCPSpokesDisconnected` — more than `thresholds.spokesDisconnectedRatio` of enrolled spokes have no tunnel. |
 | metrics.prometheusRule.runbookUrlPrefix | string | `"https://github.com/jacoknapp/prometheus-mcp-fleet/blob/main/docs/operations/runbook.md#"` | Runbook URL prefix; the alert name is appended. |
 | metrics.prometheusRule.selector | string | `""` | Label matcher appended to every shipped expression. Empty means `job="<fullname>"`, which is what a default ServiceMonitor produces. |
-| metrics.prometheusRule.thresholds.autoUpdateStaleSeconds | int | `1382400` | Seconds since the last SUCCESSFUL auto-update run above which `PrometheusMCPAutoUpdateStale` fires. 16 days, which clears two weekly runs plus a day of slack, so a single missed window is not an alert but a stopped schedule is. |
 | metrics.prometheusRule.thresholds.caCertExpirySeconds | int | `1209600` | Seconds of remaining CA certificate validity below which `PrometheusMCPHubCACertExpiringSoon` fires. 14 days. `promfleet_hub_ca_cert_expiry_seconds` is seconds REMAINING, not a unix timestamp. |
 | metrics.prometheusRule.thresholds.proxyErrorRatio | float | `0.1` | 5xx ratio of proxied requests above which `PrometheusMCPHubProxyErrorRatioHigh` fires. |
 | metrics.prometheusRule.thresholds.restartsPerHour | int | `3` | Container restarts in one hour above which `PrometheusMCPHubRestartLoop` fires. |

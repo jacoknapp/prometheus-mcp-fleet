@@ -1,7 +1,23 @@
 # 0011. Fleet auto-update is opt-in, verified and staggered
 
-* Status: Accepted
+* Status: **Withdrawn — the feature was removed**
 * Date: 2026-08-29
+* Withdrawn: 2026-08-31
+
+> **This decision no longer describes the software.** The in-cluster updater
+> — the CronJob, its RBAC, its alerts and its values — has been removed from
+> both charts. Nothing in a cluster now updates itself.
+>
+> The record is kept rather than deleted because the reasoning is still the
+> reason: an unattended weekly rollout across a hundred production clusters is
+> a fleet-wide outage delivery mechanism, and the hub is the single point of
+> failure for every agent. Shipping it opt-in and off was one answer to that;
+> not shipping it is a simpler one. Images are still rebuilt weekly, signed and
+> published with provenance, and `stable` still moves only through a
+> human-approved promotion — what is gone is the thing that acted on that
+> automatically, inside the cluster.
+>
+> Anything below describes machinery that no longer exists.
 
 ## Context
 

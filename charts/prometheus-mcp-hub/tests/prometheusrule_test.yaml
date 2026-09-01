@@ -46,46 +46,6 @@ tests:
           path: spec.groups[0].rules[5].expr
           pattern: "pod=~\"RELEASE-NAME-prometheus-mcp-hub-\\[a-z0-9\\]\\+-\\[a-z0-9\\]\\+\""
 
-  - it: omits the auto-update alert while auto-update is off
-    asserts:
-      - lengthEqual:
-          path: spec.groups[0].rules
-          count: 6
-
-  # Two alerts, not one, and they are complements. A failing job is loud;
-  # a CronJob that was suspended or lost its RBAC is silent, and the workload
-  # simply stops receiving rebuilds. Only the second catches that.
-  - it: adds both auto-update alerts once auto-update is on
-    set:
-      autoUpdate:
-        enabled: true
-    asserts:
-      - lengthEqual:
-          path: spec.groups[0].rules
-          count: 8
-      - equal:
-          path: spec.groups[0].rules[6].alert
-          value: PrometheusMCPAutoUpdateFailed
-      - equal:
-          path: spec.groups[0].rules[7].alert
-          value: PrometheusMCPAutoUpdateStale
-
-  - it: drops the staleness alert when it is turned off, keeping the failure alert
-    set:
-      autoUpdate:
-        enabled: true
-      metrics:
-        prometheusRule:
-          rules:
-            autoUpdateStale: false
-    asserts:
-      - lengthEqual:
-          path: spec.groups[0].rules
-          count: 7
-      - equal:
-          path: spec.groups[0].rules[6].alert
-          value: PrometheusMCPAutoUpdateFailed
-
   - it: renders nothing when disabled
     set:
       metrics:

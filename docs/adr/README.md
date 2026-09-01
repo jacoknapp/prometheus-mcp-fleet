@@ -20,7 +20,7 @@ reasoning that turned out to be wrong is often the most useful part.
 | [0008](0008-metric-naming-and-cardinality.md) | Metric naming and cardinality policy | Accepted |
 | [0009](0009-no-client-go.md) | No client-go; a minimal Kubernetes client instead | Accepted |
 | [0010](0010-dependency-budget.md) | A closed dependency budget | Accepted |
-| [0011](0011-auto-update-is-opt-in.md) | Fleet auto-update is opt-in, verified and staggered | Accepted |
+| [0011](0011-auto-update-is-opt-in.md) | Fleet auto-update is opt-in, verified and staggered | **Withdrawn** — feature removed |
 | [0012](0012-token-efficient-tool-output.md) | Tool output is token-efficient by default | Accepted |
 | [0013](0013-no-hub-peer-forwarding.md) | No hub-to-hub forwarding | Accepted |
 | [0014](0014-websocket-tunnel-through-standard-ingress.md) | Tunnel over WebSocket through a standard Ingress | Accepted |

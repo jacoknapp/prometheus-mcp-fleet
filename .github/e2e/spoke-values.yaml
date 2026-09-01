@@ -59,10 +59,6 @@ metrics:
     enabled: false
   prometheusRule:
     enabled: false
-
-autoUpdate:
-  enabled: false
-
 config:
   logLevel: debug
   logFormat: json

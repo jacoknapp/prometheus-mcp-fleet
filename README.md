@@ -283,14 +283,13 @@ Full threat model: [docs/security.md](docs/security.md). Reporting:
 
 ## Operating a fleet
 
-- **Auto-update is off by default and stays that way unless you opt in.** An
-  automatic weekly rollout to 100 production clusters is a fleet-wide outage
-  delivery mechanism. When enabled, the chart's CronJob resolves a digest,
-  verifies its cosign signature *and* SLSA provenance, patches by digest, and
-  rolls back on failure. Schedules are derived from a hash of the cluster
-  identity so 100 clusters spread across a week, and `stable` only moves through
-  a human-approved promotion — which is the fleet-wide kill switch.
-  See [docs/operations/auto-update.md](docs/operations/auto-update.md).
+- **Updating is yours to drive.** The charts do not ship an in-cluster updater.
+  Images are rebuilt weekly against fresh bases and republished, signed and with
+  SLSA provenance, and `stable` moves only through a human-approved promotion —
+  but nothing in the cluster acts on that by itself. Point your existing
+  delivery mechanism at the digest you want. An unattended rollout across a
+  hundred production clusters is a fleet-wide outage delivery mechanism, and the
+  hub is the single point of failure for every agent.
 - **The hub defaults to three replicas behind a single Ingress hostname.**
   Credentials live in a shared Secret, so every replica sees the same keys —
   but a *tunnel* pins a spoke to the replica that accepted it, and there is
@@ -315,7 +314,7 @@ Full threat model: [docs/security.md](docs/security.md). Reporting:
 | [Configuration](docs/configuration.md) | Every environment variable and flag |
 | [Deployment](docs/deployment/) | Quickstart, hub chart, spoke chart, TLS |
 | [Spoke enrollment](docs/spoke-enrollment.md) | Token → CSR → certificate → renewal → revocation |
-| [Operations](docs/operations/) | Runbook, alerts, auto-update, HA, capacity |
+| [Operations](docs/operations/) | Runbook, alerts, HA, capacity |
 | [Troubleshooting](docs/troubleshooting.md) | Symptom → cause → fix |
 | [Development](docs/development.md) | Build, test, lint, codegen, release |
 | [ADRs](docs/adr/) | Why the design is the way it is |

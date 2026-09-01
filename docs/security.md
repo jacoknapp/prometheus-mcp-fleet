@@ -460,5 +460,3 @@ Before pointing an agent at production:
 - [ ] Alert on `promfleet_hub_authn_failures_total`,
       `promfleet_hub_ca_cert_expiry_seconds` and
       `promfleet_hub_state_bytes`.
-- [ ] Decide deliberately about `autoUpdate`. It is off by default for a reason;
-      see [ADR-0011](adr/0011-auto-update-is-opt-in.md).

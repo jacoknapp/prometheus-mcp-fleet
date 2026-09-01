@@ -50,24 +50,6 @@ tests:
           path: spec.groups[0].rules[4].expr
           pattern: "time\\(\\)"
 
-  - it: omits the auto-update alert while auto-update is off
-    asserts:
-      - lengthEqual:
-          path: spec.groups[0].rules
-          count: 7
-
-  - it: adds the auto-update alert once auto-update is on
-    set:
-      autoUpdate:
-        enabled: true
-    asserts:
-      - lengthEqual:
-          path: spec.groups[0].rules
-          count: 8
-      - equal:
-          path: spec.groups[0].rules[7].alert
-          value: PrometheusMCPSpokeAutoUpdateFailed
-
   - it: renders nothing when disabled
     set:
       metrics:

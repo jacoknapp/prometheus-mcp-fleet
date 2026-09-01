@@ -109,18 +109,6 @@ must have it, memory and file never touch the API and must not.
 {{- end -}}
 {{- end -}}
 
-{{- define "prometheus-mcp-spoke.autoUpdate.image" -}}
-{{- $base := .Values.autoUpdate.image.repository -}}
-{{- with .Values.autoUpdate.image.registry -}}
-{{- $base = printf "%s/%s" . $.Values.autoUpdate.image.repository -}}
-{{- end -}}
-{{- if .Values.autoUpdate.image.digest -}}
-{{- printf "%s@%s" $base .Values.autoUpdate.image.digest -}}
-{{- else -}}
-{{- printf "%s:%s" $base (.Values.autoUpdate.image.tag | default .Chart.AppVersion) -}}
-{{- end -}}
-{{- end -}}
-
 {{/* Repository reference without a tag or digest, for `crane digest`. */}}
 {{- define "prometheus-mcp-spoke.imageRepository" -}}
 {{- if .Values.image.registry -}}
@@ -163,14 +151,6 @@ exactly one place.
 {{/* True when an enrollment token reaches the pod at all. */}}
 {{- define "prometheus-mcp-spoke.hasEnrollment" -}}
 {{- if or .Values.enrollment.token .Values.enrollment.existingSecret -}}true{{- end -}}
-{{- end -}}
-
-{{- define "prometheus-mcp-spoke.autoUpdateName" -}}
-{{- printf "%s-autoupdate" (include "prometheus-mcp-spoke.fullname" .) | trunc 52 | trimSuffix "-" -}}
-{{- end -}}
-
-{{- define "prometheus-mcp-spoke.autoUpdate.serviceAccountName" -}}
-{{- include "prometheus-mcp-spoke.autoUpdateName" . -}}
 {{- end -}}
 
 {{/*
@@ -275,39 +255,6 @@ produces for this chart.
 {{- .Values.metrics.prometheusRule.selector -}}
 {{- else -}}
 {{- printf "job=%q" (include "prometheus-mcp-spoke.name" .) -}}
-{{- end -}}
-{{- end -}}
-
-{{/*
-Deterministic stagger. adler32sum over the release identity spreads a fleet of
-100 clusters across a whole week instead of having them all update at 02:00
-Monday. minute = h % 60, hour = 2 + h % 4, weekday = (h + cohortShift) % 7.
-
-Set autoUpdate.identity to cluster.id when every cluster installs under the same
-release name and namespace, or the hash is identical everywhere and the whole
-point is lost.
-*/}}
-{{- define "prometheus-mcp-spoke.autoUpdate.schedule" -}}
-{{- if .Values.autoUpdate.schedule -}}
-{{- .Values.autoUpdate.schedule -}}
-{{- else -}}
-{{- $identity := .Values.autoUpdate.identity | default (printf "%s/%s" .Release.Name (include "prometheus-mcp-spoke.namespace" .)) -}}
-{{- $h := adler32sum $identity | int64 -}}
-{{- $minute := mod $h 60 -}}
-{{- $hour := add 2 (mod $h 4) -}}
-{{- $shift := 0 -}}
-{{- if eq .Values.autoUpdate.cohort "early" -}}{{- $shift = 2 -}}{{- end -}}
-{{- if eq .Values.autoUpdate.cohort "stable" -}}{{- $shift = 4 -}}{{- end -}}
-{{- $weekday := mod (add $h $shift) 7 -}}
-{{- printf "%d %d * * %d" $minute $hour $weekday -}}
-{{- end -}}
-{{- end -}}
-
-{{/* Minimum age of a promotion this cohort will accept, in hours. */}}
-{{- define "prometheus-mcp-spoke.autoUpdate.minAgeHours" -}}
-{{- if eq .Values.autoUpdate.cohort "canary" -}}0
-{{- else if eq .Values.autoUpdate.cohort "early" -}}72
-{{- else -}}168
 {{- end -}}
 {{- end -}}
 
@@ -446,25 +393,6 @@ be publishing that port.
 {{/* ---- tracing ---- */}}
 {{- if and .Values.tracing.enabled (not .Values.tracing.endpoint) -}}
 {{- fail "prometheus-mcp-spoke: tracing.enabled is true but tracing.endpoint is empty." -}}
-{{- end -}}
-
-{{/* ---- auto update ---- */}}
-{{- if .Values.autoUpdate.enabled -}}
-{{- if not (has .Values.autoUpdate.cohort (list "canary" "early" "stable")) -}}
-{{- fail (printf "prometheus-mcp-spoke: autoUpdate.cohort must be canary, early or stable, got %q." .Values.autoUpdate.cohort) -}}
-{{- end -}}
-{{- if not .Values.autoUpdate.certificateIdentityRegexp -}}
-{{- fail "prometheus-mcp-spoke: autoUpdate.certificateIdentityRegexp is empty. An unpinned signer identity makes cosign verification meaningless." -}}
-{{- end -}}
-{{- if eq .Values.autoUpdate.certificateIdentityRegexp ".*" -}}
-{{- fail "prometheus-mcp-spoke: autoUpdate.certificateIdentityRegexp is \".*\", which accepts any signer." -}}
-{{- end -}}
-{{- if not .Values.autoUpdate.certificateOidcIssuer -}}
-{{- fail "prometheus-mcp-spoke: autoUpdate.certificateOidcIssuer is empty." -}}
-{{- end -}}
-{{- if not .Values.autoUpdate.channelTag -}}
-{{- fail "prometheus-mcp-spoke: autoUpdate.channelTag is empty; there is nothing to resolve to a digest." -}}
-{{- end -}}
 {{- end -}}
 
 {{/*

@@ -457,10 +457,6 @@ metrics:
       proxyErrorRatioHigh: true
       # -- `PrometheusMCPHubRestartLoop` — container restarts above `thresholds.restartsPerHour`. Requires kube-state-metrics.
       restartLoop: true
-      # -- `PrometheusMCPAutoUpdateFailed` — the auto-update CronJob failed. Requires kube-state-metrics. Only rendered when `autoUpdate.enabled` is true.
-      autoUpdateFailed: true
-      # -- `PrometheusMCPAutoUpdateStale` — no auto-update job has SUCCEEDED within `thresholds.autoUpdateStaleSeconds`. Requires kube-state-metrics. Only rendered when `autoUpdate.enabled` is true. This is the complement of `autoUpdateFailed`: a job that fails is loud, whereas a CronJob that was suspended, lost its RBAC, or was never scheduled fails silently, and the workload simply stops receiving the CVE rebuilds auto-update exists to deliver.
-      autoUpdateStale: true
     thresholds:
       # -- Fraction of enrolled spokes that may be disconnected before `PrometheusMCPSpokesDisconnected` fires.
       spokesDisconnectedRatio: 0.10
@@ -472,92 +468,8 @@ metrics:
       proxyErrorRatio: 0.10
       # -- Container restarts in one hour above which `PrometheusMCPHubRestartLoop` fires.
       restartsPerHour: 3
-      # -- Seconds since the last SUCCESSFUL auto-update run above which `PrometheusMCPAutoUpdateStale` fires. 16 days, which clears two weekly runs plus a day of slack, so a single missed window is not an alert but a stopped schedule is.
-      autoUpdateStaleSeconds: 1382400
     # -- Extra rule groups appended verbatim to `spec.groups`.
     additionalGroups: []
-
-autoUpdate:
-  # -- Render a CronJob that resolves `autoUpdate.channelTag` to a digest, verifies the signature and SLSA provenance with cosign, and patches this Deployment to that DIGEST.
-  # OFF BY DEFAULT AND DISCOURAGED ON THE HUB. An unattended weekly rollout across a fleet is a
-  # fleet-wide outage delivery mechanism, and the hub is the single point of failure for every
-  # agent. Read "Automatic updates" in the README before enabling.
-  enabled: false
-  # -- Explicit cron schedule. Empty derives one from a hash of the release identity so a fleet spreads across a whole week instead of updating simultaneously.
-  schedule: ""
-  # -- IANA time zone for the schedule (Kubernetes >= 1.27). Empty means the kube-controller-manager's zone.
-  timeZone: ""
-  # -- Release cohort. `canary` accepts a promotion immediately, `early` after 72h, `stable` after 7 days. The cohort also shifts the derived weekday so canaries always move first.
-  cohort: stable
-  # -- Moving OCI tag the updater resolves to a digest. It is never written into the pod spec.
-  channelTag: stable
-  # -- Refuse to patch anything. Set alongside an explicit `image.digest` to freeze the workload while keeping the CronJob's verification output.
-  pinned: false
-  # -- Extra string mixed into the stagger hash. Empty means release name plus namespace. Set it to your cluster identity when many clusters share a release name.
-  identity: ""
-  # -- `spec.concurrencyPolicy`.
-  concurrencyPolicy: Forbid
-  # -- `spec.startingDeadlineSeconds`.
-  startingDeadlineSeconds: 600
-  # -- `spec.successfulJobsHistoryLimit`.
-  successfulJobsHistoryLimit: 3
-  # -- `spec.failedJobsHistoryLimit`.
-  failedJobsHistoryLimit: 3
-  # -- `backoffLimit` of the update Job. 0 — a failed verified rollout must not be retried blindly.
-  backoffLimit: 0
-  # -- `activeDeadlineSeconds` of the update Job.
-  activeDeadlineSeconds: 900
-  # -- `ttlSecondsAfterFinished` of the update Job. Empty means unset.
-  ttlSecondsAfterFinished: ""
-  image:
-    # -- Registry of the updater image.
-    registry: ghcr.io
-    # -- Repository of the updater image. It MUST provide a POSIX shell plus `kubectl`, `cosign`, `crane` and `jq`; the hub and spoke images are distroless and have no shell. The job aborts if a tool is missing. Point this at your own internal image if you will not consume ours.
-    repository: jacoknapp/prometheus-mcp-fleet/updater
-    # -- Tag of the updater image. Empty means `.Chart.AppVersion`.
-    tag: ""
-    # -- Digest of the updater image. Strongly recommended: this image is handed write access to your workload.
-    digest: ""
-    # -- Pull policy for the updater image.
-    pullPolicy: IfNotPresent
-  # -- OIDC issuer that must have signed the image.
-  certificateOidcIssuer: https://token.actions.githubusercontent.com
-  # -- Regex the signing certificate's SAN identity must match. Narrow, never `.*`.
-  certificateIdentityRegexp: "^https://github\\.com/jacoknapp/prometheus-mcp-fleet/\\.github/workflows/.+@refs/tags/v.+$"
-  # -- Rekor transparency log URL. Empty uses cosign's default public instance.
-  rekorURL: ""
-  # -- `kubectl rollout status` timeout. On expiry the job runs `kubectl rollout undo`.
-  rolloutTimeout: 5m
-  resources:
-    requests:
-      # -- CPU request for the update job.
-      cpu: 50m
-      # -- Memory request for the update job.
-      memory: 128Mi
-    limits:
-      # -- Memory limit for the update job.
-      memory: 512Mi
-  # -- Pod security context for the update job. Deliberately does not pin a UID, because the updater image is not ours to make assumptions about.
-  podSecurityContext:
-    runAsNonRoot: true
-    seccompProfile:
-      type: RuntimeDefault
-  # -- Container security context for the update job.
-  containerSecurityContext:
-    allowPrivilegeEscalation: false
-    readOnlyRootFilesystem: true
-    capabilities:
-      drop:
-        - ALL
-  # -- `sizeLimit` of the writable scratch emptyDir the updater needs for cosign and crane caches.
-  scratchSizeLimit: 512Mi
-  # -- Node selector for the update job.
-  nodeSelector: {}
-  # -- Tolerations for the update job.
-  tolerations: []
-  # -- Extra environment variables for the update job, in raw `EnvVar` form. Proxy settings and registry credential helpers go here.
-  extraEnv: []
-
 tests:
   image:
     # -- Registry for the `helm test` image.

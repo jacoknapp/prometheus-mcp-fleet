@@ -215,37 +215,6 @@ timestamp. Renewal happens automatically at half the certificate's life, so
 `PrometheusMCPSpokeCertExpiringSoon` firing means renewal is failing, not that renewal is
 due.
 
-## Automatic updates
-
-**`autoUpdate.enabled` is `false` by default.**
-
-An automatic weekly rollout to 100 production clusters is a fleet-wide outage delivery
-mechanism. One bad image, and every cluster applies it unattended, on a schedule, while
-nobody is watching. That is the whole reason this path is opt-in and built the way it is:
-
-* **Off by default.** Nothing renders at all while `autoUpdate.enabled` is false.
-* **Digest-pinned.** The job resolves `autoUpdate.channelTag` to a digest and patches the
-  workload to `repo@sha256:...`. A tag is never written into the pod spec.
-* **Signature- and provenance-verified.** Both `cosign verify` and
-  `cosign verify-attestation --type slsaprovenance` must pass against a pinned OIDC issuer
-  and a narrow identity regexp; either failure aborts before anything is patched. A `.*`
-  regexp is refused at render time.
-* **Staggered.** With no explicit `autoUpdate.schedule` the slot is derived from
-  `adler32(release/namespace)` — minute `h%60`, hour `2 + h%4`, weekday
-  `(h + cohortShift)%7` — so the fleet spreads across a whole week.
-  **If every cluster installs the same release name into the same namespace, that hash is
-  identical everywhere and the stagger does nothing. Set `autoUpdate.identity` to
-  `cluster.id`.** `NOTES.txt` warns about this at install time.
-* **Cohorted.** `canary` takes a promotion immediately, `early` after 72h, `stable` after 7
-  days; the cohort also shifts the weekday so canaries move first. An unparseable image
-  timestamp fails closed.
-* **Rolled back.** A failed `kubectl rollout status` triggers `kubectl rollout undo` and a
-  non-zero exit, raising `PrometheusMCPSpokeAutoUpdateFailed`.
-* **Scoped.** Its `Role` is namespaced and restricted by `resourceNames` to exactly the one
-  Deployment this release owns.
-
-`autoUpdate.image` must provide a POSIX shell plus `kubectl`, `cosign`, `crane` and `jq` —
-the spoke image is distroless and has none of them.
 
 ## When the spoke cannot reach the hub
 

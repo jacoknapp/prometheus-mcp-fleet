@@ -94,19 +94,6 @@ YAML key -- which parses under Helm and is rejected by a strict decoder. Call as
 {{- end -}}
 {{- end -}}
 
-{{- define "prometheus-mcp-hub.autoUpdate.image" -}}
-{{- $registry := .Values.autoUpdate.image.registry | default "" -}}
-{{- $base := .Values.autoUpdate.image.repository -}}
-{{- if $registry -}}
-{{- $base = printf "%s/%s" $registry .Values.autoUpdate.image.repository -}}
-{{- end -}}
-{{- if .Values.autoUpdate.image.digest -}}
-{{- printf "%s@%s" $base .Values.autoUpdate.image.digest -}}
-{{- else -}}
-{{- printf "%s:%s" $base (.Values.autoUpdate.image.tag | default .Chart.AppVersion) -}}
-{{- end -}}
-{{- end -}}
-
 {{/* Repository reference without a tag or digest, for `crane digest`. */}}
 {{- define "prometheus-mcp-hub.imageRepository" -}}
 {{- if .Values.image.registry -}}
@@ -150,10 +137,6 @@ that is the point of the state and CA Secrets.
 {{- .Values.config.dataDir -}}
 {{- end -}}
 
-{{- define "prometheus-mcp-hub.autoUpdate.serviceAccountName" -}}
-{{- include "prometheus-mcp-hub.autoUpdateName" . -}}
-{{- end -}}
-
 {{/*
 Label matcher appended to every shipped alert expression. Empty resolves to
 job="<name>", which is what a ServiceMonitor with jobLabel: app.kubernetes.io/name
@@ -171,42 +154,9 @@ produces for this chart.
 {{- printf "%s-config" (include "prometheus-mcp-hub.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
-{{- define "prometheus-mcp-hub.autoUpdateName" -}}
-{{- printf "%s-autoupdate" (include "prometheus-mcp-hub.fullname" .) | trunc 52 | trimSuffix "-" -}}
-{{- end -}}
-
 {{/* PodDisruptionBudget is force-disabled below two replicas. */}}
 {{- define "prometheus-mcp-hub.pdbEnabled" -}}
 {{- if and .Values.podDisruptionBudget.enabled (ge (int .Values.replicaCount) 2) -}}true{{- end -}}
-{{- end -}}
-
-{{/*
-Deterministic stagger. adler32sum over the release identity spreads a fleet of
-clusters across a whole week instead of having them all update at 02:00 Monday.
-minute = h % 60, hour = 2 + h % 4, weekday = (h + cohortShift) % 7.
-*/}}
-{{- define "prometheus-mcp-hub.autoUpdate.schedule" -}}
-{{- if .Values.autoUpdate.schedule -}}
-{{- .Values.autoUpdate.schedule -}}
-{{- else -}}
-{{- $identity := .Values.autoUpdate.identity | default (printf "%s/%s" .Release.Name (include "prometheus-mcp-hub.namespace" .)) -}}
-{{- $h := adler32sum $identity | int64 -}}
-{{- $minute := mod $h 60 -}}
-{{- $hour := add 2 (mod $h 4) -}}
-{{- $shift := 0 -}}
-{{- if eq .Values.autoUpdate.cohort "early" -}}{{- $shift = 2 -}}{{- end -}}
-{{- if eq .Values.autoUpdate.cohort "stable" -}}{{- $shift = 4 -}}{{- end -}}
-{{- $weekday := mod (add $h $shift) 7 -}}
-{{- printf "%d %d * * %d" $minute $hour $weekday -}}
-{{- end -}}
-{{- end -}}
-
-{{/* Minimum age of the `stable` promotion this cohort will accept, in hours. */}}
-{{- define "prometheus-mcp-hub.autoUpdate.minAgeHours" -}}
-{{- if eq .Values.autoUpdate.cohort "canary" -}}0
-{{- else if eq .Values.autoUpdate.cohort "early" -}}72
-{{- else -}}168
-{{- end -}}
 {{- end -}}
 
 {{/*
@@ -373,25 +323,6 @@ otherwise install cleanly and be wrong in production.
 {{- if .Values.tracing.enabled -}}
 {{- if not .Values.tracing.endpoint -}}
 {{- fail "prometheus-mcp-hub: tracing.enabled is true but tracing.endpoint is empty." -}}
-{{- end -}}
-{{- end -}}
-
-{{/* ---- auto update ---- */}}
-{{- if .Values.autoUpdate.enabled -}}
-{{- if not (has .Values.autoUpdate.cohort (list "canary" "early" "stable")) -}}
-{{- fail (printf "prometheus-mcp-hub: autoUpdate.cohort must be canary, early or stable, got %q." .Values.autoUpdate.cohort) -}}
-{{- end -}}
-{{- if not .Values.autoUpdate.certificateIdentityRegexp -}}
-{{- fail "prometheus-mcp-hub: autoUpdate.certificateIdentityRegexp is empty. An unpinned signer identity makes cosign verification meaningless." -}}
-{{- end -}}
-{{- if eq .Values.autoUpdate.certificateIdentityRegexp ".*" -}}
-{{- fail "prometheus-mcp-hub: autoUpdate.certificateIdentityRegexp is \".*\", which accepts any signer." -}}
-{{- end -}}
-{{- if not .Values.autoUpdate.certificateOidcIssuer -}}
-{{- fail "prometheus-mcp-hub: autoUpdate.certificateOidcIssuer is empty." -}}
-{{- end -}}
-{{- if not .Values.autoUpdate.channelTag -}}
-{{- fail "prometheus-mcp-hub: autoUpdate.channelTag is empty; there is nothing to resolve to a digest." -}}
 {{- end -}}
 {{- end -}}
 

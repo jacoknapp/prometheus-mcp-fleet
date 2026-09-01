@@ -215,9 +215,6 @@ Ask it *"which prod clusters have firing alerts?"* It should call
 - [ ] Install the shipped `PrometheusRule`, or copy its alerts.
 - [ ] Add the token regex `pmf_(adm|agt|enr)_[0-9A-Za-z]{53}_[0-9A-Za-z]{6}` to
       your secret scanner and log scrubber.
-- [ ] Decide deliberately about
-      [auto-update](../operations/auto-update.md). It is off by default for a
-      reason.
 - [ ] Read the [hardening checklist](../security.md#hardening-checklist).
 
 ## Onboarding at scale

@@ -171,26 +171,6 @@ spec:
               between clusters sees an out-of-date picture of {{ $cluster }}.
             runbook_url: {{ $runbook }}prometheusmcpspokefactsrefreshfailing
         {{- end }}
-        {{- if and .Values.autoUpdate.enabled .Values.metrics.prometheusRule.rules.autoUpdateFailed }}
-        - alert: PrometheusMCPSpokeAutoUpdateFailed
-          expr: >-
-            kube_job_status_failed{namespace="{{ $ns }}",
-            job_name=~"{{ include "prometheus-mcp-spoke.autoUpdateName" . }}-.*"} > 0
-          for: 15m
-          labels:
-            severity: warning
-            {{- with .Values.metrics.prometheusRule.additionalRuleLabels }}
-            {{- toYaml . | nindent 12 }}
-            {{- end }}
-          annotations:
-            summary: The spoke auto-update job failed in cluster {{ $cluster }}
-            description: >-
-              {{ printf "{{ $labels.job_name }}" }} failed. Either the cosign signature
-              or the SLSA provenance verification refused the new digest, or the rollout
-              was rolled back. The workload is still on its previous digest; nothing was
-              applied unverified.
-            runbook_url: {{ $runbook }}prometheusmcpspokeautoupdatefailed
-        {{- end }}
     {{- with .Values.metrics.prometheusRule.additionalGroups }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

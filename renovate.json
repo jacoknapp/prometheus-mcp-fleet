@@ -137,7 +137,7 @@
       "enabled": false
     },
     {
-      "description": "Third-party images referenced from chart values (helm-test busybox, the auto-update kubectl image) are pinned by digest.",
+      "description": "Third-party images referenced from chart values (helm-test busybox) are pinned by digest.",
       "groupName": "chart image references",
       "matchManagers": [
         "helm-values"
