@@ -37,6 +37,7 @@ import (
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/authn"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/ca"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/config"
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/fleet"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/httpx"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/hubapi"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/kube"
@@ -305,6 +306,9 @@ func (h *hub) buildRequestPath() error {
 		Logger:            h.logger,
 		Metrics:           h.metrics,
 		FactsPollInterval: h.cfg.FactsPollInterval,
+		// Labels an operator put on the enrollment token outrank anything the
+		// spoke says about itself; see registry.Options.AuthoritativeLabels.
+		AuthoritativeLabels: h.enrollmentLabels,
 	})
 	if err != nil {
 		return fmt.Errorf("configure the registry: %w", err)
@@ -509,4 +513,51 @@ func (h *hub) shutdown(srv *httpx.Server, name string) {
 	if err := srv.Shutdown(ctx); err != nil {
 		h.logger.Warn("listener did not shut down cleanly", "listener", name, "error", err)
 	}
+}
+
+// enrollmentLabels returns the labels an operator attached to the enrollment
+// token that admitted a cluster.
+//
+// Agent key scopes select clusters by label, so these decide which credentials
+// can reach a cluster. Taking them from the token rather than from the spoke's
+// own report is what stops a compromised spoke relabelling itself into a scope
+// it was never granted.
+//
+// A miss returns nil, which leaves the spoke's own labels in place: a cluster
+// enrolled before labels were recorded, or by a token since deleted, is
+// described by what it reports and simply gains no operator-set selectors.
+// enrollmentLabelTimeout bounds the store read behind a label lookup.
+const enrollmentLabelTimeout = 5 * time.Second
+
+func (h *hub) enrollmentLabels(clusterID string) map[string]string {
+	if h.store == nil || clusterID == "" {
+		return nil
+	}
+	// Bounded: this runs on session attach and on every facts refresh, not per
+	// request, and the store is a read-through cache over one Secret.
+	ctx, cancel := context.WithTimeout(context.Background(), enrollmentLabelTimeout)
+	defer cancel()
+
+	keys, err := h.store.ListKeys(ctx, fleet.ClassEnrollment)
+	if err != nil {
+		h.logger.WarnContext(ctx, "could not read enrollment labels; using the spoke's own",
+			"cluster", clusterID, "error", err)
+		return nil
+	}
+	var newest *fleet.Key
+	for _, k := range keys {
+		if k.Enrollment == nil || k.Enrollment.ClusterID != clusterID {
+			continue
+		}
+		// Several tokens may exist for one cluster over its lifetime -- a
+		// rebuild mints a new one. The most recently created is the current
+		// operator intent.
+		if newest == nil || k.CreatedAt.After(newest.CreatedAt) {
+			newest = k
+		}
+	}
+	if newest == nil {
+		return nil
+	}
+	return newest.Enrollment.Labels
 }

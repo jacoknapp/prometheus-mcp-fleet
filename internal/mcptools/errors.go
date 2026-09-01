@@ -50,6 +50,11 @@ const (
 	// CodeResponseTooLarge reports a response truncated at the hub's byte
 	// budget before it could be parsed.
 	CodeResponseTooLarge = "RESPONSE_TOO_LARGE"
+	// CodeRateLimited reports that this agent key has exceeded the call rate its
+	// scope allows. It is distinct from CodeHubBusy: busy is the hub being out
+	// of capacity and is nobody's fault, whereas this names the caller's own
+	// limit and is fixed by slowing down or by widening the scope.
+	CodeRateLimited = "RATE_LIMITED"
 	// CodeHubBusy reports an exhausted concurrency or memory budget.
 	CodeHubBusy = "HUB_BUSY"
 	// CodeUpstreamError reports any other failure of the cluster's Prometheus

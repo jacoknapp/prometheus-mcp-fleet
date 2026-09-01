@@ -39,6 +39,17 @@ type Options struct {
 	// Logger receives session lifecycle and identity-mismatch events. Nil
 	// discards them.
 	Logger *slog.Logger
+	// AuthoritativeLabels returns labels an OPERATOR set for a cluster, which
+	// override anything the spoke reports about itself. Nil means the spoke's
+	// own labels stand alone.
+	//
+	// This is a trust boundary, not a convenience. Agent key scopes select
+	// clusters by label, so a self-reported label is a cluster asking to be
+	// visible to whichever credentials match it -- a compromised spoke could
+	// relabel itself `env: prod` and appear to every key scoped at production.
+	// Labels attached to the enrollment token were chosen by the operator who
+	// minted it, so they are the ones that decide reachability.
+	AuthoritativeLabels func(clusterID string) map[string]string
 	// Metrics receives connection and certificate gauges. Nil uses
 	// [NopMetrics].
 	Metrics Metrics
@@ -114,10 +125,11 @@ type Registry struct {
 	metrics Metrics
 	now     func() time.Time
 
-	pollInterval  time.Duration
-	pollTimeout   time.Duration
-	grace         time.Duration
-	sweepInterval time.Duration
+	pollInterval        time.Duration
+	pollTimeout         time.Duration
+	grace               time.Duration
+	authoritativeLabels func(string) map[string]string
+	sweepInterval       time.Duration
 
 	mu      sync.RWMutex
 	entries map[string]*entry
@@ -149,14 +161,15 @@ func New(opts Options) (*Registry, error) {
 		return nil, fmt.Errorf("registry: sweep interval %s is negative", opts.SweepInterval)
 	}
 	r := &Registry{
-		log:          opts.Logger,
-		metrics:      opts.Metrics,
-		now:          opts.Clock,
-		pollInterval: opts.FactsPollInterval,
-		pollTimeout:  opts.FactsPollTimeout,
-		grace:        opts.DisconnectGrace,
-		entries:      make(map[string]*entry),
-		done:         make(chan struct{}),
+		log:                 opts.Logger,
+		metrics:             opts.Metrics,
+		now:                 opts.Clock,
+		pollInterval:        opts.FactsPollInterval,
+		pollTimeout:         opts.FactsPollTimeout,
+		grace:               opts.DisconnectGrace,
+		authoritativeLabels: opts.AuthoritativeLabels,
+		entries:             make(map[string]*entry),
+		done:                make(chan struct{}),
 	}
 	if r.log == nil {
 		r.log = slog.New(slog.DiscardHandler)
@@ -348,6 +361,7 @@ func (r *Registry) clusterFrom(id string, ident tunnel.Identity, reported fleet.
 	c := copyCluster(reported)
 	c.ID = id
 	c.CertNotAfter = ident.CertNotAfter
+	c.Labels = r.mergeLabels(id, c.Labels)
 	now := r.now()
 	c.LastSeen = now
 	c.ConnectedSince = now
@@ -816,4 +830,29 @@ func copyCluster(c fleet.Cluster) fleet.Cluster {
 	c.Prometheus.Namespaces = slices.Clone(c.Prometheus.Namespaces)
 	c.Prometheus.MetricPrefixes = slices.Clone(c.Prometheus.MetricPrefixes)
 	return c
+}
+
+// mergeLabels folds operator-set labels over whatever the spoke reported.
+//
+// The operator's win on collision. A spoke's own labels are useful description
+// -- it knows its Prometheus version and its region -- but they are also a
+// request to be selected by any agent key scoped to them, and the spoke is the
+// party a compromise would control. Labels set on the enrollment token were
+// chosen by whoever decided this cluster should exist.
+func (r *Registry) mergeLabels(clusterID string, reported map[string]string) map[string]string {
+	if r.authoritativeLabels == nil {
+		return reported
+	}
+	owned := r.authoritativeLabels(clusterID)
+	if len(owned) == 0 {
+		return reported
+	}
+	merged := make(map[string]string, len(reported)+len(owned))
+	for k, v := range reported {
+		merged[k] = v
+	}
+	for k, v := range owned {
+		merged[k] = v
+	}
+	return merged
 }

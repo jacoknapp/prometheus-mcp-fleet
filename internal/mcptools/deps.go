@@ -132,6 +132,8 @@ type Tools struct {
 	metrics  Metrics
 	now      func() time.Time
 
+	rate *rateLimiter
+
 	tokenCeiling      int
 	maxLookback       time.Duration
 	fanoutConcurrency int
@@ -164,6 +166,9 @@ func New(opts Options) (*Tools, error) {
 	if t.now == nil {
 		t.now = time.Now
 	}
+	// After t.now is settled, so the limiter shares the injected clock and a
+	// test can advance both together.
+	t.rate = newRateLimiter(t.now)
 	if t.tokenCeiling == 0 {
 		t.tokenCeiling = render.DefaultTokenCeiling
 	}

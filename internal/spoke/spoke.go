@@ -356,9 +356,32 @@ func (s *spoke) establishIdentity(ctx context.Context) error {
 			break
 		}
 		if id.Expired(s.now()) {
-			s.logger.WarnContext(ctx, "stored certificate has expired, re-enrolling",
+			// Expired is not the end of the road. The hub renews an expired
+			// certificate inside its grace window given proof this spoke still
+			// holds the private key, so try that before falling back to
+			// enrollment -- which needs a token this pod very likely does not
+			// have, because the one it enrolled with was consumed months ago
+			// and, in a GitOps rollout, nobody is standing by to mint another.
+			//
+			// Discarding it here made the grace window reachable only by a pod
+			// that had stayed up, which is the case least likely to need it: a
+			// cluster offline long enough to expire its certificate is a
+			// cluster whose pod has almost certainly restarted too.
+			s.logger.WarnContext(ctx, "stored certificate has expired; attempting renewal within the hub's grace window",
 				"not_after", id.Leaf.NotAfter.Format(time.RFC3339))
-			break
+			renewed, rerr := s.enroller.renew(ctx, id)
+			if rerr != nil {
+				s.logger.WarnContext(ctx, "renewal of the expired certificate was refused, re-enrolling",
+					"error", rerr)
+				break
+			}
+			if serr := s.store.Save(ctx, renewed.KeyPEM, renewed.CertPEM, renewed.CABundle); serr != nil {
+				s.logger.ErrorContext(ctx, "could not persist the renewed identity", "error", serr)
+			}
+			s.setIdentity(renewed)
+			s.logger.InfoContext(ctx, "recovered an expired certificate by renewal; no enrollment token was needed",
+				"not_after", renewed.Leaf.NotAfter.Format(time.RFC3339))
+			return nil
 		}
 		s.setIdentity(id)
 		s.logger.InfoContext(ctx, "loaded stored identity",

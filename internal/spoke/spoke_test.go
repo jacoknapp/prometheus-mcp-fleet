@@ -281,14 +281,25 @@ func TestEstablishIdentityDiscardsAnUnusableStoredIdentity(t *testing.T) {
 		wantLog string
 	}{
 		{
-			name: "an expired certificate",
+			// An expired certificate whose RENEWAL is refused. Expiry alone no
+			// longer forces enrollment: the hub renews an expired certificate
+			// inside its grace window, and a spoke that has been offline long
+			// enough to expire has almost certainly restarted, so falling
+			// straight to a token it no longer has was how that recovery path
+			// became unreachable. Renewal is tried first; only its refusal
+			// lands here. See TestExpiredCertificateRecoversByRenewalAtStartup
+			// for the path where it succeeds.
+			name: "an expired certificate the hub will not renew",
 			spoil: func(t *testing.T, f *establishFixture) {
 				t.Helper()
 				expired := f.hub.ca.identityOver(t, "prod-eu-1",
 					f.clock.Now().Add(-48*time.Hour), f.clock.Now().Add(-time.Second))
 				f.store.key, f.store.cert, f.store.ca = expired.KeyPEM, expired.CertPEM, expired.CABundle
+				f.hub.mu.Lock()
+				f.hub.renewStatus = http.StatusForbidden
+				f.hub.mu.Unlock()
 			},
-			wantLog: "stored certificate has expired",
+			wantLog: "renewal of the expired certificate was refused",
 		},
 		{
 			name: "material that does not parse",

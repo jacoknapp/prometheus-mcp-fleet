@@ -62,6 +62,26 @@ func run[In any, Out toolOut](
 				mcpsurface.CodeUnauthenticated,
 				"tool %q requires an authenticated principal", name)
 		}
+		// The key's own rate limit, before any work is done. It is checked
+		// after authentication so an unauthenticated caller cannot consume
+		// another key's allowance, and before the scope check only in the sense
+		// that both are cheap: neither reaches a cluster.
+		if ok, retry := tl.rate.allow(p); !ok {
+			retryable := true
+			tl.log.WarnContext(ctx, "mcptools: call refused by the key's rate limit",
+				"principal", p.String(), "tool", name,
+				"rate_rps", p.Scope.Limits.RateRPS, "retry_in", retry.Round(time.Millisecond).String())
+			tl.metrics.ToolCall(name, CodeRateLimited)
+			tl.metrics.ToolDuration(name, tl.now().Sub(start))
+			out := zero()
+			out.setError(&ToolError{
+				Code: CodeRateLimited,
+				Message: "this credential has exceeded the call rate its scope allows; " +
+					"retry in " + retry.Round(time.Millisecond).String(),
+				Retryable: &retryable,
+			})
+			return out, mcpsurface.ErrorResult, nil
+		}
 		if !p.Scope.AllowsTool(name) {
 			tl.log.WarnContext(ctx, "mcptools: tool denied by scope",
 				"principal", p.String(), "tool", name)

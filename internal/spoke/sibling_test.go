@@ -570,3 +570,75 @@ func TestHubCAFileIsReadAtStartup(t *testing.T) {
 		}
 	})
 }
+
+// TestExpiredCertificateRecoversByRenewalAtStartup covers the case the renewal
+// grace window exists for and previously could not reach.
+//
+// A cluster offline long enough to expire its certificate is a cluster whose
+// pod has almost certainly restarted too. Startup used to discard an expired
+// certificate and fall back to enrollment, which needs a token that was
+// consumed at install and that nobody is standing by to re-mint in a GitOps
+// rollout — so the spoke was stranded despite the hub being willing to renew it.
+func TestExpiredCertificateRecoversByRenewalAtStartup(t *testing.T) {
+	t.Parallel()
+
+	f := newRenewFixture(t)
+	// Expired, but the hub's grace window still accepts it.
+	issued := f.clock.Now().Add(-15 * 24 * time.Hour)
+	expired := f.hub.ca.identityOver(t, "prod-eu-1", issued, issued.Add(14*24*time.Hour))
+
+	f.store.mu.Lock()
+	f.store.key, f.store.cert, f.store.ca = expired.KeyPEM, expired.CertPEM, expired.CABundle
+	f.store.mu.Unlock()
+
+	if err := f.spoke.establishIdentity(t.Context()); err != nil {
+		t.Fatalf("establishIdentity() = %v, want recovery by renewal", err)
+	}
+
+	got := f.spoke.currentIdentity()
+	if got == nil {
+		t.Fatal("no identity after startup; the spoke is stranded")
+	}
+	if got.Leaf.SerialNumber.Cmp(expired.Leaf.SerialNumber) == 0 {
+		t.Error("still holding the expired certificate; renewal did not happen")
+	}
+	if got.Expired(f.clock.Now()) {
+		t.Error("the recovered certificate is itself expired")
+	}
+	if !f.logs.has("recovered an expired certificate by renewal") {
+		t.Errorf("recovery was not logged; got %s", f.logs.messages())
+	}
+	if _, saves := f.store.counts(); saves == 0 {
+		t.Error("the recovered identity was not persisted, so the next restart repeats this")
+	}
+}
+
+// TestExpiredCertificateRecoveryToleratesAnUnwritableStore covers the case
+// where renewal succeeds but the store refuses the write.
+//
+// The spoke must still come up on the certificate it just obtained: it is valid
+// and this pod holds its key, so refusing to start would strand a cluster over
+// a problem that only costs it a repeat renewal after the next restart.
+func TestExpiredCertificateRecoveryToleratesAnUnwritableStore(t *testing.T) {
+	t.Parallel()
+
+	f := newRenewFixture(t)
+	issued := f.clock.Now().Add(-15 * 24 * time.Hour)
+	expired := f.hub.ca.identityOver(t, "prod-eu-1", issued, issued.Add(14*24*time.Hour))
+
+	f.store.mu.Lock()
+	f.store.key, f.store.cert, f.store.ca = expired.KeyPEM, expired.CertPEM, expired.CABundle
+	f.store.saveErr = errors.New("secret is read-only")
+	f.store.mu.Unlock()
+
+	if err := f.spoke.establishIdentity(t.Context()); err != nil {
+		t.Fatalf("establishIdentity() = %v, want the spoke to start on the renewed certificate", err)
+	}
+	got := f.spoke.currentIdentity()
+	if got == nil || got.Leaf.SerialNumber.Cmp(expired.Leaf.SerialNumber) == 0 {
+		t.Fatal("the spoke did not adopt the renewed certificate")
+	}
+	if !f.logs.has("could not persist the renewed identity") {
+		t.Error("the failed write was not reported; a silent one repeats every restart")
+	}
+}
