@@ -22,7 +22,7 @@ than that warrants.
 - [PrometheusMCPSpokeTunnelDown](#prometheusmcpspoketunneldown)
 - [PrometheusMCPHubCACertExpiringSoon](#prometheusmcphubcacertexpiringsoon)
 - [PrometheusMCPSpokeCertExpiringSoon](#prometheusmcpspokecertexpiringsoon)
-- [PrometheusMCPProxyErrorRatioHigh](#prometheusmcpproxyerrorratiohigh)
+- [PrometheusMCPHubProxyErrorRatioHigh](#prometheusmcphubproxyerrorratiohigh)
 - [PrometheusMCPHubRestartLoop](#prometheusmcphubrestartloop)
 - [PrometheusMCPHubStateSecretLarge](#prometheusmcphubstatesecretlarge)
 - [PrometheusMCPAutoUpdateFailed](#prometheusmcpautoupdatefailed)
@@ -57,7 +57,7 @@ The three failures that account for most of these:
 | Log line | Cause | Fix |
 |---|---|---|
 | `cannot create the CA secret … the hub needs a Role granting create on secrets` | RBAC is missing or its `resourceNames` do not match the configured Secret names | Reconcile `PMF_STATE_SECRET_NAME` / `PMF_CA_SECRET_NAME` against the Role's `resourceNames` |
-| `load or create the CA: … exists but the key does not` | The CA Secret was partially restored or hand-edited | Restore both `ca.crt` and `ca.key` together, or see [disaster recovery](#disaster-recovery) |
+| `load or create the CA: ca: incomplete certificate authority on disk: … present but … missing` | The CA Secret was partially restored or hand-edited | Restore both `ca.crt` and `ca.key` together, or see [disaster recovery](#disaster-recovery) |
 | `bind: address already in use` | A port collides with something else in the pod | Check the three listener addresses |
 
 If the pod is `Pending`, it is a scheduling problem, not a hub problem. There is
@@ -109,7 +109,7 @@ alert.
 
 ## PrometheusMCPSpokeTunnelDown
 
-**Means:** one cluster has no tunnel for 15 minutes.
+**Means:** one cluster has no tunnel for 5 minutes.
 
 Work in the **spoke's** cluster — this is almost always a network problem there,
 not a hub problem.
@@ -122,7 +122,7 @@ kubectl -n prometheus-mcp logs deploy/pmf-spoke --tail=50
 |---|---|---|
 | `dial tcp: i/o timeout` | Egress to the hub is blocked | Check the NetworkPolicy and the cluster's egress firewall |
 | `x509: certificate signed by unknown authority` | The spoke does not trust the hub's CA | Re-supply `hub.caBundle`; fetch it from `GET /pki/bundle` |
-| `x509: certificate has expired` | The spoke's own certificate lapsed | Mint a fresh enrollment token and re-enroll |
+| `x509: certificate has expired` | The spoke's own certificate lapsed | Nothing, usually: `/renew` accepts an expired certificate within `--renew-grace` (default 30 days), and the spoke's own renewal loop keeps retrying it automatically. Past that grace period `/renew` refuses it and the cluster needs a fresh enrollment token |
 | `auth-rejected` | The hub refused the handshake — usually a revoked certificate | Check the hub's audit log for the serial |
 | `upgrade-rejected` / `404` | The Ingress is not routing `/tunnel` | Fix the Ingress path |
 | `no such host` | DNS in that cluster cannot resolve the hub | Check the cluster's DNS and the NetworkPolicy's DNS egress rule |
@@ -157,7 +157,8 @@ instantly and requires re-enrolling all hundred clusters by hand.
 
 ## PrometheusMCPSpokeCertExpiringSoon
 
-**Means:** an issued spoke certificate expires within 7 days and renewal is not
+**Means:** an issued spoke certificate expires within 3 days (the default
+threshold, against a 14-day certificate lifetime) and renewal is not
 succeeding.
 
 Spokes renew at half their lifetime, so reaching this alert means renewal has
@@ -165,10 +166,18 @@ been failing for days. Look at the spoke's logs for the renewal error — the mo
 common causes are the hub's enrollment listener being unreachable from that
 cluster, or the spoke's certificate having been revoked.
 
-If it does expire, that cluster needs a fresh single-use enrollment token. That
-is deliberate: an expired identity should require a deliberate act.
+If it does expire, nothing needs to happen by hand yet: `/renew` accepts a
+certificate that has already expired, as long as it is within
+`--renew-grace` (default 30 days), and the spoke's own renewal loop keeps
+retrying on its normal schedule. That is exactly the case this alert should
+usually resolve on its own once the underlying renewal problem — enrollment
+listener unreachable, certificate revoked — is fixed. Only once the outage
+outlasts the grace period does `/renew` start refusing it, at which point the
+cluster needs a fresh enrollment token. Enrollment tokens are reusable by
+default (`--single-use` opts out), so minting one does not by itself require
+tracking down and burning a one-shot credential.
 
-## PrometheusMCPProxyErrorRatioHigh
+## PrometheusMCPHubProxyErrorRatioHigh
 
 **Means:** a meaningful fraction of proxied queries are failing.
 
@@ -207,6 +216,11 @@ what bounds it.
 
 ## PrometheusMCPHubStateSecretLarge
 
+No PrometheusRule ships for this today — `promfleet_hub_state_bytes` exists but
+nothing alerts on it yet, so this section is here for when you wire that alert
+yourself, or when someone notices the metric climbing during triage for
+something else.
+
 **Means:** `promfleet_hub_state_bytes` is approaching the 700 KiB write ceiling.
 A Kubernetes Secret caps at 1 MiB, and the hub refuses writes past 700 KiB
 rather than discovering the limit during an enrollment.
@@ -214,10 +228,22 @@ rather than discovering the limit during an enrollment.
 At roughly a kilobyte per credential this means several hundred records, which
 is far past any plausible fleet — so it almost always means accumulated cruft.
 
+There is no `hub keys list` or `hub enroll list` CLI subcommand — the hub
+binary's only administrative subcommands are `enroll create` and `keys create`
+(`internal/hubcli`). List and prune through the admin REST API directly:
+
 ```bash
-kubectl exec -n $HUB_NS deploy/pmf-hub -- hub keys list --class agt
-kubectl exec -n $HUB_NS deploy/pmf-hub -- hub enroll list
+kubectl -n $HUB_NS port-forward deploy/pmf-hub 9090:9090 &
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
+  'localhost:9090/admin/v1/keys?class=agt' | jq
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
+  localhost:9090/admin/v1/enrollments | jq
 ```
+
+`$ADMIN_TOKEN` is the `pmf_adm_…` credential you saved at install time (see the
+quickstart) or a replacement minted since. The admin API listens on the same
+loopback port as `/metrics`, `/readyz` and `/healthz`, so the same
+port-forward from Quick triage above already reaches it.
 
 Prune expired agent keys and burned enrollment records, and revoked certificate
 serials whose `notAfter` has passed. If you genuinely need more records than
@@ -251,7 +277,7 @@ just to a dashboard.
 
 | Event | Severity | Response |
 |---|---|---|
-| `enrollment token replay` (409) | **High** | The install secret leaked. Find out where the token was stored and who could read it. The burn is atomic, so no second certificate was issued |
+| `enrollment token replay` (409) | **High**, unless the token was minted `--single-use` or with `--max-redemptions` on purpose. Enrollment tokens are reusable with no cap by default, and ordinary reinstalls or sibling pods enrolling together never trigger this against a default token | Check what the token was minted with (`GET /admin/v1/enrollments`). If it was single-use or capped and still got replayed, the install secret leaked — find out where it was stored and who could read it. The burn/cap check is atomic, so no extra certificate was issued beyond the limit |
 | `cluster ID mismatch` | Medium | A spoke reported an ID different from its certificate. The hub used the certificate. Investigate that spoke |
 | Repeated `authn failure` from one source | Medium | Credential stuffing or a misconfigured client. Rate limiting is already applied |
 | `key revoked` / `scope changed` unexpectedly | **High** | An admin credential may be compromised. Rotate it |
@@ -291,15 +317,27 @@ redistribute them. Nothing about the fleet's connectivity is affected.
 
 ### Everything is on fire and you need agents cut off now
 
-Revoking every agent key is a single loop, and it takes effect within one cache
-TTL (60 seconds by default) because the revocation epoch invalidates every
-cached entry:
+Revoking every agent key is a single loop against the admin API (there is no
+`hub keys list` or `hub keys revoke` CLI subcommand — only `enroll create` and
+`keys create` exist), and it takes effect within one cache TTL (60 seconds by
+default) because the revocation epoch invalidates every cached entry:
 
 ```bash
-kubectl exec -n $HUB_NS deploy/pmf-hub -- hub keys list --class agt --quiet |
-  xargs -n1 -I{} kubectl exec -n $HUB_NS deploy/pmf-hub -- \
-    hub keys revoke {} --reason "incident"
+kubectl -n $HUB_NS port-forward deploy/pmf-hub 9090:9090 &
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
+  'localhost:9090/admin/v1/keys?class=agt' |
+  jq -r '.keys[].kid' |
+  xargs -n1 -I{} curl -s -X DELETE -H "Authorization: Bearer $ADMIN_TOKEN" \
+    "localhost:9090/admin/v1/keys/{}?reason=incident"
 ```
+
+This revokes **agent keys** (MCP access), not spoke certificates. Revoking a
+spoke's certificate is checked at handshake only — it does not tear down a
+tunnel that is already up, so it will not immediately disconnect a spoke that
+is already connected. If the thing on fire is a compromised spoke rather than
+a compromised agent, cut its tunnel by scaling that spoke down or blocking its
+egress in its own cluster; revoking its certificate only stops it from
+reconnecting or renewing afterward.
 
 Scaling the hub to zero also works and is faster, but it is a blunter instrument
 — it stops enrollment and renewal too.

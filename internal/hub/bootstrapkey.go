@@ -90,7 +90,8 @@ func (h *hub) bootstrapAdminKey(ctx context.Context) error {
 		"kid", minted.KID,
 		"expires_at", record.ExpiresAt.Format(time.RFC3339),
 		"note", "no admin credential existed, so one was created. "+
-			"Mint a replacement and revoke this one: hub keys revoke "+minted.KID)
+			"Mint a replacement with `hub keys create --class admin`, then revoke this "+
+			"one with DELETE /admin/v1/keys/"+minted.KID)
 	return nil
 }
 

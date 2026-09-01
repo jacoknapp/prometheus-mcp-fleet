@@ -167,12 +167,15 @@ kubectl exec -n prometheus-mcp deploy/pmf-hub -- \
 
 ### 3. Enroll a cluster
 
-Mint a single-use enrollment token bound to one cluster ID:
+Mint an enrollment token bound to one cluster ID. Tokens are reusable by
+default — so one token can enroll several spoke pods that start together, or
+survive a cluster rebuild — pass `--single-use` to burn it on first
+redemption instead:
 
 ```bash
 kubectl exec -n prometheus-mcp deploy/pmf-hub -- \
   hub enroll create --cluster prod-us-east-1 --labels env=prod,region=us-east-1
-# pmf_enr_9dK2mQ4pLz…  (valid 15 minutes, redeemable once)
+# pmf_enr_9dK2mQ4pLz…  (valid 15 minutes, reusable)
 ```
 
 Then, **in the target cluster**:
@@ -185,6 +188,7 @@ kubectl create secret generic pmf-enrollment -n prometheus-mcp \
 helm install pmf-spoke oci://ghcr.io/jacoknapp/charts/prometheus-mcp-spoke \
   --namespace prometheus-mcp \
   --set cluster.id=prod-us-east-1 \
+  --set cluster.sdlc=prod \
   --set hub.endpoints[0]=wss://pmf.example.com/tunnel \
   --set hub.apiUrl=https://pmf.example.com \
   --set enrollment.existingSecret=pmf-enrollment \
@@ -192,10 +196,12 @@ helm install pmf-spoke oci://ghcr.io/jacoknapp/charts/prometheus-mcp-spoke \
 ```
 
 The spoke generates a P-256 key, exchanges a CSR for a 14-day client
-certificate, burns the enrollment token, and dials the hub. The key never
-crosses the network — it is written only to a Secret in the spoke's own
-namespace so a restart does not need a fresh enrollment token. Repeat for each
-cluster.
+certificate, redeems the enrollment token, and dials the hub. Since the token
+above wasn't minted with `--single-use`, it survives that redemption and can
+enroll more spoke pods for the same cluster — useful for a rebuild, or for
+several pods started together. The key never crosses the network — it is
+written only to a Secret in the spoke's own namespace so a restart does not
+need a fresh enrollment token. Repeat for each cluster.
 
 ### 4. Point your agent at it
 
@@ -242,7 +248,7 @@ error codes: [docs/mcp-tools.md](docs/mcp-tools.md).
 |---|---|---|---|
 | Admin | `pmf_adm_` | 90d | Administer the hub, on a separate listener |
 | Agent | `pmf_agt_` | 30d | Call the MCP tools its scope permits |
-| Enrollment | `pmf_enr_` | 15m, **one use** | Exchange a CSR for one spoke certificate |
+| Enrollment | `pmf_enr_` | 15m, reusable by default | Exchange a CSR for one or more spoke certificates |
 | Spoke identity | X.509 | 14d, auto-renewed | Serve one cluster, and only that cluster |
 
 - **An agent never supplies a URL.** It names a tool; the tool maps to a
@@ -285,12 +291,16 @@ Full threat model: [docs/security.md](docs/security.md). Reporting:
   identity so 100 clusters spread across a week, and `stable` only moves through
   a human-approved promotion — which is the fleet-wide kill switch.
   See [docs/operations/auto-update.md](docs/operations/auto-update.md).
-- **The hub defaults to one replica.** Credentials live in a shared Secret, so
-  every replica sees the same keys — but a *tunnel* pins a spoke to the replica
-  that accepted it, and there is deliberately no hub-to-hub forwarding. Running
-  more than one replica therefore requires each to be individually addressable,
-  with spokes configured to dial all of them. Documented honestly rather than
-  papered over: [docs/operations/high-availability.md](docs/operations/high-availability.md).
+- **The hub defaults to three replicas behind a single Ingress hostname.**
+  Credentials live in a shared Secret, so every replica sees the same keys —
+  but a *tunnel* pins a spoke to the replica that accepted it, and there is
+  deliberately no hub-to-hub forwarding. That used to mean every replica needed
+  its own external hostname wired into every spoke; now the hub counts its own
+  replicas via a headless Service and tells each spoke how many to expect, and
+  the spoke keeps dialing the one hostname until it has reached them all. A
+  cluster may likewise run several spoke pods, pooled by the hub with no leader
+  election. Documented in full:
+  [docs/operations/high-availability.md](docs/operations/high-availability.md).
 - Alerts, runbooks and dashboards: [docs/operations/](docs/operations/).
 
 ---

@@ -41,8 +41,11 @@ Separate **publishing** from **promoting**, and make the in-cluster half opt-in.
    repository's OIDC identity **and** `cosign verify-attestation` for SLSA
    provenance, refuses to proceed if either fails, patches the workload to the
    **digest**, waits on `rollout status`, and runs `rollout undo` on failure. Its
-   ServiceAccount holds `get,patch` on exactly one Deployment by
-   `resourceNames` — no cluster scope, no ability to restart anything else.
+   ServiceAccount holds `get,patch,update` on exactly one Deployment by
+   `resourceNames` (`update` is what `rollout undo` issues), plus read-only,
+   namespace-scoped `list,watch` on Deployments and ReplicaSets that
+   `rollout status`/`rollout undo` need and which RBAC cannot restrict by name
+   — no cluster scope, no ability to mutate anything else.
 6. **Staggering is automatic, not configured.** The schedule is derived from a
    hash of the cluster identity: `minute = h % 60`, `hour = 2 + h % 4`,
    `weekday = h % 7`. A hundred clusters spread across a whole week without
@@ -70,9 +73,13 @@ cannot be stopped — but it is a deviation, and this record exists so it is a
 stated one rather than a quiet one.
 
 **Operational cost.** Someone has to approve promotions. If nobody does, the
-fleet silently stops updating, which is the safe failure but is still a failure.
-The `PrometheusMCPAutoUpdateStale` alert fires when the running digest falls too
-far behind `stable`, so "nobody approved anything for two months" is visible.
+fleet silently stops updating, which is the safe failure but is still a
+failure. Today that failure is genuinely silent: the chart ships
+`PrometheusMCPAutoUpdateFailed`, which fires when the CronJob's Job fails
+verification or rollout, but nothing yet alerts on "nobody approved a
+promotion in two months" — a running digest can drift arbitrarily far behind
+`stable` without paging anyone. A staleness alert comparing the running
+digest's age against `stable` is the obvious gap to close next.
 
 ## Alternatives considered
 

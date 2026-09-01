@@ -23,7 +23,9 @@ listers, no scheme registration, no CRDs, no leader election.
 
 ## Decision
 
-Write `internal/kube`: roughly 250 lines of standard library.
+Write `internal/kube`: a few hundred lines of standard library (it started at
+roughly 250 and has grown with better error messages and tests, but still
+touches nothing beyond the three verbs below).
 
 * In-cluster configuration from the projected service account —
   `/var/run/secrets/kubernetes.io/serviceaccount/{token,ca.crt,namespace}` plus

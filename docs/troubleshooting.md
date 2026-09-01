@@ -31,8 +31,15 @@ The key is wrong, expired, revoked, or of the wrong class. An *admin* key
 presented to the MCP endpoint is rejected on purpose — the classes are separated
 so that a leaked agent key can never administer the hub, and vice versa.
 
+There is no `hub keys list` CLI subcommand — the hub binary's only
+administrative subcommands are `enroll create` and `keys create`
+(`internal/hubcli`). List keys through the admin REST API, port-forwarded from
+the same admin listener as `/readyz` above:
+
 ```bash
-kubectl exec -n prometheus-mcp-hub deploy/pmf-hub -- hub keys list --class agt
+kubectl -n prometheus-mcp-hub port-forward deploy/pmf-hub 9090:9090 &
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
+  'localhost:9090/admin/v1/keys?class=agt' | jq
 ```
 
 The hub never echoes the offending token, in the response or in the log. That is
@@ -42,10 +49,12 @@ deliberate; identify the key by its KID, which is the ten characters after the
 **`403` or an empty `list_clusters`**
 
 The key authenticated but its scope permits nothing. An empty scope authorizes
-nothing by design. Check what it was minted with:
+nothing by design. Check what it was minted with (again, there is no `hub keys
+get` subcommand — this is the admin API directly):
 
 ```bash
-kubectl exec -n prometheus-mcp-hub deploy/pmf-hub -- hub keys get <kid>
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
+  localhost:9090/admin/v1/keys/<kid> | jq
 ```
 
 The most common cause is a scope with `matchLabels: {env: prod}` against
@@ -80,7 +89,7 @@ than not showing it.
 Work in the spoke's cluster. See
 [spoke-enrollment.md](spoke-enrollment.md#when-it-goes-wrong) for the full
 table; the three that account for most cases are an expired enrollment token
-(15 minutes, single use), blocked egress to the hub, and a missing hub CA
+(15 minutes by default), blocked egress to the hub, and a missing hub CA
 bundle.
 
 **It shows `degraded`**
@@ -153,9 +162,9 @@ offending agent key's scope.
 | Log line | Cause | Fix |
 |---|---|---|
 | `cannot create the CA secret … needs a Role granting create on secrets` | RBAC missing, or `resourceNames` does not match the configured Secret names | Reconcile the Role against `PMF_STATE_SECRET_NAME` and `PMF_CA_SECRET_NAME` |
-| `exists but the key does not` | The CA Secret was partially restored or hand-edited | Restore `ca.crt` and `ca.key` together |
+| `incomplete certificate authority on disk: … present but … missing` | The CA Secret was partially restored or hand-edited | Restore `ca.crt` and `ca.key` together |
 | `another replica created the CA secret first` | Two replicas started simultaneously on first boot | Informational. The loser adopts the winner's material and continues |
-| `state exceeds the write ceiling` | The state Secret is approaching 700 KiB | Prune expired keys and burned enrollments; see the runbook |
+| `state document too large` | The state Secret is approaching 700 KiB | Prune expired keys and burned enrollments; see the runbook |
 | `403` on any Secret operation | The projected token lacks a verb | The error names the exact rule you are missing |
 
 There is no PVC, so a pod stuck in `Pending` is a scheduling problem — resources,
@@ -170,8 +179,12 @@ the hub's CA. Fetch it from `GET /pki/bundle` and supply it as `hub.caBundle`.
 revoked; check the hub's audit log for the serial.
 
 **`certificate has expired`** — renewal has been failing for at least half the
-certificate's lifetime. The spoke's logs have the renewal error. An expired
-identity needs a fresh single-use enrollment token, deliberately.
+certificate's lifetime. The spoke's logs have the renewal error. This usually
+recovers on its own: `/renew` accepts a certificate that has already expired,
+within `--renew-grace` (default 30 days), and the spoke keeps retrying
+automatically on its normal renewal schedule once the underlying cause is
+fixed. Only past that grace period does the identity need a fresh enrollment
+token.
 
 **The whole fleet disconnects at once** — almost always the Ingress. Either it
 stopped routing `/tunnel` (spokes report a 404 on upgrade), or its idle timeout

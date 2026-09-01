@@ -36,7 +36,7 @@ often, and it is what the defaults use.
 |---|---|---|
 | `compact` (default) | baseline | Columnar. One `start`, one `stepSeconds`, bare `values` arrays, shared labels factored out |
 | `json` | **10–50× more tokens** | Prometheus' native shape. Only when compact loses detail you actually need |
-| `table` | ~35% below `json` | Fixed-width text. Best for wide, shallow results — targets, alerts, rules |
+| `table` | ~35% below `compact` | Fixed-width text. Best for wide, shallow results — targets, alerts, rules |
 
 **Truncation is never silent.** Any capped result carries an explicit object:
 
@@ -70,11 +70,11 @@ Every cluster this credential can reach, with enough facts to choose one.
 
 | Argument | Default | Notes |
 |---|---|---|
-| `filter` | — | Substring match on cluster ID or display name |
+| `filter` | — | Case-insensitive substring match on cluster ID, display name or description |
 | `labelSelector` | — | Object of label equality matches, e.g. `{"env":"prod"}` |
-| `status` | `all` | `all` · `connected` · `degraded` · `disconnected` |
+| `status` | `all` | `all` · `healthy` · `degraded` · `unreachable` |
 | `limit` | `100` | |
-| `format` | `compact` | |
+| `format` | `compact` | `compact` · `table` — no `json`, since there is no upstream payload to pass through |
 
 Returns cluster ID, display name, labels, state, `lastSeen`, Prometheus flavour
 and version, retention, active series, job count and Alertmanager presence —
@@ -143,8 +143,11 @@ ladder and never below the cluster's scrape interval. It always reports what it
 did:
 
 ```json
-"downsampled": {"requestedStep": "15s", "appliedStep": "3m", "reason": "maxPoints=120"}
+"downsampled": {"requestedStep": "15s", "appliedStep": "3m", "reason": "max_points"}
 ```
+
+`reason` is one of `requested_step_honoured`, `max_points`,
+`scrape_interval_floor` or `snapped_to_ladder`.
 
 Read that before reasoning about a spike — averaged data hides them. If you need
 raw resolution, shorten the range rather than raising `maxPoints`.
@@ -217,10 +220,12 @@ Scrape target health, summarised then listed.
 | `health` | `any` | `any` · `up` · `down` · `unknown` |
 | `job` | — | |
 | `limit` | `50` | |
+| `format` | `compact` | `compact` · `table` — no `json`: the raw payload carries the scrape URLs redacted below |
 
-**Scrape URLs are redacted.** `scrapeUrl`, `globalUrl` and query strings are
-stripped before the result leaves the hub, because scrape configurations
-routinely carry bearer tokens and basic-auth credentials in URL parameters.
+**Scrape URLs are redacted.** `scrapeUrl`, `globalUrl`, `discoveredLabels` and
+scrape-pool query strings are stripped before the result leaves the hub,
+because scrape configurations routinely carry bearer tokens and basic-auth
+credentials in URL parameters.
 
 ### `rules`
 
@@ -231,6 +236,7 @@ routinely carry bearer tokens and basic-auth credentials in URL parameters.
 | `group` / `ruleName` | — | |
 | `includeExpr` | `false` | Expressions are verbose; ask only when you need them |
 | `limit` | `50` | |
+| `format` | `compact` | `compact` · `table` |
 
 ### `alerts`
 
@@ -241,6 +247,7 @@ routinely carry bearer tokens and basic-auth credentials in URL parameters.
 | `alertname` / `severity` / `labelSelector` | — | |
 | `includeAnnotations` | `true` | |
 | `limit` | `50` | |
+| `format` | `compact` | `compact` · `table` |
 
 Annotations are attacker-influenced free text. They are sanitised and clipped,
 and they arrive inside the `_untrusted` envelope.
@@ -308,8 +315,9 @@ should be hard to do by accident.
 Two kinds, and the distinction matters.
 
 **Protocol errors** (JSON-RPC `error`) mean the request never really happened:
-unknown tool, schema-invalid arguments, authentication failure. An
-authentication failure is deliberately never a tool result — an agent that saw
+unknown tool, schema-invalid arguments, authentication failure, or a scope that
+forbids the tool (`FORBIDDEN`, JSON-RPC code -32003). Authentication and
+authorization failures are deliberately never a tool result — an agent that saw
 one as a tool error would try to "fix" it by editing its PromQL.
 
 **Tool errors** (`isError: true`) are facts about the world, and are written so
@@ -328,15 +336,16 @@ a model can self-correct in one turn:
 | Code | Meaning | What to do |
 |---|---|---|
 | `UNKNOWN_CLUSTER` | No such cluster, or your scope forbids it | Use `didYouMean`, or `list_clusters` |
-| `FORBIDDEN` | Your scope forbids this tool or cluster | Ask an operator to widen the key's scope |
 | `SPOKE_UNREACHABLE` | Enrolled but not connected; carries `lastSeen` | Retryable |
 | `PROMQL_PARSE` | Prometheus' own parse error, with a caret | Fix the query; `explain_promql` validates cheaply |
 | `RANGE_TOO_LARGE` | Includes a corrected argument object to copy | Use it |
-| `TOO_LARGE` | Response exceeded the byte budget | Raise `step`, narrow the selector |
-| `BUSY` | Per-cluster in-flight limit reached | Retryable; back off |
+| `RESPONSE_TOO_LARGE` | Response exceeded the byte budget | Raise `step`, narrow the selector |
+| `HUB_BUSY` | A hub concurrency or memory budget is exhausted | Retryable; back off |
 | `QUERY_TIMEOUT` | Upstream took too long | Narrow the range |
 | `TSDB_STATS_UNAVAILABLE` | Endpoint disabled upstream | Use `count by(__name__)` |
 | `NO_SELECTOR_TOO_BROAD` | Untargeted fan-out refused | Add `clusters` or `labelSelector` |
+
+(`FORBIDDEN` is a protocol error, not a row here — see above.)
 
 Every error carries `retryable: true|false`. Honour it — that flag alone
 prevents most retry-loop pathologies.

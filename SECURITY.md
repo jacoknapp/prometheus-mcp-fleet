@@ -72,8 +72,12 @@ vulnerability regardless of severity rating:
 3. **Certificate-bound identity.** A spoke's `clusterID` derives only from the
    URI SAN of its verified client certificate. No self-reported value may
    override it, and no spoke may answer for another spoke's cluster.
-4. **Single-use enrollment.** An enrollment token can be redeemed exactly once.
-   A second redemption must fail and raise a security event.
+4. **Bounded enrollment redemption.** An enrollment token minted with
+   `--single-use` can be redeemed exactly once; a second redemption must fail
+   and raise a security event. A reusable token (the default) can be redeemed
+   only up to its configured `--max-redemptions` cap, if one was set, and never
+   for a cluster ID other than the one it was bound to, past its TTL, or after
+   revocation.
 5. **CSR subject is discarded.** The hub mints its own subject and SANs and
    ignores whatever the CSR requested.
 6. **No secret at rest in plaintext.** API keys are stored as

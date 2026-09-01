@@ -207,6 +207,11 @@ Pods are told apart by an `InstanceID` (the pod hostname) sent in the handshake.
 It authenticates nothing — the certificate still decides what a session may
 serve — it only decides which slot a session occupies within its own cluster.
 
+`promfleet_hub_spoke_sessions{cluster}` on the hub is the count of live
+sessions it currently holds for one cluster. Scale a spoke to three pods and
+this should read 3; it is the way to confirm sibling pods really did come up
+and reconnect, rather than one of them silently failing to enrol.
+
 ## Choosing
 
 | You want | Do this |
@@ -228,11 +233,23 @@ accidentally to one:
 # Should equal the number of enrolled clusters, on every replica
 promfleet_hub_spokes_connected
 
-# Should be the replica count, per endpoint, on every spoke
-promfleet_spoke_tunnel_up
+# Should equal promfleet_spoke_hub_replicas, per endpoint, on every spoke
+promfleet_spoke_tunnels_covered
+promfleet_spoke_hub_replicas
 ```
 
-If a spoke shows `tunnel_up` for two of three endpoints, its third tunnel is
-failing — almost always a missing SAN or a DNS record that does not resolve from
-that cluster. Alert on it; a partially connected fleet fails intermittently and
-is far harder to diagnose after the fact.
+`promfleet_spoke_tunnels_covered < promfleet_spoke_hub_replicas` on the same
+`endpoint` label means that spoke has not reached every replica behind that
+hostname — almost always a session-affinity setting on the Ingress that keeps
+pinning it back to replicas it already holds. Alert on it; a partially
+connected fleet fails intermittently and is far harder to diagnose after the
+fact.
+
+`promfleet_spoke_tunnel_up` is 1 while at least one tunnel to a configured
+endpoint is up; it does not by itself distinguish "connected to one replica"
+from "connected to all of them" behind a single discovered hostname. It is
+most useful under [explicit per-replica addressing](#addressing-each-replica-explicitly),
+where each replica is its own `endpoint` label value and `tunnel_up` really is
+one series per replica — there, a spoke showing `tunnel_up` for two of three
+configured endpoints has a third tunnel that is failing, almost always a
+missing SAN or a DNS record that does not resolve from that cluster.

@@ -76,8 +76,13 @@ the first; reviewers enforce the rest.
 context — `fmt.Errorf("route %s: %w", id, err)`, never `"failed to route"`.
 Callers branch with `errors.Is` and `errors.As`, never on strings.
 
-**Context** is the first parameter of every function that touches I/O.
-`context.Background()` appears only in `main` and in tests.
+**Context** is the first parameter of every function that touches I/O, enforced
+by `golangci-lint`'s `contextcheck`. `context.Background()` shows up outside
+`main` and tests only at roots with nothing to inherit from — a background
+goroutine, a session constructor — or on a shutdown path running after the
+parent context is already cancelled; the latter carries a
+`//nolint:contextcheck` explaining why, since a live parent context did exist
+at that call site.
 
 **Tests are table-driven**, with `t.Parallel()` in both the outer function and
 each subtest, `cmp.Diff` for structs and `errors.Is`/`errors.As` for errors.
@@ -88,14 +93,20 @@ line in the file.
 
 ## Coverage
 
-The repository gate is 80%. These packages are held to 90% or higher because a
-bug in them is a security bug or a fleet-wide outage: `fleet`, `config`,
-`token`, `authn`, `ca`, `promapi`, `store`, `registry`, `promproxy`, `kube`.
+The repository gate is **100% handwritten statement coverage** — `make test`
+fails on any uncovered statement block. Generated protobuf and the reusable
+test-support conformance suites (`storetest`, `tunneltest`) are excluded, since
+they are reviewed through other means and not shipped as product code.
 
 Coverage is a floor, not a goal. A test that executes a line without asserting
 anything meaningful is worse than no test, because it makes the number lie. What
-we actually look for is that every `if err != nil` branch in those packages has a
-test that reaches it.
+we actually look for is that every `if err != nil` branch has a test that
+reaches it — and that scrutiny is sharpest in `fleet`, `config`, `token`,
+`authn`, `ca`, `promapi`, `store`, `registry`, `promproxy` and `kube`, where a
+bug is a security bug or a fleet-wide outage. Those packages also carry the
+highest mutation-testing floors in `hack/mutation-baseline.txt` (see
+[docs/development.md](docs/development.md#mutation-testing)) for the same
+reason: 100% of lines executed is not 100% of behaviours checked.
 
 **Fuzz targets earn their keep here.** `FuzzLookup` found both a panic and a
 path-aliasing bug in the allow-list that no example-based test would have. If
@@ -136,8 +147,10 @@ path that only works on the happy path is not finished.
 
 ## Releasing
 
-Maintainers only. `release-please` opens a release pull request from the
-Conventional Commit history; merging it tags `vX.Y.Z`, which triggers the
-release workflow. Publishing does **not** promote — moving the `stable` tag is a
-separate, human-approved workflow, and it is the fleet-wide kill switch. See
-[ADR-0011](docs/adr/0011-auto-update-is-opt-in.md).
+Maintainers only. Pushing a `vX.Y.Z` tag triggers `release.yml` — GoReleaser
+builds the binaries, archives, checksums and SBOMs, publishes signed hub and
+spoke images, and packages both charts, and its GitHub Release notes are
+grouped from the Conventional Commit history since the last tag (`feat:`,
+`fix:`, breaking `!`, and so on). Publishing does **not** promote — moving the
+`stable` tag is a separate, human-approved workflow, and it is the fleet-wide
+kill switch. See [ADR-0011](docs/adr/0011-auto-update-is-opt-in.md).

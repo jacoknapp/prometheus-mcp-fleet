@@ -27,7 +27,7 @@ the old one stays in place.
 ## Consequences
 
 Reviewers get a place to argue about design without blocking on implementation
-detail. New contributors can read thirteen short documents instead of
+detail. New contributors can read a handful of short documents instead of
 reverse-engineering intent from a diff. The cost is discipline: a record that is
 written after the fact to justify a decision already shipped is worse than none,
 because it launders an accident into a rationale.

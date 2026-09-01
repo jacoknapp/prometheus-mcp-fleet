@@ -25,17 +25,25 @@ The hub runs a small internal certificate authority.
 * The CA keypair is ECDSA P-256, generated on first boot, stored in a
   Kubernetes Secret the hub owns, `IsCA: true` with path length 0 so it can only
   sign leaves.
-* An operator mints a **single-use enrollment token bound to one cluster ID**.
+* An operator mints an **enrollment token bound to one cluster ID**. It is
+  reusable by default, so a GitOps rollout can redeem it again after that
+  cluster is rebuilt, or seed several spoke pods that start together;
+  `--single-use` burns it on first redemption for the human-installing-one-
+  cluster-by-hand case, optionally capped with `--max-redemptions`.
 * The spoke generates a P-256 key locally and sends a CSR with that token.
 * **The hub discards the CSR's requested subject and SANs entirely** and mints
   its own: `CN=spoke:<clusterID>`, a single URI SAN
   `pmf://<trustDomain>/spoke/<clusterID>`, `clientAuth` only, 14-day lifetime.
   A CSR asking for `CN=admin` gets a certificate that does not contain it.
-* The enrollment token is burned atomically before the certificate is returned.
-  A second redemption is refused and logged as a security event, because a
-  replayed enrollment token means the install secret leaked.
+* Every redemption is recorded atomically against the state Secret's
+  `resourceVersion`. A single-use token's second redemption is refused and
+  logged as a security event, because a replayed single-use token means the
+  install secret leaked; a reusable token's redemption past its
+  `--max-redemptions` cap is refused the same way.
 * Renewal happens at half of the certificate's lifetime with jitter, using no
-  enrollment token at all.
+  enrollment token at all. A spoke that misses that window can still renew for
+  `--renew-grace` (default 30 days) after expiry, on the same possession proof
+  and a non-revoked serial, before it needs a fresh enrollment token.
 * Revocation is a hub-side denylist keyed on serial, consulted on every
   connection. A CRL is published for external auditors but nothing depends on it.
 
@@ -58,8 +66,14 @@ identity purposes.
 **Better.** Onboarding is one token. There is no dependency on cert-manager,
 SPIFFE or a mesh. Identity is cryptographic and certificate-bound, so nothing a
 spoke reports at runtime can override it, and a compromised spoke is confined to
-its own cluster. The 14-day lifetime means a stolen certificate has a short
-window even if revocation never reaches anything.
+its own cluster.
+
+The 14-day lifetime was originally the backstop for a stolen certificate even if
+revocation never reached anything. That is no longer true. Renewal now accepts
+an expired certificate within `--renew-grace`, and it authenticates by proof of
+possession of the private key, so whoever holds the key can renew indefinitely.
+Revocation is the control; the lifetime alone bounds nothing against an attacker
+who keeps renewing.
 
 **Worse.** We are now running a CA, and a CA is a serious object. Losing the key
 means every spoke keeps working until its certificate expires — at most 14 days

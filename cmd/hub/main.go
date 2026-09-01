@@ -32,6 +32,11 @@ func main() {
 func mainWithExit(args []string, stderr io.Writer, exit func(int)) {
 	if err := run(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
+			// flag has already written the usage text to the FlagSet's output.
+			// Discarding the error here is what makes `--help` a success; it
+			// used to print nothing at all, because the usage went to a writer
+			// nothing surfaced.
+			_, _ = fmt.Fprintln(stderr, err)
 			exit(0)
 			return
 		}

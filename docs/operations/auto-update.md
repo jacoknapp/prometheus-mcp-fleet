@@ -42,9 +42,12 @@ flowchart TD
    Environment. **This is the kill switch**: stop approving and the entire fleet
    freezes, with no code change and no incident call.
 4. **The recommended consumption path is not the CronJob.** It is Renovate or
-   Flux against your own GitOps repository, for which we publish a preset. That
-   gives a reviewable pull request per release. Most teams running a hundred
-   clusters already have this and should use it.
+   Flux against your own GitOps repository. (The intent is to publish a
+   Renovate preset and/or a Flux `ImagePolicy` example for this; as of this
+   writing neither ships from this repo, so point ordinary digest-tracking
+   automation at `IMAGE_REPO:stable` yourself in the meantime.) This path gives
+   a reviewable pull request per release. Most teams running a hundred clusters
+   already have this and should use it.
 5. **The chart's CronJob is the opt-in fallback**, for clusters with no GitOps.
 
 ## Enabling it
@@ -77,15 +80,29 @@ shell.
 The schedule is *derived*, not fixed:
 
 ```
-h       = hash(release name + cluster id)
-minute  = h % 60
-hour    = 2 + h % 4
-weekday = h % 7
+identity = autoUpdate.identity, default "<release name>/<namespace>"
+h        = adler32(identity)
+minute   = h % 60
+hour     = 2 + h % 4
+shift    = 0 (canary) | 2 (early) | 4 (stable)
+weekday  = (h + shift) % 7
 ```
 
-A hundred clusters therefore spread across a whole week without anyone
-coordinating anything. Set `autoUpdate.schedule` explicitly only if you have a
-maintenance window you must hit.
+The cohort shift on `weekday` is deliberate, not just the `MIN_AGE_HOURS` soak
+gate above: it also nudges canary clusters earlier in the week than stable
+ones, so a regression has more time to surface before the bulk of the fleet's
+scheduled runs even arrive.
+
+Every cluster that installs under the same release name and namespace hashes
+to the same `identity` and therefore the same schedule — the default only
+spreads a fleet across a week when each cluster's release name or namespace
+actually differs. If every cluster shares both, set `autoUpdate.identity` to
+something that varies per cluster (`cluster.id`, on the spoke chart) so the
+hash actually differs.
+
+A hundred clusters with distinct identities therefore spread across a whole
+week without anyone coordinating anything. Set `autoUpdate.schedule` explicitly
+only if you have a maintenance window you must hit.
 
 ### Cohorts
 

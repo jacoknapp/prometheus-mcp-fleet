@@ -82,13 +82,19 @@ kubectl exec -n prometheus-mcp-hub deploy/pmf-hub -- \
     --admin-token-file /var/run/pmf/admin-token \
     --cluster prod-us-east-1 \
     --labels env=prod,region=us-east-1,tier=customer-facing
-# pmf_enr_9dK2mQ4pLz…   valid 15 minutes, redeemable once
+# pmf_enr_9dK2mQ4pLz…   valid 15 minutes, reusable by default
 ```
 
-The subcommand is an HTTP client against the hub's own admin listener, which
-binds to loopback and is never in a Service — exec'ing into the pod is already
-the privileged path, so the credential never crosses the network. It still needs
-an admin credential of its own: mount one as a file and pass
+The subcommand is an HTTP client against the hub's own admin listener. The
+binary itself defaults that listener to loopback only, but the shipped chart
+deliberately widens it to all interfaces and publishes it on the ClusterIP
+Service (`service.admin.enabled: true` by default) so kubelet probes and a
+`ServiceMonitor` can reach it — access is then narrowed by a NetworkPolicy to
+scrapers in the `monitoring` namespace, not by loopback binding. Running the
+subcommand via `kubectl exec` still doesn't add any new network exposure of
+its own. It still needs an admin credential of its own: mount one as a file
+(the chart has no built-in option for this — wire it up yourself with
+`extraVolumes`/`extraVolumeMounts` against a Secret you create) and pass
 `--admin-token-file`, or set `PMF_ADMIN_TOKEN` in the pod's environment. Prefer
 the file. There is no way to set an environment variable on a `kubectl exec`
 without putting it in the argument list, where it lands in the node's process
@@ -112,9 +118,11 @@ kubectl create secret generic pmf-enrollment -n prometheus-mcp \
 
 helm install pmf-spoke oci://ghcr.io/jacoknapp/charts/prometheus-mcp-spoke \
   --namespace prometheus-mcp \
+  --set fullnameOverride=pmf-spoke \
   --set cluster.id=prod-us-east-1 \
-  --set cluster.labels.env=prod \
-  --set cluster.labels.region=us-east-1 \
+  --set cluster.sdlc=prod \
+  --set cluster.labels[0].name=env --set cluster.labels[0].value=prod \
+  --set cluster.labels[1].name=region --set cluster.labels[1].value=us-east-1 \
   --set hub.endpoints[0]=wss://pmf.example.com/tunnel \
   --set hub.apiUrl=https://pmf.example.com \
   --set hub.existingCASecret=pmf-hub-ca \
@@ -122,9 +130,15 @@ helm install pmf-spoke oci://ghcr.io/jacoknapp/charts/prometheus-mcp-spoke \
   --set prometheus.url=http://prometheus-operated.monitoring.svc:9090
 ```
 
-There are no defaults for `cluster.id`, `hub.endpoints`, `hub.apiUrl` or
-`prometheus.url`. Every one of them differs per cluster, and a default that
-happened to work in one place would be a trap in the other ninety-nine.
+`fullnameOverride=pmf-spoke` keeps every object named `pmf-spoke` rather than
+the chart's default `<release>-<chart>` (here `pmf-spoke-prometheus-mcp-spoke`)
+— without it, the `deploy/pmf-spoke` used to verify and troubleshoot below
+would not exist. `cluster.labels` is a **list** of `{name, value}` entries, not
+a map — a duplicate key or a `sdlc` key here fails the render, since `sdlc` is
+reserved for `cluster.sdlc` above. There are no defaults for `cluster.id`,
+`cluster.sdlc`, `hub.endpoints`, `hub.apiUrl` or `prometheus.url`. Every one of
+them differs per cluster, and a default that happened to work in one place
+would be a trap in the other ninety-nine.
 
 ### 3. Verify
 
@@ -284,8 +298,10 @@ key. Only then does it issue.
 A spoke renews at half its certificate's life, so reaching expiry means the
 cluster was unreachable for half a lifetime — switched off over a holiday, a
 long outage, a rollout paused mid-flight. Refusing that renewal strands the
-spoke permanently: its enrollment token was single-use and burned at install,
-and in a declarative deployment nobody is standing by to mint another.
+spoke permanently: renewal only ever uses the certificate, never the
+enrollment token, so a reusable token sitting in the cluster's Secret does not
+help — and if the original token was single-use it is long since burned. In a
+declarative deployment nobody is standing by to mint a replacement.
 
 So the hub renews an expired certificate for `--renew-grace` after expiry
 (`PMF_RENEW_GRACE`, default 30 days; `0` restores strict expiry).
@@ -313,9 +329,11 @@ invalidate one in flight. It expires after 60 seconds.
 The nonce is deliberately **not** single-use. Replaying a captured renewal
 request returns a certificate for the public key in the captured CSR — a key
 whose private half belongs to the spoke that built it — so a replay gains an
-attacker nothing it can use. Enrollment is the opposite case: its token is a
-bearer credential, so it is burned atomically and a second redemption is a
-security event.
+attacker nothing it can use. Enrollment is different: its token is a bearer
+credential, so a `--single-use` token (or a reusable one past
+`--max-redemptions`) is burned atomically and a redemption past that point is
+a security event — a plain reusable token, though, is expected to be redeemed
+more than once and is not.
 
 The cluster ID for a renewal comes from the verified certificate, never from the
 request body. `RenewRequest` has no cluster field at all, and the hub decodes
@@ -326,9 +344,13 @@ hours before expiry it escalates to `error`. Alert on
 `promfleet_spoke_client_cert_expiry_seconds` and
 `promfleet_hub_spoke_cert_expiry_seconds`.
 
-If a certificate does expire, the spoke needs a **fresh enrollment token**. That
-is intentional: an expired identity should require a deliberate act, not a
-silent automatic re-issue.
+If a certificate expires, that alone is not fatal: see
+[Renewing an expired certificate](#renewing-an-expired-certificate) above — the
+hub still renews it from possession proof alone, with no token, inside
+`--renew-grace` (30 days by default). Only once that grace window has *also*
+elapsed does the spoke need a **fresh enrollment token**. That is intentional:
+an identity nobody has proved possession of in a month or more should require
+a deliberate act, not a silent automatic re-issue.
 
 ## Where the identity is stored
 
@@ -353,15 +375,23 @@ multi-use and long-lived, which is a materially weaker credential than a
 helm uninstall pmf-spoke -n prometheus-mcp
 kubectl delete secret pmf-spoke-identity -n prometheus-mcp
 
-# On the hub — revoke so the certificate cannot be used until it expires
+# On the hub — revoke so the certificate cannot be used until it expires.
+# There is no `hub certs` subcommand (only `hub enroll create` and
+# `hub keys create` exist); revocation is a direct call against the admin API.
 kubectl exec -n prometheus-mcp-hub deploy/pmf-hub -- \
-  hub certs revoke --serial <hex-serial> --reason "cluster decommissioned"
+  curl -sS -X POST "http://127.0.0.1:9090/admin/v1/certs/<hex-serial>/revoke" \
+    -H "Authorization: Bearer $(cat /var/run/pmf/admin-token)" \
+    -H 'Content-Type: application/json' \
+    -d '{"reason":"cluster decommissioned"}'
 ```
 
 Uninstalling alone is not enough if the cluster or its Secret may be
-compromised: the certificate stays valid for up to 14 days. Revocation is
-checked during the TLS handshake, so it takes effect on the next connection
-attempt.
+compromised: the certificate stays valid for up to 14 days. There is no TLS
+handshake to check it at — as in [Renewal](#renewal), the Ingress terminates
+TLS and the hub never sees a peer certificate. Revocation is instead checked
+against the chain presented in the tunnel's own in-band possession proof
+(ADR-0014) each time a spoke dials in, so it takes effect on the next
+connection attempt.
 
 The cluster disappears from `list_clusters` once its grace window elapses. The
 registry is in memory and self-registering, so there is nothing else to clean
@@ -371,7 +401,7 @@ up — no database row, no stale entry.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `enrollment token has already been used` (409) | The token was redeemed once already. **Treat this as a security event** — it means the install secret leaked, or an automation retried a burn | Investigate, then mint a fresh token |
+| `this enrollment token has already been redeemed and cannot be redeemed again` (409) | The token was redeemed once already (only possible for a `--single-use` token, or a reusable one past `--max-redemptions`). **Treat this as a security event** — it means the install secret leaked, or an automation retried a burn | Investigate, then mint a fresh token |
 | `401` from `/enroll` | The token expired. They last 15 minutes | Mint a new one; consider a faster delivery path |
 | `cluster ID mismatch` | The `cluster.id` value does not match what the token was minted for | Reinstall with the right ID, or mint a token for this one |
 | `x509: certificate signed by unknown authority` on the tunnel | The spoke does not trust the hub's CA | Supply `hub.caBundle` / `hub.existingCASecret`; the bundle is at `GET /pki/bundle` on the hub |

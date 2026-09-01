@@ -53,7 +53,7 @@ a query.
 |---|---|---|---|---|---|
 | Admin | `pmf_adm_` | Operator, IaC | 90 days | Mint and revoke keys, mint enrollments, CA operations | Admin listener only |
 | Agent | `pmf_agt_` | AI agent runtime | 30 days | Call the MCP tools its scope permits | MCP listener only |
-| Enrollment | `pmf_enr_` | Spoke install | 15 minutes, **single use** | Exchange one CSR for one certificate | Public listener |
+| Enrollment | `pmf_enr_` | Spoke install | 15 minutes, **reusable by default** | Exchange a CSR for a certificate | Public listener |
 | Spoke identity | X.509 | Spoke pod | 14 days, auto-renewed | Serve one cluster | Tunnel handshake and `POST /renew` |
 
 ### Token format
@@ -114,18 +114,27 @@ The hub runs a small internal CA. Its key is ECDSA P-256, generated on first
 boot, stored in a Kubernetes Secret the hub owns, with `IsCA: true` and path
 length 0 so it can only sign leaves.
 
-**Enrollment.** An operator mints a single-use token bound to exactly one
-cluster ID. The spoke generates a P-256 key locally and sends a CSR. Three
-things then matter:
+**Enrollment.** An operator mints a token bound to exactly one cluster ID, via
+`hub enroll create --cluster <id>`. Tokens are **reusable by default** — the
+same token can install the same cluster's spoke again after a rebuild, or seed
+several spoke pods that start together, without minting a new one each time.
+`--single-use` burns the token on first redemption instead, which is right for
+a human installing one cluster by hand and watching it. A reusable token can
+still be capped with `--max-redemptions`, and either kind is revocable and
+stops working the moment its TTL expires. The spoke generates a P-256 key
+locally and sends a CSR. Three things then matter:
 
 - **The CSR's requested subject and SANs are discarded entirely.** The hub takes
   only the public key and mints its own subject. A CSR asking for `CN=admin`
   produces a certificate that does not contain it. This kills the classic
   escalation in one line of policy.
-- **The token is burned atomically before the certificate is returned**, via a
-  compare-and-swap on the state Secret's `resourceVersion`. A second redemption
-  returns 409 and raises a security event, because a replayed enrollment token
-  means the install secret leaked.
+- **Every redemption is recorded atomically**, via a compare-and-swap on the
+  state Secret's `resourceVersion`. For a single-use token, a second redemption
+  returns 409 and raises a security event, because a replayed single-use token
+  means the install secret leaked. For a reusable token, redemption beyond its
+  `--max-redemptions` cap is refused the same way; short of that cap, repeat
+  redemption is the expected use and is audited rather than treated as an
+  incident.
 - The issued profile is `CN=spoke:<clusterID>`, a single URI SAN
   `pmf://<trustDomain>/spoke/<clusterID>`, `clientAuth` extended key usage only,
   and a 14-day lifetime.
@@ -165,8 +174,9 @@ purposes — it is decoration.
 
 **Renewal** happens at half of the certificate's lifetime with ±10% jitter, so
 100 spokes do not stampede. No enrollment token is involved. Below 10% remaining
-the spoke alarms; on expiry it needs a fresh enrollment token, which is
-intentional.
+the spoke alarms; past expiry it still has `--renew-grace` (default 30 days) to
+renew with the same possession proof, given a non-revoked serial. Only past that
+grace window does it need a fresh enrollment token.
 
 Renewal is **not** mutual TLS. It cannot be: the Ingress terminates TLS, so the
 hub sees no client certificate on any request, and a route that read
@@ -182,14 +192,31 @@ The challenge is unauthenticated and stateless: `random ‖ expiry ‖
 HMAC(pepper, …)`, valid for 60 seconds, verifiable at any replica. It is not
 single-use, because replaying a renewal returns a certificate for a public key
 the replayer holds no private half of. That reasoning does *not* transfer to
-enrollment, whose token is a bearer credential and is burned atomically.
+enrollment, whose token is a bearer credential: a single-use enrollment token
+is burned atomically on first redemption, and a reusable one is recorded and
+checked against its redemption cap on every redemption.
 
 **Revocation** is a hub-side denylist keyed on certificate serial, consulted on
-every tunnel handshake and on every renewal, against live state rather than a
-cached list. A CRL is published at `/pki/crl`
+every tunnel handshake and on every renewal (including a grace-period renewal of
+an already-expired certificate), against live state rather than a cached list.
+A CRL is published at `/pki/crl`
 for external auditors, but nothing in this system depends on it — a CRL adds
 latency, a distribution problem and a `nextUpdate` gap for no benefit when the
-hub is the only verifier. The 14-day lifetime is the backstop.
+hub is the only verifier.
+
+**Certificate lifetime is not a backstop against a stolen key.** It used to be:
+a 14-day certificate expired and `/renew` refused it. Since renewal accepts an
+expired certificate within `--renew-grace` (30 days by default), and renewal is
+authenticated by proof of possession of the private key, whoever holds that key
+can renew indefinitely — each renewal issuing a fresh 14-day certificate. The
+44-day figure that follows from the two defaults is the window only for an
+attacker who renews once and stops.
+
+**Revocation is therefore the only control that closes this.** Set
+`--renew-grace=0` to restore strict expiry as a second line, at the cost of
+stranding any spoke that was offline longer than its certificate's life. And
+note the limit of revocation itself, below: it is checked at handshake, so it
+stops the next connection rather than the current one.
 
 **If the CA key is lost:** existing spokes keep working until their certificates
 expire, at most 14 days, and no renewal succeeds in the meantime. Recovery is
@@ -335,7 +362,7 @@ successful injection worthless than pretend to detect one.
 | **Malicious cluster operator** | Injects hostile labels and annotations; tries to exhaust the hub | Per-cluster concurrency and byte quotas, so one cluster cannot starve the other 99; sanitisation and clipping; decompressed-size cap; nothing they send becomes a metric label, so they cannot inflate our cardinality either |
 | **Hub compromise** | Read across the whole fleet; mint certificates | The pepper is stored outside the credential document; the admin API is on a separate listener with separate credentials; every mint, burn and revocation is an immutable audit event; the spoke's independent allow-list still blocks destructive endpoints |
 | **Prompt-injected agent** | Acts maliciously with its *own* legitimate key | Read-only by construction; destructive endpoints absent for everyone; scope confines it; the admin API is unreachable from an agent key |
-| **Stolen enrollment token** | One certificate, for one cluster | Single use with atomic burn; 15-minute lifetime; bound to one cluster ID; a replay attempt raises a security event |
+| **Stolen enrollment token** | One or more certificates, all for the same one cluster, within the token's window | 15-minute lifetime; bound to one cluster ID; a single-use token is atomically burned on first redemption and a replay raises a security event; a reusable token (the default) is capped by `--max-redemptions` when set and every redemption is audited |
 | **Network attacker** | — | HTTPS only; the spoke verifies the hub's server certificate, and the hub verifies the spoke's certificate and a signature over a nonce it chose. Observing traffic is not enough to impersonate either side |
 | **Compromised Ingress** | Observe tunnel traffic; relay a live connection | Cannot impersonate a spoke — it holds no spoke private key, and the signature covers a fresh hub-chosen nonce. This is the accepted cost of Ingress-only exposure; see ADR-0014 |
 | **Malicious CSR** | — | Subject and SANs discarded; only the public key is used; key type and size are checked |
@@ -373,8 +400,10 @@ data. Instead the **hub generates its own pepper and CA on first boot** into a
 Secret it owns, using a Role scoped by `resourceNames` to exactly that object.
 Idempotent, no plaintext in the release, nothing for an operator to handle.
 
-The spoke receives only the enrollment token, which is short-lived and
-single-use. It writes its issued key and certificate into a Secret in its own
+The spoke receives only the enrollment token, which is short-lived (15 minutes
+by default) and, unless minted with `--single-use`, reusable so the same
+declared token can re-seed the same cluster after a rebuild. It writes its
+issued key and certificate into a Secret in its own
 namespace, which is why it holds `get,create,update` on exactly that one Secret
 by name — and nothing else, nothing cluster-scoped. An RBAC-free mode is
 available at the cost of re-enrolling on every restart.

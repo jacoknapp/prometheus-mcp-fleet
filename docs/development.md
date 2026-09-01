@@ -153,7 +153,8 @@ export PMF_ADMIN_TOKEN=pmf_adm_...
 
 # Terminal 4 — the spoke
 ./bin/spoke \
-  --cluster-id=local-dev --hub-endpoints=ws://127.0.0.1:8080/tunnel \
+  --cluster-id=local-dev --cluster-sdlc=dev \
+  --hub-endpoints=ws://127.0.0.1:8080/tunnel \
   --hub-api-url=https://127.0.0.1:8080 --hub-ca-file=/tmp/pmf/ca.crt \
   --enrollment-token-file=/tmp/pmf/enroll.token \
   --identity-backend=file --data-dir=/tmp/pmf/spoke \
@@ -307,18 +308,23 @@ stated cardinality bound.
 `mcp.tool.call → hub.proxy → spoke.prom.request` across the tunnel. Unset, the
 provider is a no-op with no network activity.
 
-**pprof.** `--pprof-enabled` exposes it on the admin listener, which defaults to
-loopback and is never in the chart's Service.
+**pprof.** `--pprof-enabled` exposes it on the admin listener, off by default.
+Run the bare binary, the hub's admin listener defaults to loopback; the spoke's
+does not. Either chart rebinds it to all interfaces instead, because the
+kubelet and a scraper need to reach `/metrics`, `/healthz` and `/readyz` — the
+admin port is published in the hub's Service by default (`service.admin.enabled`)
+and is the only port the spoke's Service carries. What actually confines it is
+a NetworkPolicy scoped to the `monitoring` namespace, not the bind address.
 
 **A spoke that will not connect** is nearly always one of: an expired enrollment
-token (15 minutes, single use), a cluster ID that does not match the one the
-token was minted for, or the hub's tunnel address not being reachable. The
-spoke's logs name which.
+token (15 minutes by default; reusable unless minted with `--single-use`), a
+cluster ID that does not match the one the token was minted for, or the hub's
+tunnel address not being reachable. The spoke's logs name which.
 
 ## Common tasks
 
 **Adding an MCP tool.** Add the endpoint to `internal/promapi` if it is not
-there; implement in `internal/mcptools` with `mcp.AddTool[In,Out]` so the schema
+there; implement in `internal/mcptools` with `mcpsurface.AddTool[In,Out]` so the schema
 is inferred from the struct; add the golden schema file; document it in
 [mcp-tools.md](mcp-tools.md). Then read the tool description as if you were the
 model — a description that is ambiguous to you is worse to it.

@@ -30,12 +30,17 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/config"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/fleet"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/hubapi"
 )
 
 // DefaultAdminURL is the hub's loopback admin listener.
-const DefaultAdminURL = "http://127.0.0.1:9091"
+//
+// It must track config.DefaultHubAdminAddr. It did not: this said 9091 while
+// the hub listens on 9090, so every documented invocation that omitted
+// --admin-url connected to nothing.
+const DefaultAdminURL = "http://" + config.DefaultHubAdminAddr
 
 // requestTimeout bounds a single admin call. These are local, in-pod requests
 // against an API that does no long work, so a short bound is right: a CLI that

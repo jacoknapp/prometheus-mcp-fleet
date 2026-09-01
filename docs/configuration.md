@@ -12,12 +12,15 @@ so they cannot drift: flag `--foo-bar` is environment variable `PMF_FOO_BAR`.
 **Precedence:** flag > environment variable > default.
 
 Validation reports *every* problem at once rather than the first, and each
-message names both the flag and the variable it came from. Run either binary
-with `--help` for the same list generated from the source.
+message names both the flag and the variable it came from. The full list is
+generated from the source and is meant to be printed by `--help` — but as of
+this writing `--help` exits `0` and prints nothing (a bug: the loader builds
+the usage text, main just never writes it out). Until that is fixed, passing
+any unrecognised flag prints the same usage text to stderr as a side effect of
+reporting the error:
 
 ```console
-$ hub --help
-$ spoke --help
+$ hub --not-a-real-flag   # prints the full flag list to stderr, then exits 1
 $ hub version
 ```
 
@@ -35,6 +38,7 @@ agent can reach.
 | `--tunnel-path` | `/tunnel` | Path on the MCP listener where spokes open a WebSocket. There is no separate tunnel port: an Ingress terminates TLS, so mutual authentication happens inside the connection (ADR-0014). |
 | `--admin-addr` | `127.0.0.1:9090` | Admin API, metrics, health and pprof. **Never expose this.** The chart fails the render if you try. |
 | `--public-url` | — | Canonical external URL of the MCP endpoint, used in the RFC 9728 protected-resource document. |
+| `--peer-discovery-domain` | — | Headless Service FQDN resolving to one address per hub replica. Enables multi-replica HA behind one Ingress hostname: since a tunnel terminates on exactly one replica and there is no hub-to-hub forwarding, the hub counts addresses here and tells each spoke how many replicas to expect, so it dials the same hostname until it has seen them all. Empty disables discovery. |
 
 ### State
 
@@ -62,12 +66,13 @@ startup error naming the rule you are missing.
 | `--ca-cert-file` | — | Internal CA certificate. Empty self-initialises inside `--data-dir`. |
 | `--ca-key-file` | — | Private key for the above. Both must be set or neither. |
 | `--spoke-cert-ttl` | `336h` (14d) | Lifetime of an issued spoke certificate. Spokes renew at half life with jitter. |
+| `--renew-grace` | `720h` (30d) | How long after expiry `/renew` still accepts a spoke's certificate, given a valid possession proof and an unrevoked serial. `0` restores strict expiry. See [Renewing an expired certificate](spoke-enrollment.md#renewing-an-expired-certificate). |
 
 ### Credentials
 
 | Flag / `PMF_` variable | Default | Description |
 |---|---|---|
-| `--enrollment-token-ttl` | `15m` | Lifetime of a single-use enrollment token. |
+| `--enrollment-token-ttl` | `15m` | Lifetime of an enrollment token. Applies whether the token is reusable (the default) or `--single-use`; a reusable token still expires, it just can be redeemed more than once before it does. |
 | `--agent-key-ttl` | `720h` (30d) | Default lifetime of a minted agent key. |
 | `--pepper-file` | `<data-dir>/pepper.key` | Out-of-database HMAC pepper. Generated on first start. |
 
@@ -125,10 +130,14 @@ widen them past what is set here.
 | Flag / `PMF_` variable | Default | Description |
 |---|---|---|
 | `--cluster-id` | **required** | Immutable cluster identity, matching `^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`. It ends up in a certificate SAN. |
+| `--cluster-sdlc` | **required** | Lifecycle stage such as `dev`, `staging` or `prod`. Normalised before validation — `PROD` and `Pre Prod` become `prod` and `pre-prod` — then published as the reserved label `sdlc`, which agent key scopes and `fanout_query` select on. A cluster enrolled without it is one no scoped credential can reach and no fleet-wide query targets. |
 | `--cluster-display-name` | — | Human-facing name, e.g. `prod-us-east-1`. |
 | `--cluster-description` | — | One line describing what this cluster runs. Shown to the agent. |
-| `--cluster-labels` | — | `k=v,k=v` selector labels, e.g. `env=prod,region=us-east-1`. Agent key scopes match on these. |
-| `--enrollment-token-file` | — | File holding the single-use enrollment token. |
+| `--cluster-k8s-version` | — | Kubernetes version, for a cluster whose Prometheus does not publish `kubernetes_build_info`. The spoke has no Kubernetes API access by design, so without either source this fact is unavailable. Set, it wins over anything derived. |
+| `--cluster-k8s-uid` | — | Kubernetes cluster UID, same reasoning as `--cluster-k8s-version`. |
+| `--cluster-k8s-nodes` | `0` | Node count, for a cluster that does not scrape `kube_node_info`. |
+| `--cluster-labels` | — | `k=v,k=v` selector labels, e.g. `env=prod,region=us-east-1`. Agent key scopes match on these. `sdlc` is reserved for `--cluster-sdlc` and wins over any entry of that name here. |
+| `--enrollment-token-file` | — | File holding the enrollment token (reusable by default; see [spoke-enrollment.md](spoke-enrollment.md#tokens-are-reusable-by-default)). |
 | `--identity-backend` | `auto` | `secret`, `file`, `memory`, or `auto`. |
 | `--identity-secret-name` | `prometheus-mcp-fleet-identity` | Secret holding the issued key and certificate. |
 | `--namespace` | projected | Namespace of the identity Secret. |
@@ -199,6 +208,8 @@ env:
 env:
   - name: PMF_CLUSTER_ID
     value: "prod-us-east-1"
+  - name: PMF_CLUSTER_SDLC
+    value: "prod"
   - name: PMF_CLUSTER_LABELS
     value: "env=prod,region=us-east-1,tier=customer-facing"
   - name: PMF_HUB_ENDPOINTS

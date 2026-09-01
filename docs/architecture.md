@@ -50,10 +50,11 @@ maintained by the spokes themselves, and a single place to re-encode results.
 flowchart TB
     subgraph hub ["hub — one per fleet"]
         direction TB
-        MCP["mcpserver + mcptools<br/><small>tool surface, token-efficient encoding</small>"]
+        MCP["mcpserver + mcptools<br/><small>tool surface</small>"]
+        REND["render<br/><small>token-efficient encoding, sanitisation</small>"]
         AUTHN["authn<br/><small>key verification, LRU, revocation epoch</small>"]
         PROXY["promproxy<br/><small>authorize, validate, budget, route</small>"]
-        REG["registry<br/><small>live fleet view, in memory</small>"]
+        REG["registry<br/><small>live fleet view, pooled sessions, in memory</small>"]
         LIS["tunnel/wstun<br/><small>WebSocket + signed-nonce auth</small>"]
         API["hubapi<br/><small>admin REST, enrollment, PKI</small>"]
         CA["ca<br/><small>issue / renew / revoke</small>"]
@@ -61,6 +62,7 @@ flowchart TB
 
         MCP --> AUTHN
         MCP --> PROXY
+        MCP --> REND
         PROXY --> REG
         REG --> LIS
         API --> CA
@@ -85,7 +87,15 @@ flowchart TB
 
 ### hub
 
-One deployment per fleet. It runs three listeners, deliberately separated:
+One Deployment per fleet, and that Deployment may run several replicas behind
+a **single** Ingress hostname. There is no hub-to-hub forwarding
+([ADR-0013](adr/0013-no-hub-peer-forwarding.md)), so a tunnel that terminates
+on one replica is invisible to the others; the hub instead resolves its own
+headless Service over DNS to count its peers and reports that count, plus a
+per-replica `ServerID`, in the tunnel `ServerHello`. A spoke dials the shared
+hostname repeatedly until it has seen every distinct `ServerID`, so a fraction
+of tool calls never lands on a replica with no tunnel to that cluster. It runs
+three listeners, deliberately separated:
 
 | Listener | Default | Exposure | Carries |
 |---|---|---|---|
@@ -101,9 +111,14 @@ signed certificate challenge.
 
 ### spoke
 
-One deployment per cluster, about 20 MiB resident. It listens for nothing but
-its own metrics and health. Everything it does is a consequence of the
-connection it dialed:
+One Deployment per cluster, about 20 MiB resident per pod. It listens for
+nothing but its own metrics and health. A cluster may run more than one spoke
+pod for its own availability: the hub pools their sessions rather than
+electing a leader (see [Discovery and the registry](#discovery-and-the-registry)),
+and sibling pods share one certificate through the identity Secret — at
+renewal, whichever pod loses the write to the Secret re-reads it and adopts
+what a sibling already wrote instead of minting a competing certificate.
+Everything a pod does is a consequence of the connection it dialed:
 
 - serve allow-listed Prometheus requests the hub sends down the tunnel;
 - re-validate each of those against its own copy of the allow-list;
@@ -134,7 +149,7 @@ sequenceDiagram
     S->>H: HTTPS GET /tunnel, Upgrade: websocket
     Note over S,H: the Ingress terminates TLS and proxies the upgrade
     H-->>S: 101 Switching Protocols
-    H->>S: ServerHello{nonce}
+    H->>S: ServerHello{nonce, serverID, replicas}
     S->>H: ClientAuth{certificate chain, signature over the transcript}
     H->>H: verify chain against the CA, check revocation denylist
     H->>H: verify signature, derive clusterID from the URI SAN
@@ -144,7 +159,7 @@ sequenceDiagram
     H->>H: grpc.NewClient over the accepted conn
     H->>S: Describe("")
     S-->>H: ClusterFacts + fingerprint + generation
-    H->>H: registry attach (generation CAS)
+    H->>H: registry attach (pool slot by instance ID, generation CAS)
     loop every 60s
         H->>S: Describe(knownFingerprint)
         S-->>H: unchanged (~40 bytes)
@@ -212,11 +227,22 @@ Polling is fingerprint-based. The hub sends the fingerprint it holds; an
 unchanged spoke replies `unchanged` and nothing else, so steady-state cost for
 100 clusters is a few kilobytes a minute.
 
-Session identity uses a **generation CAS**. Each session carries the spoke's
-process start time in nanoseconds; a new session replaces an existing one only
-if its generation is greater or equal, and the loser is drained and closed. A
-stale reconnect racing a fresh one loses deterministically, so the cluster list
-an agent sees never flaps or double-counts.
+A cluster's entry holds a **pool of sessions, one slot per spoke pod**, not a
+single session — a cluster may run several pods for its own availability, and
+the registry treats them as an interchangeable pool with no leader election,
+since every Prometheus query a spoke serves is read-only and idempotent. Which
+slot a session occupies is keyed by the spoke's self-reported instance ID (or
+its certificate serial, if that is absent), never by anything that could steer
+a session into colliding with an unrelated pod's slot. A session whose key
+names no existing slot is a sibling pod and simply joins the pool.
+
+Within one slot, identity still uses a **generation CAS**: each session
+carries the spoke's process start time in nanoseconds, and a newcomer displaces
+the slot's incumbent only if its generation is greater than or equal, with the
+loser drained and closed. A stale reconnect racing a fresh one for the same
+slot loses deterministically, so a single pod's identity in the pool never
+flaps or double-counts — but two distinct pods never compete for the same
+slot in the first place, by design.
 
 ## The request path
 
@@ -270,27 +296,35 @@ There is no database and no PersistentVolumeClaim
 | Issued key records | Kubernetes Secret | KID, HMAC, scope, expiry — never a raw secret |
 | Enrollment burn state | Same Secret | Needs atomicity; `resourceVersion` provides it |
 | Revoked serials | Same Secret | Small, consulted at handshake |
-| Spoke key and certificate | Secret in the spoke's namespace | Survives a restart without a fresh enrollment token |
+| Spoke key and certificate | Secret in the spoke's namespace, shared by every pod of that cluster | Survives a restart without a fresh enrollment token |
 
 Every mutation of the hub's state Secret is a read-modify-write against the
-current `resourceVersion`, retried on conflict. That is what makes "burn this
-enrollment token exactly once" atomic *across replicas* — a guarantee the
-original single-writer database design could not have offered.
+current `resourceVersion`, retried on conflict. That is what makes burning an
+enrollment token — whether it is single-use or capped at N redemptions —
+atomic *across replicas* — a guarantee the original single-writer database
+design could not have offered.
 
 ## Identity and trust
 
 ```mermaid
 flowchart LR
     OP(["operator"]) -->|"pmf_adm_"| MINT["mint enrollment token<br/>bound to one clusterID"]
-    MINT --> TOK["pmf_enr_ · 15 min · one use"]
+    MINT --> TOK["pmf_enr_ · 15 min<br/>reusable by default"]
     TOK --> SPOKE["spoke generates P-256 key<br/>sends CSR"]
-    SPOKE --> BURN{"burn atomically"}
-    BURN -->|already used| SEC["409 + security event"]
+    SPOKE --> BURN{"burn/redeem atomically"}
+    BURN -->|already used or over cap| SEC["409 + security event"]
     BURN --> ISSUE["CA mints its OWN subject<br/>CSR subject/SANs discarded"]
     ISSUE --> CERT["cert · 14 days<br/>URI SAN pmf://domain/spoke/id"]
     CERT --> TUN["tunnel: in-band proof of possession"]
     CERT -->|"at 50% life, signed challenge"| RENEW["renew, no token"]
 ```
+
+Enrollment tokens are **reusable by default** — `hub enroll create` only mints a
+single-use token when passed `--single-use`. A single-use token cannot be
+committed to a GitOps repo, cannot survive a cluster rebuild, and cannot enroll
+several spoke pods that start together, so in practice a reusable token
+(optionally capped with `--max-redemptions`) is what most operators want; a
+single-use one suits a human enrolling one cluster by hand.
 
 The cluster ID comes only from the certificate's URI SAN. Nothing a spoke reports
 at runtime can override it — if a spoke's self-reported ID disagrees, the hub
@@ -298,16 +332,16 @@ logs a warning, counts it, and uses the certificate value.
 
 Four credential classes, each with a different issuance path, verification path
 and blast radius: `pmf_adm_` (admin listener only), `pmf_agt_` (MCP only),
-`pmf_enr_` (single use, buys one certificate), and the X.509 spoke identity. An
-agent key cannot enroll; an enrollment token cannot query. See
-[docs/security.md](security.md).
+`pmf_enr_` (reusable by default, buys one certificate per redemption), and the
+X.509 spoke identity. An agent key cannot enroll; an enrollment token cannot
+query. See [docs/security.md](security.md).
 
 ## Failure domains
 
 | Failure | Detected by | Effect | Recovery |
 |---|---|---|---|
-| Spoke pod or node dies | HTTP/2 keepalive, ~15s | That cluster reports disconnected with `lastSeen`; queries fail fast rather than hanging | Automatic on restart |
-| Network partition | Same | Spoke re-dials with full jitter; generation CAS prevents a duplicate entry | Automatic |
+| Spoke pod or node dies | HTTP/2 keepalive, ~15s | Its slot leaves the cluster's session pool; a sibling pod keeps the cluster connected, or if it was the last slot the cluster reports disconnected with `lastSeen` and queries fail fast rather than hanging | Automatic on restart |
+| Network partition | Same | Spoke re-dials with full jitter; the per-slot generation CAS prevents a duplicate entry for that pod | Automatic |
 | Prometheus down, spoke up | Spoke's own probe | Cluster reports `degraded` with a reason — the agent gets the truth, not a timeout | Automatic |
 | Hub restart | — | Agents get connection errors; registry rebuilds as spokes reconnect. Monitoring itself is unaffected | Seconds |
 | Hub Secret unreadable (RBAC) | Startup | Hub fails readiness with an error naming the missing rule | Fix the Role |
@@ -332,6 +366,9 @@ L0  fleet      domain types — imports nothing from this module
     config     flag + environment loader
     tunnel     transport-agnostic interfaces, no gRPC symbols
     promapi    the Prometheus allow-list, pure, no I/O
+    certproof  proof-of-possession transcript shared by the tunnel
+               handshake (L1) and hubapi renewal (L2), which sit on
+               different layers and cannot import each other
 L1  obs        slog, metrics, tracing, health, pprof
     httpx      middleware and a graceful server
     token      pmf_ token format and HMAC
@@ -341,19 +378,25 @@ L1  obs        slog, metrics, tracing, health, pprof
     authn      credential verification and caching
     promclient spoke-side Prometheus client
     tunnel/wstun · tunnel/grpctun · tunnel/memtun · tunnel/tunneltest
-L2  registry   live fleet view
+    gen/fleet/v1 generated protobuf/gRPC stubs for the tunnel service
+L2  registry   live fleet view, pooled sessions per cluster
     promproxy  authorize, budget, route
     clusterfacts spoke-side facts
     hubapi     admin REST, enrollment, PKI endpoints
     mcpsurface adapter isolating the MCP SDK
-L3  mcptools   the tool implementations and encoders
-L4  hub · spoke composition roots
+    render     Prometheus responses -> token-efficient shapes, sanitised
+L3  mcptools   the tool implementations, built on render's encoders
+L4  hub · hubcli · spoke composition roots
 L5  cmd/hub · cmd/spoke
 ```
 
 `tunnel` containing no gRPC symbols is what lets `memtun` and `grpctun` run the
 same conformance suite, and what lets the hub's routing be tested with no
 network at all.
+
+`hubcli` (L4) is the `hub enroll create` / `hub keys create` command-line
+surface run with `kubectl exec` against a running hub pod — a composition root
+like `hub` and `spoke`, not a library anything else depends on.
 
 ## Capacity
 

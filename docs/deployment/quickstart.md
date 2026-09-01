@@ -11,7 +11,8 @@ From nothing to an AI agent querying two clusters. Budget about twenty minutes.
 you install the spoke **once per monitored cluster** — a separate Helm release,
 from a separate chart, in a different cluster each time. The spoke chart contains
 no hub templates and references no hub resource; all it knows is an address, a
-trust bundle and a single-use token.
+trust bundle and an enrollment token (reusable by default; see
+[spoke-enrollment.md](../spoke-enrollment.md#tokens-are-reusable-by-default)).
 
 ## Prerequisites
 
@@ -34,6 +35,7 @@ kubectl create namespace prometheus-mcp-hub
 
 helm install pmf-hub oci://ghcr.io/jacoknapp/charts/prometheus-mcp-hub \
   --namespace prometheus-mcp-hub \
+  --set fullnameOverride=pmf-hub \
   --set ingress.enabled=true \
   --set ingress.className=nginx \
   --set ingress.host=pmf.example.com \
@@ -42,6 +44,13 @@ helm install pmf-hub oci://ghcr.io/jacoknapp/charts/prometheus-mcp-hub \
   --set config.publicURL=https://pmf.example.com/mcp \
   --set config.trustDomain=fleet.example.com
 ```
+
+`fullnameOverride=pmf-hub` matters beyond cosmetics: the chart's default name
+is `<release>-<chart>` whenever the release name doesn't already contain the
+chart name (`prometheus-mcp-hub`), which would render the Deployment as
+`pmf-hub-prometheus-mcp-hub` instead of `pmf-hub` and break every
+`deploy/pmf-hub` command below, along with the CA Secret name the spoke
+install further down points at (`pmf-hub-ca`).
 
 On first boot the hub generates its own CA and HMAC pepper into a Secret it
 owns, using a Role scoped by `resourceNames` to exactly that object. There is no
@@ -67,17 +76,29 @@ kubectl -n prometheus-mcp-hub logs deploy/pmf-hub | grep pmf_adm_
 export PMF_ADMIN_TOKEN='pmf_adm_...'
 ```
 
-Losing it is recoverable — you can mint another from inside the pod — but it is
-easier to keep this one.
+Every admin route, including the one that mints keys, requires a valid admin
+bearer token — there is no bypass for `kubectl exec`. So losing this token
+**before** minting a replacement with it is not casually recoverable: without
+any usable admin credential you cannot authenticate a call to mint another
+one. Recovery then means waiting for this bootstrap credential to expire (tied
+to `--agent-key-ttl`, 30 days by default) and restarting the hub, which mints
+a fresh one only once none of the stored admin keys are still usable. Keep
+this one, and mint a properly scoped replacement with it soon after — see
+[step 4](#4-mint-an-agent-key) for the `hub keys create` invocation and pass
+`--class admin`.
 
 ## 3. Export the CA bundle
 
 Each spoke is in a different cluster and different trust domain, so it needs the
 hub's CA out of band for its first connection.
 
+There is no `hub ca` subcommand (the hub binary only implements `hub enroll
+create` and `hub keys create`). The bundle is served unauthenticated at
+`/pki/bundle` on the same public hostname as the MCP endpoint, so no `exec` is
+needed at all:
+
 ```bash
-kubectl exec -n prometheus-mcp-hub deploy/pmf-hub -- \
-  hub ca bundle > hub-ca.crt
+curl -fsS https://pmf.example.com/pki/bundle > hub-ca.crt
 ```
 
 ## 4. Mint an agent key
@@ -109,9 +130,10 @@ Repeat this pair of steps once per cluster.
 ```bash
 kubectl exec -n prometheus-mcp-hub deploy/pmf-hub -- \
   hub enroll create \
+    --admin-token-file /var/run/pmf/admin-token \
     --cluster prod-us-east-1 \
     --labels env=prod,region=us-east-1
-# pmf_enr_9dK2mQ4pLz…   valid 15 minutes, redeemable once
+# pmf_enr_9dK2mQ4pLz…   valid 15 minutes, reusable by default
 ```
 
 **In the target cluster — install the spoke:**
@@ -127,9 +149,11 @@ kubectl create secret generic pmf-hub-ca -n prometheus-mcp \
 
 helm install pmf-spoke oci://ghcr.io/jacoknapp/charts/prometheus-mcp-spoke \
   --namespace prometheus-mcp \
+  --set fullnameOverride=pmf-spoke \
   --set cluster.id=prod-us-east-1 \
-  --set cluster.labels.env=prod \
-  --set cluster.labels.region=us-east-1 \
+  --set cluster.sdlc=prod \
+  --set cluster.labels[0].name=env --set cluster.labels[0].value=prod \
+  --set cluster.labels[1].name=region --set cluster.labels[1].value=us-east-1 \
   --set hub.endpoints[0]=wss://pmf.example.com/tunnel \
   --set hub.apiUrl=https://pmf.example.com \
   --set hub.existingCASecret=pmf-hub-ca \
@@ -137,9 +161,13 @@ helm install pmf-spoke oci://ghcr.io/jacoknapp/charts/prometheus-mcp-spoke \
   --set prometheus.url=http://prometheus-operated.monitoring.svc:9090
 ```
 
-Every one of `cluster.id`, `hub.endpoints`, `hub.apiUrl` and `prometheus.url`
-differs per cluster and has **no default**. A default that happened to work in
-one place would be a trap in the other ninety-nine.
+`fullnameOverride=pmf-spoke` is the same fix as for the hub above — without it
+the Deployment renders as `pmf-spoke-prometheus-mcp-spoke`, not `pmf-spoke`,
+breaking the `deploy/pmf-spoke` command below. `cluster.labels` is a **list**
+of `{name, value}` entries, not a map. Every one of `cluster.id`,
+`cluster.sdlc`, `hub.endpoints`, `hub.apiUrl` and `prometheus.url` differs per
+cluster and has **no default**. A default that happened to work in one place
+would be a trap in the other ninety-nine.
 
 Verify:
 
@@ -172,9 +200,12 @@ Ask it *"which prod clusters have firing alerts?"* It should call
 
 - [ ] **Scope every agent key** to the clusters and tools it actually needs.
 - [ ] **Back up the hub's CA Secret**, and test the restore. Losing it means
-      re-enrolling every cluster.
+      re-enrolling every cluster. The chart names it `<release>-ca`
+      (`state.caSecretName` overrides it) — with `fullnameOverride=pmf-hub` set
+      above, that's `pmf-hub-ca`, not the binary's own unprefixed default of
+      `prometheus-mcp-fleet-ca`, which only applies outside this chart.
       ```bash
-      kubectl -n prometheus-mcp-hub get secret prometheus-mcp-fleet-ca -o yaml > ca-backup.yaml
+      kubectl -n prometheus-mcp-hub get secret pmf-hub-ca -o yaml > ca-backup.yaml
       ```
 - [ ] Set `--query.max-samples` and a query timeout on every Prometheus. The hub
       bounds response size, not evaluation cost.
@@ -202,6 +233,6 @@ are short-lived on purpose — and feed your existing secret delivery. See
 | [Configuration](../configuration.md) | Every flag and environment variable |
 | [MCP tools](../mcp-tools.md) | What the agent can actually do |
 | [Security](../security.md) | Threat model and hardening |
-| [High availability](../operations/high-availability.md) | Why the hub defaults to one replica |
+| [High availability](../operations/high-availability.md) | How multi-replica HA works (both charts default to `replicaCount: 3`) |
 | [Runbook](../operations/runbook.md) | Alert-driven procedures |
 | [Troubleshooting](../troubleshooting.md) | Symptom → cause → fix |

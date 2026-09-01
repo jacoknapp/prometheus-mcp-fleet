@@ -25,6 +25,7 @@ Allowed:
 | Module | Why it earns its place |
 |---|---|
 | `google.golang.org/grpc`, `google.golang.org/protobuf` | Multiplexed streams, flow control, cancellation and deadline propagation. Hand-rolling this is the one place we refuse to save bytes ([ADR-0002](0002-spoke-dialed-reversed-grpc-tunnel.md)). |
+| `github.com/coder/websocket` | RFC 6455 framing, masking and close semantics for the tunnel's WebSocket transport, plus the `net.Conn` adapter the reversed gRPC design needs. Zero transitive dependencies is the only reason it clears the budget ([ADR-0014](0014-websocket-tunnel-through-standard-ingress.md)). |
 | `github.com/prometheus/client_golang` | Self-metrics. It *is* the ecosystem contract; reimplementing the exposition format would be absurd in this project of all projects. |
 | `github.com/modelcontextprotocol/go-sdk` | Specification conformance. A hand-rolled JSON-RPC session layer would silently drift from a moving specification. |
 | `github.com/google/jsonschema-go` | Not a choice so much as a consequence: `mcp.Tool.InputSchema` is a `*jsonschema.Schema`, so code that inspects or emits a tool schema must name the type. It arrives with the SDK regardless; only `internal/mcpsurface` imports it. |

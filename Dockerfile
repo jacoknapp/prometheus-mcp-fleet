@@ -36,7 +36,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
         -X github.com/jacoknapp/prometheus-mcp-fleet/internal/version.Version=${VERSION} \
         -X github.com/jacoknapp/prometheus-mcp-fleet/internal/version.Commit=${COMMIT} \
         -X github.com/jacoknapp/prometheus-mcp-fleet/internal/version.Date=${BUILD_DATE}" \
-      -o /out/app "./cmd/${COMPONENT}"
+      -o "/out/${COMPONENT}" "./cmd/${COMPONENT}"
 
 # ---- runtime ---------------------------------------------------------------
 # distroless static rather than scratch: we want CA certificates, tzdata and a
@@ -57,7 +57,19 @@ LABEL org.opencontainers.image.title="prometheus-mcp-fleet-${COMPONENT}" \
       org.opencontainers.image.revision="${COMMIT}" \
       org.opencontainers.image.vendor="jacoknapp"
 
-COPY --from=build /out/app /usr/local/bin/app
+# Installed under its component name, not as "app".
+#
+# The documented way to administer a hub is
+# `kubectl exec deploy/pmf-hub -- hub enroll create ...`, and the binary has to
+# be called `hub` for that to resolve. It was called `app`, so every such
+# command in the documentation failed with "executable file not found in $PATH".
+COPY --from=build "/out/${COMPONENT}" "/usr/local/bin/${COMPONENT}"
+
+# The same binary again at a fixed path, because ENTRYPOINT's exec form cannot
+# expand a build argument and this image has no shell to expand one. The chart
+# therefore starts /usr/local/bin/app without knowing the component, while an
+# operator still types the component name on an exec.
+COPY --from=build "/out/${COMPONENT}" /usr/local/bin/app
 
 # 65532 is distroless' `nonroot`. The charts set the same value explicitly.
 USER 65532:65532

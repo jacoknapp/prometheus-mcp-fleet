@@ -31,6 +31,9 @@ func main() {
 func mainWithExit(args []string, stderr io.Writer, exit func(int)) {
 	if err := run(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
+			// Print the usage the loader built. Without this --help exited 0
+			// and said nothing, which reads as a broken binary.
+			_, _ = fmt.Fprintln(stderr, err)
 			exit(0)
 			return
 		}
