@@ -14,10 +14,15 @@ RawToken.String
 # Deliberate package contracts used by conformance tests, SDK adapters,
 # operator tooling, or the shipped secret-scanning pattern. These internal
 # package APIs are kept explicit so additions require review here.
-CA.Certificate
 Endpoints
 ErrorCode
 MaxBody
+# ca.Parse builds an authority from PEM already in memory. Production reaches
+# a CA through LoadOrCreate (from disk) or AdoptPEM (rotation replacing the
+# signer in place), so nothing in either binary calls it any more -- but it is
+# how eighteen tests construct an authority without a temp directory, and the
+# alternative is worse tests, not less code.
+Parse
 Pattern
 PromptNames
 Register

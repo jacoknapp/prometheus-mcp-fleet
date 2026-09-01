@@ -21,7 +21,6 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/prometheus/client_golang/prometheus"
-	dto "github.com/prometheus/client_model/go"
 
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/ca"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/config"
@@ -1613,44 +1612,28 @@ func TestMetricsAdapterCARotation(t *testing.T) {
 			a.CAOutgoingRootSessions(3)
 			a.CARotationTransition("signing")
 
+			// Read through the exposition, like every other metric
+			// assertion in this package: it is what an operator sees, and it
+			// keeps client_model out of the module's direct dependencies
+			// (ADR-0010 budgets those deliberately, test deps included).
 			got := map[string]float64{}
 			for phase := range tc.wantPhase {
-				got[phase] = gaugeValue(t, a.m.CARotationPhase.WithLabelValues(phase))
+				got[phase] = metricValue(t, reg, `promfleet_hub_ca_rotation_phase{phase="`+phase+`"}`)
 			}
 			if diff := cmp.Diff(tc.wantPhase, got); diff != "" {
 				t.Errorf("phase gauges (-want +got):\n%s", diff)
 			}
-			if start := gaugeValue(t, a.m.CARotationPhaseStart); start != tc.wantStart {
+			if start := metricValue(t, reg, "promfleet_hub_ca_rotation_phase_start_timestamp_seconds"); start != tc.wantStart {
 				t.Errorf("phase start = %v, want %v", start, tc.wantStart)
 			}
-			if n := gaugeValue(t, a.m.CAOutgoingRootSessions); n != 3 {
+			if n := metricValue(t, reg, "promfleet_hub_ca_outgoing_root_sessions"); n != 3 {
 				t.Errorf("outgoing root sessions = %v, want 3", n)
 			}
-			if n := counterValue(t, a.m.CARotationTransitionsTotal.WithLabelValues("signing")); n != 1 {
+			if n := metricValue(t, reg, `promfleet_hub_ca_rotation_transitions_total{to="signing"}`); n != 1 {
 				t.Errorf("transitions = %v, want 1", n)
 			}
 		})
 	}
-}
-
-// gaugeValue reads one gauge.
-func gaugeValue(t *testing.T, g prometheus.Gauge) float64 {
-	t.Helper()
-	var m dto.Metric
-	if err := g.Write(&m); err != nil {
-		t.Fatalf("read gauge: %v", err)
-	}
-	return m.GetGauge().GetValue()
-}
-
-// counterValue reads one counter.
-func counterValue(t *testing.T, c prometheus.Counter) float64 {
-	t.Helper()
-	var m dto.Metric
-	if err := c.Write(&m); err != nil {
-		t.Fatalf("read counter: %v", err)
-	}
-	return m.GetCounter().GetValue()
 }
 
 // TestRevocationPredicateIsBuiltOnce pins the memo: the handshake and the
