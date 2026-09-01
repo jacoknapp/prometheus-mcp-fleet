@@ -225,6 +225,13 @@ func TestFlagParseErrorsAreReturned(t *testing.T) {
 	}{
 		{"enroll create", []string{"enroll", "create", "--this-flag-does-not-exist"}},
 		{"keys create", []string{"keys", "create", "--this-flag-does-not-exist"}},
+		{"keys list", []string{"keys", "list", "--this-flag-does-not-exist"}},
+		{"keys revoke", []string{"keys", "revoke", "--this-flag-does-not-exist"}},
+		{"keys rotate", []string{"keys", "rotate", "--this-flag-does-not-exist"}},
+		{"enroll list", []string{"enroll", "list", "--this-flag-does-not-exist"}},
+		{"enroll revoke", []string{"enroll", "revoke", "--this-flag-does-not-exist"}},
+		{"certs revoke", []string{"certs", "revoke", "--this-flag-does-not-exist"}},
+		{"certs list", []string{"certs", "list", "--this-flag-does-not-exist"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1152,5 +1159,416 @@ func TestKeysCreateOverRealServerReportsAuthFailure(t *testing.T) {
 		&stdout, nil)
 	if err == nil || !strings.Contains(err.Error(), "the admin credential is invalid or has expired") {
 		t.Fatalf("error = %v, want the envelope message surfaced", err)
+	}
+}
+
+// keyViews is a small listing for the read commands to render.
+func keyViews() []hubapi.KeyView {
+	at := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	revoked := at.Add(time.Hour)
+	return []hubapi.KeyView{
+		{KID: "agent0001", Class: fleet.ClassAgent, Name: "sre-bot", CreatedAt: at, ExpiresAt: at.Add(2160 * time.Hour)},
+		{KID: "agent0002", Class: fleet.ClassAgent, Name: "immortal", CreatedAt: at},
+		{KID: "agent0003", Class: fleet.ClassAgent, Name: "old", CreatedAt: at, ExpiresAt: at.Add(-time.Hour), Expired: true},
+		{
+			KID: "enr00001", Class: fleet.ClassEnrollment, Name: "enroll:prod-eu-1", CreatedAt: at,
+			ExpiresAt: at.Add(15 * time.Minute), RevokedAt: &revoked, Revoked: true,
+			Enrollment: &hubapi.EnrollmentView{ClusterID: "prod-eu-1"},
+		},
+	}
+}
+
+// TestKeysListRendersStatusAndTarget covers the listing an operator reads
+// before acting: the status column has to say the one thing that decides
+// whether a credential still works, and a key with no expiry must read
+// "never" rather than a zero year.
+func TestKeysListRendersStatusAndTarget(t *testing.T) {
+	t.Parallel()
+
+	doer, cap := capturingDoer(jsonResponse(http.StatusOK,
+		hubapi.KeyListResponse{Keys: keyViews(), Count: 4}))
+	var stdout bytes.Buffer
+	if err := Run(context.Background(), []string{"keys", "list"},
+		env(map[string]string{"PMF_ADMIN_TOKEN": "pmf_adm_x"}), &stdout, doer); err != nil {
+		t.Fatalf("keys list: %v", err)
+	}
+	if got := cap.req.Method; got != http.MethodGet {
+		t.Errorf("method = %s, want GET", got)
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"KID", "CLASS", "STATUS", "EXPIRES", "CLUSTER",
+		"agent0001", "live",
+		"agent0002", "never", // no expiry
+		"agent0003", "expired",
+		"enr00001", "revoked", "prod-eu-1",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("listing is missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestKeysListFiltersByClass pins the query the filter builds, since a typo
+// there would silently list everything.
+func TestKeysListFiltersByClass(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name, arg, wantQuery string
+		wantErr              bool
+	}{
+		{name: "agent", arg: "agent", wantQuery: "class=agt"},
+		{name: "admin", arg: "admin", wantQuery: "class=adm"},
+		{name: "enrollment", arg: "enrollment", wantQuery: "class=enr"},
+		{name: "wire spelling passes through", arg: "agt", wantQuery: "class=agt"},
+		{name: "unknown is refused", arg: "operator", wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			doer, cap := capturingDoer(jsonResponse(http.StatusOK, hubapi.KeyListResponse{}))
+			var stdout bytes.Buffer
+			err := Run(context.Background(), []string{"keys", "list", "--class=" + tc.arg},
+				env(map[string]string{"PMF_ADMIN_TOKEN": "pmf_adm_x"}), &stdout, doer)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("an unknown class was accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("keys list: %v", err)
+			}
+			if got := cap.req.URL.RawQuery; got != tc.wantQuery {
+				t.Errorf("query = %q, want %q", got, tc.wantQuery)
+			}
+		})
+	}
+}
+
+// TestKeysListEmpty: an empty fleet says so rather than printing a bare
+// header an operator has to interpret.
+func TestKeysListEmpty(t *testing.T) {
+	t.Parallel()
+	doer, _ := capturingDoer(jsonResponse(http.StatusOK, hubapi.KeyListResponse{}))
+	var stdout bytes.Buffer
+	if err := Run(context.Background(), []string{"keys", "list"},
+		env(map[string]string{"PMF_ADMIN_TOKEN": "pmf_adm_x"}), &stdout, doer); err != nil {
+		t.Fatalf("keys list: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "no credentials") {
+		t.Errorf("empty listing = %q", stdout.String())
+	}
+}
+
+// TestKeysRevoke covers the control the threat model leans on: the right
+// method, the reason carried as a query parameter, and a confirmation naming
+// what was withdrawn.
+func TestKeysRevoke(t *testing.T) {
+	t.Parallel()
+
+	t.Run("revokes with a reason", func(t *testing.T) {
+		t.Parallel()
+		doer, cap := capturingDoer(&http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody})
+		var stdout bytes.Buffer
+		if err := Run(context.Background(),
+			[]string{"keys", "revoke", "--kid=agent0001", "--reason=leaked in a build log"},
+			env(map[string]string{"PMF_ADMIN_TOKEN": "pmf_adm_x"}), &stdout, doer); err != nil {
+			t.Fatalf("keys revoke: %v", err)
+		}
+		if cap.req.Method != http.MethodDelete {
+			t.Errorf("method = %s, want DELETE", cap.req.Method)
+		}
+		if !strings.HasSuffix(cap.req.URL.Path, "/admin/v1/keys/agent0001") {
+			t.Errorf("path = %q", cap.req.URL.Path)
+		}
+		if got := cap.req.URL.Query().Get("reason"); got != "leaked in a build log" {
+			t.Errorf("reason = %q", got)
+		}
+		if !strings.Contains(stdout.String(), "revoked agent0001") {
+			t.Errorf("output = %q", stdout.String())
+		}
+	})
+
+	t.Run("purge is opt-in and says so", func(t *testing.T) {
+		t.Parallel()
+		doer, cap := capturingDoer(&http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody})
+		var stdout bytes.Buffer
+		if err := Run(context.Background(),
+			[]string{"keys", "revoke", "--kid=agent0001", "--purge"},
+			env(map[string]string{"PMF_ADMIN_TOKEN": "pmf_adm_x"}), &stdout, doer); err != nil {
+			t.Fatalf("keys revoke --purge: %v", err)
+		}
+		if got := cap.req.URL.Query().Get("purge"); got != "true" {
+			t.Errorf("purge = %q, want true", got)
+		}
+		if !strings.Contains(stdout.String(), "purged agent0001") {
+			t.Errorf("a purge reported itself as a revocation: %q", stdout.String())
+		}
+	})
+
+	t.Run("a missing kid never reaches the network", func(t *testing.T) {
+		t.Parallel()
+		var stdout bytes.Buffer
+		err := Run(context.Background(), []string{"keys", "revoke"},
+			env(map[string]string{"PMF_ADMIN_TOKEN": "pmf_adm_x"}), &stdout,
+			fakeDoer{do: func(*http.Request) (*http.Response, error) {
+				t.Fatal("a revoke with no kid was sent")
+				return nil, nil
+			}})
+		if err == nil || !strings.Contains(err.Error(), "--kid is required") {
+			t.Fatalf("err = %v, want a --kid complaint", err)
+		}
+	})
+
+	t.Run("the hub's refusal is reported, not a status line", func(t *testing.T) {
+		t.Parallel()
+		doer, _ := capturingDoer(jsonResponse(http.StatusConflict, hubapi.ErrorEnvelope{
+			Error: hubapi.ErrorBody{Code: hubapi.CodeConflict, Message: "key agent0001 is revoked"},
+		}))
+		var stdout bytes.Buffer
+		err := Run(context.Background(), []string{"keys", "revoke", "--kid=agent0001"},
+			env(map[string]string{"PMF_ADMIN_TOKEN": "pmf_adm_x"}), &stdout, doer)
+		if err == nil || !strings.Contains(err.Error(), "key agent0001 is revoked") {
+			t.Fatalf("err = %v, want the hub's own message", err)
+		}
+	})
+}
+
+// TestKeysRotate pins the replacement path, including the mutual exclusion
+// that would otherwise be decided by the hub after a round trip.
+func TestKeysRotate(t *testing.T) {
+	t.Parallel()
+
+	t.Run("sends the body and prints the replacement", func(t *testing.T) {
+		t.Parallel()
+		doer, cap := capturingDoer(jsonResponse(http.StatusCreated, hubapi.MintedKeyResponse{
+			Key:   hubapi.KeyView{KID: "agent0009", Class: fleet.ClassAgent},
+			Token: "pmf_agt_new", TokenShownOnce: true, Warning: hubapi.TokenOnceNotice,
+		}))
+		var stdout bytes.Buffer
+		if err := Run(context.Background(),
+			[]string{"keys", "rotate", "--kid=agent0001", "--reason=suspected leak", "--ttl=2h"},
+			env(map[string]string{"PMF_ADMIN_TOKEN": "pmf_adm_x"}), &stdout, doer); err != nil {
+			t.Fatalf("keys rotate: %v", err)
+		}
+		if !strings.HasSuffix(cap.req.URL.Path, "/admin/v1/keys/agent0001/rotate") {
+			t.Errorf("path = %q", cap.req.URL.Path)
+		}
+		var body rotateBody
+		if err := json.Unmarshal(cap.body, &body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		if body.Reason != "suspected leak" || time.Duration(body.TTL) != 2*time.Hour {
+			t.Errorf("body = %+v", body)
+		}
+		if !strings.Contains(stdout.String(), "pmf_agt_new") {
+			t.Errorf("the replacement token was not printed: %q", stdout.String())
+		}
+	})
+
+	t.Run("ttl and no-expiry are refused together, before the round trip", func(t *testing.T) {
+		t.Parallel()
+		var stdout bytes.Buffer
+		err := Run(context.Background(),
+			[]string{"keys", "rotate", "--kid=agent0001", "--ttl=2h", "--no-expiry"},
+			env(map[string]string{"PMF_ADMIN_TOKEN": "pmf_adm_x"}), &stdout,
+			fakeDoer{do: func(*http.Request) (*http.Response, error) {
+				t.Fatal("a contradictory rotate was sent")
+				return nil, nil
+			}})
+		if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+			t.Fatalf("err = %v, want a mutual-exclusion complaint", err)
+		}
+	})
+
+	t.Run("a missing kid never reaches the network", func(t *testing.T) {
+		t.Parallel()
+		var stdout bytes.Buffer
+		err := Run(context.Background(), []string{"keys", "rotate"},
+			env(map[string]string{"PMF_ADMIN_TOKEN": "pmf_adm_x"}), &stdout,
+			fakeDoer{do: func(*http.Request) (*http.Response, error) {
+				t.Fatal("a rotate with no kid was sent")
+				return nil, nil
+			}})
+		if err == nil || !strings.Contains(err.Error(), "--kid is required") {
+			t.Fatalf("err = %v, want a --kid complaint", err)
+		}
+	})
+}
+
+// TestEnrollListAndRevoke covers the enrollment half, which exists so the
+// noun is not half-implemented: you could mint a token and never see or
+// withdraw it.
+func TestEnrollListAndRevoke(t *testing.T) {
+	t.Parallel()
+
+	t.Run("list", func(t *testing.T) {
+		t.Parallel()
+		doer, cap := capturingDoer(jsonResponse(http.StatusOK,
+			hubapi.KeyListResponse{Keys: keyViews()[3:], Count: 1}))
+		var stdout bytes.Buffer
+		if err := Run(context.Background(), []string{"enroll", "list"},
+			env(map[string]string{"PMF_ADMIN_TOKEN": "pmf_adm_x"}), &stdout, doer); err != nil {
+			t.Fatalf("enroll list: %v", err)
+		}
+		if !strings.HasSuffix(cap.req.URL.Path, "/admin/v1/enrollments") {
+			t.Errorf("path = %q", cap.req.URL.Path)
+		}
+		if !strings.Contains(stdout.String(), "prod-eu-1") {
+			t.Errorf("the cluster binding was not shown: %q", stdout.String())
+		}
+	})
+
+	t.Run("revoke", func(t *testing.T) {
+		t.Parallel()
+		doer, cap := capturingDoer(&http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody})
+		var stdout bytes.Buffer
+		if err := Run(context.Background(),
+			[]string{"enroll", "revoke", "--kid=enr00001", "--reason=cluster cancelled"},
+			env(map[string]string{"PMF_ADMIN_TOKEN": "pmf_adm_x"}), &stdout, doer); err != nil {
+			t.Fatalf("enroll revoke: %v", err)
+		}
+		if cap.req.Method != http.MethodDelete ||
+			!strings.HasSuffix(cap.req.URL.Path, "/admin/v1/enrollments/enr00001") {
+			t.Errorf("request = %s %s", cap.req.Method, cap.req.URL.Path)
+		}
+		if got := cap.req.URL.Query().Get("reason"); got != "cluster cancelled" {
+			t.Errorf("reason = %q", got)
+		}
+	})
+
+	t.Run("revoke requires a kid", func(t *testing.T) {
+		t.Parallel()
+		var stdout bytes.Buffer
+		err := Run(context.Background(), []string{"enroll", "revoke"},
+			env(map[string]string{"PMF_ADMIN_TOKEN": "pmf_adm_x"}), &stdout,
+			fakeDoer{do: func(*http.Request) (*http.Response, error) {
+				t.Fatal("a revoke with no kid was sent")
+				return nil, nil
+			}})
+		if err == nil || !strings.Contains(err.Error(), "--kid is required") {
+			t.Fatalf("err = %v, want a --kid complaint", err)
+		}
+	})
+}
+
+// TestCertsRevokeAndList covers cutting off a compromised cluster, which is
+// the one revocation that also terminates a live session.
+func TestCertsRevokeAndList(t *testing.T) {
+	t.Parallel()
+
+	t.Run("revoke", func(t *testing.T) {
+		t.Parallel()
+		doer, cap := capturingDoer(jsonResponse(http.StatusOK, map[string]any{"serial": "0a1b"}))
+		var stdout bytes.Buffer
+		if err := Run(context.Background(),
+			[]string{"certs", "revoke", "--serial=0a1b", "--reason=decommissioned"},
+			env(map[string]string{"PMF_ADMIN_TOKEN": "pmf_adm_x"}), &stdout, doer); err != nil {
+			t.Fatalf("certs revoke: %v", err)
+		}
+		if cap.req.Method != http.MethodPost ||
+			!strings.HasSuffix(cap.req.URL.Path, "/admin/v1/certs/0a1b/revoke") {
+			t.Errorf("request = %s %s", cap.req.Method, cap.req.URL.Path)
+		}
+		var body hubapi.RevokeCertRequest
+		if err := json.Unmarshal(cap.body, &body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		if body.Reason != "decommissioned" {
+			t.Errorf("reason = %q", body.Reason)
+		}
+		if !strings.Contains(stdout.String(), "revoked certificate 0a1b") {
+			t.Errorf("output = %q", stdout.String())
+		}
+	})
+
+	t.Run("revoke requires a serial", func(t *testing.T) {
+		t.Parallel()
+		var stdout bytes.Buffer
+		err := Run(context.Background(), []string{"certs", "revoke"},
+			env(map[string]string{"PMF_ADMIN_TOKEN": "pmf_adm_x"}), &stdout,
+			fakeDoer{do: func(*http.Request) (*http.Response, error) {
+				t.Fatal("a revoke with no serial was sent")
+				return nil, nil
+			}})
+		if err == nil || !strings.Contains(err.Error(), "--serial is required") {
+			t.Fatalf("err = %v, want a --serial complaint", err)
+		}
+	})
+
+	t.Run("list", func(t *testing.T) {
+		t.Parallel()
+		at := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+		doer, _ := capturingDoer(jsonResponse(http.StatusOK, hubapi.RevokedCertListResponse{
+			Revoked: []hubapi.RevokedCert{
+				{Serial: "0a1b", RevokedAt: at, NotAfter: at.Add(336 * time.Hour), Reason: "decommissioned"},
+				{Serial: "0c2d", RevokedAt: at},
+			},
+			Count: 2,
+		}))
+		var stdout bytes.Buffer
+		if err := Run(context.Background(), []string{"certs", "list"},
+			env(map[string]string{"PMF_ADMIN_TOKEN": "pmf_adm_x"}), &stdout, doer); err != nil {
+			t.Fatalf("certs list: %v", err)
+		}
+		out := stdout.String()
+		for _, want := range []string{"SERIAL", "0a1b", "decommissioned", "0c2d"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("listing is missing %q:\n%s", want, out)
+			}
+		}
+		// An unrecorded expiry prints as a dash, not the zero year.
+		if strings.Contains(out, "0001-01-01") {
+			t.Errorf("a zero timestamp was printed raw:\n%s", out)
+		}
+	})
+
+	t.Run("list empty", func(t *testing.T) {
+		t.Parallel()
+		doer, _ := capturingDoer(jsonResponse(http.StatusOK, hubapi.RevokedCertListResponse{}))
+		var stdout bytes.Buffer
+		if err := Run(context.Background(), []string{"certs", "list"},
+			env(map[string]string{"PMF_ADMIN_TOKEN": "pmf_adm_x"}), &stdout, doer); err != nil {
+			t.Fatalf("certs list: %v", err)
+		}
+		if !strings.Contains(stdout.String(), "no revoked certificates") {
+			t.Errorf("output = %q", stdout.String())
+		}
+	})
+}
+
+// TestEveryCommandSurfacesATransportFailure: a hub that cannot be reached --
+// the usual cause being a forgotten port-forward, or an exec into a pod whose
+// admin listener is not up yet -- must produce the transport error, not a nil
+// error and an empty listing that reads like an empty fleet.
+func TestEveryCommandSurfacesATransportFailure(t *testing.T) {
+	t.Parallel()
+
+	boom := errors.New("connection refused")
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{"keys list", []string{"keys", "list"}},
+		{"keys revoke", []string{"keys", "revoke", "--kid=agent0001"}},
+		{"keys rotate", []string{"keys", "rotate", "--kid=agent0001"}},
+		{"enroll list", []string{"enroll", "list"}},
+		{"enroll revoke", []string{"enroll", "revoke", "--kid=enr00001"}},
+		{"certs revoke", []string{"certs", "revoke", "--serial=0a1b"}},
+		{"certs list", []string{"certs", "list"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var stdout bytes.Buffer
+			err := Run(context.Background(), tc.args,
+				env(map[string]string{"PMF_ADMIN_TOKEN": "pmf_adm_x"}), &stdout,
+				fakeDoer{do: func(*http.Request) (*http.Response, error) { return nil, boom }})
+			if err == nil || !strings.Contains(err.Error(), "connection refused") {
+				t.Fatalf("err = %v, want the transport failure", err)
+			}
+		})
 	}
 }

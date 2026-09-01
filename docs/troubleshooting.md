@@ -31,16 +31,22 @@ The key is wrong, expired, revoked, or of the wrong class. An *admin* key
 presented to the MCP endpoint is rejected on purpose — the classes are separated
 so that a leaked agent key can never administer the hub, and vice versa.
 
-There is no `hub keys list` CLI subcommand — the hub binary's only
-administrative subcommands are `enroll create` and `keys create`
-(`internal/hubcli`). List keys through the admin REST API, port-forwarded from
-the same admin listener as `/readyz` above:
+List the keys and read the STATUS column, which says the one thing that
+decides whether a credential still works:
 
 ```bash
-kubectl -n prometheus-mcp-hub port-forward deploy/pmf-hub 9090:9090 &
-curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
-  'localhost:9090/admin/v1/keys?class=agt' | jq
+kubectl -n prometheus-mcp-hub exec deploy/pmf-hub -- \
+  hub keys list --class agent --admin-token-file /var/run/pmf/admin-token
 ```
+
+```
+KID         CLASS  NAME     STATUS   EXPIRES               CLUSTER
+h4fD7aDsno  agt    sre-bot  revoked  2026-11-30T17:31:09Z
+```
+
+If the key is live and still rejected, it is the wrong class or the wrong
+hub. The admin REST API is the same data if you prefer curl — the CLI is a
+client of it, nothing more.
 
 The hub never echoes the offending token, in the response or in the log. That is
 deliberate; identify the key by its KID, which is the ten characters after the

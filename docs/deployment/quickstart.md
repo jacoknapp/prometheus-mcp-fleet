@@ -115,8 +115,9 @@ kubectl -n prometheus-mcp-hub rollout status deploy/pmf-hub
 Each spoke is in a different cluster and different trust domain, so it needs the
 hub's CA out of band for its first connection.
 
-There is no `hub ca` subcommand (the hub binary only implements `hub enroll
-create` and `hub keys create`). The bundle is served unauthenticated at
+There is no `hub ca` subcommand — the bundle needs no credential, so a
+command would only be a longer way to type `curl`. It is served
+unauthenticated at
 `/pki/bundle` on the same public hostname as the MCP endpoint, so no `exec` is
 needed at all:
 

@@ -466,22 +466,28 @@ Three reasons the alert fires anyway, in order of likelihood:
 
 For 2 and 3, the manual route below is still the tool.
 
-There is no `hub keys list` or `hub enroll list` CLI subcommand — the hub
-binary's only administrative subcommands are `enroll create` and `keys create`
-(`internal/hubcli`). List and prune through the admin REST API directly:
+Look at what is actually stored. Every administrative command runs inside the
+pod, against the loopback admin listener, so nothing has to be exposed:
 
 ```bash
-kubectl -n $HUB_NS port-forward deploy/pmf-hub 9090:9090 &
-curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
-  'localhost:9090/admin/v1/keys?class=agt' | jq
-curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
-  localhost:9090/admin/v1/enrollments | jq
+X="kubectl -n $HUB_NS exec deploy/pmf-hub -- hub"
+$X keys list   --admin-token-file /var/run/pmf/admin-token
+$X enroll list --admin-token-file /var/run/pmf/admin-token
+$X certs list  --admin-token-file /var/run/pmf/admin-token
 ```
 
-`$ADMIN_TOKEN` is the `pmf_adm_…` credential you saved at install time (see the
-quickstart) or a replacement minted since. The admin API listens on the same
-loopback port as `/metrics`, `/readyz` and `/healthz`, so the same
-port-forward from Quick triage above already reaches it.
+Then withdraw what should not be there — revoking rather than purging, so the
+audit trail survives:
+
+```bash
+$X keys revoke   --kid <kid>    --reason "..." --admin-token-file /var/run/pmf/admin-token
+$X enroll revoke --kid <kid>    --reason "..." --admin-token-file /var/run/pmf/admin-token
+$X certs revoke  --serial <hex> --reason "..." --admin-token-file /var/run/pmf/admin-token
+```
+
+The token file is mounted by `adminToken.existingSecret` (see the quickstart).
+The admin API is the same data if you prefer curl — port-forward 9090 and the
+CLI's own default URL is already `http://127.0.0.1:9090`.
 
 Prune expired agent keys and burned enrollment records, and revoked certificate
 serials whose `notAfter` has passed. If you genuinely need more records than

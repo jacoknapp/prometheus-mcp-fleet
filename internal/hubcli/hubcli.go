@@ -29,7 +29,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"text/tabwriter"
 	"time"
+
+	neturl "net/url"
 
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/config"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/fleet"
@@ -57,6 +60,11 @@ type Doer interface {
 	Do(*http.Request) (*http.Response, error)
 }
 
+// Nouns are the first words Run answers to. cmd/hub routes these to the CLI
+// instead of the flag parser, so a noun missing here is a subcommand the
+// binary refuses with the server's usage text.
+var Nouns = []string{"enroll", "keys", "certs"}
+
 // Run executes one administrative subcommand.
 //
 // getenv supplies PMF_ADMIN_TOKEN and optionally PMF_ADMIN_URL. client may be
@@ -73,6 +81,20 @@ func Run(ctx context.Context, args []string, getenv func(string) string, stdout 
 		return enrollCreate(ctx, args[2:], getenv, stdout, client)
 	case "keys create":
 		return keysCreate(ctx, args[2:], getenv, stdout, client)
+	case "keys list":
+		return keysList(ctx, args[2:], getenv, stdout, client)
+	case "keys revoke":
+		return keysRevoke(ctx, args[2:], getenv, stdout, client)
+	case "keys rotate":
+		return keysRotate(ctx, args[2:], getenv, stdout, client)
+	case "enroll list":
+		return enrollList(ctx, args[2:], getenv, stdout, client)
+	case "enroll revoke":
+		return enrollRevoke(ctx, args[2:], getenv, stdout, client)
+	case "certs revoke":
+		return certsRevoke(ctx, args[2:], getenv, stdout, client)
+	case "certs list":
+		return certsList(ctx, args[2:], getenv, stdout, client)
 	default:
 		return ErrUsage
 	}
@@ -290,20 +312,53 @@ func adminToken(file string, getenv func(string) string) func() (string, error) 
 
 // post sends one authenticated admin request and decodes the reply.
 func post(ctx context.Context, client Doer, url string, tokenFn func() (string, error), in, out any) error {
+	return call(ctx, client, http.MethodPost, url, tokenFn, in, out)
+}
+
+// get performs an authenticated GET and decodes the response into out.
+func get(ctx context.Context, client Doer, url string, tokenFn func() (string, error), out any) error {
+	return call(ctx, client, http.MethodGet, url, tokenFn, nil, out)
+}
+
+// del performs an authenticated DELETE. out may be nil for the routes that
+// answer 204.
+func del(ctx context.Context, client Doer, url string, tokenFn func() (string, error), out any) error {
+	return call(ctx, client, http.MethodDelete, url, tokenFn, nil, out)
+}
+
+// call is the one request path every subcommand goes through: attach the
+// credential, bound the read, turn an error envelope back into the operator's
+// message rather than a status line, and decode.
+//
+// in is encoded as a JSON body when non-nil; out is decoded into when non-nil,
+// which the 204 routes skip.
+func call(
+	ctx context.Context,
+	client Doer,
+	method, url string,
+	tokenFn func() (string, error),
+	in, out any,
+) error {
 	token, err := tokenFn()
 	if err != nil {
 		return err
 	}
-	payload, marshalErr := json.Marshal(in)
-	if marshalErr != nil {
-		return fmt.Errorf("encode request: %w", marshalErr)
+	var body io.Reader
+	if in != nil {
+		payload, marshalErr := json.Marshal(in)
+		if marshalErr != nil {
+			return fmt.Errorf("encode request: %w", marshalErr)
+		}
+		body = bytes.NewReader(payload)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
+	if in != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("call %s: %w", url, err)
@@ -313,18 +368,23 @@ func post(ctx context.Context, client Doer, url string, tokenFn func() (string, 
 	// Bound the read: this is a trusted endpoint, but a CLI that buffers an
 	// unbounded body because something else is listening on the port is a bad
 	// failure mode.
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return fmt.Errorf("read response: %w", err)
 	}
-	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusCreated, http.StatusNoContent:
+	default:
 		var env hubapi.ErrorEnvelope
-		if json.Unmarshal(body, &env) == nil && env.Error.Message != "" {
+		if json.Unmarshal(respBody, &env) == nil && env.Error.Message != "" {
 			return fmt.Errorf("%s: %s", resp.Status, env.Error.Message)
 		}
-		return fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(body)))
+		return fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(respBody)))
 	}
-	if err := json.Unmarshal(body, out); err != nil {
+	if out == nil || len(bytes.TrimSpace(respBody)) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(respBody, out); err != nil {
 		return fmt.Errorf("decode response: %w", err)
 	}
 	return nil
@@ -375,4 +435,301 @@ func report(stdout io.Writer, out hubapi.MintedKeyResponse, quiet bool) error {
 	b.WriteString("\nThis token is shown once and cannot be retrieved again.\n")
 	_, err := io.WriteString(stdout, b.String())
 	return err
+}
+
+// keysList prints the stored credentials.
+//
+// The hub is the only place this list exists -- there is no database and the
+// registry is rebuilt from reconnects -- so without this an operator's only
+// route to "which keys exist" was a port-forward and curl.
+func keysList(ctx context.Context, args []string, getenv func(string) string, stdout io.Writer, client Doer) error {
+	fs := flag.NewFlagSet("hub keys list", flag.ContinueOnError)
+	fs.SetOutput(stdout)
+	var (
+		class     = fs.String("class", "", `restrict to one class: "agent", "admin" or "enrollment"`)
+		adminURL  = fs.String("admin-url", "", "admin API base URL; defaults to $PMF_ADMIN_URL or "+DefaultAdminURL)
+		tokenFile = fs.String("admin-token-file", "", "read the admin credential from a file instead of $PMF_ADMIN_TOKEN")
+	)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	url := resolveURL(*adminURL, getenv) + "/admin/v1/keys"
+	if *class != "" {
+		cls, err := keyClassFilter(*class)
+		if err != nil {
+			return err
+		}
+		url += "?class=" + string(cls)
+	}
+	var out hubapi.KeyListResponse
+	if err := get(ctx, client, url, adminToken(*tokenFile, getenv), &out); err != nil {
+		return err
+	}
+	return printKeys(stdout, out.Keys)
+}
+
+// keysRevoke withdraws one credential.
+//
+// This is the control the threat model leans on: an agent key's expiry is not
+// a backstop -- the default is ninety days and a key may be minted with none
+// -- so revocation is what actually stops a leaked credential, and it should
+// not require assembling an HTTP request by hand while under way.
+func keysRevoke(ctx context.Context, args []string, getenv func(string) string, stdout io.Writer, client Doer) error {
+	fs := flag.NewFlagSet("hub keys revoke", flag.ContinueOnError)
+	fs.SetOutput(stdout)
+	var (
+		kid    = fs.String("kid", "", "key identifier to revoke (required)")
+		reason = fs.String("reason", "", "audit note recorded against the revocation")
+		purge  = fs.Bool("purge", false,
+			"delete the record outright instead of revoking it. Destroys the audit trail and "+
+				"frees the identifier; revoking is almost always what you want")
+		adminURL  = fs.String("admin-url", "", "admin API base URL; defaults to $PMF_ADMIN_URL or "+DefaultAdminURL)
+		tokenFile = fs.String("admin-token-file", "", "read the admin credential from a file instead of $PMF_ADMIN_TOKEN")
+	)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *kid == "" {
+		return errors.New("--kid is required")
+	}
+	url := resolveURL(*adminURL, getenv) + "/admin/v1/keys/" + neturl.PathEscape(*kid) + revokeQuery(*reason, *purge)
+	if err := del(ctx, client, url, adminToken(*tokenFile, getenv), nil); err != nil {
+		return err
+	}
+	verb := "revoked"
+	if *purge {
+		verb = "purged"
+	}
+	_, err := fmt.Fprintf(stdout, "%s %s\n", verb, *kid)
+	return err
+}
+
+// keysRotate mints a replacement with the same identity and scope and revokes
+// the original, as one store mutation.
+//
+// It is the response to a suspected compromise that does not take the caller
+// offline: the replacement is live before the original stops working.
+func keysRotate(ctx context.Context, args []string, getenv func(string) string, stdout io.Writer, client Doer) error {
+	fs := flag.NewFlagSet("hub keys rotate", flag.ContinueOnError)
+	fs.SetOutput(stdout)
+	var (
+		kid       = fs.String("kid", "", "key identifier to rotate (required)")
+		reason    = fs.String("reason", "", "audit note recorded against the credential being replaced")
+		ttl       = fs.Duration("ttl", 0, "lifetime of the replacement; zero reuses the class default")
+		noExpiry  = fs.Bool("no-expiry", false, "mint the replacement with no expiry; agent keys only")
+		quiet     = fs.Bool("quiet", false, "print only the token, for scripting")
+		adminURL  = fs.String("admin-url", "", "admin API base URL; defaults to $PMF_ADMIN_URL or "+DefaultAdminURL)
+		tokenFile = fs.String("admin-token-file", "", "read the admin credential from a file instead of $PMF_ADMIN_TOKEN")
+	)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *kid == "" {
+		return errors.New("--kid is required")
+	}
+	if *noExpiry && *ttl > 0 {
+		return errors.New("--ttl and --no-expiry are mutually exclusive")
+	}
+	body := rotateBody{Reason: *reason, NoExpiry: *noExpiry}
+	if *ttl > 0 {
+		body.TTL = fleet.Duration(*ttl)
+	}
+	var out hubapi.MintedKeyResponse
+	url := resolveURL(*adminURL, getenv) + "/admin/v1/keys/" + neturl.PathEscape(*kid) + "/rotate"
+	if err := post(ctx, client, url, adminToken(*tokenFile, getenv), body, &out); err != nil {
+		return err
+	}
+	return report(stdout, out, *quiet)
+}
+
+// rotateBody mirrors the rotate route's optional body. It is declared here
+// rather than exported from hubapi because the route's own request type is
+// unexported: the wire contract is the JSON, not the Go type.
+type rotateBody struct {
+	TTL      fleet.Duration `json:"ttl,omitempty"`
+	NoExpiry bool           `json:"noExpiry,omitempty"`
+	Reason   string         `json:"reason,omitempty"`
+}
+
+// enrollList prints the enrollment tokens.
+func enrollList(ctx context.Context, args []string, getenv func(string) string, stdout io.Writer, client Doer) error {
+	fs := flag.NewFlagSet("hub enroll list", flag.ContinueOnError)
+	fs.SetOutput(stdout)
+	var (
+		adminURL  = fs.String("admin-url", "", "admin API base URL; defaults to $PMF_ADMIN_URL or "+DefaultAdminURL)
+		tokenFile = fs.String("admin-token-file", "", "read the admin credential from a file instead of $PMF_ADMIN_TOKEN")
+	)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	var out hubapi.KeyListResponse
+	url := resolveURL(*adminURL, getenv) + "/admin/v1/enrollments"
+	if err := get(ctx, client, url, adminToken(*tokenFile, getenv), &out); err != nil {
+		return err
+	}
+	return printKeys(stdout, out.Keys)
+}
+
+// enrollRevoke withdraws an enrollment token that has not been redeemed, or
+// caps a reusable one that has.
+func enrollRevoke(ctx context.Context, args []string, getenv func(string) string, stdout io.Writer, client Doer) error {
+	fs := flag.NewFlagSet("hub enroll revoke", flag.ContinueOnError)
+	fs.SetOutput(stdout)
+	var (
+		kid       = fs.String("kid", "", "enrollment token identifier to revoke (required)")
+		reason    = fs.String("reason", "", "audit note recorded against the revocation")
+		adminURL  = fs.String("admin-url", "", "admin API base URL; defaults to $PMF_ADMIN_URL or "+DefaultAdminURL)
+		tokenFile = fs.String("admin-token-file", "", "read the admin credential from a file instead of $PMF_ADMIN_TOKEN")
+	)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *kid == "" {
+		return errors.New("--kid is required")
+	}
+	url := resolveURL(*adminURL, getenv) + "/admin/v1/enrollments/" + neturl.PathEscape(*kid) + revokeQuery(*reason, false)
+	if err := del(ctx, client, url, adminToken(*tokenFile, getenv), nil); err != nil {
+		return err
+	}
+	_, err := fmt.Fprintf(stdout, "revoked %s\n", *kid)
+	return err
+}
+
+// certsRevoke denies one spoke certificate by serial.
+//
+// Revoking a certificate also terminates the live session presenting it, so
+// this is how a compromised cluster is cut off rather than merely stopped
+// from reconnecting.
+func certsRevoke(ctx context.Context, args []string, getenv func(string) string, stdout io.Writer, client Doer) error {
+	fs := flag.NewFlagSet("hub certs revoke", flag.ContinueOnError)
+	fs.SetOutput(stdout)
+	var (
+		serial    = fs.String("serial", "", "certificate serial in the hub CA's notation (required)")
+		reason    = fs.String("reason", "", "audit note recorded against the revocation")
+		adminURL  = fs.String("admin-url", "", "admin API base URL; defaults to $PMF_ADMIN_URL or "+DefaultAdminURL)
+		tokenFile = fs.String("admin-token-file", "", "read the admin credential from a file instead of $PMF_ADMIN_TOKEN")
+	)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *serial == "" {
+		return errors.New("--serial is required")
+	}
+	url := resolveURL(*adminURL, getenv) + "/admin/v1/certs/" + neturl.PathEscape(*serial) + "/revoke"
+	var out map[string]any
+	if err := post(ctx, client, url, adminToken(*tokenFile, getenv), hubapi.RevokeCertRequest{Reason: *reason}, &out); err != nil {
+		return err
+	}
+	_, err := fmt.Fprintf(stdout, "revoked certificate %s\n", *serial)
+	return err
+}
+
+// certsList prints the certificate revocation list.
+func certsList(ctx context.Context, args []string, getenv func(string) string, stdout io.Writer, client Doer) error {
+	fs := flag.NewFlagSet("hub certs list", flag.ContinueOnError)
+	fs.SetOutput(stdout)
+	var (
+		adminURL  = fs.String("admin-url", "", "admin API base URL; defaults to $PMF_ADMIN_URL or "+DefaultAdminURL)
+		tokenFile = fs.String("admin-token-file", "", "read the admin credential from a file instead of $PMF_ADMIN_TOKEN")
+	)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	var out hubapi.RevokedCertListResponse
+	url := resolveURL(*adminURL, getenv) + "/admin/v1/certs/revoked"
+	if err := get(ctx, client, url, adminToken(*tokenFile, getenv), &out); err != nil {
+		return err
+	}
+	if len(out.Revoked) == 0 {
+		_, err := fmt.Fprintln(stdout, "no revoked certificates")
+		return err
+	}
+	w := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "SERIAL\tREVOKED\tEXPIRES\tREASON")
+	for _, rc := range out.Revoked {
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", rc.Serial, stamp(rc.RevokedAt), stamp(rc.NotAfter), rc.Reason)
+	}
+	return w.Flush()
+}
+
+// printKeys renders a credential listing.
+//
+// STATUS is computed rather than printed raw because it is the column an
+// operator actually reads: "live" or the single reason it is not.
+func printKeys(stdout io.Writer, keys []hubapi.KeyView) error {
+	if len(keys) == 0 {
+		_, err := fmt.Fprintln(stdout, "no credentials")
+		return err
+	}
+	w := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "KID\tCLASS\tNAME\tSTATUS\tEXPIRES\tCLUSTER")
+	for _, k := range keys {
+		cluster := ""
+		if k.Enrollment != nil {
+			cluster = k.Enrollment.ClusterID
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			k.KID, k.Class, k.Name, keyStatus(k), expiry(k.ExpiresAt), cluster)
+	}
+	return w.Flush()
+}
+
+// keyStatus is the one word that decides whether a credential still works.
+func keyStatus(k hubapi.KeyView) string {
+	switch {
+	case k.Revoked:
+		return "revoked"
+	case k.Expired:
+		return "expired"
+	default:
+		return "live"
+	}
+}
+
+// expiry renders a credential expiry, where the zero time means never.
+func expiry(t time.Time) string {
+	if t.IsZero() {
+		return "never"
+	}
+	return stamp(t)
+}
+
+// stamp renders a timestamp, leaving an unset one blank rather than printing
+// the zero year.
+func stamp(t time.Time) string {
+	if t.IsZero() {
+		return "-"
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
+// revokeQuery builds the optional query string the revoke routes accept.
+func revokeQuery(reason string, purge bool) string {
+	q := neturl.Values{}
+	if reason != "" {
+		q.Set("reason", reason)
+	}
+	if purge {
+		q.Set("purge", "true")
+	}
+	if len(q) == 0 {
+		return ""
+	}
+	return "?" + q.Encode()
+}
+
+// keyClassFilter maps the friendly spelling onto the wire value for a list
+// filter. Unlike keyClass it accepts enrollment, because listing enrollment
+// tokens is legitimate even though minting one goes through its own route.
+func keyClassFilter(s string) (fleet.KeyClass, error) {
+	switch s {
+	case "agent", string(fleet.ClassAgent):
+		return fleet.ClassAgent, nil
+	case "admin", string(fleet.ClassAdmin):
+		return fleet.ClassAdmin, nil
+	case "enrollment", string(fleet.ClassEnrollment):
+		return fleet.ClassEnrollment, nil
+	default:
+		return "", fmt.Errorf("unknown class %q: want agent, admin or enrollment", s)
+	}
 }

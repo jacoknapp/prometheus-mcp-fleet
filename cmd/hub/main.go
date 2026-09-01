@@ -17,6 +17,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"slices"
 	"syscall"
 
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/config"
@@ -72,7 +73,12 @@ func runWith(
 	// than starting a server. They are documented as
 	// `kubectl exec deploy/pmf-hub -- hub enroll create ...`, which is why they
 	// live in the same binary as the server.
-	if len(args) > 0 && (args[0] == "enroll" || args[0] == "keys") {
+	// The nouns hubcli owns. Kept as one list rather than a condition per
+	// noun so that adding a subcommand is one edit here and one in hubcli,
+	// and forgetting this side fails loudly -- the flag parser rejects the
+	// noun as a stray argument and prints the SERVER's usage, which is a
+	// baffling thing to read when you asked to revoke a key.
+	if len(args) > 0 && slices.Contains(hubcli.Nouns, args[0]) {
 		return hubcli.Run(context.Background(), args, getenv, stdout, nil)
 	}
 

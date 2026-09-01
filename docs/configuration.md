@@ -175,6 +175,42 @@ Same keys as the hub: `--admin-addr` (default `:9090`), `--log-level`,
 `--log-format`, `--otel-exporter-otlp-endpoint`, `--trace-sample-ratio`,
 `--pprof-enabled`, `--shutdown-drain-delay`, `--shutdown-grace`.
 
+## Administrative subcommands
+
+The `hub` binary is the server and the CLI. The subcommands talk to the
+loopback admin listener rather than starting anything, so they are run inside
+the pod — the admin API is never exposed, which is the point:
+
+```bash
+kubectl -n $NS exec deploy/pmf-hub -- hub keys list \
+  --admin-token-file /var/run/pmf/admin-token
+```
+
+The token file comes from `adminToken.existingSecret`; `$PMF_ADMIN_TOKEN`
+works too. `--admin-url` defaults to `http://127.0.0.1:9090`, which is also
+what a `kubectl port-forward 9090:9090` gives you, so the same commands run
+from a workstation with no extra flags.
+
+| Command | Does |
+|---|---|
+| `hub keys create` | Mint an agent or admin key. `--class`, `--name`, `--clusters`, `--tools`, `--ttl`, `--no-expiry`, `--quiet` |
+| `hub keys list` | List credentials with a STATUS column. `--class agent\|admin\|enrollment` |
+| `hub keys revoke` | Withdraw one key. `--kid`, `--reason`, and `--purge` to destroy the record rather than revoke it |
+| `hub keys rotate` | Mint a replacement with the same identity and scope and revoke the original, as one store mutation. `--kid`, `--ttl`, `--no-expiry`, `--reason` |
+| `hub enroll create` | Mint an enrollment token bound to one cluster. `--cluster`, `--labels`, `--ttl`, `--single-use`, `--max-redemptions` |
+| `hub enroll list` | List enrollment tokens and their cluster bindings |
+| `hub enroll revoke` | Withdraw an enrollment token. `--kid`, `--reason` |
+| `hub certs revoke` | Deny one spoke certificate by serial, which also terminates its live session. `--serial`, `--reason` |
+| `hub certs list` | The certificate revocation list |
+
+Revocation is the control the threat model leans on — an agent key's expiry is
+not a backstop, since the default is ninety days and a key may be minted with
+none — which is why withdrawing a credential is a command rather than a
+hand-assembled HTTP request.
+
+The CA bundle has no subcommand: it needs no credential, so `curl` against the
+public `/pki/bundle` is shorter than anything this could add.
+
 ## Health endpoint semantics
 
 Both binaries serve these on the admin listener.

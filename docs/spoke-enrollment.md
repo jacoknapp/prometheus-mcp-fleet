@@ -509,10 +509,11 @@ Anything that prints is a cluster git no longer knows about *and* whose
 certificate is still valid — offboarding stopped after `helm uninstall`. Page
 on it rather than auto-revoking — a stale inventory checkout or a rename can
 produce a false positive, and revocation is exactly the kind of action you
-don't want a cron job getting wrong unattended. There is no shipped alert or
-CLI subcommand for this today (`hub enroll create` and `hub keys create` are
-still the only administrative subcommands); this reconciliation
-has to be a script you own, run on a schedule against the admin API above.
+don't want a cron job getting wrong unattended. There is no shipped alert for
+this reconciliation -- it has to be a script you own, run on a schedule -- but
+the pieces it needs are commands now: `hub certs list` for what the hub still
+trusts, and `hub certs revoke --serial` for what your inventory says should
+be gone.
 
 | Symptom | Cause | Fix |
 |---|---|---|
