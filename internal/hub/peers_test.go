@@ -6,11 +6,12 @@ package hub
 import (
 	"context"
 	"errors"
-	"github.com/jacoknapp/prometheus-mcp-fleet/internal/config"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/config"
 )
 
 // ---------------------------------------------------------------------------

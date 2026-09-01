@@ -14,8 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/go-cmp/cmp"
 	"sync/atomic"
+
+	"github.com/google/go-cmp/cmp"
 )
 
 // fakeSessions is a [SessionCloser] under the test's control. It records what

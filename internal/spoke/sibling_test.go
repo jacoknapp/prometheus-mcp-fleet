@@ -8,8 +8,6 @@ import (
 	"context"
 
 	"errors"
-	"github.com/jacoknapp/prometheus-mcp-fleet/internal/config"
-	"github.com/jacoknapp/prometheus-mcp-fleet/internal/obs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -17,6 +15,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/config"
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/obs"
 )
 
 // errStore is an identity store whose Load always fails, standing in for a

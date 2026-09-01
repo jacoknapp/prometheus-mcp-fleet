@@ -6,10 +6,12 @@ package registry
 import (
 	"testing"
 
+	"time"
+
 	"github.com/google/go-cmp/cmp"
+
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/fleet"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel"
-	"time"
 )
 
 // TestAuthoritativeLabelsOverrideTheSpoke covers a trust boundary, not a

@@ -13,9 +13,10 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 
+	"strings"
+
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/fleet"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/store"
-	"strings"
 )
 
 // OpenFunc creates a store for one subtest. It must return an independent,

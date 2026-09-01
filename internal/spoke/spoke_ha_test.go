@@ -12,11 +12,12 @@ import (
 	"testing"
 	"time"
 
+	"sync/atomic"
+
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/config"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel/grpctun"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel/wstun"
-	"sync/atomic"
 )
 
 // ---------------------------------------------------------------------------

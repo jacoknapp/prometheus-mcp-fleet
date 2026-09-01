@@ -11,10 +11,11 @@ import (
 	"strings"
 	"sync"
 
+	"time"
+
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/fleet"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/mcpsurface"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/render"
-	"time"
 )
 
 // Resource URIs published by this hub.
