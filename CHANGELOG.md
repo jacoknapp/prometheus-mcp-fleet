@@ -12,6 +12,44 @@ lockstep.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-01
+
+### Added
+
+- **The admin operations are subcommands.** `hub keys list`, `keys revoke`,
+  `keys rotate`, `enroll list`, `enroll revoke`, `certs revoke` and
+  `certs list` join the existing creates. Every admin route now has a command
+  except `GET /admin/v1/ca`, which needs no credential — `curl` against the
+  public `/pki/bundle` is shorter than a command would be.
+
+  This closes a gap the no-expiry work opened: `docs/security.md` says expiry
+  is not among the controls on a leaked agent key and "revocation is the
+  control that has to work", yet revoking was the one operation with no
+  tooling — a port-forward and a hand-assembled request, at whatever hour it
+  was needed. Minting, the safe operation, had a command; withdrawing did not.
+
+  Listings carry a STATUS column — live, expired, revoked — because that is
+  the one thing that decides whether a credential still works, and a key
+  minted with no expiry reads `never` rather than a zero year. Revoking is
+  the default; `--purge` is an explicit flag, since deletion destroys the
+  audit trail.
+
+### Fixed
+
+- `cmd/hub` routed CLI nouns by matching `enroll` or `keys` literally, so
+  `hub certs revoke` fell through to the server's flag parser and answered a
+  revocation request with the server's usage text. Found by running the
+  commands against a real hub rather than only against fakes.
+- The quickstart could not actually mint a key: steps 4 and 5 read an admin
+  token from a file that the chart only mounts when `adminToken.existingSecret`
+  is set, and no earlier step set it. Four smaller doc corrections alongside,
+  including README's credential table still claiming a 30-day agent key.
+- `make lint` now installs the linter CI uses instead of trusting PATH. An
+  older golangci-lint does not report findings against a newer module — it
+  panics inside the type checker — which is how a batch of gosec, errcheck,
+  revive and staticcheck findings reached main while local checks looked
+  clean.
+
 ## [0.8.2] - 2026-09-01
 
 ### Fixed
