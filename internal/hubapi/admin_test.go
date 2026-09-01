@@ -797,6 +797,25 @@ func TestCertRevocationRoutes(t *testing.T) {
 		}
 	})
 
+	t.Run("a notAfter in the past is refused", func(t *testing.T) {
+		// The revocation cache treats an entry past its notAfter as moot,
+		// so accepting one would report success for a revocation that
+		// blocks nothing.
+		resp := h.adminDo(http.MethodPost, "/admin/v1/certs/ee00/revoke",
+			RevokeCertRequest{Reason: "typo in the year", NotAfter: testNow.Add(-time.Second)})
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+		}
+		var list RevokedCertListResponse
+		decode(t, h.adminDo(http.MethodGet, "/admin/v1/certs/revoked", nil), &list)
+		for _, rc := range list.Revoked {
+			if rc.Serial == "ee00" {
+				t.Fatal("a refused revocation was recorded anyway")
+			}
+		}
+	})
+
 	t.Run("bad serial", func(t *testing.T) {
 		resp := h.adminDo(http.MethodPost, "/admin/v1/certs/NOTHEX/revoke", RevokeCertRequest{Reason: "x"})
 		if resp.StatusCode != http.StatusBadRequest {

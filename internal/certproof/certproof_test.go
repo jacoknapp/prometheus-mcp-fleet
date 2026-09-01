@@ -111,6 +111,53 @@ func TestRenewIsNotTheTunnelVersion(t *testing.T) {
 	}
 }
 
+// TestBindingsAreCovered proves a bound field is part of what is signed: the
+// same proof over a different binding fails, an absent binding is not an
+// empty one, and the renewal's CSR binding is a fixed function of the DER.
+func TestBindingsAreCovered(t *testing.T) {
+	t.Parallel()
+	key := newECDSA(t)
+	leaf := selfSigned(t, key)
+	nonce := []byte("nonce")
+	csr := certproof.CSRBinding([]byte("csr-der"))
+
+	sig, err := certproof.Sign(key, nonce, certproof.RenewProtocolVersion, "prod", csr)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	if err := certproof.Verify(leaf, sig, nonce, certproof.RenewProtocolVersion, "prod", csr); err != nil {
+		t.Fatalf("Verify with the same binding: %v", err)
+	}
+	swapped := certproof.CSRBinding([]byte("attacker-csr-der"))
+	if err := certproof.Verify(leaf, sig, nonce, certproof.RenewProtocolVersion, "prod", swapped); !errors.Is(err, certproof.ErrBadSignature) {
+		t.Errorf("Verify over a swapped binding = %v, want ErrBadSignature", err)
+	}
+	if err := certproof.Verify(leaf, sig, nonce, certproof.RenewProtocolVersion, "prod"); !errors.Is(err, certproof.ErrBadSignature) {
+		t.Errorf("Verify with the binding dropped = %v, want ErrBadSignature", err)
+	}
+
+	bare, err := certproof.Transcript(nonce, "v", "c")
+	if err != nil {
+		t.Fatalf("Transcript: %v", err)
+	}
+	empty, err := certproof.Transcript(nonce, "v", "c", nil)
+	if err != nil {
+		t.Fatalf("Transcript: %v", err)
+	}
+	if bytes.Equal(bare, empty) {
+		t.Error("an absent binding and an empty one produced the same transcript")
+	}
+	if len(empty) != len(bare)+4 {
+		t.Errorf("an empty binding added %d bytes, want exactly its 4-byte length prefix", len(empty)-len(bare))
+	}
+	if !bytes.Equal(certproof.CSRBinding([]byte("csr-der")), csr) || len(csr) != 32 {
+		t.Error("CSRBinding is not a stable 32-byte digest of the DER")
+	}
+	if _, err := certproof.Transcript(nonce, "v", "c", make([]byte, certproof.MaxFieldBytes+1)); !errors.Is(err, certproof.ErrFieldTooLarge) {
+		t.Errorf("Transcript with an oversized binding = %v, want ErrFieldTooLarge", err)
+	}
+}
+
 // TestSignVerifyRoundTrip covers each key algorithm a spoke certificate might
 // carry, and every way a proof must fail.
 func TestSignVerifyRoundTrip(t *testing.T) {

@@ -483,7 +483,7 @@ func (t *Tools) series(
 	if terr != nil {
 		return nil, terr
 	}
-	start, end, terr := t.resolveRange(in.Start, in.End, t.now(), map[string]any{
+	start, end, terr := t.resolveRange(p, in.Start, in.End, t.now(), map[string]any{
 		"cluster": c.ID, "matchers": matchers, "start": in.Start, "end": in.End,
 	})
 	if terr != nil {
@@ -621,7 +621,7 @@ func (t *Tools) labelNames(
 	if terr != nil {
 		return nil, terr
 	}
-	start, end, terr := t.resolveRange(in.Start, in.End, t.now(), map[string]any{
+	start, end, terr := t.resolveRange(p, in.Start, in.End, t.now(), map[string]any{
 		"cluster": c.ID, "matchers": matchers, "start": in.Start, "end": in.End,
 	})
 	if terr != nil {
@@ -718,7 +718,7 @@ func (t *Tools) labelValues(
 	if terr != nil {
 		return nil, terr
 	}
-	start, end, terr := t.resolveRange(in.Start, in.End, t.now(), map[string]any{
+	start, end, terr := t.resolveRange(p, in.Start, in.End, t.now(), map[string]any{
 		"cluster": c.ID, "label": in.Label, "start": in.Start, "end": in.End,
 	})
 	if terr != nil {

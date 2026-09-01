@@ -11,15 +11,20 @@ import (
 // Failure rate limiting constants.
 //
 // The limiter exists because a cache miss is the expensive path: it costs a
-// store round trip plus an HMAC. Without a limit, an attacker who knows only
-// the token *shape* could turn a single connection into unbounded store load,
-// and the decoy HMAC that closes the timing oracle would become the
+// store round trip plus an HMAC. Without a limit, an attacker who knows a
+// KID could turn a single connection into unbounded store load against that
+// key, and the decoy HMAC that closes the timing oracle would become the
 // amplification. Ten failures a minute is far above what any correct client
 // produces and far below what is useful for a brute-force attempt against 256
 // bits of entropy.
+//
+// The bucket is per (source address, KID), not per address: see the note in
+// [Verifier.verify]. A spray of invented KIDs is therefore refused key by key
+// rather than throttled as a whole, at about the cost refusing it here would
+// have had; what is bounded is the work one source can aim at one key.
 const (
-	// failureBurst is how many authentication failures a single source address
-	// may produce before it enters backoff.
+	// failureBurst is how many authentication failures a single source may
+	// produce before it enters backoff.
 	failureBurst = 10
 	// failureWindow is the period over which failureBurst is replenished.
 	failureWindow = time.Minute
@@ -30,13 +35,14 @@ const (
 	// in bounded time and the limiter cannot be used to lock out an address
 	// permanently.
 	maxPenalty = 5 * time.Minute
-	// limiterEntries bounds how many source addresses are tracked. The map is
-	// LRU-evicted, so a source-address flood costs memory proportional to this
-	// constant and nothing more.
+	// limiterEntries bounds how many sources are tracked. The map is
+	// LRU-evicted, so a flood of addresses or KIDs costs memory proportional
+	// to this constant and nothing more.
 	limiterEntries = 8192
 )
 
-// failureLimiter throttles authentication failures per source address.
+// failureLimiter throttles authentication failures per source, where the
+// verifier's source is a (source address, KID) pair -- see limiterKey.
 //
 // It is a token bucket over failures, not over attempts: a client presenting a
 // valid credential is never slowed down no matter how fast it calls. Only
@@ -50,7 +56,7 @@ type failureLimiter struct {
 	cache *lruCache[string, *failureBucket]
 }
 
-// failureBucket is one source address's state.
+// failureBucket is one source's state.
 type failureBucket struct {
 	tokens       float64
 	last         time.Time
@@ -64,17 +70,17 @@ func newFailureLimiter() *failureLimiter {
 	return &failureLimiter{cache: newLRU[string, *failureBucket](limiterEntries)}
 }
 
-// Allow reports whether ip may attempt an authentication at time now. An empty
-// ip is always allowed: an unattributable request cannot be rate limited
-// fairly, and bucketing every such request together would let one caller deny
-// service to the rest.
-func (l *failureLimiter) Allow(ip string, now time.Time) bool {
-	if ip == "" {
+// Allow reports whether src may attempt an authentication at time now. An
+// empty src is always allowed: an unattributable request cannot be rate
+// limited fairly, and bucketing every such request together would let one
+// caller deny service to the rest.
+func (l *failureLimiter) Allow(src string, now time.Time) bool {
+	if src == "" {
 		return true
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	b, ok := l.cache.Get(ip)
+	b, ok := l.cache.Get(src)
 	if !ok {
 		return true
 	}
@@ -82,17 +88,17 @@ func (l *failureLimiter) Allow(ip string, now time.Time) bool {
 	return !now.Before(b.penaltyUntil)
 }
 
-// Fail records one authentication failure from ip at time now.
-func (l *failureLimiter) Fail(ip string, now time.Time) {
-	if ip == "" {
+// Fail records one authentication failure from src at time now.
+func (l *failureLimiter) Fail(src string, now time.Time) {
+	if src == "" {
 		return
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	b, ok := l.cache.Get(ip)
+	b, ok := l.cache.Get(src)
 	if !ok {
 		b = &failureBucket{tokens: failureBurst, last: now}
-		l.cache.Put(ip, b)
+		l.cache.Put(src, b)
 	}
 	l.refill(b, now)
 	if b.tokens >= 1 {
@@ -112,13 +118,13 @@ func (l *failureLimiter) Fail(ip string, now time.Time) {
 
 // Succeed clears the penalty state for ip after a successful authentication,
 // so a client that fixes its credential is not held in backoff.
-func (l *failureLimiter) Succeed(ip string, now time.Time) {
-	if ip == "" {
+func (l *failureLimiter) Succeed(src string, now time.Time) {
+	if src == "" {
 		return
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if b, ok := l.cache.Get(ip); ok {
+	if b, ok := l.cache.Get(src); ok {
 		b.tokens = failureBurst
 		b.last = now
 		b.penalty = 0

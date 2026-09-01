@@ -32,7 +32,15 @@ import (
 // matters. Every replica runs one; they collide harmlessly, because the
 // loser of a CAS finds the work already done on its next pass.
 func (h *hub) runStatePrune(ctx context.Context) {
-	interval, retain := h.cfg.StatePruneInterval, h.cfg.StateRetention
+	interval := h.cfg.StatePruneInterval
+	// The renew grace is what makes retention safe to set to zero. /renew
+	// honours a certificate for RenewGrace past its own expiry, so a
+	// revocation entry still refuses something until then; pruning it at
+	// expiry + retention alone would, with a short retention, hand a revoked
+	// spoke its identity back through /renew for the rest of the grace
+	// period. An expired key has no such afterlife and is merely kept a
+	// little longer than it needed to be.
+	retain := h.cfg.StateRetention + h.cfg.RenewGrace
 	if interval <= 0 {
 		h.logger.InfoContext(ctx, "state pruning is disabled; the state Secret will grow without bound",
 			"remedy", "set --state-prune-interval, or prune by hand per the runbook")

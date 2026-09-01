@@ -241,8 +241,13 @@ func (f *fakeHub) renew(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	clusterID := clusterIDFromCert(leaf)
+	csrDER, err := base64.StdEncoding.DecodeString(req.CSR)
+	if err != nil {
+		http.Error(w, "bad csr", http.StatusBadRequest)
+		return
+	}
 	if err := certproof.Verify(leaf, req.Signature, req.Nonce,
-		certproof.RenewProtocolVersion, clusterID); err != nil {
+		certproof.RenewProtocolVersion, clusterID, certproof.CSRBinding(csrDER)); err != nil {
 		http.Error(w, "bad proof", http.StatusForbidden)
 		return
 	}
@@ -378,9 +383,20 @@ func TestRenewSendsTheCertificateItHolds(t *testing.T) {
 	// The key that signed is the one behind the certificate that was sent, and
 	// the transcript is scoped to the cluster that certificate names. Verifying
 	// it here with the shared package is what proves the two halves agree.
+	csrDER, err := base64.StdEncoding.DecodeString(got.CSR)
+	if err != nil {
+		t.Fatalf("decode csr: %v", err)
+	}
 	if err := certproof.Verify(current.Leaf, got.Signature, got.Nonce,
-		certproof.RenewProtocolVersion, "prod-eu-1"); err != nil {
+		certproof.RenewProtocolVersion, "prod-eu-1", certproof.CSRBinding(csrDER)); err != nil {
 		t.Errorf("the hub cannot verify the spoke's proof: %v", err)
+	}
+	// And the proof is for THIS csr: swap it and the same signature is
+	// worthless, which is what keeps an on-path Ingress from being issued
+	// the spoke's identity over a key of its own.
+	if err := certproof.Verify(current.Leaf, got.Signature, got.Nonce,
+		certproof.RenewProtocolVersion, "prod-eu-1", certproof.CSRBinding([]byte("other csr"))); !errors.Is(err, certproof.ErrBadSignature) {
+		t.Errorf("Verify over a swapped csr = %v, want ErrBadSignature", err)
 	}
 }
 

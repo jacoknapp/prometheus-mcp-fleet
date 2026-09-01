@@ -503,6 +503,15 @@ func (p PruneResult) Empty() bool { return p.Keys == 0 && p.RevokedCerts == 0 }
 //     replayed token into a 409 and a security event rather than a bare
 //     "unknown credential", and that distinction is how a leaked install
 //     secret announces itself.
+//   - the newest non-revoked enrollment record for each cluster, however old.
+//     It carries the operator's labels for that cluster, and the hub reads
+//     them from this record on every attach (see hub.enrollmentLabels): drop
+//     it and the cluster falls back to the labels the spoke reports for
+//     itself, which is exactly the self-relabelling the record exists to
+//     prevent. Enrollment tokens expire in minutes, so without this rule the
+//     authority lasted retain past the install and then quietly vanished.
+//     An older superseded record for the same cluster is prunable; a revoked
+//     one is too, since revocation already withdrew its labels.
 //
 // The epoch is deliberately NOT bumped. Every record removed here is one no
 // decision can depend on, so a replica still serving its larger cached view
@@ -520,9 +529,10 @@ func (s *State) Prune(now time.Time, retain time.Duration) (PruneResult, bool, e
 		delete(s.RevokedCerts, serial)
 		res.RevokedCerts++
 	}
+	authority := s.labelAuthorities()
 	for kid, rec := range s.Keys {
 		exp := rec.Key.ExpiresAt
-		if exp.IsZero() || !now.After(exp.Add(retain)) {
+		if exp.IsZero() || !now.After(exp.Add(retain)) || authority[kid] {
 			continue
 		}
 		delete(s.Keys, kid)
@@ -553,4 +563,29 @@ func CheckContext(ctx context.Context, closed bool) error {
 		return ErrClosed
 	}
 	return nil
+}
+
+// labelAuthorities returns the KID of the newest non-revoked enrollment record
+// for each cluster: the record whose labels the hub treats as the operator's
+// current intent. The selection mirrors hub.enrollmentLabels exactly --
+// latest CreatedAt, earliest KID on a tie -- because a prune that kept a
+// different record from the one the hub reads would protect nothing.
+func (s *State) labelAuthorities() map[string]bool {
+	newest := map[string]*fleet.Key{}
+	for _, rec := range s.Keys {
+		k := &rec.Key
+		if k.Class != fleet.ClassEnrollment || k.Enrollment == nil || k.Revoked() {
+			continue
+		}
+		cur := newest[k.Enrollment.ClusterID]
+		if cur == nil || k.CreatedAt.After(cur.CreatedAt) ||
+			(k.CreatedAt.Equal(cur.CreatedAt) && k.KID < cur.KID) {
+			newest[k.Enrollment.ClusterID] = k
+		}
+	}
+	out := make(map[string]bool, len(newest))
+	for _, k := range newest {
+		out[k.KID] = true
+	}
+	return out
 }

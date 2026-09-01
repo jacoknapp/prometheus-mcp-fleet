@@ -86,7 +86,7 @@ func (t *Tools) queryExemplars(
 	if terr := validateExpr(in.Query, in.Cluster); terr != nil {
 		return nil, terr
 	}
-	start, end, terr := t.resolveRange(in.Start, in.End, t.now(), map[string]any{
+	start, end, terr := t.resolveRange(p, in.Start, in.End, t.now(), map[string]any{
 		"cluster": c.ID, "query": render.ClipRunes(in.Query, 512), "start": in.Start, "end": in.End,
 	})
 	if terr != nil {

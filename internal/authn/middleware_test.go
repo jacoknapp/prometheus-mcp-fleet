@@ -187,18 +187,15 @@ func TestMiddleware(t *testing.T) {
 
 func TestMiddlewareRateLimitAnswers429(t *testing.T) {
 	t.Parallel()
-	v, _, _, _ := newTestVerifier(t, nil)
+	v, store, _, _ := newTestVerifier(t, nil)
 	handler := v.Middleware(fleet.ClassAgent)(http.HandlerFunc(echoPrincipal))
+	_, k := mintKey(t, store, v.hasher, fleet.ClassAgent, nil)
 
 	var last *httptest.ResponseRecorder
 	for range failureBurst + 3 {
-		m, err := token.Mint(fleet.ClassAgent)
-		if err != nil {
-			t.Fatalf("Mint: %v", err)
-		}
 		req := httptest.NewRequest(http.MethodGet, "/mcp", nil)
 		req.RemoteAddr = "192.0.2.55:41000"
-		req.Header.Set("Authorization", "Bearer "+m.Raw.Reveal())
+		req.Header.Set("Authorization", "Bearer "+wrongSecretFor(t, k.KID))
 		last = httptest.NewRecorder()
 		handler.ServeHTTP(last, req)
 		if last.Code == http.StatusTooManyRequests {
@@ -376,22 +373,19 @@ func TestSourceAddr(t *testing.T) {
 
 func TestMiddlewareForwardedHeadersAreIgnored(t *testing.T) {
 	t.Parallel()
-	v, _, _, _ := newTestVerifier(t, nil)
+	v, store, _, _ := newTestVerifier(t, nil)
 	handler := v.Middleware(fleet.ClassAgent)(http.HandlerFunc(echoPrincipal))
+	_, k := mintKey(t, store, v.hasher, fleet.ClassAgent, nil)
 
-	// Every request comes from the same peer but claims a different
-	// forwarded-for address. Honouring the header would give each a fresh
-	// budget and defeat the limiter entirely.
+	// Every request comes from the same peer, against the same key, but
+	// claims a different forwarded-for address. Honouring the header would
+	// give each a fresh budget and defeat the limiter entirely.
 	var limited bool
 	for i := range failureBurst * 2 {
-		m, err := token.Mint(fleet.ClassAgent)
-		if err != nil {
-			t.Fatalf("Mint: %v", err)
-		}
 		req := httptest.NewRequest(http.MethodGet, "/mcp", nil)
 		req.RemoteAddr = "192.0.2.77:9000"
 		req.Header.Set("X-Forwarded-For", "10.0.0."+string(rune('0'+i%10)))
-		req.Header.Set("Authorization", "Bearer "+m.Raw.Reveal())
+		req.Header.Set("Authorization", "Bearer "+wrongSecretFor(t, k.KID))
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 		if rec.Code == http.StatusTooManyRequests {

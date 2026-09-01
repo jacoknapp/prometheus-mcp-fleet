@@ -121,8 +121,20 @@ takes effect within one cache TTL at worst and immediately on the node that
 performed it. Recording a key's last-used time deliberately does *not* bump the
 epoch, or every request would invalidate every cache.
 
-Failed authentications are rate-limited per source IP so that cache misses
-cannot be used as an amplification vector.
+Failed authentications are rate-limited per **(source IP, KID)**: ten
+failures a minute against one key from one address, then an exponential
+backoff answered with `429` before any store or HMAC work. The KID is part of
+the bucket because behind an Ingress every agent shares the Ingress pod's
+address: a bucket per address alone let one client retrying a revoked key put
+the whole fleet into backoff on its next cache miss, and anyone outside,
+holding no credential at all, could keep it there. The trade is that a spray
+of invented KIDs from one address is not throttled as a whole -- each one is
+refused on its own, at the cost of one in-memory lookup and one HMAC, which
+is about what refusing it at the limiter would have cost. The limiter bounds
+work against a *key*, which is what brute force is; it is not a request-rate
+control and no Ingress-level one is assumed. Forwarded-for headers are
+ignored (the hub cannot know which proxy to trust), so the address is always
+the TCP peer's.
 
 Why not Argon2id: [ADR-0007](adr/0007-hmac-pepper-not-argon2.md).
 
@@ -454,7 +466,7 @@ successful injection worthless than pretend to detect one.
 | **Prompt-injected agent** | Acts maliciously with its *own* legitimate key | Read-only by construction; destructive endpoints absent for everyone; scope confines it; the admin API is unreachable from an agent key |
 | **Stolen enrollment token** | One or more certificates, all for the same one cluster, within the token's window | 15-minute lifetime; bound to one cluster ID; a single-use token is atomically burned on first redemption and a replay raises a security event; a reusable token (the default) is capped by `--max-redemptions` when set and every redemption is audited |
 | **Network attacker** | — | HTTPS only; the spoke verifies the hub's server certificate, and the hub verifies the spoke's certificate and a signature over a nonce it chose. Observing traffic is not enough to impersonate either side |
-| **Compromised Ingress** | Observe tunnel traffic; relay a live connection | Cannot impersonate a spoke — it holds no spoke private key, and the signature covers a fresh hub-chosen nonce. This is the accepted cost of Ingress-only exposure; see ADR-0014 |
+| **Compromised Ingress** | Observe tunnel traffic; relay a live connection; see every plaintext `/renew` request | Cannot impersonate a spoke — it holds no spoke private key, the signature covers a fresh hub-chosen nonce, and the renewal signature also covers the CSR, so it cannot keep a spoke's valid proof and swap in a CSR over its own key. This is the accepted cost of Ingress-only exposure; see ADR-0014 |
 | **Malicious CSR** | — | Subject and SANs discarded; only the public key is used; key type and size are checked |
 
 ## Certificates and cert-manager

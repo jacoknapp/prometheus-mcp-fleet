@@ -63,6 +63,59 @@ func TestRunStatePruneSweepsAtStartup(t *testing.T) {
 	}
 }
 
+// TestRunStatePruneHoldsRevocationsThroughRenewGrace pins the window the
+// hub actually prunes with: retention on top of the renew grace. A revoked
+// certificate can reach /renew for RenewGrace past its own expiry, and the
+// revocation entry is the only thing refusing it there, so a prune keyed to
+// retention alone would -- with a short retention -- hand a revoked spoke its
+// identity back for the rest of the grace period.
+func TestRunStatePruneHoldsRevocationsThroughRenewGrace(t *testing.T) {
+	t.Parallel()
+
+	cfg := newHubConfig(t)
+	cfg.StatePruneInterval = time.Hour
+	cfg.StateRetention = 0
+	cfg.RenewGrace = 30 * 24 * time.Hour
+	h, _ := newKeyHub(t, newFileStore(t))
+	h.cfg = cfg
+	h.metrics = newMetricsAdapter(obs.NewHubMetrics(prometheus.NewRegistry()))
+	now := h.clock()
+
+	// Expired ten days ago: inside the grace, still renewable, must stay.
+	// Expired forty days ago: past the grace, nothing can present it, goes.
+	for serial, ago := range map[string]time.Duration{"0a": 10, "0b": 40} {
+		if err := h.store.RevokeCert(context.Background(), store.RevokedCert{
+			Serial: serial, RevokedAt: now.Add(-50 * 24 * time.Hour),
+			NotAfter: now.Add(-ago * 24 * time.Hour), Reason: "stolen",
+		}); err != nil {
+			t.Fatalf("RevokeCert(%s): %v", serial, err)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); h.runStatePrune(ctx) }()
+	eventually(t, 5*time.Second, "the startup pass to drop the revocation past the grace", func() bool {
+		left, err := h.store.ListRevokedCerts(context.Background())
+		return err == nil && len(left) < 2
+	})
+	cancel()
+	<-done
+
+	left, err := h.store.ListRevokedCerts(context.Background())
+	if err != nil {
+		t.Fatalf("ListRevokedCerts: %v", err)
+	}
+	var serials []string
+	for _, rc := range left {
+		serials = append(serials, rc.Serial)
+	}
+	if len(serials) != 1 || serials[0] != "0a" {
+		t.Fatalf("revocations left = %v, want only 0a: it is still inside the renew grace", serials)
+	}
+}
+
 // TestRunStatePruneKeepsSweepingOnItsTicker covers the loop past its startup
 // pass: records that lapse while the hub is up are collected too, which is
 // the case that actually keeps a long-lived fleet under the write ceiling.

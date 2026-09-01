@@ -640,7 +640,7 @@ func TestRenewChallenge(t *testing.T) {
 		resp := verifier.renew(RenewRequest{
 			CSR:       csr,
 			Chain:     id.chain(),
-			Signature: signRenew(t, id.key, nonce, certproof.RenewProtocolVersion, id.clusterID),
+			Signature: signRenew(t, id.key, nonce, certproof.RenewProtocolVersion, id.clusterID, csrBinding(t, csr)),
 			Nonce:     nonce,
 		})
 		if resp.StatusCode != http.StatusUnauthorized {
@@ -841,6 +841,7 @@ func TestRenewIdentityComesFromTheCertificate(t *testing.T) {
 
 		req := h.renewRequestFor(id)
 		req.CSR = csr
+		h.resign(&req, id)
 
 		var got EnrollResponse
 		resp := h.renew(req)
@@ -987,7 +988,7 @@ func TestRenewRejections(t *testing.T) {
 				// and somebody with a certificate generator.
 				foreign := issueSpokeFrom(t, h.otherAuthority(), cluster)
 				req.Chain = foreign.chain()
-				req.Signature = signRenew(t, foreign.key, req.Nonce, certproof.RenewProtocolVersion, cluster)
+				req.Signature = signRenew(t, foreign.key, req.Nonce, certproof.RenewProtocolVersion, cluster, csrBinding(t, req.CSR))
 			},
 			wantStatus: http.StatusForbidden,
 			wantCode:   CodeForbidden,
@@ -999,7 +1000,7 @@ func TestRenewRejections(t *testing.T) {
 				// SAN. Being trusted is not the same as being a spoke.
 				rogue := h.rogueClientCert("admin")
 				req.Chain = rogue.chain()
-				req.Signature = signRenew(t, rogue.key, req.Nonce, certproof.RenewProtocolVersion, cluster)
+				req.Signature = signRenew(t, rogue.key, req.Nonce, certproof.RenewProtocolVersion, cluster, csrBinding(t, req.CSR))
 			},
 			wantStatus: http.StatusForbidden,
 			wantCode:   CodeForbidden,
@@ -1024,7 +1025,7 @@ func TestRenewRejections(t *testing.T) {
 				// Both nonces are ones this hub issued and both are in date.
 				// The signature simply does not cover the one that was sent.
 				other := h.challenge().Nonce
-				req.Signature = signRenew(t, id.key, other, certproof.RenewProtocolVersion, cluster)
+				req.Signature = signRenew(t, id.key, other, certproof.RenewProtocolVersion, cluster, csrBinding(t, req.CSR))
 			},
 			wantStatus: http.StatusForbidden,
 			wantCode:   CodeForbidden,
@@ -1033,7 +1034,7 @@ func TestRenewRejections(t *testing.T) {
 		{
 			name: "signature scoped to a different cluster",
 			build: func(t *testing.T, _ *harness, id spokeIdentity, req *RenewRequest) {
-				req.Signature = signRenew(t, id.key, req.Nonce, certproof.RenewProtocolVersion, "prod-us-9")
+				req.Signature = signRenew(t, id.key, req.Nonce, certproof.RenewProtocolVersion, "prod-us-9", csrBinding(t, req.CSR))
 			},
 			wantStatus: http.StatusForbidden,
 			wantCode:   CodeForbidden,
@@ -1046,7 +1047,7 @@ func TestRenewRejections(t *testing.T) {
 				// protocol version in the transcript belongs to the other
 				// exchange. This is what stops a proof captured from a tunnel
 				// handshake being redeemed here for a certificate.
-				req.Signature = signRenew(t, id.key, req.Nonce, wstun.ProtocolVersion, cluster)
+				req.Signature = signRenew(t, id.key, req.Nonce, wstun.ProtocolVersion, cluster, csrBinding(t, req.CSR))
 			},
 			wantStatus: http.StatusForbidden,
 			wantCode:   CodeForbidden,
@@ -1062,11 +1063,25 @@ func TestRenewRejections(t *testing.T) {
 			wantEvent:  EventRenewalUnproven,
 		},
 		{
+			// The Ingress case. Under ADR-0014 the hub reads /renew as plain
+			// HTTP after the Ingress terminates TLS, so the Ingress sees a
+			// valid signature and the CSR beside it. Before the CSR was bound
+			// into the transcript it could keep the one and replace the other,
+			// and the hub issued the spoke's identity to the Ingress's key.
+			name: "valid signature, csr swapped for one over another key",
+			build: func(t *testing.T, _ *harness, _ spokeIdentity, req *RenewRequest) {
+				req.CSR, _ = makeCSR(t, csrOptions{CommonName: "spoke"})
+			},
+			wantStatus: http.StatusForbidden,
+			wantCode:   CodeForbidden,
+			wantEvent:  EventRenewalUnproven,
+		},
+		{
 			name: "signature by a key that is not the certificate's",
 			build: func(t *testing.T, _ *harness, _ spokeIdentity, req *RenewRequest) {
 				// Quoting somebody else's certificate is easy: it is public.
 				// Signing for it is the part that is not.
-				req.Signature = signRenew(t, newKeyPair(t), req.Nonce, certproof.RenewProtocolVersion, cluster)
+				req.Signature = signRenew(t, newKeyPair(t), req.Nonce, certproof.RenewProtocolVersion, cluster, csrBinding(t, req.CSR))
 			},
 			wantStatus: http.StatusForbidden,
 			wantCode:   CodeForbidden,
@@ -1090,8 +1105,9 @@ func TestRenewRejections(t *testing.T) {
 		},
 		{
 			name: "csr that is not a certificate request",
-			build: func(_ *testing.T, _ *harness, _ spokeIdentity, req *RenewRequest) {
+			build: func(_ *testing.T, h *harness, id spokeIdentity, req *RenewRequest) {
 				req.CSR = base64.StdEncoding.EncodeToString([]byte("not a csr"))
+				h.resign(req, id)
 			},
 			wantStatus: http.StatusBadRequest,
 			wantCode:   CodeInvalidRequest,

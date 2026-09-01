@@ -251,12 +251,21 @@ func (t *Tools) fanoutQuery(
 		if at.IsZero() {
 			at = now
 		}
+		// The same ceiling the single-cluster query enforces. Range mode gets
+		// it through resolveRange; instant mode had nothing, which made
+		// fanout_query the one tool where a principal's maxLookback did not
+		// apply -- times a hundred clusters.
+		if terr := t.checkLookback(p, at, "", map[string]any{
+			"query": render.ClipRunes(in.Query, 512), "time": in.Time,
+		}); terr != nil {
+			return nil, terr
+		}
 		endpoint = promapi.EndpointQuery
 		form = url.Values{}
 		form.Set("query", in.Query)
 		form.Set("time", formatUpstreamTime(at))
 	} else {
-		start, end, terr = t.resolveRange(in.Start, in.End, now, map[string]any{
+		start, end, terr = t.resolveRange(p, in.Start, in.End, now, map[string]any{
 			"query": render.ClipRunes(in.Query, 512),
 			"start": in.Start, "end": in.End, "step": in.Step,
 		})
@@ -268,7 +277,13 @@ func (t *Tools) fanoutQuery(
 			return nil, invalidTime("step", in.Step, "", err)
 		}
 		var down render.Downsampled
-		step, down = t.commonStep(targets, start, end, userStep)
+		// A principal's point ceiling is honoured the way query_range honours
+		// it: by widening the step until the window fits.
+		maxPoints := render.DefaultMaxPoints
+		if l := p.Scope.Limits; l.MaxPoints > 0 {
+			maxPoints = min(maxPoints, l.MaxPoints)
+		}
+		step, down = t.commonStep(targets, start, end, userStep, maxPoints)
 		// One aligned start for every cluster, so index i means the same
 		// wall-clock instant in every series and the rows are comparable.
 		start = time.Unix(start.Unix()-start.Unix()%int64(step.Seconds()), 0).UTC()
@@ -290,6 +305,9 @@ func (t *Tools) fanoutQuery(
 	results := t.dispatch(fctx, p, targets, endpoint, form, concurrency, perCluster)
 
 	maxSeries := clampInt(in.MaxSeriesPerCluster, 5, 1, 50)
+	if l := p.Scope.Limits; l.MaxSeries > 0 {
+		maxSeries = min(maxSeries, l.MaxSeries)
+	}
 	if mode == FanoutInstant {
 		t.mergeInstant(out, results, maxSeries)
 	} else {
@@ -313,13 +331,36 @@ func (t *Tools) fanoutQuery(
 		return nil, e
 	}
 	if out.Coverage.OK == 0 && out.Coverage.Requested > 0 {
-		e := newError(CodeAllClustersFailed,
-			fmt.Sprintf("all %d selected clusters failed", out.Coverage.Requested), true).
-			WithInput(map[string]any{"query": render.ClipRunes(in.Query, 512)}).
-			WithHint("Call list_clusters to see which clusters are connected.")
-		return nil, e
+		return nil, allClustersFailed(out, in.Query)
 	}
 	return out, nil
+}
+
+// allClustersFailed builds the error for a fan-out nobody answered. It
+// carries the first failure and says whether a retry could help, because a
+// bare "all clusters failed, retryable" sent an agent into a retry loop when
+// the real cause was its own expression -- and the per-cluster detail that
+// would have told it so was on the result it never received.
+func allClustersFailed(out *FanoutQueryOut, query string) *ToolError {
+	pc := out.PerCluster
+	retryable := out.Coverage.TimedOut > 0
+	for _, f := range pc.Failed {
+		retryable = retryable || f.Retryable
+	}
+	input := map[string]any{"query": render.ClipRunes(query, 512)}
+	msg := fmt.Sprintf("all %d selected clusters failed", out.Coverage.Requested)
+	hint := "Call list_clusters to see which clusters are connected."
+	if len(pc.Failed) > 0 {
+		first := pc.Failed[0]
+		input["firstFailure"] = map[string]any{
+			"cluster": first.Cluster, "code": first.Code, "message": first.Message,
+		}
+		msg = fmt.Sprintf("%s; %s: %s: %s", msg, first.Cluster, first.Code, first.Message)
+		if !retryable {
+			hint = "Every failure is permanent: fix the expression or the arguments before retrying."
+		}
+	}
+	return newError(CodeAllClustersFailed, msg, retryable).WithInput(input).WithHint("%s", hint)
 }
 
 // selectClusters resolves the fan-out's targets, refusing the untargeted case.
@@ -411,7 +452,7 @@ func (t *Tools) selectClusters(
 // above zero, so there is deliberately no empty-targets fallback branch — it
 // could never fire and would be an untested branch.
 func (t *Tools) commonStep(
-	targets []fleet.Cluster, start, end time.Time, userStep time.Duration,
+	targets []fleet.Cluster, start, end time.Time, userStep time.Duration, maxPoints int,
 ) (time.Duration, render.Downsampled) {
 	var best time.Duration
 	var chosen render.Downsampled
@@ -422,7 +463,7 @@ func (t *Tools) commonStep(
 			End:            end,
 			UserStep:       userStep,
 			ScrapeInterval: scrape,
-			MaxPoints:      render.DefaultMaxPoints,
+			MaxPoints:      maxPoints,
 		})
 		if step > best {
 			best, chosen = step, down
@@ -506,19 +547,43 @@ func (t *Tools) queryOne(
 		return fanoutResult{cluster: c.ID, err: malformed(c.ID, derr)}
 	}
 	res := fanoutResult{cluster: c.ID, warnings: append(env.Warnings, env.Infos...)}
-	if data.ResultType == "matrix" {
+	switch data.ResultType {
+	case "matrix":
+		if endpoint == promapi.EndpointQuery {
+			// A range-vector selector in instant mode. Merged as an empty
+			// vector this would read as "cluster answered, no series", which
+			// is the opposite of the truth.
+			return fanoutResult{cluster: c.ID, err: newError(CodeInvalidArgument,
+				"that expression returns a range vector; use mode \"range\" instead", false).
+				WithHint("Re-run with mode \"range\", or wrap the expression in a function " +
+					"such as rate(...) to get an instant vector.")}
+		}
 		m, err := render.DecodeMatrix(data.Result)
 		if err != nil {
 			return fanoutResult{cluster: c.ID, err: malformed(c.ID, err)}
 		}
 		res.matrix = m
-		return res
+	case "scalar":
+		// A scalar is a one-sample vector with no labels, and that is how it
+		// merges: one row per cluster. Before this branch a scalar expression
+		// -- scalar(...), time(), a bare number -- was reported as every
+		// cluster having returned garbage.
+		pt, err := render.DecodeScalar(data.Result)
+		if err != nil {
+			return fanoutResult{cluster: c.ID, err: malformed(c.ID, err)}
+		}
+		res.vector = render.Vector{{Metric: map[string]string{}, Value: pt}}
+	case "string":
+		return fanoutResult{cluster: c.ID, err: newError(CodeInvalidArgument,
+			"that expression returns a string, which has no fleet-wide merge", false).
+			WithHint("Use query against one cluster for string-valued expressions.")}
+	default:
+		v, err := render.DecodeVector(data.Result)
+		if err != nil {
+			return fanoutResult{cluster: c.ID, err: malformed(c.ID, err)}
+		}
+		res.vector = v
 	}
-	v, err := render.DecodeVector(data.Result)
-	if err != nil {
-		return fanoutResult{cluster: c.ID, err: malformed(c.ID, err)}
-	}
-	res.vector = v
 	return res
 }
 

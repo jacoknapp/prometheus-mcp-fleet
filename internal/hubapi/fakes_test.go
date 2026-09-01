@@ -907,13 +907,24 @@ func (h *harness) verifyNonce(nonce []byte) error {
 
 // signRenew produces the proof of possession a renewal carries. Every argument
 // is explicit so a test can sign the wrong thing on purpose.
-func signRenew(t *testing.T, key *ecdsa.PrivateKey, nonce []byte, protocolVersion, clusterID string) []byte {
+func signRenew(t *testing.T, key *ecdsa.PrivateKey, nonce []byte, protocolVersion, clusterID string, bindings ...[]byte) []byte {
 	t.Helper()
-	sig, err := certproof.Sign(key, nonce, protocolVersion, clusterID)
+	sig, err := certproof.Sign(key, nonce, protocolVersion, clusterID, bindings...)
 	if err != nil {
 		t.Fatalf("certproof.Sign: %v", err)
 	}
 	return sig
+}
+
+// csrBinding is the transcript field a renewal's signature must cover for the
+// CSR it carries, computed from the wire form the way the hub computes it.
+func csrBinding(t *testing.T, csrB64 string) []byte {
+	t.Helper()
+	der, err := base64.StdEncoding.DecodeString(csrB64)
+	if err != nil {
+		t.Fatalf("decode csr fixture: %v", err)
+	}
+	return certproof.CSRBinding(der)
 }
 
 // renewRequestFor builds a well-formed renewal for id against a fresh
@@ -927,9 +938,18 @@ func (h *harness) renewRequestFor(id spokeIdentity) RenewRequest {
 	return RenewRequest{
 		CSR:       csr,
 		Chain:     id.chain(),
-		Signature: signRenew(h.t, id.key, nonce, certproof.RenewProtocolVersion, id.clusterID),
+		Signature: signRenew(h.t, id.key, nonce, certproof.RenewProtocolVersion, id.clusterID, csrBinding(h.t, csr)),
 		Nonce:     nonce,
 	}
+}
+
+// resign recomputes req's proof for whatever CSR and nonce it now carries,
+// for tests that swap the CSR after building the request and mean the spoke
+// to have signed the swapped one.
+func (h *harness) resign(req *RenewRequest, id spokeIdentity) {
+	h.t.Helper()
+	req.Signature = signRenew(h.t, id.key, req.Nonce, certproof.RenewProtocolVersion, id.clusterID,
+		csrBinding(h.t, req.CSR))
 }
 
 // renew posts a renewal to the plain-HTTP public mux, which is the production

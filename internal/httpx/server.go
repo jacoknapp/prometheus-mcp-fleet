@@ -63,6 +63,14 @@ type ServerConfig struct {
 	// limit, which is intentional: a large remote-write-shaped upload or a
 	// slow client on a long POST must not be cut off by a clock. Body size is
 	// bounded by [MaxBody] instead, which is the right control for it.
+	//
+	// It is also unsafe on any listener that streams: over HTTP/1.1 the
+	// server keeps a background read on the connection while a handler
+	// runs, and when that read hits the deadline it cancels the request
+	// context -- so a 30-second ReadTimeout would abort every tool call or
+	// event stream that outlived it, not just slow uploads. The MCP listener
+	// serves 120-second tool calls and open-ended SSE, and the tunnel
+	// upgrade hijacks the same listener's connections.
 	ReadTimeout time.Duration
 	// WriteTimeout bounds the whole response. Zero means no limit -- see
 	// [NewServer] for why that is the default here.

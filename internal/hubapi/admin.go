@@ -461,6 +461,19 @@ func (s *server) handleRevokeCert(w http.ResponseWriter, r *http.Request) {
 	if notAfter.IsZero() {
 		notAfter = now.Add(s.spokeCertTTL)
 	}
+	// A notAfter already in the past is refused rather than recorded. The
+	// tunnel's revocation cache drops entries past their notAfter as moot --
+	// an expired certificate cannot complete a handshake anyway -- so an
+	// operator who mistyped the year, or copied the expiry of the wrong
+	// certificate, would get a 204 and a revocation that blocks nothing
+	// while the certificate it was meant for connects on. Omitting the field
+	// records the longest lifetime this hub can have issued, which is always
+	// safe.
+	if notAfter.Before(now) {
+		s.fail(w, r, CodeInvalidRequest,
+			"notAfter is in the past; omit it to cover the longest possible certificate lifetime, or supply the certificate's real expiry")
+		return
+	}
 	if err := s.store.RevokeCert(r.Context(), RevokedCert{
 		Serial:    serial,
 		RevokedAt: now,

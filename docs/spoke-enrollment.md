@@ -304,8 +304,18 @@ POST /renew  {csr, chain, signature, nonce}
 The hub verifies, in this order: that the nonce is one it issued and has not
 expired; that the chain verifies against its CA; that the serial is not on the
 revocation denylist; and that the signature over
-`transcript(nonce, "renew-v1", clusterID)` checks out under the leaf's public
-key. Only then does it issue.
+`transcript(nonce, "renew-v2", clusterID, sha256(csr))` checks out under the
+leaf's public key. Only then does it issue.
+
+The CSR is inside the signature on purpose. The hub reads `/renew` as plain
+HTTP behind an Ingress that terminated TLS, so the Ingress sees the request
+whole; a signature that covered only the nonce would let it keep the spoke's
+valid proof and swap in a CSR over a key of its own. Binding the CSR makes the
+proof worthless for any CSR but the one the spoke built. Consequence for
+upgrades: a spoke and a hub on different sides of the `renew-v2` change cannot
+renew with each other. Existing tunnels are unaffected, and `--renew-grace`
+(30d) means a spoke upgraded after its certificate lapsed still recovers, so
+upgrade both within that window.
 
 ### Renewing an expired certificate
 

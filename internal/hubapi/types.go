@@ -146,7 +146,8 @@ type RevokeCertRequest struct {
 	// NotAfter is the certificate's own expiry, after which the entry may be
 	// pruned. Zero means the configured spoke certificate lifetime from now,
 	// which is the longest a certificate issued by this hub can still be
-	// valid.
+	// valid. A value in the past is refused: it would record a revocation
+	// that enforces nothing.
 	NotAfter time.Time `json:"notAfter,omitzero"`
 }
 

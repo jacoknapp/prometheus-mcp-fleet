@@ -174,7 +174,8 @@ func (e *enroller) renew(ctx context.Context, current *Identity) (*Identity, err
 	// issued, not the one in local configuration: the hub verifies the
 	// signature against the identity it derives from that same certificate, so
 	// any other value would simply fail to verify.
-	sig, err := certproof.Sign(signer, challenge.Nonce, certproof.RenewProtocolVersion, clusterID)
+	sig, err := certproof.Sign(signer, challenge.Nonce, certproof.RenewProtocolVersion, clusterID,
+		certproof.CSRBinding(csr))
 	if err != nil {
 		return nil, fmt.Errorf("sign the renewal challenge: %w", err)
 	}

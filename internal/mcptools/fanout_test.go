@@ -493,12 +493,12 @@ func TestCommonStepSharedSuffixBoundary(t *testing.T) {
 		{ID: "c2", Prometheus: fleet.PrometheusInfo{ScrapeInterval: "30s"}},
 	}
 
-	_, oneDown := h.tools.commonStep(one, start, end, 0)
+	_, oneDown := h.tools.commonStep(one, start, end, 0, render.DefaultMaxPoints)
 	if strings.Contains(oneDown.Reason, "common step across") {
 		t.Errorf("reason = %q, want no shared-step suffix for a single cluster", oneDown.Reason)
 	}
 
-	_, twoDown := h.tools.commonStep(two, start, end, 0)
+	_, twoDown := h.tools.commonStep(two, start, end, 0, render.DefaultMaxPoints)
 	if !strings.Contains(twoDown.Reason, "common step across 2 clusters") {
 		t.Errorf("reason = %q, want the shared-step suffix for two clusters", twoDown.Reason)
 	}

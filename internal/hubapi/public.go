@@ -299,23 +299,27 @@ func (s *server) handleRenew(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	csrDER, ok := s.decodeCSRField(w, r, req.CSR)
+	if !ok {
+		return
+	}
+
 	// The cluster ID passed here is the one derived from the certificate in
 	// step 2, never one the caller supplied: the transcript is what binds the
 	// proof to an identity, so verifying it against a claimed value would make
-	// the binding decorative.
+	// the binding decorative. The CSR is bound for the same reason: it names
+	// the key the new certificate will be issued to, and a proof that did not
+	// cover it authorised whatever CSR arrived beside it -- which, through an
+	// Ingress that sees the plaintext request, need not be the spoke's.
 	if err := certproof.Verify(chain[0], req.Signature, req.Nonce,
-		certproof.RenewProtocolVersion, identity.ClusterID); err != nil {
+		certproof.RenewProtocolVersion, identity.ClusterID, certproof.CSRBinding(csrDER)); err != nil {
 		s.metrics.Enrollment(ResultDenied)
 		s.security(r, EventRenewalUnproven,
 			slog.String("cluster", identity.ClusterID),
 			slog.String("serial", identity.CertSerial))
 		s.fail(w, r, CodeForbidden,
-			"the signature does not prove possession of the private key for the presented certificate")
-		return
-	}
-
-	csrDER, ok := s.decodeCSRField(w, r, req.CSR)
-	if !ok {
+			"the signature does not prove possession of the private key for the presented certificate, "+
+				"or does not cover the certificate signing request")
 		return
 	}
 

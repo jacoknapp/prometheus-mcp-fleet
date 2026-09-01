@@ -225,6 +225,11 @@ type Hub struct {
 	// safety margin: nothing pruned can change an answer, so the only reason
 	// to keep it at all is that an operator investigating last week's
 	// incident wants last week's records still there.
+	//
+	// The safety margin is added by the hub, not the operator: a revoked
+	// certificate is honoured by /renew for RenewGrace past its own expiry,
+	// so the hub prunes at expiry + RenewGrace + StateRetention. Setting
+	// this to zero therefore trims the forensics window and nothing else.
 	StateRetention time.Duration
 	// StatePruneInterval is how often each replica prunes the state
 	// document. Zero disables pruning, which leaves the Secret growing
@@ -328,7 +333,7 @@ func LoadHub(args []string, getenv func(string) string) (*Hub, error) {
 	l.duration(&c.AgentKeyTTL, "agent-key-ttl", 2160*time.Hour, "default and maximum lifetime of a minted agent key (90d)")
 	l.duration(&c.AdminKeyTTL, "admin-key-ttl", 2160*time.Hour, "default and maximum lifetime of a minted admin key, including the bootstrap key (90d)")
 	l.duration(&c.StateRetention, "state-retention", 720*time.Hour,
-		"how long expired credentials and lapsed revocations are kept before pruning (30d); a forensics window, not a safety margin")
+		"how long expired credentials and lapsed revocations are kept before pruning (30d), on top of --renew-grace; a forensics window, not a safety margin")
 	l.duration(&c.StatePruneInterval, "state-prune-interval", 6*time.Hour,
 		"how often each replica prunes the state document; zero disables pruning")
 	l.integer(&c.MaxSpokes, "max-spokes", 0, "optional cap on concurrent spoke sessions on this replica; 0 means no limit")

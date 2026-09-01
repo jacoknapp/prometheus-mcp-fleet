@@ -970,4 +970,60 @@ func TestStatePrune(t *testing.T) {
 			t.Fatalf("Prune(negative) = %v, want ErrInvalid", err)
 		}
 	})
+
+	// The hub reads a cluster's operator labels from its newest non-revoked
+	// enrollment record on every attach. Tokens expire in minutes, so the
+	// first release of Prune deleted that record retain after the install and
+	// the cluster silently fell back to whatever labels the spoke reported --
+	// the self-relabelling that record exists to prevent.
+	t.Run("the newest enrollment record per cluster survives, older and revoked ones do not", func(t *testing.T) {
+		t.Parallel()
+		s := NewState()
+		put := func(k *fleet.Key) {
+			t.Helper()
+			if _, err := s.PutKey(k); err != nil {
+				t.Fatalf("PutKey(%s): %v", k.KID, err)
+			}
+		}
+		// Three tokens for prod-eu-1 across its life: the original install,
+		// a rebuild, and one minted by mistake and revoked. Plus one for a
+		// second cluster, so the rule is visibly per cluster.
+		first := enrollmentKey("enrol001", tBase)
+		rebuild := enrollmentKey("enrol002", tBase.Add(30*24*time.Hour))
+		mistake := enrollmentKey("enrol003", tBase.Add(60*24*time.Hour))
+		other := enrollmentKey("enrol004", tBase)
+		other.Enrollment.ClusterID = "prod-us-1"
+		for _, k := range []*fleet.Key{first, rebuild, mistake, other} {
+			put(k)
+		}
+		if _, err := s.RevokeKey(mistake.KID, "wrong cluster", tBase.Add(61*24*time.Hour), clockAt(now)); err != nil {
+			t.Fatalf("RevokeKey: %v", err)
+		}
+		// Two tokens minted in the same instant: the tie goes to the lower
+		// KID, exactly as hub.enrollmentLabels resolves it, so the record
+		// kept is the record read.
+		tieA := enrollmentKey("tie00002", tBase.Add(time.Hour))
+		tieB := enrollmentKey("tie00001", tBase.Add(time.Hour))
+		tieA.Enrollment.ClusterID, tieB.Enrollment.ClusterID = "prod-ap-1", "prod-ap-1"
+		put(tieA)
+		put(tieB)
+
+		res, changed, err := s.Prune(now, 0)
+		if err != nil || !changed {
+			t.Fatalf("Prune() = %+v, %v, %v; want a change", res, changed, err)
+		}
+		if res.Keys != 3 {
+			t.Errorf("Prune() dropped %d keys, want 3 (the superseded original, the revoked mistake, the tie loser)", res.Keys)
+		}
+		for _, want := range []string{rebuild.KID, other.KID, tieB.KID} {
+			if _, ok := s.Keys[want]; !ok {
+				t.Errorf("%s was pruned; it carries its cluster's operator labels", want)
+			}
+		}
+		for _, gone := range []string{first.KID, mistake.KID, tieA.KID} {
+			if _, ok := s.Keys[gone]; ok {
+				t.Errorf("%s survived; it is not any cluster's label authority", gone)
+			}
+		}
+	})
 }

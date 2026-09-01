@@ -534,36 +534,70 @@ func TestVerifyIsConcurrencySafe(t *testing.T) {
 	wg.Wait()
 }
 
+// wrongSecretFor returns a token carrying kid with a secret that is not the
+// key's: the shape of a brute-force attempt, and of a client that kept an
+// old secret after a rotation.
+func wrongSecretFor(t *testing.T, kid string) string {
+	t.Helper()
+	m, err := token.MintWithKID(fleet.ClassAgent, kid)
+	if err != nil {
+		t.Fatalf("MintWithKID: %v", err)
+	}
+	return m.Raw.Reveal()
+}
+
+// exhaustBurst fails against kid from ip until the limiter refuses, or gives
+// up a few attempts past the burst.
+func exhaustBurst(t *testing.T, v *Verifier, ip, kid string) bool {
+	t.Helper()
+	ctx := ContextWithSourceIP(context.Background(), ip)
+	for range failureBurst + 3 {
+		if _, err := v.Verify(ctx, wrongSecretFor(t, kid), fleet.ClassAgent); errors.Is(err, ErrRateLimited) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestVerifyRateLimitsFailuresPerSource pins the bucket's identity: a source
+// address and a KID together. Behind an Ingress every agent shares the
+// address, so a bucket per address alone let one client with a bad key put
+// the whole fleet into backoff -- and let anyone outside, holding no
+// credential at all, keep it there.
 func TestVerifyRateLimitsFailuresPerSource(t *testing.T) {
 	t.Parallel()
-	v, _, metrics, clock := newTestVerifier(t, nil)
-	ctx := ContextWithSourceIP(context.Background(), "203.0.113.9")
+	v, store, metrics, _ := newTestVerifier(t, nil)
+	const ip = "203.0.113.9"
+	ctx := ContextWithSourceIP(context.Background(), ip)
 
-	var limited bool
-	for range failureBurst + 3 {
-		m, err := token.Mint(fleet.ClassAgent)
-		if err != nil {
-			t.Fatalf("Mint: %v", err)
-		}
-		if _, err := v.Verify(ctx, m.Raw.Reveal(), fleet.ClassAgent); errors.Is(err, ErrRateLimited) {
-			limited = true
-			break
-		}
-		clock.advance(time.Millisecond)
-	}
-	if !limited {
+	_, victim := mintKey(t, store, v.hasher, fleet.ClassAgent, nil)
+	if !exhaustBurst(t, v, ip, victim.KID) {
 		t.Fatal("a source producing more than the failure burst was never rate limited")
 	}
 	if metrics.failure(ReasonRateLimited) == 0 {
 		t.Error("rate_limited failure was not counted")
 	}
 
-	// A successful verification from a different source is unaffected.
+	// The same key from a different address is a different bucket.
 	other := ContextWithSourceIP(context.Background(), "198.51.100.4")
-	store := v.store.(*fakeStore)
-	raw, _ := mintKey(t, store, v.hasher, fleet.ClassAgent, nil)
-	if _, err := v.Verify(other, raw, fleet.ClassAgent); err != nil {
-		t.Fatalf("unrelated source was throttled: %v", err)
+	if _, err := v.Verify(other, wrongSecretFor(t, victim.KID), fleet.ClassAgent); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("same key from another address: err = %v, want a plain refusal, not a shared penalty", err)
+	}
+
+	// A different key from the SAME address is too: the fleet behind one
+	// Ingress is not locked out by one of its members. The neighbour's first
+	// call is a cache miss, which is exactly the path the limiter guards.
+	neighbour, _ := mintKey(t, store, v.hasher, fleet.ClassAgent, nil)
+	if _, err := v.Verify(ctx, neighbour, fleet.ClassAgent); err != nil {
+		t.Fatalf("a neighbour behind the same address was throttled: %v", err)
+	}
+	// And a stranger spraying invented KIDs from that address is refused key
+	// by key, never granted, and never able to touch the neighbour's budget.
+	if _, err := v.Verify(ctx, wrongSecretFor(t, "nosuchkey1"), fleet.ClassAgent); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("unknown key from the penalised address: err = %v, want ErrUnauthenticated", err)
+	}
+	if _, err := v.Verify(ctx, neighbour, fleet.ClassAgent); err != nil {
+		t.Fatalf("neighbour throttled after a stranger's attempt: %v", err)
 	}
 }
 
@@ -572,18 +606,18 @@ func TestVerifyRateLimitRecoversAndClearsOnSuccess(t *testing.T) {
 	v, store, _, clock := newTestVerifier(t, nil)
 	ip := "203.0.113.10"
 	ctx := ContextWithSourceIP(context.Background(), ip)
+	raw, k := mintKey(t, store, v.hasher, fleet.ClassAgent, nil)
+	src := limiterKey(ip, k.KID)
 	for range failureBurst + 1 {
-		m, _ := token.Mint(fleet.ClassAgent)
-		_, _ = v.Verify(ctx, m.Raw.Reveal(), fleet.ClassAgent)
+		_, _ = v.Verify(ctx, wrongSecretFor(t, k.KID), fleet.ClassAgent)
 	}
-	if v.limiter.Allow(ip, clock.Now()) {
+	if v.limiter.Allow(src, clock.Now()) {
 		t.Fatal("source should be in backoff")
 	}
 	clock.advance(2 * time.Second)
-	if !v.limiter.Allow(ip, clock.Now()) {
+	if !v.limiter.Allow(src, clock.Now()) {
 		t.Fatal("backoff never expired")
 	}
-	raw, _ := mintKey(t, store, v.hasher, fleet.ClassAgent, nil)
 	if _, err := v.Verify(ctx, raw, fleet.ClassAgent); err != nil {
 		t.Fatalf("Verify after backoff: %v", err)
 	}

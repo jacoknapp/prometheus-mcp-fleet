@@ -57,7 +57,16 @@ var ErrBadSignature = errors.New("certproof: signature does not verify")
 // spoke's cluster but keyed to the attacker — turning a transient position on
 // the path into a permanent forged identity. With separation the collected
 // signature is worthless outside the exchange it was made for.
-const RenewProtocolVersion = "renew-v1"
+//
+// v2 binds the certificate signing request into the transcript (see
+// [CSRBinding]). Under v1 the signature covered only the nonce, the version
+// and the cluster, and the CSR travelled beside it unbound -- so anything
+// that saw the plaintext request, which under ADR-0014 is the Ingress, could
+// swap in a CSR over its own key and be issued the spoke's identity. A
+// spoke and a hub on different sides of this change cannot renew with each
+// other; existing tunnels are unaffected, and the renew grace covers a
+// spoke upgraded after its certificate lapsed.
+const RenewProtocolVersion = "renew-v2"
 
 // domainTag prefixes every transcript, so a signature produced here can never
 // be mistaken for a signature over some other structure this project signs.
@@ -88,18 +97,26 @@ var ErrFieldTooLarge = errors.New("certproof: transcript field is too large")
 // combination. Concatenating without lengths is the classic way to make a
 // signature cover something other than what it appears to.
 //
+// bindings are further fields the signature must cover, in order: whatever
+// else the exchange carries that the verifier acts on. They are what stops
+// an on-path party from keeping a valid signature and replacing the thing
+// it was meant to authorise. A field is a field whether it is empty or
+// absent -- Transcript(n, v, c) and Transcript(n, v, c, nil) differ -- so
+// both ends must agree on the count.
+//
 // The returned slice is freshly allocated and owned by the caller.
-func Transcript(nonce []byte, protocolVersion, clusterID string) ([]byte, error) {
-	fields := [][]byte{nonce, []byte(protocolVersion), []byte(clusterID)}
+func Transcript(nonce []byte, protocolVersion, clusterID string, bindings ...[]byte) ([]byte, error) {
+	fields := append([][]byte{nonce, []byte(protocolVersion), []byte(clusterID)}, bindings...)
+	size := len(domainTag) + len(fields)*4
 	for _, f := range fields {
 		if len(f) > MaxFieldBytes {
 			return nil, fmt.Errorf("%w: %d bytes, limit %d",
 				ErrFieldTooLarge, len(f), MaxFieldBytes)
 		}
+		size += len(f)
 	}
 
-	buf := make([]byte, 0, len(domainTag)+len(fields)*4+
-		len(nonce)+len(protocolVersion)+len(clusterID))
+	buf := make([]byte, 0, size)
 	buf = append(buf, domainTag...)
 	for _, f := range fields {
 		var n [4]byte
@@ -112,13 +129,14 @@ func Transcript(nonce []byte, protocolVersion, clusterID string) ([]byte, error)
 }
 
 // Sign produces a proof of possession over
-// [Transcript](nonce, protocolVersion, clusterID), hashed with SHA-256.
+// [Transcript](nonce, protocolVersion, clusterID, bindings...), hashed with
+// SHA-256.
 //
 // key is the private half of the presented certificate's public key. It is a
 // crypto.Signer rather than a concrete type so the key may stay behind an
 // interface; crypto/tls hands one back for every key type it parses.
-func Sign(key crypto.Signer, nonce []byte, protocolVersion, clusterID string) ([]byte, error) {
-	t, err := Transcript(nonce, protocolVersion, clusterID)
+func Sign(key crypto.Signer, nonce []byte, protocolVersion, clusterID string, bindings ...[]byte) ([]byte, error) {
+	t, err := Transcript(nonce, protocolVersion, clusterID, bindings...)
 	if err != nil {
 		return nil, err
 	}
@@ -136,11 +154,11 @@ func Sign(key crypto.Signer, nonce []byte, protocolVersion, clusterID string) ([
 // errors.Is(err, [ErrBadSignature]): a certificate whose key this build cannot
 // verify has not proven anything, and reporting that as a separate class would
 // invite a caller to treat it as a soft failure.
-func Verify(leaf *x509.Certificate, sig, nonce []byte, protocolVersion, clusterID string) error {
+func Verify(leaf *x509.Certificate, sig, nonce []byte, protocolVersion, clusterID string, bindings ...[]byte) error {
 	if leaf == nil {
 		return fmt.Errorf("%w: no certificate presented", ErrBadSignature)
 	}
-	t, err := Transcript(nonce, protocolVersion, clusterID)
+	t, err := Transcript(nonce, protocolVersion, clusterID, bindings...)
 	if err != nil {
 		return err
 	}
@@ -159,4 +177,17 @@ func Verify(leaf *x509.Certificate, sig, nonce []byte, protocolVersion, clusterI
 		return fmt.Errorf("%w: unsupported key type %T", ErrBadSignature, leaf.PublicKey)
 	}
 	return nil
+}
+
+// CSRBinding is the transcript field a renewal binds its certificate signing
+// request with: the SHA-256 of the CSR's DER encoding.
+//
+// The hash rather than the DER keeps the transcript small and, more to the
+// point, makes what is signed unambiguous: the bytes the hub will parse and
+// issue against, and nothing derived from them. Both ends compute it from the
+// same decoded bytes, so base64 padding or whitespace differences on the wire
+// cannot make a legitimate renewal fail.
+func CSRBinding(csrDER []byte) []byte {
+	sum := sha256.Sum256(csrDER)
+	return sum[:]
 }

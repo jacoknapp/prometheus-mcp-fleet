@@ -270,8 +270,20 @@ func (v *Verifier) verify(ctx context.Context, raw string, want fleet.KeyClass) 
 
 	// 4. Only failures are rate limited, and only after the caches have been
 	//    consulted, so a valid client is never throttled.
+	//
+	//    The bucket is per source address AND per KID. Behind an Ingress the
+	//    address is the Ingress pod's, shared by every agent in the fleet:
+	//    keyed on it alone, one client retrying a revoked key put the whole
+	//    fleet into backoff on its next cache miss, and anyone outside with
+	//    no credential at all could hold it there. Adding the KID -- which
+	//    the token carries in the clear -- confines a bad client's penalty to
+	//    the key it is failing with. What the limiter is for, bounding the
+	//    store and decoy-HMAC work one source can provoke against ONE key,
+	//    is unchanged; the map is LRU-bounded, so spraying KIDs costs memory
+	//    up to limiterEntries and nothing more.
 	ip := SourceIPFrom(ctx)
-	if !v.limiter.Allow(ip, now) {
+	src := limiterKey(ip, kid)
+	if !v.limiter.Allow(src, now) {
 		v.metrics.AuthFailure(ReasonRateLimited)
 		return nil, time.Time{}, fmt.Errorf("source in authentication backoff: %w", ErrRateLimited)
 	}
@@ -280,7 +292,7 @@ func (v *Verifier) verify(ctx context.Context, raw string, want fleet.KeyClass) 
 		// Not negative-cached: the epoch read gates the cache lookup itself,
 		// so an entry recorded here could never be consulted.
 		v.metrics.AuthFailure(ReasonStoreError)
-		v.limiter.Fail(ip, now)
+		v.limiter.Fail(src, now)
 		v.log.LogAttrs(ctx, slog.LevelError, "authentication denied: revocation epoch unreadable",
 			slog.String("error", epochErr.Error()))
 		return nil, time.Time{}, fmt.Errorf("read revocation epoch: %w", ErrUnauthenticated)
@@ -288,14 +300,14 @@ func (v *Verifier) verify(ctx context.Context, raw string, want fleet.KeyClass) 
 
 	p, exp, reason, err := v.verifyAgainstStore(ctx, kid, secret, want, now)
 	if err != nil {
-		v.fail(ctx, ip, now, sum, reason, err)
+		v.fail(ctx, src, now, sum, reason, err)
 		return nil, time.Time{}, err
 	}
 
 	p.Epoch = epoch
 	v.pos.Put(sum, cacheEntry{principal: p, keyExpiry: exp, cachedAt: now, epoch: epoch})
 	v.neg.Remove(sum)
-	v.limiter.Succeed(ip, now)
+	v.limiter.Succeed(src, now)
 	v.metrics.AuthSuccess(want)
 	v.touch(ctx, kid, now)
 	return p, exp, nil
@@ -376,10 +388,10 @@ func (v *Verifier) fromCache(
 
 // fail records a rejection: one metric, one negative-cache entry, one debit
 // against the source address, and one log line that names no secret.
-func (v *Verifier) fail(ctx context.Context, ip string, now time.Time, sum [sha256.Size]byte, reason string, err error) {
+func (v *Verifier) fail(ctx context.Context, src string, now time.Time, sum [sha256.Size]byte, reason string, err error) {
 	v.metrics.AuthFailure(reason)
 	v.neg.Put(sum, negEntry{err: err, reason: reason, cachedAt: now})
-	v.limiter.Fail(ip, now)
+	v.limiter.Fail(src, now)
 	v.log.LogAttrs(ctx, slog.LevelDebug, "authentication failed", slog.String("reason", reason))
 }
 
@@ -444,4 +456,16 @@ func principalFor(k *fleet.Key) *fleet.Principal {
 		p.Role = k.Scope.Role
 	}
 	return p
+}
+
+// limiterKey names the failure bucket for one source address and one KID.
+// The separator cannot occur in either: addresses are numeric and KIDs are
+// the token alphabet. An unattributable request stays unattributable: the
+// limiter's empty-source rule applies to the pair, not to the KID alone,
+// or a stranger who knew a KID could lock its owner out from nowhere.
+func limiterKey(ip, kid string) string {
+	if ip == "" {
+		return ""
+	}
+	return ip + "\x00" + kid
 }

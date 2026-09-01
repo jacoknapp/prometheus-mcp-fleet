@@ -77,12 +77,17 @@ var (
 //
 // Replaying a captured renewal request gets the attacker another certificate for
 // the public key in the captured CSR — a key whose private half is held by the
-// spoke that built it, and not by the attacker. The reply is a certificate the
-// legitimate spoke could have obtained anyway, carrying an identity it already
-// has. There is no privilege to escalate to and nothing to impersonate: the
-// certificate is useless to anyone who cannot sign with that key. The only cost
-// of a replay is a CA signature and a log line, and that is bounded by the
-// sixty-second window and by the ordinary rate limits in front of the hub.
+// spoke that built it, and not by the attacker. That holds only because the
+// signature covers the CSR (certproof.CSRBinding): were the CSR free to vary
+// under a fixed signature, a replay with a substituted CSR would be an
+// identity for the attacker's own key, and single-use nonces would be the
+// least of what this needed. With the CSR bound, the reply is a certificate
+// the legitimate spoke could have obtained anyway, carrying an identity it
+// already has. There is no privilege to escalate to and nothing to
+// impersonate: the certificate is useless to anyone who cannot sign with
+// that key. The only cost of a replay is a CA signature and a log line, and
+// that is bounded by the sixty-second window and by the ordinary rate limits
+// in front of the hub.
 //
 // This is the opposite of /enroll, where single-use is the entire security
 // property: an enrollment token is a bearer credential, so a replay hands a

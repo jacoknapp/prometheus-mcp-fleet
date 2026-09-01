@@ -163,6 +163,9 @@ func (t *Tools) query(
 	}
 
 	limit := clampInt(in.Limit, 100, 1, 1000)
+	if l := p.Scope.Limits; l.MaxSeries > 0 {
+		limit = min(limit, l.MaxSeries)
+	}
 	enc := render.EncodeInstant(input, render.Options{
 		MaxItems:     limit,
 		TokenCeiling: t.tokenCeiling,
@@ -281,7 +284,7 @@ func (t *Tools) queryRange(
 	}
 
 	now := t.now()
-	start, end, terr := t.resolveRange(in.Start, in.End, now, map[string]any{
+	start, end, terr := t.resolveRange(p, in.Start, in.End, now, map[string]any{
 		"cluster": in.Cluster,
 		"query":   render.ClipRunes(in.Query, 512),
 		"start":   in.Start,
@@ -403,7 +406,7 @@ func (t *Tools) queryRange(
 const defaultRangeSpan = time.Hour
 
 func (t *Tools) resolveRange(
-	startArg, endArg string, now time.Time, echo map[string]any,
+	p *fleet.Principal, startArg, endArg string, now time.Time, echo map[string]any,
 ) (time.Time, time.Time, *ToolError) {
 	defaultSpan := defaultRangeSpan
 	end, err := ParseTime(endArg, now)
@@ -426,7 +429,7 @@ func (t *Tools) resolveRange(
 			WithHint("Relative times are the reliable form: start \"now-6h\", end \"now\".")
 	}
 
-	limit := t.lookbackLimit(nil)
+	limit := t.lookbackLimit(p)
 	if span := end.Sub(start); span > limit {
 		corrected := maps(echo)
 		corrected["start"] = "now-" + render.FormatDuration(limit)
