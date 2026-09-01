@@ -644,12 +644,11 @@ func certsList(ctx context.Context, args []string, getenv func(string) string, s
 		_, err := fmt.Fprintln(stdout, "no revoked certificates")
 		return err
 	}
-	w := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "SERIAL\tREVOKED\tEXPIRES\tREASON")
+	rows := make([][]string, 0, len(out.Revoked))
 	for _, rc := range out.Revoked {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", rc.Serial, stamp(rc.RevokedAt), stamp(rc.NotAfter), rc.Reason)
+		rows = append(rows, []string{rc.Serial, stamp(rc.RevokedAt), stamp(rc.NotAfter), rc.Reason})
 	}
-	return w.Flush()
+	return writeTable(stdout, []string{"SERIAL", "REVOKED", "EXPIRES", "REASON"}, rows)
 }
 
 // printKeys renders a credential listing.
@@ -661,17 +660,43 @@ func printKeys(stdout io.Writer, keys []hubapi.KeyView) error {
 		_, err := fmt.Fprintln(stdout, "no credentials")
 		return err
 	}
-	w := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "KID\tCLASS\tNAME\tSTATUS\tEXPIRES\tCLUSTER")
+	rows := make([][]string, 0, len(keys))
 	for _, k := range keys {
 		cluster := ""
 		if k.Enrollment != nil {
 			cluster = k.Enrollment.ClusterID
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
-			k.KID, k.Class, k.Name, keyStatus(k), expiry(k.ExpiresAt), cluster)
+		rows = append(rows, []string{
+			k.KID, string(k.Class), k.Name, keyStatus(k), expiry(k.ExpiresAt), cluster,
+		})
 	}
-	return w.Flush()
+	return writeTable(stdout, []string{"KID", "CLASS", "NAME", "STATUS", "EXPIRES", "CLUSTER"}, rows)
+}
+
+// writeTable renders aligned columns.
+//
+// It assembles into a buffer and writes once, which is the same shape report
+// uses above and exists for the same reason: a tabwriter buffers until Flush,
+// so per-cell error returns are noise -- there is nothing they could report
+// that the single write below will not.
+func writeTable(stdout io.Writer, header []string, rows [][]string) error {
+	var b strings.Builder
+	w := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
+	cells := func(c []string) {
+		// Writes to a strings.Builder cannot fail: Builder.Write always
+		// returns a nil error, and tabwriter only forwards to it on Flush.
+		_, _ = fmt.Fprintln(w, strings.Join(c, "\t"))
+	}
+	cells(header)
+	for _, r := range rows {
+		cells(r)
+	}
+	// Flushing cannot fail either, for the same reason: every write goes to
+	// the Builder. The single write below is the only one that can, and it
+	// is the one an operator would ever see fail -- a closed pipe.
+	_ = w.Flush()
+	_, err := io.WriteString(stdout, b.String())
+	return err
 }
 
 // keyStatus is the one word that decides whether a credential still works.
