@@ -54,7 +54,7 @@ spec:
               Cluster {{ $cluster }} is almost certainly invisible to every AI agent:
               the hub reports it disconnected and every query against it returns a
               spoke-unreachable tool error.
-            runbook_url: {{ $runbook }}PrometheusMCPSpokeDown.md
+            runbook_url: {{ $runbook }}prometheusmcpspokedown
         {{- end }}
         {{- if .Values.metrics.prometheusRule.rules.tunnelDown }}
         - alert: PrometheusMCPSpokeTunnelDown
@@ -75,7 +75,7 @@ spec:
               in this cluster's direction, not an inbound firewall one. Check the
               spoke logs for the dial error and confirm the NetworkPolicy egress
               rules still cover the hub's address.
-            runbook_url: {{ $runbook }}PrometheusMCPSpokeTunnelDown.md
+            runbook_url: {{ $runbook }}prometheusmcpspoketunneldown
         {{- end }}
         {{- if .Values.metrics.prometheusRule.rules.tunnelFlapping }}
         - alert: PrometheusMCPSpokeTunnelFlapping
@@ -95,7 +95,7 @@ spec:
               reconnect drops the in-flight queries the hub had routed here. Check
               for MTU, idle-timeout or LoadBalancer connection-reaping problems on
               the path to the hub.
-            runbook_url: {{ $runbook }}PrometheusMCPSpokeTunnelFlapping.md
+            runbook_url: {{ $runbook }}prometheusmcpspoketunnelflapping
         {{- end }}
         {{- if .Values.metrics.prometheusRule.rules.prometheusDown }}
         - alert: PrometheusMCPSpokePrometheusDown
@@ -113,7 +113,7 @@ spec:
               10 minutes. The spoke stays RUNNING on purpose -- /healthz never checks a
               dependency -- but it reports NotReady and every query the hub routes here
               fails.
-            runbook_url: {{ $runbook }}PrometheusMCPSpokePrometheusDown.md
+            runbook_url: {{ $runbook }}prometheusmcpspokeprometheusdown
         {{- end }}
         {{- if .Values.metrics.prometheusRule.rules.certExpiringSoon }}
         - alert: PrometheusMCPSpokeCertExpiringSoon
@@ -132,7 +132,7 @@ spec:
               automatically at half the certificate's life, so this firing means
               RENEWAL IS FAILING. When it expires the tunnel stops re-establishing and
               the cluster needs a fresh enrollment token by hand.
-            runbook_url: {{ $runbook }}PrometheusMCPSpokeCertExpiringSoon.md
+            runbook_url: {{ $runbook }}prometheusmcpspokecertexpiringsoon
         {{- end }}
         {{- if .Values.metrics.prometheusRule.rules.promErrorRatioHigh }}
         - alert: PrometheusMCPSpokePromErrorRatioHigh
@@ -151,7 +151,7 @@ spec:
               {{ printf "{{ $value | humanizePercentage }}" }} of the spoke's requests
               to its local Prometheus returned 5xx over the last 5 minutes. Agents see
               these as tool errors against cluster {{ $cluster }}.
-            runbook_url: {{ $runbook }}PrometheusMCPSpokePromErrorRatioHigh.md
+            runbook_url: {{ $runbook }}prometheusmcpspokepromerrorratiohigh
         {{- end }}
         {{- if .Values.metrics.prometheusRule.rules.factsRefreshFailing }}
         - alert: PrometheusMCPSpokeFactsRefreshFailing
@@ -169,7 +169,7 @@ spec:
               Fact collection has been failing for 30 minutes. Queries still work; what
               degrades is the hub's description of this cluster, so an agent choosing
               between clusters sees an out-of-date picture of {{ $cluster }}.
-            runbook_url: {{ $runbook }}PrometheusMCPSpokeFactsRefreshFailing.md
+            runbook_url: {{ $runbook }}prometheusmcpspokefactsrefreshfailing
         {{- end }}
         {{- if and .Values.autoUpdate.enabled .Values.metrics.prometheusRule.rules.autoUpdateFailed }}
         - alert: PrometheusMCPSpokeAutoUpdateFailed
@@ -189,7 +189,7 @@ spec:
               or the SLSA provenance verification refused the new digest, or the rollout
               was rolled back. The workload is still on its previous digest; nothing was
               applied unverified.
-            runbook_url: {{ $runbook }}PrometheusMCPSpokeAutoUpdateFailed.md
+            runbook_url: {{ $runbook }}prometheusmcpspokeautoupdatefailed
         {{- end }}
     {{- with .Values.metrics.prometheusRule.additionalGroups }}
     {{- toYaml . | nindent 4 }}

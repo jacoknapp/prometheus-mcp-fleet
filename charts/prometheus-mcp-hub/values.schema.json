@@ -1007,6 +1007,10 @@
                 "autoUpdateFailed": {
                   "description": "PrometheusMCPAutoUpdateFailed. Requires kube-state-metrics.",
                   "type": "boolean"
+                },
+                "autoUpdateStale": {
+                  "description": "PrometheusMCPAutoUpdateStale. No auto-update job has succeeded within thresholds.autoUpdateStaleSeconds. Requires kube-state-metrics.",
+                  "type": "boolean"
                 }
               }
             },
@@ -1041,6 +1045,11 @@
                   "description": "Container restarts in one hour.",
                   "type": "integer",
                   "minimum": 0
+                },
+                "autoUpdateStaleSeconds": {
+                  "description": "Seconds since the last successful auto-update run above which PrometheusMCPAutoUpdateStale fires.",
+                  "type": "integer",
+                  "minimum": 1
                 }
               }
             },
@@ -1515,6 +1524,27 @@
         "domain": {
           "description": "PMF_PEER_DISCOVERY_DOMAIN. Empty derives it from the rendered headless Service.",
           "type": "string"
+        }
+      }
+    },
+    "adminToken": {
+      "description": "An admin credential mounted into the hub pod so the administrative subcommands can use --admin-token-file.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "existingSecret": {
+          "description": "Name of an existing Secret holding an admin token. Empty mounts nothing.",
+          "type": "string"
+        },
+        "key": {
+          "description": "Key inside the Secret holding the token.",
+          "type": "string",
+          "minLength": 1
+        },
+        "mountPath": {
+          "description": "Directory the Secret is mounted at.",
+          "type": "string",
+          "minLength": 1
         }
       }
     }

@@ -51,7 +51,7 @@ spec:
               No hub instance matching {{ $sel }} has reported up==1 for 5 minutes.
               Every AI agent has lost Prometheus access to the whole fleet and every
               spoke tunnel is down.
-            runbook_url: {{ $runbook }}PrometheusMCPHubDown.md
+            runbook_url: {{ $runbook }}prometheusmcphubdown
         {{- end }}
         {{- if .Values.metrics.prometheusRule.rules.spokesDisconnected }}
         - alert: PrometheusMCPSpokesDisconnected
@@ -70,7 +70,7 @@ spec:
               {{ printf "{{ $value | humanizePercentage }}" }} of the spokes known to the
               hub have promfleet_hub_spoke_connected == 0 and have had for 10 minutes.
               Queries against those clusters fail with a spoke-unreachable tool error.
-            runbook_url: {{ $runbook }}PrometheusMCPSpokesDisconnected.md
+            runbook_url: {{ $runbook }}prometheusmcpspokesdisconnected
         {{- end }}
         {{- if .Values.metrics.prometheusRule.rules.caCertExpiringSoon }}
         - alert: PrometheusMCPHubCACertExpiringSoon
@@ -88,7 +88,7 @@ spec:
               {{ printf "{{ $value | humanizeDuration }}" }}. When it expires no spoke can
               enrol or renew and every existing tunnel fails to re-establish. The hub
               also reports NotReady once the CA is inside 24h of expiry.
-            runbook_url: {{ $runbook }}PrometheusMCPHubCACertExpiringSoon.md
+            runbook_url: {{ $runbook }}prometheusmcphubcacertexpiringsoon
         {{- end }}
         {{- if .Values.metrics.prometheusRule.rules.spokeCertExpiringSoon }}
         - alert: PrometheusMCPHubSpokeCertExpiringSoon
@@ -105,7 +105,7 @@ spec:
               The certificate issued to cluster {{ printf "{{ $labels.cluster }}" }}
               expires in {{ printf "{{ $value | humanizeDuration }}" }} and the spoke has
               not renewed it. That spoke drops off the fleet when it does.
-            runbook_url: {{ $runbook }}PrometheusMCPHubSpokeCertExpiringSoon.md
+            runbook_url: {{ $runbook }}prometheusmcphubspokecertexpiringsoon
         {{- end }}
         {{- if .Values.metrics.prometheusRule.rules.proxyErrorRatioHigh }}
         - alert: PrometheusMCPHubProxyErrorRatioHigh
@@ -124,7 +124,7 @@ spec:
               {{ printf "{{ $value | humanizePercentage }}" }} of proxied requests to
               cluster {{ printf "{{ $labels.cluster }}" }} returned 5xx over the last 5
               minutes. Check that cluster's Prometheus and the spoke's logs.
-            runbook_url: {{ $runbook }}PrometheusMCPHubProxyErrorRatioHigh.md
+            runbook_url: {{ $runbook }}prometheusmcphubproxyerrorratiohigh
         {{- end }}
         {{- if .Values.metrics.prometheusRule.rules.restartLoop }}
         {{/* Requires kube-state-metrics. The hub is a Deployment, so its pods are
@@ -146,7 +146,7 @@ spec:
               {{ printf "{{ $labels.pod }}" }} has restarted
               {{ printf "{{ $value }}" }} times in the last hour. Every restart drops
               every spoke tunnel and every in-flight agent request.
-            runbook_url: {{ $runbook }}PrometheusMCPHubRestartLoop.md
+            runbook_url: {{ $runbook }}prometheusmcphubrestartloop
         {{- end }}
         {{- if and .Values.autoUpdate.enabled .Values.metrics.prometheusRule.rules.autoUpdateFailed }}
         - alert: PrometheusMCPAutoUpdateFailed
@@ -166,7 +166,44 @@ spec:
               or the SLSA provenance verification refused the new digest, or the rollout
               was rolled back. The workload is still on its previous digest; nothing was
               applied unverified.
-            runbook_url: {{ $runbook }}PrometheusMCPAutoUpdateFailed.md
+            runbook_url: {{ $runbook }}prometheusmcpautoupdatefailed
+        {{- end }}
+        {{- if and .Values.autoUpdate.enabled .Values.metrics.prometheusRule.rules.autoUpdateStale }}
+        {{/*
+        The complement of AutoUpdateFailed. A failing job is loud; a CronJob
+        that was suspended, lost its RBAC, or never got scheduled is silent, and
+        the workload quietly stops receiving the rebuilds this feature exists to
+        deliver. Alerting on the last SUCCESS rather than on failures is what
+        catches "nothing has run at all".
+
+        kube_cronjob_status_last_successful_time is a unix timestamp, so the
+        expression is an age. A CronJob that has never succeeded reports no
+        series at all rather than zero, which is why this does not fire on a
+        fresh install before the first window -- deliberately, since alerting
+        immediately after install would be noise for a week.
+        */}}
+        - alert: PrometheusMCPAutoUpdateStale
+          expr: >-
+            time() - max(kube_cronjob_status_last_successful_time{namespace="{{ $ns }}",
+            cronjob="{{ include "prometheus-mcp-hub.autoUpdateName" . }}"})
+            > {{ .Values.metrics.prometheusRule.thresholds.autoUpdateStaleSeconds }}
+          for: 1h
+          labels:
+            severity: warning
+            {{- with .Values.metrics.prometheusRule.additionalRuleLabels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: The hub auto-update has not run successfully in too long
+            description: >-
+              No auto-update job has succeeded for
+              {{ printf "{{ $value | humanizeDuration }}" }}. The workload is
+              still running whatever digest it last received, and is no longer
+              picking up rebuilt images, so any CVE fixed since then is
+              unapplied. Check whether the CronJob is suspended, whether its
+              ServiceAccount still has patch on the Deployment, and whether the
+              schedule fires at all.
+            runbook_url: {{ $runbook }}prometheusmcpautoupdatestale
         {{- end }}
     {{- with .Values.metrics.prometheusRule.additionalGroups }}
     {{- toYaml . | nindent 4 }}

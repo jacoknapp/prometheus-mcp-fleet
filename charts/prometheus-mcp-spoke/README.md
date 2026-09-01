@@ -405,7 +405,7 @@ Kubernetes: `>=1.28.0-0`
 | metrics.prometheusRule.rules.spokeDown | bool | `true` | `PrometheusMCPSpokeDown` — this spoke is not being scraped successfully. |
 | metrics.prometheusRule.rules.tunnelDown | bool | `true` | `PrometheusMCPSpokeTunnelDown` — `promfleet_spoke_tunnel_up` is 0 for some hub endpoint, so this cluster is invisible to every agent. |
 | metrics.prometheusRule.rules.tunnelFlapping | bool | `true` | `PrometheusMCPSpokeTunnelFlapping` — `promfleet_spoke_tunnel_reconnects_total` rising faster than `thresholds.reconnectsPerHour`. |
-| metrics.prometheusRule.runbookUrlPrefix | string | `"https://github.com/jacoknapp/prometheus-mcp-fleet/blob/main/docs/runbooks/"` | Runbook URL prefix; the alert name is appended. |
+| metrics.prometheusRule.runbookUrlPrefix | string | `"https://github.com/jacoknapp/prometheus-mcp-fleet/blob/main/docs/operations/runbook.md#"` | Runbook URL prefix; the alert name is appended. |
 | metrics.prometheusRule.selector | string | `""` | Label matcher appended to every shipped expression. Empty means `job="<chart name>"`, which is what a default ServiceMonitor produces. |
 | metrics.prometheusRule.thresholds.certExpirySeconds | int | `259200` | Seconds of remaining client certificate validity below which `PrometheusMCPSpokeCertExpiringSoon` fires. 3 days against the hub's 14 day default TTL, which is well after the half-life renewal should have happened. |
 | metrics.prometheusRule.thresholds.promErrorRatio | float | `0.1` | 5xx ratio from the local Prometheus above which `PrometheusMCPSpokePromErrorRatioHigh` fires. |

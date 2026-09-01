@@ -323,6 +323,9 @@ Kubernetes: `>=1.28.0-0`
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
+| adminToken.existingSecret | string | `""` | Name of an existing Secret holding an admin token to mount read-only into the hub pod. Empty mounts nothing, and the administrative subcommands then need `PMF_ADMIN_TOKEN` or an explicit `--admin-token-file`. |
+| adminToken.key | string | `"admin-token"` | Key inside `adminToken.existingSecret` holding the token. The default makes the mounted file `/var/run/pmf/admin-token`, which is the path the documentation passes to `--admin-token-file`. |
+| adminToken.mountPath | string | `"/var/run/pmf"` | Directory the Secret is mounted at. The file is `<mountPath>/<key>`, which is what `--admin-token-file` should point at. |
 | affinity | object | `{}` | `spec.template.spec.affinity`. |
 | autoUpdate.activeDeadlineSeconds | int | `900` | `activeDeadlineSeconds` of the update Job. |
 | autoUpdate.backoffLimit | int | `0` | `backoffLimit` of the update Job. 0 — a failed verified rollout must not be retried blindly. |
@@ -441,14 +444,16 @@ Kubernetes: `>=1.28.0-0`
 | metrics.prometheusRule.labels | object | `{}` | Extra labels. Must match your Prometheus' `ruleSelector`. |
 | metrics.prometheusRule.namespace | string | `""` | Namespace for the PrometheusRule. Empty means the release namespace. |
 | metrics.prometheusRule.rules.autoUpdateFailed | bool | `true` | `PrometheusMCPAutoUpdateFailed` — the auto-update CronJob failed. Requires kube-state-metrics. Only rendered when `autoUpdate.enabled` is true. |
+| metrics.prometheusRule.rules.autoUpdateStale | bool | `true` | `PrometheusMCPAutoUpdateStale` — no auto-update job has SUCCEEDED within `thresholds.autoUpdateStaleSeconds`. Requires kube-state-metrics. Only rendered when `autoUpdate.enabled` is true. This is the complement of `autoUpdateFailed`: a job that fails is loud, whereas a CronJob that was suspended, lost its RBAC, or was never scheduled fails silently, and the workload simply stops receiving the CVE rebuilds auto-update exists to deliver. |
 | metrics.prometheusRule.rules.caCertExpiringSoon | bool | `true` | `PrometheusMCPHubCACertExpiringSoon` — `promfleet_hub_ca_cert_expiry_seconds` below `thresholds.caCertExpirySeconds`. |
 | metrics.prometheusRule.rules.hubDown | bool | `true` | `PrometheusMCPHubDown` — no hub instance is being scraped successfully. |
 | metrics.prometheusRule.rules.proxyErrorRatioHigh | bool | `true` | `PrometheusMCPHubProxyErrorRatioHigh` — 5xx ratio of proxied Prometheus requests above `thresholds.proxyErrorRatio`. |
 | metrics.prometheusRule.rules.restartLoop | bool | `true` | `PrometheusMCPHubRestartLoop` — container restarts above `thresholds.restartsPerHour`. Requires kube-state-metrics. |
 | metrics.prometheusRule.rules.spokeCertExpiringSoon | bool | `true` | `PrometheusMCPHubSpokeCertExpiringSoon` — `promfleet_hub_spoke_cert_expiry_seconds` below `thresholds.spokeCertExpirySeconds` for some cluster. |
 | metrics.prometheusRule.rules.spokesDisconnected | bool | `true` | `PrometheusMCPSpokesDisconnected` — more than `thresholds.spokesDisconnectedRatio` of enrolled spokes have no tunnel. |
-| metrics.prometheusRule.runbookUrlPrefix | string | `"https://github.com/jacoknapp/prometheus-mcp-fleet/blob/main/docs/runbooks/"` | Runbook URL prefix; the alert name is appended. |
+| metrics.prometheusRule.runbookUrlPrefix | string | `"https://github.com/jacoknapp/prometheus-mcp-fleet/blob/main/docs/operations/runbook.md#"` | Runbook URL prefix; the alert name is appended. |
 | metrics.prometheusRule.selector | string | `""` | Label matcher appended to every shipped expression. Empty means `job="<fullname>"`, which is what a default ServiceMonitor produces. |
+| metrics.prometheusRule.thresholds.autoUpdateStaleSeconds | int | `1382400` | Seconds since the last SUCCESSFUL auto-update run above which `PrometheusMCPAutoUpdateStale` fires. 16 days, which clears two weekly runs plus a day of slack, so a single missed window is not an alert but a stopped schedule is. |
 | metrics.prometheusRule.thresholds.caCertExpirySeconds | int | `1209600` | Seconds of remaining CA certificate validity below which `PrometheusMCPHubCACertExpiringSoon` fires. 14 days. `promfleet_hub_ca_cert_expiry_seconds` is seconds REMAINING, not a unix timestamp. |
 | metrics.prometheusRule.thresholds.proxyErrorRatio | float | `0.1` | 5xx ratio of proxied requests above which `PrometheusMCPHubProxyErrorRatioHigh` fires. |
 | metrics.prometheusRule.thresholds.restartsPerHour | int | `3` | Container restarts in one hour above which `PrometheusMCPHubRestartLoop` fires. |

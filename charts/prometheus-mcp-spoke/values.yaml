@@ -379,7 +379,7 @@ metrics:
     # -- Extra labels added to every shipped alert.
     additionalRuleLabels: {}
     # -- Runbook URL prefix; the alert name is appended.
-    runbookUrlPrefix: https://github.com/jacoknapp/prometheus-mcp-fleet/blob/main/docs/runbooks/
+    runbookUrlPrefix: https://github.com/jacoknapp/prometheus-mcp-fleet/blob/main/docs/operations/runbook.md#
     rules:
       # -- `PrometheusMCPSpokeDown` — this spoke is not being scraped successfully.
       spokeDown: true

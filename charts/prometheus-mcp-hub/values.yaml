@@ -100,6 +100,23 @@ state:
   # -- `PMF_STATE_FILE`. Only used when `state.backend` is `file`.
   file: /tmp/prometheus-mcp-fleet/state.json
 
+# An admin credential mounted into the hub pod, so that
+# `kubectl exec deploy/pmf-hub -- hub enroll create --admin-token-file ...` works
+# without hand-rolling extraVolumes.
+#
+# The administrative subcommands are HTTP clients against the hub's own admin
+# listener, so they need an admin credential of their own. The alternative is
+# `PMF_ADMIN_TOKEN` in the exec's argument list, which puts the credential in the
+# node's process table. The chart never creates this Secret; mint the token with
+# `hub keys create --class admin` and store it yourself.
+adminToken:
+  # -- Name of an existing Secret holding an admin token to mount read-only into the hub pod. Empty mounts nothing, and the administrative subcommands then need `PMF_ADMIN_TOKEN` or an explicit `--admin-token-file`.
+  existingSecret: ""
+  # -- Key inside `adminToken.existingSecret` holding the token. The default makes the mounted file `/var/run/pmf/admin-token`, which is the path the documentation passes to `--admin-token-file`.
+  key: admin-token
+  # -- Directory the Secret is mounted at. The file is `<mountPath>/<key>`, which is what `--admin-token-file` should point at.
+  mountPath: /var/run/pmf
+
 bootstrap:
   # -- Name of an existing Secret holding operator-supplied bootstrap material (HMAC pepper and/or CA keypair) to adopt instead of letting the hub self-generate. Mounted read-only; the chart never creates this Secret, so no key material is ever stored in Helm release values.
   existingSecret: ""
@@ -426,7 +443,7 @@ metrics:
     # -- Extra labels added to every shipped alert.
     additionalRuleLabels: {}
     # -- Runbook URL prefix; the alert name is appended.
-    runbookUrlPrefix: https://github.com/jacoknapp/prometheus-mcp-fleet/blob/main/docs/runbooks/
+    runbookUrlPrefix: https://github.com/jacoknapp/prometheus-mcp-fleet/blob/main/docs/operations/runbook.md#
     rules:
       # -- `PrometheusMCPHubDown` — no hub instance is being scraped successfully.
       hubDown: true
@@ -442,6 +459,8 @@ metrics:
       restartLoop: true
       # -- `PrometheusMCPAutoUpdateFailed` — the auto-update CronJob failed. Requires kube-state-metrics. Only rendered when `autoUpdate.enabled` is true.
       autoUpdateFailed: true
+      # -- `PrometheusMCPAutoUpdateStale` — no auto-update job has SUCCEEDED within `thresholds.autoUpdateStaleSeconds`. Requires kube-state-metrics. Only rendered when `autoUpdate.enabled` is true. This is the complement of `autoUpdateFailed`: a job that fails is loud, whereas a CronJob that was suspended, lost its RBAC, or was never scheduled fails silently, and the workload simply stops receiving the CVE rebuilds auto-update exists to deliver.
+      autoUpdateStale: true
     thresholds:
       # -- Fraction of enrolled spokes that may be disconnected before `PrometheusMCPSpokesDisconnected` fires.
       spokesDisconnectedRatio: 0.10
@@ -453,6 +472,8 @@ metrics:
       proxyErrorRatio: 0.10
       # -- Container restarts in one hour above which `PrometheusMCPHubRestartLoop` fires.
       restartsPerHour: 3
+      # -- Seconds since the last SUCCESSFUL auto-update run above which `PrometheusMCPAutoUpdateStale` fires. 16 days, which clears two weekly runs plus a day of slack, so a single missed window is not an alert but a stopped schedule is.
+      autoUpdateStaleSeconds: 1382400
     # -- Extra rule groups appended verbatim to `spec.groups`.
     additionalGroups: []
 

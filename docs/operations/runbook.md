@@ -26,6 +26,13 @@ than that warrants.
 - [PrometheusMCPHubRestartLoop](#prometheusmcphubrestartloop)
 - [PrometheusMCPHubStateSecretLarge](#prometheusmcphubstatesecretlarge)
 - [PrometheusMCPAutoUpdateFailed](#prometheusmcpautoupdatefailed)
+- [PrometheusMCPAutoUpdateStale](#prometheusmcpautoupdatestale)
+- [PrometheusMCPHubSpokeCertExpiringSoon](#prometheusmcphubspokecertexpiringsoon)
+- [PrometheusMCPSpokeDown](#prometheusmcpspokedown)
+- [PrometheusMCPSpokePrometheusDown](#prometheusmcpspokeprometheusdown)
+- [PrometheusMCPSpokePromErrorRatioHigh](#prometheusmcpspokepromerrorratiohigh)
+- [PrometheusMCPSpokeTunnelFlapping](#prometheusmcpspoketunnelflapping)
+- [PrometheusMCPSpokeFactsRefreshFailing](#prometheusmcpspokefactsrefreshfailing)
 - [Security events](#security-events)
 - [Disaster recovery](#disaster-recovery)
 
@@ -269,6 +276,146 @@ kubectl -n <ns> logs job/<release>-autoupdate-<id>
 If several clusters report this at once, the release is bad. **Stop approving
 promotions** — that freezes the whole fleet with no code change, and is the
 intended kill switch ([ADR-0011](../adr/0011-auto-update-is-opt-in.md)).
+
+## PrometheusMCPAutoUpdateStale
+
+No auto-update job has **succeeded** within
+`metrics.prometheusRule.thresholds.autoUpdateStaleSeconds` (16 days by default,
+which clears two weekly windows plus a day of slack).
+
+This is the complement of the alert above, and the more dangerous of the two.
+A job that fails is loud. A schedule that stopped is silent: the workload keeps
+running the digest it last received, keeps passing every health check, and
+quietly stops collecting the CVE rebuilds auto-update exists to deliver. Nothing
+is broken, which is exactly why nobody notices.
+
+```bash
+# Is the schedule suspended?
+kubectl -n <ns> get cronjob <release>-autoupdate -o jsonpath='{.spec.suspend}{"\n"}'
+
+# When did it last succeed, and has it ever?
+kubectl -n <ns> get cronjob <release>-autoupdate \
+  -o jsonpath='{.status.lastSuccessfulTime}{"\n"}'
+
+# Did any run get created at all?
+kubectl -n <ns> get jobs -l job-name --sort-by=.metadata.creationTimestamp | tail
+```
+
+| Finding | Meaning | Action |
+|---|---|---|
+| `suspend: true` | Somebody paused it, possibly during an incident and never resumed | Resume it, or turn the alert off deliberately |
+| No jobs created at all | The schedule never fires — a bad cron expression, or a controller that cannot create Jobs | Check `kubectl -n <ns> describe cronjob` events |
+| Jobs exist but none succeeded | Every run failed; `PrometheusMCPAutoUpdateFailed` should also be firing | Work that alert instead — this one is a symptom |
+| `lastSuccessfulTime` is empty on a new install | The first window has not arrived yet | Nothing to do; the alert does not fire in this state, because a CronJob that has never succeeded reports no series |
+
+If auto-update was turned off on purpose, set
+`metrics.prometheusRule.rules.autoUpdateStale: false` rather than leaving an
+alert firing forever — a permanently red alert trains people to ignore the
+board.
+
+## PrometheusMCPHubSpokeCertExpiringSoon
+
+The **hub's** view of a spoke certificate nearing expiry
+(`promfleet_hub_spoke_cert_expiry_seconds`), as distinct from
+[PrometheusMCPSpokeCertExpiringSoon](#prometheusmcpspokecertexpiringsoon),
+which is the spoke's own view of its own certificate. The hub sees every
+cluster, so this is the one that catches a spoke too broken to alert for itself.
+
+A spoke renews at half its certificate's life, so this firing means renewal has
+been failing for days.
+
+```bash
+kubectl -n <ns> logs deploy/<hub> | grep -E 'renewal|cert.renewed'
+```
+
+Renewal needs no enrollment token, so a spoke that can reach the hub fixes
+itself. If the certificate has already expired, it still can: `/renew` accepts
+an expired certificate for `--renew-grace` (30 days by default) given proof the
+spoke holds the private key. Past that window the spoke must enrol again.
+
+## PrometheusMCPSpokeDown
+
+The spoke is not being scraped at all (`absent(up == 1)`). This says nothing
+about the tunnel: a spoke can be serving the fleet perfectly while its own
+metrics endpoint is unreachable, and it can be scraped fine while its tunnel is
+down. Check the hub's view before assuming this cluster has lost agent access:
+
+```bash
+# What does the hub think? This is the question that matters.
+kubectl -n <hub-ns> port-forward deploy/<hub> 9090:9090
+curl -s localhost:9090/metrics | grep promfleet_hub_spoke_connected
+```
+
+If the hub still shows the cluster connected, this is a monitoring problem, not
+an availability one — usually a ServiceMonitor selector or a NetworkPolicy.
+
+## PrometheusMCPSpokePrometheusDown
+
+`promfleet_spoke_prom_up == 0`: the spoke is healthy and connected, but the
+Prometheus it proxies to is unreachable. The cluster stays in the fleet and is
+reported **degraded** rather than disappearing, deliberately — an agent gets an
+explicit error naming the reason, which is more useful than a cluster silently
+missing from `list_clusters`.
+
+```bash
+kubectl -n <ns> logs deploy/<spoke> | grep -i prometheus
+kubectl -n <ns> exec deploy/<spoke> -- wget -qO- $PMF_PROMETHEUS_URL/-/ready
+```
+
+Almost always the local Prometheus, not the spoke: check it is up, that
+`prometheus.url` is right, and that a NetworkPolicy permits the spoke to reach
+it.
+
+## PrometheusMCPSpokePromErrorRatioHigh
+
+The local Prometheus is answering, but returning 5xx to the spoke. Distinguish
+this from the alert above: the path works, the server is failing.
+
+Common causes, in the order worth checking: the query load from agents is
+heavier than that Prometheus can serve; a query is hitting
+`--query.max-samples`; the server is under memory pressure and OOM-killing
+queries. Tighten the agent key's scope limits if a single agent is responsible —
+that is what they are for.
+
+## PrometheusMCPSpokeTunnelFlapping
+
+The tunnel is reconnecting repeatedly rather than staying down, which is worse
+than being cleanly down: each reconnect re-registers the cluster and re-publishes
+facts, and agents see intermittent failures rather than a clear one.
+
+```bash
+kubectl -n <ns> logs deploy/<spoke> | grep -E 'tunnel closed|reason='
+```
+
+The reason label is a closed set and names the cause directly. An Ingress with
+an idle timeout shorter than the 10-second keepalive is the classic one: the
+proxy closes a quiet tunnel, the spoke redials, and the cycle repeats. Raise
+the proxy's timeout rather than lowering the keepalive.
+
+## PrometheusMCPSpokeFactsRefreshFailing
+
+The tunnel is up, but the spoke's periodic refresh of cluster facts is failing,
+so what the hub reports about this cluster is going stale.
+
+This is quieter than it sounds and worth understanding before you chase it. The
+facts are what an agent reads from `list_clusters` and `describe_cluster` —
+Prometheus version, retention, scrape interval, series and job counts. Queries
+keep working throughout; the routing table is unaffected. What degrades is the
+agent's *picture* of the cluster, which is exactly the input it uses to decide
+what to query. Stale retention or a stale series count leads a model to plan
+against a cluster that no longer exists in that shape.
+
+```bash
+kubectl -n <ns> logs deploy/<spoke> | grep -i facts
+```
+
+Usually the same cause as
+[PrometheusMCPSpokePromErrorRatioHigh](#prometheusmcpspokepromerrorratiohigh):
+the queries behind the facts (`kubernetes_build_info`, `kube_node_info`, TSDB
+status) are failing or timing out. A cluster that does not scrape
+kube-state-metrics cannot supply some of them at all — set
+`cluster.k8sVersion`, `cluster.k8sUid` and `cluster.k8sNodes` in the spoke's
+values instead, which take precedence over anything derived.
 
 ## Security events
 
