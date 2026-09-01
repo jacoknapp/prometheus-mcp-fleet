@@ -427,6 +427,14 @@ func checkPositiveInt(flagName string, n int) error {
 	return nil
 }
 
+// checkNonNegativeInt permits zero, which callers use to mean "no limit".
+func checkNonNegativeInt(flagName string, n int) error {
+	if n < 0 {
+		return problem(flagName, "must not be negative, got %d", n)
+	}
+	return nil
+}
+
 // checkPositiveBytes requires a strictly positive byte size.
 func checkPositiveBytes(flagName string, n int64) error {
 	if n <= 0 {

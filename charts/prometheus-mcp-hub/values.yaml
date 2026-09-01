@@ -202,8 +202,14 @@ config:
   renewGrace: 720h
   # -- `PMF_AGENT_KEY_TTL`. Default lifetime of a minted `pmf_agt_` agent key.
   agentKeyTTL: 720h
-  # -- `PMF_MAX_SPOKES`. Hard cap on enrolled clusters.
-  maxSpokes: 256
+  # -- `PMF_MAX_SPOKES`. Optional cap on concurrent spoke sessions on one hub replica. `0`, the
+  # default, means no limit. A cap here refuses spokes rather than shedding load: it is applied
+  # before the WebSocket upgrade, so an over-limit spoke gets a 503 and its cluster silently
+  # never joins, which looks like a missing cluster rather than a limit being hit. It also counts
+  # sessions and not clusters — a cluster running several spoke pods holds one per pod — so any
+  # number picked for a cluster count is wrong by that multiple. Set it only as a deliberate
+  # resource guard.
+  maxSpokes: 0
   # -- `PMF_QUERY_TIMEOUT`. Instant and metadata query deadline.
   queryTimeout: 30s
   # -- `PMF_RANGE_QUERY_TIMEOUT`. Range query deadline.

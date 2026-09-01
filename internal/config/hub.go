@@ -150,7 +150,17 @@ type Hub struct {
 	EnrollmentTokenTTL time.Duration
 	// AgentKeyTTL is the default lifetime of a newly minted agent key.
 	AgentKeyTTL time.Duration
-	// MaxSpokes caps how many clusters may be enrolled.
+	// MaxSpokes optionally caps concurrent spoke sessions on this replica.
+	// Zero, the default, means no limit.
+	//
+	// It is off by default because a cap here refuses spokes rather than
+	// shedding load: the limit is enforced before the WebSocket upgrade, so an
+	// over-limit spoke gets a 503 and its cluster silently never joins the
+	// fleet, which is invisible to anyone looking at the hub wondering where a
+	// cluster went. It also counts sessions, not clusters -- a cluster running
+	// several spoke pods holds one per pod -- so any number chosen for a
+	// cluster count is wrong by that multiple. Set it only as a deliberate
+	// resource guard, knowing what it does when reached.
 	MaxSpokes int
 
 	// QueryTimeout bounds an instant query and every non-range endpoint.
@@ -228,7 +238,7 @@ func LoadHub(args []string, getenv func(string) string) (*Hub, error) {
 	l.duration(&c.RenewGrace, "renew-grace", 30*24*time.Hour,
 		"how long after expiry a spoke certificate may still be renewed; 0 to require an unexpired certificate")
 	l.duration(&c.AgentKeyTTL, "agent-key-ttl", 720*time.Hour, "default lifetime of a minted agent key")
-	l.integer(&c.MaxSpokes, "max-spokes", 256, "maximum number of enrolled clusters")
+	l.integer(&c.MaxSpokes, "max-spokes", 0, "optional cap on concurrent spoke sessions on this replica; 0 means no limit")
 
 	l.duration(&c.QueryTimeout, "query-timeout", 30*time.Second, "timeout for instant and metadata queries")
 	l.duration(&c.RangeQueryTimeout, "range-query-timeout", 120*time.Second, "timeout for range queries")
@@ -321,7 +331,7 @@ func (c *Hub) Validate() error {
 	add(checkPositive("enrollment-token-ttl", c.EnrollmentTokenTTL))
 	add(checkNonNegative("renew-grace", c.RenewGrace))
 	add(checkPositive("agent-key-ttl", c.AgentKeyTTL))
-	add(checkPositiveInt("max-spokes", c.MaxSpokes))
+	add(checkNonNegativeInt("max-spokes", c.MaxSpokes))
 
 	add(checkPositive("query-timeout", c.QueryTimeout))
 	add(checkPositive("range-query-timeout", c.RangeQueryTimeout))

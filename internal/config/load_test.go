@@ -160,7 +160,7 @@ func TestLoadHubDefaults(t *testing.T) {
 		RenewGrace:             30 * 24 * time.Hour,
 		EnrollmentTokenTTL:     15 * time.Minute,
 		AgentKeyTTL:            720 * time.Hour,
-		MaxSpokes:              256,
+		MaxSpokes:              0,
 		QueryTimeout:           30 * time.Second,
 		RangeQueryTimeout:      120 * time.Second,
 		MaxResponseBytes:       33554432,

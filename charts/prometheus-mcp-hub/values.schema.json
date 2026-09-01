@@ -451,9 +451,9 @@
           "type": "string"
         },
         "maxSpokes": {
-          "description": "PMF_MAX_SPOKES.",
+          "description": "PMF_MAX_SPOKES. Optional cap on concurrent spoke sessions per hub replica. 0 means no limit.",
           "type": "integer",
-          "minimum": 1
+          "minimum": 0
         },
         "queryTimeout": {
           "description": "PMF_QUERY_TIMEOUT.",

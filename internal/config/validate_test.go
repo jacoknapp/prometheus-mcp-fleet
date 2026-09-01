@@ -73,7 +73,7 @@ func TestHubValidate(t *testing.T) {
 		{"enrollment token ttl", func(c *Hub) { c.EnrollmentTokenTTL = -time.Second }, "--enrollment-token-ttl"},
 		{"renew grace negative", func(c *Hub) { c.RenewGrace = -time.Second }, "--renew-grace"},
 		{"agent key ttl", func(c *Hub) { c.AgentKeyTTL = 0 }, "--agent-key-ttl"},
-		{"max spokes", func(c *Hub) { c.MaxSpokes = 0 }, "--max-spokes"},
+		{"max spokes negative", func(c *Hub) { c.MaxSpokes = -1 }, "--max-spokes"},
 		{"query timeout", func(c *Hub) { c.QueryTimeout = 0 }, "--query-timeout"},
 		{"range query timeout", func(c *Hub) { c.RangeQueryTimeout = 0 }, "--range-query-timeout"},
 		{"max response bytes", func(c *Hub) { c.MaxResponseBytes = 0 }, "--max-response-bytes"},
@@ -116,7 +116,7 @@ func TestHubValidateAccumulates(t *testing.T) {
 	c := validHub(t)
 	c.MCPAddr = "nope"
 	c.LogLevel = "loud"
-	c.MaxSpokes = 0
+	c.MaxSpokes = -1
 	c.TraceSampleRatio = 3
 
 	err := c.Validate()

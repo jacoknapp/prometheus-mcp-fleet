@@ -319,7 +319,7 @@ Kubernetes: `>=1.28.0-0`
 | config.maxInflightPerCluster | int | `8` | `PMF_MAX_INFLIGHT_PER_CLUSTER`. Per-cluster in-flight request semaphore. |
 | config.maxResponseBudgetBytes | int | `268435456` | `PMF_MAX_RESPONSE_BUDGET_BYTES`. Process-wide in-flight response byte budget. |
 | config.maxResponseBytes | int | `33554432` | `PMF_MAX_RESPONSE_BYTES`. Maximum bytes accepted from one upstream response. |
-| config.maxSpokes | int | `256` | `PMF_MAX_SPOKES`. Hard cap on enrolled clusters. |
+| config.maxSpokes | int | `0` | `PMF_MAX_SPOKES`. Optional cap on concurrent spoke sessions on one hub replica. `0`, the default, means no limit. A cap here refuses spokes rather than shedding load: it is applied before the WebSocket upgrade, so an over-limit spoke gets a 503 and its cluster silently never joins, which looks like a missing cluster rather than a limit being hit. It also counts sessions and not clusters — a cluster running several spoke pods holds one per pod — so any number picked for a cluster count is wrong by that multiple. Set it only as a deliberate resource guard. |
 | config.pprofEnabled | bool | `false` | `PMF_PPROF_ENABLED`. Exposes `/debug/pprof` on the admin listener. |
 | config.publicURL | string | `""` | `PMF_PUBLIC_URL`. Canonical external MCP URL, used for the OAuth protected-resource-metadata document. Set this to whatever your Ingress publishes. |
 | config.queryTimeout | string | `"30s"` | `PMF_QUERY_TIMEOUT`. Instant and metadata query deadline. |
