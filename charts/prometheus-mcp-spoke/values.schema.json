@@ -921,6 +921,10 @@
                 "factsRefreshFailing": {
                   "description": "PrometheusMCPSpokeFactsRefreshFailing.",
                   "type": "boolean"
+                },
+                "partialCoverage": {
+                  "description": "PrometheusMCPSpokePartialCoverage. The spoke reaches only some hub replicas.",
+                  "type": "boolean"
                 }
               }
             },

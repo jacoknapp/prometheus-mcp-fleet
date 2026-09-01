@@ -676,7 +676,10 @@ func testSlowReader(t *testing.T, newSession Factory) {
 
 func testInvalidRequests(t *testing.T, newSession Factory) {
 	t.Helper()
-	s, cleanup := newSession(t, &EchoHandler{Body: []byte("ok")})
+	// Held, not discarded: the whole point below is to assert that none of these
+	// requests reached it.
+	echo := &EchoHandler{Body: []byte("ok")}
+	s, cleanup := newSession(t, echo)
 	defer cleanup()
 
 	tests := []struct {
@@ -704,8 +707,17 @@ func testInvalidRequests(t *testing.T, newSession Factory) {
 	if ident.Identity().ClusterID == "" {
 		t.Error("Identity().ClusterID is empty")
 	}
-	if calls := len(newEchoCalls(s)); calls != 0 {
-		t.Errorf("%d invalid requests reached the handler, want 0", calls)
+	// A rejected request must be refused by the transport, not merely fail after
+	// the spoke has already acted on it. Every case above is invalid on its
+	// face -- a method the protocol does not allow, a relative path, a
+	// nonsensical byte budget -- so the handler in the monitored cluster should
+	// never see any of them.
+	//
+	// This used to call a helper that returned nil unconditionally, so the
+	// assertion was `len(nil) != 0` and could not fail for any transport. The
+	// property was never actually tested.
+	if calls := echo.Calls(); len(calls) != 0 {
+		t.Errorf("%d invalid request(s) reached the handler, want 0: %+v", len(calls), calls)
 	}
 }
 
@@ -826,11 +838,6 @@ func settle() {
 		time.Sleep(50 * time.Millisecond)
 	}
 }
-
-// newEchoCalls is a tiny helper that keeps testInvalidRequests readable; the
-// session does not expose its handler, so the count comes from the handler the
-// caller still holds. It exists as a seam for transports that wrap the handler.
-func newEchoCalls(tunnel.Session) []Call { return nil }
 
 // diffCluster reports a human-readable difference between two cluster fact
 // payloads, or the empty string when they match. It exists so the conformance

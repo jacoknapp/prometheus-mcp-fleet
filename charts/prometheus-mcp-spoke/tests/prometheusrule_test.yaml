@@ -25,29 +25,38 @@ tests:
       - matchRegex:
           path: spec.groups[0].rules[1].expr
           pattern: "promfleet_spoke_tunnel_up"
+      # PartialCoverage sits directly after TunnelDown: it is the case
+      # TunnelDown cannot see, where SOME hub replicas are reachable and the
+      # cluster still reports connected while a share of calls fail.
       - matchRegex:
           path: spec.groups[0].rules[2].expr
-          pattern: "promfleet_spoke_tunnel_reconnects_total"
+          pattern: "promfleet_spoke_tunnels_covered"
+      - equal:
+          path: spec.groups[0].rules[2].alert
+          value: PrometheusMCPSpokePartialCoverage
       - matchRegex:
           path: spec.groups[0].rules[3].expr
-          pattern: "promfleet_spoke_prom_up"
+          pattern: "promfleet_spoke_tunnel_reconnects_total"
       - matchRegex:
           path: spec.groups[0].rules[4].expr
-          pattern: "promfleet_spoke_client_cert_expiry_seconds"
+          pattern: "promfleet_spoke_prom_up"
       - matchRegex:
           path: spec.groups[0].rules[5].expr
-          pattern: "promfleet_spoke_prom_requests_total"
+          pattern: "promfleet_spoke_client_cert_expiry_seconds"
       - matchRegex:
           path: spec.groups[0].rules[6].expr
+          pattern: "promfleet_spoke_prom_requests_total"
+      - matchRegex:
+          path: spec.groups[0].rules[7].expr
           pattern: "promfleet_spoke_facts_refresh_total"
 
   - it: compares the expiry gauge as seconds remaining, never against time()
     asserts:
       - equal:
-          path: spec.groups[0].rules[4].expr
+          path: spec.groups[0].rules[5].expr
           value: 'promfleet_spoke_client_cert_expiry_seconds{ job="prometheus-mcp-spoke" } < 259200'
       - notMatchRegex:
-          path: spec.groups[0].rules[4].expr
+          path: spec.groups[0].rules[5].expr
           pattern: "time\\(\\)"
 
   - it: renders nothing when disabled

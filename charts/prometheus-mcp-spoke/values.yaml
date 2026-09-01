@@ -385,6 +385,8 @@ metrics:
       spokeDown: true
       # -- `PrometheusMCPSpokeTunnelDown` — `promfleet_spoke_tunnel_up` is 0 for some hub endpoint, so this cluster is invisible to every agent.
       tunnelDown: true
+      # -- `PrometheusMCPSpokePartialCoverage` — this spoke reaches only SOME hub replicas (`promfleet_spoke_tunnels_covered` < `promfleet_spoke_hub_replicas`). The cluster still looks connected while a share of tool calls fail as if it were down, so this is the hardest failure in the system to diagnose without an alert. Usually Ingress session affinity.
+      partialCoverage: true
       # -- `PrometheusMCPSpokeTunnelFlapping` — `promfleet_spoke_tunnel_reconnects_total` rising faster than `thresholds.reconnectsPerHour`.
       tunnelFlapping: true
       # -- `PrometheusMCPSpokePrometheusDown` — `promfleet_spoke_prom_up` is 0, so the local Prometheus is unreachable.

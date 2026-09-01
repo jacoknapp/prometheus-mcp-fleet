@@ -30,6 +30,7 @@ than that warrants.
 - [PrometheusMCPSpokePrometheusDown](#prometheusmcpspokeprometheusdown)
 - [PrometheusMCPSpokePromErrorRatioHigh](#prometheusmcpspokepromerrorratiohigh)
 - [PrometheusMCPSpokeTunnelFlapping](#prometheusmcpspoketunnelflapping)
+- [PrometheusMCPSpokePartialCoverage](#prometheusmcpspokepartialcoverage)
 - [PrometheusMCPSpokeFactsRefreshFailing](#prometheusmcpspokefactsrefreshfailing)
 - [Security events](#security-events)
 - [Disaster recovery](#disaster-recovery)
@@ -196,7 +197,7 @@ Read the `code` label first; it tells you which layer is at fault.
 |---|---|---|
 | `busy` | Hub | The per-cluster in-flight limit is saturated. An agent is fanning out too hard, or `--max-inflight-per-cluster` is too low for your workload |
 | `too_large` | Hub | Results exceed the byte budget. Usually an unbounded range query; the agent should get a hint telling it to raise `step` |
-| `unavailable` | Tunnel | That spoke is disconnected — see the tunnel alert |
+| `unavailable` | Tunnel | That spoke is disconnected — see the tunnel alert. **Or it holds a tunnel to only SOME hub replicas**, which is indistinguishable from here: check [PrometheusMCPSpokePartialCoverage](#prometheusmcpspokepartialcoverage) before concluding the cluster is down |
 | `4xx` | Prometheus | Bad PromQL from the agent. Expected at some rate; a spike suggests a model looping |
 | `5xx` | Prometheus | The upstream is unhealthy or overloaded. **Check whether your agents caused it** |
 
@@ -290,8 +291,16 @@ kubectl -n <hub-ns> port-forward deploy/<hub> 9090:9090
 curl -s localhost:9090/metrics | grep promfleet_hub_spoke_connected
 ```
 
-If the hub still shows the cluster connected, this is a monitoring problem, not
-an availability one — usually a ServiceMonitor selector or a NetworkPolicy.
+If the hub still shows the cluster connected, this is *probably* a monitoring
+problem rather than an availability one — usually a ServiceMonitor selector or a
+NetworkPolicy.
+
+**One trap before you conclude that.** `promfleet_hub_spoke_connected` is 1 on
+any replica holding a tunnel, so it reads 1 even when the spoke reaches only
+SOME replicas and a share of tool calls are failing. If agents are reporting
+intermittent "cluster not connected", check
+[PrometheusMCPSpokePartialCoverage](#prometheusmcpspokepartialcoverage) before
+treating this as cosmetic.
 
 ## PrometheusMCPSpokePrometheusDown
 
@@ -360,6 +369,42 @@ status) are failing or timing out. A cluster that does not scrape
 kube-state-metrics cannot supply some of them at all — set
 `cluster.k8sVersion`, `cluster.k8sUid` and `cluster.k8sNodes` in the spoke's
 values instead, which take precedence over anything derived.
+
+## PrometheusMCPSpokePartialCoverage
+
+`promfleet_spoke_tunnels_covered < promfleet_spoke_hub_replicas`: this spoke has
+a tunnel to some hub replicas but not all of them.
+
+**Read this section before you trust `promfleet_hub_spoke_connected`.** A tunnel
+terminates on exactly one replica and the hub does not forward between replicas.
+Reach two of three and the cluster looks *connected* — because two replicas do
+have it — while roughly a third of tool calls land on the replica that does not
+and fail with `cluster not connected`, the same error a completely dead cluster
+returns. `PrometheusMCPSpokeTunnelDown` will not fire: that needs EVERY endpoint
+down.
+
+This is the failure that sends people hunting through PromQL, agent scopes and
+the local Prometheus while the actual cause is one line of Ingress config.
+
+```bash
+# From the spoke's own metrics: how many replicas does it see, how many has it reached?
+promfleet_spoke_hub_replicas
+promfleet_spoke_tunnels_covered
+
+# The spoke logs which replica answered each dial.
+kubectl -n <ns> logs deploy/<spoke> | grep -E 'hub replica covered|redundant tunnel'
+```
+
+| Cause | Why it does this | Fix |
+|---|---|---|
+| **Session affinity on the hub's Ingress** | The load balancer pins this spoke to one backend, so redialing can never reach the others. This is the usual cause | Turn affinity off. Coverage is achieved by redialing the same hostname |
+| A hub replica is not Ready | It is out of the Service, so nothing can dial it, but its peers still count it | Fix the replica; coverage recovers by itself |
+| Hub scaled up recently | The spoke learns the new count on its next handshake and dials the difference | Wait one coverage interval (10s); if it persists, suspect affinity |
+| Per-replica hostnames configured, one is wrong | With explicit `hub.endpoints` there is no discovery to fall back on | Check DNS and the certificate SANs for each endpoint |
+
+If you deliberately run one hub replica behind a load balancer you do not
+control, set `metrics.prometheusRule.rules.partialCoverage: false` rather than
+leaving it firing.
 
 ## Security events
 

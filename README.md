@@ -143,10 +143,15 @@ sequenceDiagram
 ```bash
 helm install pmf-hub oci://ghcr.io/jacoknapp/charts/prometheus-mcp-hub \
   --namespace prometheus-mcp --create-namespace \
+  --set fullnameOverride=pmf-hub \
   --set ingress.enabled=true \
   --set ingress.host=pmf.example.com \
   --set ingress.tls.enabled=true
 ```
+
+`fullnameOverride` is not decoration. Without it Helm's usual
+`<release>-<chart>` naming makes the Deployment `pmf-hub-prometheus-mcp-hub`,
+and every `kubectl exec deploy/pmf-hub` below fails with `NotFound`.
 
 The hub generates its own CA and HMAC pepper on first boot and writes them to a
 Secret it owns, using a Role scoped by `resourceNames` to exactly that Secret.
@@ -156,16 +161,40 @@ Everything — the MCP endpoint and the spoke tunnel alike — is served on one 
 port behind one standard `networking.k8s.io/v1` Ingress. There is no second
 Service, no LoadBalancer and no passthrough annotation to arrange.
 
-### 2. Mint an agent key
+### 2. Give the hub an admin credential
+
+The administrative subcommands are HTTP clients against the hub's own admin
+listener, so they need an admin credential. The hub prints a bootstrap admin
+token **once**, on first boot:
+
+```bash
+kubectl -n prometheus-mcp logs deploy/pmf-hub | grep -o 'pmf_adm_[A-Za-z0-9_-]*'
+```
+
+Put it in a Secret and mount it, so the commands below can read it from a file
+rather than from an argument list — a `kubectl exec` argument lands in the
+node's process table:
+
+```bash
+kubectl -n prometheus-mcp create secret generic pmf-admin \
+  --from-literal=admin-token='pmf_adm_…'
+
+helm upgrade pmf-hub oci://ghcr.io/jacoknapp/charts/prometheus-mcp-hub \
+  --namespace prometheus-mcp --reuse-values \
+  --set adminToken.existingSecret=pmf-admin
+```
+
+### 3. Mint an agent key
 
 ```bash
 kubectl exec -n prometheus-mcp deploy/pmf-hub -- \
-  hub keys create --class agent --name sre-oncall-bot \
+  hub keys create --admin-token-file /var/run/pmf/admin-token \
+    --class agent --name sre-oncall-bot \
     --clusters 'env=prod' --tools query,query_range,alerts,list_clusters
 # pmf_agt_3Kf9aQ2mZx…  (shown once — store it now)
 ```
 
-### 3. Enroll a cluster
+### 4. Enroll a cluster
 
 Mint an enrollment token bound to one cluster ID. Tokens are reusable by
 default — so one token can enroll several spoke pods that start together, or
@@ -174,7 +203,8 @@ redemption instead:
 
 ```bash
 kubectl exec -n prometheus-mcp deploy/pmf-hub -- \
-  hub enroll create --cluster prod-us-east-1 --labels env=prod,region=us-east-1
+  hub enroll create --admin-token-file /var/run/pmf/admin-token \
+    --cluster prod-us-east-1 --labels env=prod,region=us-east-1
 # pmf_enr_9dK2mQ4pLz…  (valid 15 minutes, reusable)
 ```
 

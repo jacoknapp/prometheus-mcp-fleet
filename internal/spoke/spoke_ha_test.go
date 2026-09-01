@@ -293,8 +293,13 @@ func TestDialOnceOnConnectedDropsARedundantTunnel(t *testing.T) {
 
 	select {
 	case got := <-second:
-		if got != "context-cancelled" {
-			t.Errorf("the redundant dialOnce reported %q, want context-cancelled", got)
+		// Reported distinctly, not as a generic cancellation. The dial loop
+		// exempts this reason from the failure backoff: landing on a covered
+		// replica is a step in the coverage search, not a fault, and charging
+		// it to the backoff made every wrong guess slow the next one
+		// exponentially -- worst exactly when the fleet was nearly covered.
+		if got != reasonRedundantTunnel {
+			t.Errorf("the redundant dialOnce reported %q, want %q", got, reasonRedundantTunnel)
 		}
 	case <-time.After(20 * time.Second):
 		t.Fatal("the redundant tunnel was never dropped")

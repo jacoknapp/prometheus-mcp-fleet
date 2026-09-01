@@ -77,6 +77,46 @@ spec:
               rules still cover the hub's address.
             runbook_url: {{ $runbook }}prometheusmcpspoketunneldown
         {{- end }}
+        {{- if .Values.metrics.prometheusRule.rules.partialCoverage }}
+        - alert: PrometheusMCPSpokePartialCoverage
+          {{/*
+          The failure this catches is the hardest one in the system to diagnose
+          without it.
+
+          A hub tunnel terminates on exactly ONE replica and the hub does not
+          forward between replicas, so a spoke must hold a tunnel to every
+          replica. Reach two of three and the cluster still looks connected --
+          promfleet_hub_spoke_connected is 1, because two replicas do have it --
+          while roughly a third of tool calls land on the replica that does not
+          and fail with the SAME "cluster not connected" error a completely dead
+          cluster returns. TunnelDown cannot see it: that fires only when EVERY
+          endpoint is down.
+
+          The usual cause is session affinity on the Ingress, which pins the
+          spoke to one backend so it can never reach the others.
+          */}}
+          expr: >-
+            (promfleet_spoke_hub_replicas{ {{ $sel }} } > 0)
+            and
+            (promfleet_spoke_tunnels_covered{ {{ $sel }} }
+             < promfleet_spoke_hub_replicas{ {{ $sel }} })
+          for: 10m
+          labels:
+            severity: critical
+            {{- with .Values.metrics.prometheusRule.additionalRuleLabels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: Cluster {{ $cluster }} has a tunnel to only some hub replicas
+            description: >-
+              This spoke covers
+              {{ printf "{{ $value }}" }} of the hub replicas it was told exist.
+              The cluster will look connected while a proportional share of tool
+              calls fail as "cluster not connected", which is indistinguishable
+              from the cluster being down. Check that the hub's Ingress does NOT
+              use session affinity, then that every replica is Ready.
+            runbook_url: {{ $runbook }}prometheusmcpspokepartialcoverage
+        {{- end }}
         {{- if .Values.metrics.prometheusRule.rules.tunnelFlapping }}
         - alert: PrometheusMCPSpokeTunnelFlapping
           expr: >-

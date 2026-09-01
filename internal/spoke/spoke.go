@@ -77,6 +77,12 @@ const maxFirstDialDelay = 5 * time.Second
 // per tick is comparing two integers.
 const defaultCoverageInterval = 10 * time.Second
 
+// reasonRedundantTunnel marks a connection this dialer dropped on purpose
+// because it reached a hub replica another dialer already covers. It is a
+// reconnect reason like any other for metrics, but the dial loop exempts it
+// from the failure backoff: it is a step in the coverage search, not a fault.
+const reasonRedundantTunnel = "redundant-replica"
+
 // minConnectionLifetime is how long a tunnel must have lasted before its
 // closure is treated as an ordinary disconnect and the backoff is reset. A
 // connection that dies immediately is a symptom, not a success.
@@ -623,6 +629,25 @@ func (s *spoke) dialLoop(ctx context.Context, endpoint string, cov *coverage) {
 		}
 		s.metrics.TunnelReconnectsTotal.WithLabelValues(reason).Inc()
 
+		// A connection this dialer deliberately dropped because it landed on an
+		// already-covered replica is NOT a failure, and must not be charged to
+		// the failure backoff.
+		//
+		// Coverage is reached by redialing until the load balancer hands out a
+		// replica nobody has yet, so a duplicate is an expected outcome of the
+		// search -- roughly (covered/total) of the time. Treating it as a
+		// failure made every wrong guess slow the next one exponentially, which
+		// is backwards: the more of the fleet is already covered, the more
+		// duplicates there are to skip, and the slower it got exactly when it
+		// had least left to find. At ten replicas that turned seconds into
+		// minutes, and a rolling hub upgrade stopped being transparent.
+		if reason == reasonRedundantTunnel {
+			if !sleepCtx(ctx, fullJitter(s.cfg.ReconnectMinBackoff, s.cfg.ReconnectMinBackoff, 0)) {
+				return
+			}
+			continue
+		}
+
 		// Reset the backoff only after a connection that actually lasted. A
 		// connection that dies immediately must not reset the counter, or a
 		// crash-looping hub gets hammered.
@@ -656,6 +681,9 @@ func (s *spoke) dialOnce(ctx context.Context, endpoint string, log *slog.Logger,
 	// serves and returns only once the connection is over, so this is written
 	// and read on the same goroutine.
 	joined := ""
+	// Set when this connection is dropped for landing on an already-covered
+	// replica, so the caller can tell a deliberate redial from a failure.
+	redundant := false
 	defer func() {
 		if joined != "" && cov != nil {
 			cov.leave(joined)
@@ -687,7 +715,7 @@ func (s *spoke) dialOnce(ctx context.Context, endpoint string, log *slog.Logger,
 	// tunnel can be deregistered from coverage under the replica it was
 	// actually on. Dial calls OnConnected synchronously before serving and
 	// returns only after the connection ends, so there is no concurrent access.
-	return classify(wstun.Dial(dialCtx, wstun.ClientConfig{
+	reason := classify(wstun.Dial(dialCtx, wstun.ClientConfig{
 		URL:          endpoint,
 		Certificate:  id.Certificate,
 		CABundle:     id.CABundle,
@@ -713,6 +741,7 @@ func (s *spoke) dialOnce(ctx context.Context, endpoint string, log *slog.Logger,
 				// gets another roll of the dice.
 				log.InfoContext(dialCtx, "redundant tunnel to an already-covered hub replica; redialing for an uncovered one",
 					"hub_server_id", hub.ServerID, "covered", covered, "replicas", want)
+				redundant = true
 				cancel()
 				return
 			}
@@ -720,6 +749,10 @@ func (s *spoke) dialOnce(ctx context.Context, endpoint string, log *slog.Logger,
 				"hub_server_id", hub.ServerID, "covered", covered, "replicas", want)
 		},
 	}, s))
+	if redundant {
+		return reasonRedundantTunnel
+	}
+	return reason
 }
 
 // Do implements tunnel.Handler by delegating to the Prometheus client, which

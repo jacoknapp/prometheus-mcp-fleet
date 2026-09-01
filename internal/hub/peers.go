@@ -106,9 +106,31 @@ func (p *peerCounter) refresh() {
 		p.fetched = p.now()
 		return
 	}
+	// Count PODS, not addresses.
+	//
+	// A headless Service on a dual-stack cluster publishes an A record AND an
+	// AAAA record per ready pod, and LookupHost returns both. Counting raw
+	// strings therefore reports 2N replicas for N pods, and since only N
+	// distinct ServerIDs exist, every spoke would spawn N surplus dialers that
+	// hunt forever for replicas that do not exist and never reach full
+	// coverage. The symptom -- tunnels_covered below hub_replicas, permanently
+	// -- is the same one the runbook attributes to Ingress session affinity,
+	// so it would be misdiagnosed too.
+	//
+	// One family is enough to count pods, and IPv4 is tried first only because
+	// it is the commoner single-stack case; an IPv6-only Service falls through
+	// to the full set, which is then a clean one-record-per-pod count anyway.
 	unique := make(map[string]struct{}, len(addrs))
 	for _, a := range addrs {
+		if ip := net.ParseIP(a); ip != nil && ip.To4() == nil {
+			continue
+		}
 		unique[a] = struct{}{}
+	}
+	if len(unique) == 0 {
+		for _, a := range addrs {
+			unique[a] = struct{}{}
+		}
 	}
 	if len(unique) != p.count {
 		p.log.Info("hub replica count changed",

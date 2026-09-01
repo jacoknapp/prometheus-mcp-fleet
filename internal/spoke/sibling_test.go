@@ -5,7 +5,10 @@ package spoke
 
 import (
 	"context"
+
 	"errors"
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/config"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -373,5 +376,100 @@ func TestRenewLoopAdoptsWhenTheSiblingWinsTheWriteRace(t *testing.T) {
 	}
 	if f.spoke.identityUnpersisted.Load() {
 		t.Error("marked unpersisted even though the adopted certificate is the stored one")
+	}
+}
+
+// TestDialLoopRedialsRedundantTunnelsPromptly is the property that makes
+// coverage converge at all.
+//
+// A dialer that lands on an already-covered hub replica drops the connection
+// and tries again, hoping the load balancer hands out a different one. That is
+// a step in the search, not a failure, so it must not feed the exponential
+// failure backoff. Charging it there made every wrong guess slow the next one —
+// worst exactly when the fleet was nearly covered and duplicates were most
+// likely — which turned a ten-replica rollout from seconds into minutes.
+//
+// This drives the real dial loop against a hub that always answers as the same
+// replica while claiming there are two, so every connection after the first is
+// redundant by construction. With the failure backoff applied, the attempts
+// below would be spaced exponentially and the deadline would not be met.
+func TestDialLoopRedialsRedundantTunnelsPromptly(t *testing.T) {
+	t.Parallel()
+
+	ca := newTestCA(t)
+	hub := newHAHub(t, ca, 2)
+	clock := newStubClock()
+	s, logs := newTestSpoke(t, clock, &config.Spoke{
+		ClusterID: "prod-eu-1",
+		// Loose enough not to spin a core while other tests run in parallel,
+		// tight enough that a charged failure backoff (seconds) would miss the
+		// deadline by an order of magnitude.
+		ReconnectMinBackoff: 25 * time.Millisecond,
+		// Large enough that a single charged backoff would blow the deadline.
+		ReconnectMaxBackoff: 30 * time.Second,
+	})
+	s.setIdentity(ca.identityOver(t, "prod-eu-1",
+		clock.Now().Add(-time.Hour), clock.Now().Add(14*24*time.Hour)))
+
+	cov := newCoverage()
+	// Pre-cover the only replica this hub can ever answer as, so every
+	// connection the loop makes is a duplicate.
+	cov.join("hub-test-0", 2)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.dialLoop(ctx, hub.url, cov)
+
+	// TWO redials, not one. One proves only that a duplicate is detected; the
+	// second proves the loop came back round promptly afterwards, which is the
+	// exemption under test. Charged to the failure backoff, the second would be
+	// seconds away and this would time out.
+	const want = "redundant tunnel to an already-covered hub replica"
+	eventually(t, "a redundant tunnel to be dropped and then redialed again", func() bool {
+		return strings.Count(logs.messages(), want) >= 2
+	})
+}
+
+// TestDialLoopStopsWhileWaitingToRedialARedundantTunnel covers the exit path
+// out of the redundant-tunnel wait.
+//
+// The backoff here is deliberately long so the loop is reliably inside that
+// sleep when the context is cancelled, which is the branch under test: a
+// shutdown must not have to wait out the redial delay.
+func TestDialLoopStopsWhileWaitingToRedialARedundantTunnel(t *testing.T) {
+	t.Parallel()
+
+	ca := newTestCA(t)
+	hub := newHAHub(t, ca, 2)
+	clock := newStubClock()
+	s, logs := newTestSpoke(t, clock, &config.Spoke{
+		ClusterID:           "prod-eu-1",
+		ReconnectMinBackoff: 30 * time.Second,
+		ReconnectMaxBackoff: 30 * time.Second,
+	})
+	s.setIdentity(ca.identityOver(t, "prod-eu-1",
+		clock.Now().Add(-time.Hour), clock.Now().Add(14*24*time.Hour)))
+
+	cov := newCoverage()
+	cov.join("hub-test-0", 2)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); s.dialLoop(ctx, hub.url, cov) }()
+
+	eventually(t, "the redundant tunnel to be dropped", func() bool {
+		return logs.has("redundant tunnel to an already-covered hub replica")
+	})
+	// The log is emitted inside the handshake callback, a moment before the
+	// loop reaches its redial wait. Settle so the cancellation below reliably
+	// lands IN that wait, which is the branch this test exists to cover; the
+	// 30s backoff means it would otherwise be racing the dial.
+	time.Sleep(250 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("dialLoop did not return promptly; shutdown waits out the redial delay")
 	}
 }
