@@ -64,6 +64,13 @@ jobs:
       - name: go vet
         run: make vet
 
+      # The Makefile's `check` target claims to be "everything CI runs on a pull
+      # request", and this was the one member of it that CI did not run -- so
+      # the claim was false and an unreachable production function could reach
+      # main without anything objecting.
+      - name: deadcode
+        run: make deadcode
+
       - name: golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:

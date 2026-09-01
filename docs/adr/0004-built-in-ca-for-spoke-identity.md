@@ -26,7 +26,7 @@ The hub runs a small internal certificate authority.
   Kubernetes Secret the hub owns, `IsCA: true` with path length 0 so it can only
   sign leaves.
 * An operator mints an **enrollment token bound to one cluster ID**. It is
-  reusable by default, so a GitOps rollout can redeem it again after that
+  reusable when minted by `hub enroll create`, so a GitOps rollout can redeem it again after that
   cluster is rebuilt, or seed several spoke pods that start together;
   `--single-use` burns it on first redemption for the human-installing-one-
   cluster-by-hand case, optionally capped with `--max-redemptions`.

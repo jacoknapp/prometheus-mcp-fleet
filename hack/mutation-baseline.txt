@@ -17,6 +17,13 @@
 # test could observe -- is a legitimate reason to stop. A test written to
 # satisfy the tool rather than to describe the software is not.
 #
+# One entry does NOT meet that bar and says so: internal/mcptools carries 67
+# survivors with no equivalence argument at all. They are accepted for now, not
+# proven harmless. It is also the package where that matters most -- the
+# agent-facing tool layer, where an unkilled mutant means a limit, a scope check
+# or a truncation path does not do what its test claims. Treat that line as a
+# debt marker, not as a finished result.
+#
 # The dominant equivalence class here: widening a boundary by one lands on a
 # value where the guarded action is already idempotent. Clamping x to L when x
 # already equals L, slicing a string to its own length, truncating a slice to
@@ -37,7 +44,7 @@ internal/hub                94   # measured 97.00; 2 equivalent (capacity hint, 
 internal/hubapi             97   # measured 100.00
 internal/kube               95   # measured 98.59; 1 unobservable: dialer KeepAlive inside a discarded closure, no exported hook
 internal/mcpsurface         93   # measured 96.77; 2 equivalent: guarded nil-to-nil passthrough assignment
-internal/mcptools           87   # measured 90.00; 77 remaining; 10 proven equivalent, rest newly exposed by added coverage
+internal/mcptools           87   # measured 90.00; KNOWN GAP, not equivalence: 10 of 77 survivors are proven equivalent, the other 67 are simply unclassified
 internal/obs                97   # measured 100.00
 internal/promapi            94   # measured 97.62
 internal/promclient         90   # measured 93.86; 5 equivalent (min-assign no-ops), 2 impractical: dialer timeouts in a discarded closure

@@ -335,6 +335,7 @@ Kubernetes: `>=1.28.0-0`
 | metrics.prometheusRule.namespace | string | `""` | Namespace for the PrometheusRule. Empty means the release namespace. |
 | metrics.prometheusRule.rules.certExpiringSoon | bool | `true` | `PrometheusMCPSpokeCertExpiringSoon` — `promfleet_spoke_client_cert_expiry_seconds` below `thresholds.certExpirySeconds`. Renewal happens at half life, so this firing means renewal is failing. |
 | metrics.prometheusRule.rules.factsRefreshFailing | bool | `true` | `PrometheusMCPSpokeFactsRefreshFailing` — `promfleet_spoke_facts_refresh_total{result="error"}` rising, so the hub's view of this cluster is going stale. |
+| metrics.prometheusRule.rules.partialCoverage | bool | `true` | `PrometheusMCPSpokePartialCoverage` — this spoke reaches only SOME hub replicas (`promfleet_spoke_tunnels_covered` < `promfleet_spoke_hub_replicas`). The cluster still looks connected while a share of tool calls fail as if it were down, so this is the hardest failure in the system to diagnose without an alert. Usually Ingress session affinity. |
 | metrics.prometheusRule.rules.promErrorRatioHigh | bool | `true` | `PrometheusMCPSpokePromErrorRatioHigh` — 5xx ratio from the local Prometheus above `thresholds.promErrorRatio`. |
 | metrics.prometheusRule.rules.prometheusDown | bool | `true` | `PrometheusMCPSpokePrometheusDown` — `promfleet_spoke_prom_up` is 0, so the local Prometheus is unreachable. |
 | metrics.prometheusRule.rules.spokeDown | bool | `true` | `PrometheusMCPSpokeDown` — this spoke is not being scraped successfully. |
@@ -377,6 +378,10 @@ Kubernetes: `>=1.28.0-0`
 | networkPolicy.labels | object | `{}` | Extra labels for the NetworkPolicy. |
 | nodeSelector | object | `{}` | `spec.template.spec.nodeSelector`. |
 | podAnnotations | object | `{}` | Annotations for the spoke pods. |
+| podDisruptionBudget.enabled | bool | `true` | Render a PodDisruptionBudget. Force-disabled below `replicaCount: 2`, where a budget can never be satisfied and would block every node drain forever. |
+| podDisruptionBudget.maxUnavailable | string | `"50%"` | `spec.maxUnavailable`. A percentage rather than a count so it stays correct if you change `replicaCount`. |
+| podDisruptionBudget.minAvailable | string | `""` | `spec.minAvailable`. Mutually exclusive with `maxUnavailable`, which is set below and wins. |
+| podDisruptionBudget.unhealthyPodEvictionPolicy | string | `"AlwaysAllow"` | `spec.unhealthyPodEvictionPolicy` (Kubernetes >= 1.27). `AlwaysAllow` means a pod that is not Ready does not consume the budget, so a node carrying a crashlooping spoke can still be drained. |
 | podLabels | object | `{}` | Extra labels for the spoke pods. |
 | podSecurityContext.fsGroup | int | `65532` | Supplemental filesystem group. Set to `null` on OpenShift. |
 | podSecurityContext.runAsGroup | int | `65532` | Pod GID. Set to `null` on OpenShift. |

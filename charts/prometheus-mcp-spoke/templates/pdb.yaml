@@ -1,0 +1,35 @@
+{{/*
+Copyright The prometheus-mcp-fleet Authors.
+SPDX-License-Identifier: Apache-2.0
+
+Rendered only at replicaCount >= 2. `minAvailable: 1` against a single replica
+is an eviction deadlock: the node drain can never satisfy it and blocks forever.
+This is the most common bug in charts of this shape, so the guard lives in
+_helpers.tpl where a unit test can see it.
+*/}}
+{{- if include "prometheus-mcp-spoke.pdbEnabled" . -}}
+{{- include "prometheus-mcp-spoke.validate" . -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "prometheus-mcp-spoke.fullname" . }}
+  namespace: {{ include "prometheus-mcp-spoke.namespace" . }}
+  labels:
+    {{- include "prometheus-mcp-spoke.labels" . | nindent 4 }}
+  {{- with (include "prometheus-mcp-spoke.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.podDisruptionBudget.maxUnavailable }}
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  {{- else }}
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  {{- end }}
+  {{- with .Values.podDisruptionBudget.unhealthyPodEvictionPolicy }}
+  unhealthyPodEvictionPolicy: {{ . }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "prometheus-mcp-spoke.selectorLabels" . | nindent 6 }}
+{{- end }}

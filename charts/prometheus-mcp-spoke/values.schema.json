@@ -1216,6 +1216,40 @@
       "items": {
         "type": "object"
       }
+    },
+    "podDisruptionBudget": {
+      "description": "PodDisruptionBudget. Force-disabled whenever replicaCount < 2: minAvailable 1 on a single-replica workload blocks every node drain forever.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "description": "Render a PDB, subject to the replicaCount >= 2 guard.",
+          "type": "boolean"
+        },
+        "minAvailable": {
+          "description": "spec.minAvailable. Mutually exclusive with maxUnavailable.",
+          "type": [
+            "integer",
+            "string"
+          ]
+        },
+        "maxUnavailable": {
+          "description": "spec.maxUnavailable. Empty means unset.",
+          "type": [
+            "integer",
+            "string"
+          ]
+        },
+        "unhealthyPodEvictionPolicy": {
+          "description": "Kubernetes >= 1.27. AlwaysAllow lets a broken pod be evicted.",
+          "type": "string",
+          "enum": [
+            "",
+            "IfHealthyBudget",
+            "AlwaysAllow"
+          ]
+        }
+      }
     }
   }
 }

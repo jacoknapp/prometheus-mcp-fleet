@@ -247,9 +247,29 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.affinity }}
+      {{- if .Values.affinity }}
       affinity:
-        {{- toYaml . | nindent 8 }}
+        {{- toYaml .Values.affinity | nindent 8 }}
+      {{- else if gt (int .Values.replicaCount) 1 }}
+      {{/*
+      Spread replicas across nodes by default.
+
+      Three replicas exist to survive losing one, and with no placement rule the
+      scheduler is free to put all three on the same node -- so a single node
+      failure takes out every replica, the PodDisruptionBudget above, and the
+      whole point of running more than one. It is `preferred` rather than
+      `required` so a single-node cluster or a lab still schedules; an operator
+      who wants a hard guarantee sets `affinity` explicitly and this yields.
+      */}}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "prometheus-mcp-spoke.selectorLabels" . | nindent 20 }}
       {{- end }}
       {{- with .Values.topologySpreadConstraints }}
       topologySpreadConstraints:

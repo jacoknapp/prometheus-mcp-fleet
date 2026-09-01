@@ -53,6 +53,18 @@ type CreateEnrollmentRequest struct {
 	// reconciled from git rather than handed over once by a human, and where a
 	// rebuilt cluster must be able to re-enrol without anyone minting anything.
 	// It remains bound to one cluster, revocable and expiring.
+	//
+	// NOTE THE DEFAULT. Omitting this field yields a SINGLE-USE token, because
+	// the zero value of a bool is false and this is a wire type. `hub enroll
+	// create` defaults the other way and sends true unless asked for
+	// --single-use, so "reusable by default" is a property of that command and
+	// not of this API. Any other caller -- a Terraform provider, an Argo CD
+	// hook, a script -- gets single use unless it says otherwise, which is
+	// exactly the behaviour that does not survive GitOps.
+	//
+	// It is left this way rather than inverted because a wire field that means
+	// its opposite when absent is worse than a documented default, and because
+	// flipping it would silently widen every existing caller's tokens.
 	Reusable bool `json:"reusable,omitempty"`
 	// MaxRedemptions caps a reusable token. Zero means no cap.
 	MaxRedemptions int `json:"maxRedemptions,omitempty"`

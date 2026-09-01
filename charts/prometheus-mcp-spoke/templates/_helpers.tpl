@@ -131,6 +131,12 @@ exactly one place.
 {{- end -}}
 {{- end -}}
 
+{{/* PodDisruptionBudget is force-disabled below two replicas: a budget in front
+of a single pod can never be satisfied and blocks every node drain forever. */}}
+{{- define "prometheus-mcp-spoke.pdbEnabled" -}}
+{{- if and .Values.podDisruptionBudget.enabled (ge (int .Values.replicaCount) 2) -}}true{{- end -}}
+{{- end -}}
+
 {{- define "prometheus-mcp-spoke.configMapName" -}}
 {{- printf "%s-config" (include "prometheus-mcp-spoke.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}

@@ -137,7 +137,7 @@ widen them past what is set here.
 | `--cluster-k8s-uid` | — | Kubernetes cluster UID, same reasoning as `--cluster-k8s-version`. |
 | `--cluster-k8s-nodes` | `0` | Node count, for a cluster that does not scrape `kube_node_info`. |
 | `--cluster-labels` | — | `k=v,k=v` selector labels, e.g. `env=prod,region=us-east-1`. Agent key scopes match on these. `sdlc` is reserved for `--cluster-sdlc` and wins over any entry of that name here. |
-| `--enrollment-token-file` | — | File holding the enrollment token (reusable by default; see [spoke-enrollment.md](spoke-enrollment.md#tokens-are-reusable-by-default)). |
+| `--enrollment-token-file` | — | File holding the enrollment token (reusable when minted by `hub enroll create`; see [spoke-enrollment.md](spoke-enrollment.md#tokens-are-reusable-by-default)). |
 | `--identity-backend` | `auto` | `secret`, `file`, `memory`, or `auto`. |
 | `--identity-secret-name` | `prometheus-mcp-fleet-identity` | Secret holding the issued key and certificate. |
 | `--namespace` | projected | Namespace of the identity Secret. |

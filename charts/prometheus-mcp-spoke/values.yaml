@@ -287,6 +287,19 @@ service:
   # -- Extra labels for the Service.
   labels: {}
 
+# A spoke runs several pods for this cluster's own availability, so an ordinary
+# node drain should not be able to take them all at once. The hub chart has had
+# this; the spoke -- which is the one installed a hundred times -- did not.
+podDisruptionBudget:
+  # -- Render a PodDisruptionBudget. Force-disabled below `replicaCount: 2`, where a budget can never be satisfied and would block every node drain forever.
+  enabled: true
+  # -- `spec.minAvailable`. Mutually exclusive with `maxUnavailable`, which is set below and wins.
+  minAvailable: ""
+  # -- `spec.maxUnavailable`. A percentage rather than a count so it stays correct if you change `replicaCount`.
+  maxUnavailable: 50%
+  # -- `spec.unhealthyPodEvictionPolicy` (Kubernetes >= 1.27). `AlwaysAllow` means a pod that is not Ready does not consume the budget, so a node carrying a crashlooping spoke can still be drained.
+  unhealthyPodEvictionPolicy: AlwaysAllow
+
 networkPolicy:
   # -- Render a NetworkPolicy. On by default: the spoke's egress set is small, known and worth pinning down, because this pod holds a credential that can read the whole cluster's metrics.
   enabled: true

@@ -309,7 +309,7 @@ design could not have offered.
 ```mermaid
 flowchart LR
     OP(["operator"]) -->|"pmf_adm_"| MINT["mint enrollment token<br/>bound to one clusterID"]
-    MINT --> TOK["pmf_enr_ · 15 min<br/>reusable by default"]
+    MINT --> TOK["pmf_enr_ · 15 min<br/>reusable via CLI"]
     TOK --> SPOKE["spoke generates P-256 key<br/>sends CSR"]
     SPOKE --> BURN{"burn/redeem atomically"}
     BURN -->|already used or over cap| SEC["409 + security event"]
@@ -319,7 +319,9 @@ flowchart LR
     CERT -->|"at 50% life, signed challenge"| RENEW["renew, no token"]
 ```
 
-Enrollment tokens are **reusable by default** — `hub enroll create` only mints a
+Enrollment tokens minted by `hub enroll create` are **reusable** unless
+`--single-use` is passed; the admin API defaults the other way, so a direct
+caller that omits the field gets single use. `hub enroll create` only mints a
 single-use token when passed `--single-use`. A single-use token cannot be
 committed to a GitOps repo, cannot survive a cluster rebuild, and cannot enroll
 several spoke pods that start together, so in practice a reusable token
@@ -332,7 +334,8 @@ logs a warning, counts it, and uses the certificate value.
 
 Four credential classes, each with a different issuance path, verification path
 and blast radius: `pmf_adm_` (admin listener only), `pmf_agt_` (MCP only),
-`pmf_enr_` (reusable by default, buys one certificate per redemption), and the
+`pmf_enr_` (reusable when minted by the CLI, buys one certificate per
+redemption), and the
 X.509 spoke identity. An agent key cannot enroll; an enrollment token cannot
 query. See [docs/security.md](security.md).
 

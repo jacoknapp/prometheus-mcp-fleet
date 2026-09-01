@@ -34,7 +34,7 @@ sequenceDiagram
     participant Spoke as Spoke (cluster N)
 
     Op->>Hub: POST /admin/v1/enrollments {clusterId, labels}
-    Note over Hub: pmf_enr_… · reusable by default · bound to one clusterId
+    Note over Hub: pmf_enr_… · reusable via CLI · bound to one clusterId
     Hub-->>Op: token (shown once)
     Op->>Spoke: helm install, token in a Secret
 
@@ -82,7 +82,7 @@ kubectl exec -n prometheus-mcp-hub deploy/pmf-hub -- \
     --admin-token-file /var/run/pmf/admin-token \
     --cluster prod-us-east-1 \
     --labels env=prod,region=us-east-1,tier=customer-facing
-# pmf_enr_9dK2mQ4pLz…   valid 15 minutes, reusable by default
+# pmf_enr_9dK2mQ4pLz…   valid 15 minutes, reusable
 ```
 
 The subcommand is an HTTP client against the hub's own admin listener. The

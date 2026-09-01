@@ -53,7 +53,7 @@ a query.
 |---|---|---|---|---|---|
 | Admin | `pmf_adm_` | Operator, IaC | 90 days | Mint and revoke keys, mint enrollments, CA operations | Admin listener only |
 | Agent | `pmf_agt_` | AI agent runtime | 30 days | Call the MCP tools its scope permits | MCP listener only |
-| Enrollment | `pmf_enr_` | Spoke install | 15 minutes, **reusable by default** | Exchange a CSR for a certificate | Public listener |
+| Enrollment | `pmf_enr_` | Spoke install | 15 minutes, **reusable when minted by `hub enroll create`** | Exchange a CSR for a certificate | Public listener |
 | Spoke identity | X.509 | Spoke pod | 14 days, auto-renewed | Serve one cluster | Tunnel handshake and `POST /renew` |
 
 ### Token format
@@ -115,9 +115,16 @@ boot, stored in a Kubernetes Secret the hub owns, with `IsCA: true` and path
 length 0 so it can only sign leaves.
 
 **Enrollment.** An operator mints a token bound to exactly one cluster ID, via
-`hub enroll create --cluster <id>`. Tokens are **reusable by default** — the
-same token can install the same cluster's spoke again after a rebuild, or seed
-several spoke pods that start together, without minting a new one each time.
+`hub enroll create --cluster <id>`, which mints a **reusable** token unless
+`--single-use` is passed — the same token can install the same cluster's spoke
+again after a rebuild, or seed several spoke pods that start together, without
+minting a new one each time.
+
+That default belongs to the command, not to the API. `POST
+/admin/v1/enrollments` omitting `"reusable"` yields a SINGLE-USE token,
+because a JSON bool absent from the body is false. Anything minting tokens
+directly — a Terraform provider, an Argo CD hook, a script — must set it
+explicitly or it gets the behaviour that does not survive GitOps.
 `--single-use` burns the token on first redemption instead, which is right for
 a human installing one cluster by hand and watching it. A reusable token can
 still be capped with `--max-redemptions`, and either kind is revocable and

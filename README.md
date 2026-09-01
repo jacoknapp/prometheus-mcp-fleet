@@ -278,7 +278,7 @@ error codes: [docs/mcp-tools.md](docs/mcp-tools.md).
 |---|---|---|---|
 | Admin | `pmf_adm_` | 90d | Administer the hub, on a separate listener |
 | Agent | `pmf_agt_` | 30d | Call the MCP tools its scope permits |
-| Enrollment | `pmf_enr_` | 15m, reusable by default | Exchange a CSR for one or more spoke certificates |
+| Enrollment | `pmf_enr_` | 15m, reusable via `hub enroll create` | Exchange a CSR for one or more spoke certificates |
 | Spoke identity | X.509 | 14d, auto-renewed | Serve one cluster, and only that cluster |
 
 - **An agent never supplies a URL.** It names a tool; the tool maps to a

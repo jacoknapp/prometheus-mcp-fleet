@@ -11,7 +11,7 @@ From nothing to an AI agent querying two clusters. Budget about twenty minutes.
 you install the spoke **once per monitored cluster** — a separate Helm release,
 from a separate chart, in a different cluster each time. The spoke chart contains
 no hub templates and references no hub resource; all it knows is an address, a
-trust bundle and an enrollment token (reusable by default; see
+trust bundle and an enrollment token (reusable when minted by `hub enroll create`; see
 [spoke-enrollment.md](../spoke-enrollment.md#tokens-are-reusable-by-default)).
 
 ## Prerequisites
@@ -133,7 +133,7 @@ kubectl exec -n prometheus-mcp-hub deploy/pmf-hub -- \
     --admin-token-file /var/run/pmf/admin-token \
     --cluster prod-us-east-1 \
     --labels env=prod,region=us-east-1
-# pmf_enr_9dK2mQ4pLz…   valid 15 minutes, reusable by default
+# pmf_enr_9dK2mQ4pLz…   valid 15 minutes, reusable
 ```
 
 **In the target cluster — install the spoke:**
