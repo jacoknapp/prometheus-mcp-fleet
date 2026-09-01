@@ -14,7 +14,7 @@ to, see [CONTRIBUTING.md](../CONTRIBUTING.md).
 |---|---|---|
 | Go | 1.27+ | Everything |
 | `buf` | 1.72+ | Regenerating protobuf, only if you touch `api/proto` |
-| `golangci-lint` | v2 | `make lint` |
+| `golangci-lint` | pinned; installed on demand | `make lint` |
 | Docker | any recent | Building images, kind |
 | `helm` | 3.19+ | Chart work |
 | `kubectl`, `kind` | recent | End-to-end tests |
@@ -23,6 +23,23 @@ to, see [CONTRIBUTING.md](../CONTRIBUTING.md).
 | `gremlins` | v0.6.0 | Mutation testing (`make mutate`); fetched on demand |
 
 `make help` lists every target.
+
+**`make lint` installs its own linter.** The version is read out of
+`.github/workflows/ci.yml`, so the local run and CI cannot disagree, and the
+binary lands in `.tools/` (git-ignored) rather than on your PATH. A stale one
+is detected by version and replaced.
+
+This is not fussiness. A `golangci-lint` older than the module's own Go
+version does not report findings -- it panics inside the type checker, which
+`make lint` surfaces as a failure with no file names in it. That happened
+here for long enough that a batch of `gosec`, `errcheck`, `revive` and
+`staticcheck` findings reached `main` while every local check looked clean,
+because `gofmt` and `go vet` do not cover what those linters do. If you want
+the whole gate before pushing:
+
+```bash
+make test lint deadcode tidy && make helm-lint helm-unittest
+```
 
 ## The loop
 

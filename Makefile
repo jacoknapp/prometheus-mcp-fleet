@@ -7,7 +7,17 @@ SHELL := /usr/bin/env bash
 
 MODULE      := github.com/jacoknapp/prometheus-mcp-fleet
 BIN_DIR     := bin
+TOOL_DIR    := $(CURDIR)/.tools
 COMPONENTS  := hub spoke
+
+# Read golangci-lint's version out of the CI workflow rather than pinning it
+# twice. A linter that disagrees with CI is worse than no local linter: it
+# reports clean and the push fails anyway, which is how several rounds of
+# gosec, errcheck and revive findings reached main unseen -- the binary that
+# happened to be on PATH was older than the module's own Go version and
+# panicked instead of reporting. renovate updates the workflow; this follows.
+GOLANGCI_LINT_VERSION := $(shell sed -n 's/^ *GOLANGCI_LINT_VERSION: *"\(.*\)"/\1/p' .github/workflows/ci.yml)
+GOLANGCI_LINT := $(TOOL_DIR)/golangci-lint
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -81,9 +91,27 @@ fmt-check: ## Fail if any Go source is unformatted.
 vet: ## Run go vet.
 	go vet ./...
 
+$(GOLANGCI_LINT):
+	@test -n "$(GOLANGCI_LINT_VERSION)" || { \
+		echo "could not read GOLANGCI_LINT_VERSION from .github/workflows/ci.yml" >&2; exit 1; }
+	@echo "installing golangci-lint $(GOLANGCI_LINT_VERSION) into $(TOOL_DIR)"
+	@GOBIN=$(TOOL_DIR) go install \
+		github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+
 .PHONY: lint
-lint: ## Run golangci-lint.
-	golangci-lint run --timeout=5m
+lint: $(GOLANGCI_LINT) ## Run golangci-lint, pinned to the version CI uses.
+	@installed=$$($(GOLANGCI_LINT) version --short 2>/dev/null || echo none); \
+	want="$(patsubst v%,%,$(GOLANGCI_LINT_VERSION))"; \
+	if [ "$$installed" != "$$want" ]; then \
+		echo "re-installing golangci-lint: have $$installed, want $$want"; \
+		GOBIN=$(TOOL_DIR) go install \
+			github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION); \
+	fi
+	$(GOLANGCI_LINT) run --timeout=5m
+
+.PHONY: tools-clean
+tools-clean: ## Remove the pinned tool binaries.
+	rm -rf $(TOOL_DIR)
 
 .PHONY: test
 test: ## Run unit tests with the race detector.

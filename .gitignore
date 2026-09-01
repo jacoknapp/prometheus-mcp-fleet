@@ -31,3 +31,6 @@ coverage.html
 
 # Mutation testing (go-mutesting writes this into the working tree)
 report.json
+
+# Pinned developer tooling installed by `make lint`.
+.tools/
