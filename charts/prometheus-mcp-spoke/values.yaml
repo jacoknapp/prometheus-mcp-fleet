@@ -143,9 +143,11 @@ hub:
   # (Let's Encrypt, a corporate CA already in the image's trust store) you do not need this at
   # all; it exists for a private CA. The spoke needs it OUT OF BAND on first enrollment,
   # because the hub is in a different cluster and nothing here vouches for it yet. A CA
-  # certificate is public, so this is not secret material. Empty means the spoke trusts the
-  # bundle the hub returns at enrollment and caches it under `config.dataDir` — fine after the
-  # first successful enrollment, trust-on-first-use before it.
+  # certificate is public, so this is not secret material. Empty means SYSTEM ROOTS, which is
+  # correct for a publicly issued Ingress certificate. It does NOT fall back to the bundle the
+  # hub returns at enrollment: that is the internal CA which signs spoke IDENTITIES, and it can
+  # never have signed the certificate the Ingress presents, so trusting it would make every
+  # wss:// dial fail with an unknown authority.
   caBundle: ""
   # -- Name of an existing Secret holding the hub's SERVER trust bundle, used instead of
   # `hub.caBundle`. Same thing, out of a Secret you already have. The chart never creates it.

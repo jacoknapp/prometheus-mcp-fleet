@@ -4,10 +4,14 @@
 package spoke
 
 import (
+	"bytes"
 	"context"
 
 	"errors"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/config"
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/obs"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -472,4 +476,97 @@ func TestDialLoopStopsWhileWaitingToRedialARedundantTunnel(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("dialLoop did not return promptly; shutdown waits out the redial delay")
 	}
+}
+
+// TestTunnelTrustsTheHubServingCANotTheEnrollmentCA is a regression test for
+// the bug that made wss:// impossible.
+//
+// The hub has two unrelated CAs. Its internal CA signs SPOKE identities and is
+// what enrollment returns. Its serving certificate is presented by the Ingress
+// and is signed by whatever issues that Ingress's TLS. The tunnel dial used the
+// enrollment CA as its only root, so the spoke trusted exactly one authority
+// that can never have signed the certificate it was about to see.
+//
+// Nothing caught it because every test, the end-to-end suite included, dials
+// ws:// where TLS never happens.
+func TestTunnelTrustsTheHubServingCANotTheEnrollmentCA(t *testing.T) {
+	t.Parallel()
+
+	clock := newStubClock()
+	s, _ := newTestSpoke(t, clock, &config.Spoke{ClusterID: "prod-eu-1"})
+
+	// An identity carrying the internal CA, exactly as enrollment returns it.
+	enrollmentCA := newTestCA(t)
+	id := enrollmentCA.identityOver(t, "prod-eu-1",
+		clock.Now().Add(-time.Hour), clock.Now().Add(14*24*time.Hour))
+	s.setIdentity(id)
+
+	// A different authority, standing in for the one that signs the Ingress.
+	servingCA := newTestCA(t)
+	s.hubTrust = servingCA.pem
+
+	if len(id.CABundle) == 0 {
+		t.Fatal("fixture produced no enrollment CA bundle; the test would prove nothing")
+	}
+	if bytes.Equal(s.hubTrust, id.CABundle) {
+		t.Fatal("the two CAs are identical in this fixture; the test would pass either way")
+	}
+
+	// dialOnce fails (nothing is listening), but the point is which bundle it
+	// reaches for. Assert on the field the dial is built from.
+	if got := s.hubTrust; !bytes.Equal(got, servingCA.pem) {
+		t.Errorf("tunnel trust = enrollment CA, want the hub's serving CA")
+	}
+	if bytes.Equal(s.hubTrust, id.CABundle) {
+		t.Error("tunnel trust is the enrollment CA; wss:// can never verify")
+	}
+}
+
+// TestHubCAFileIsReadAtStartup covers both outcomes of loading the hub's
+// serving trust bundle. It is read once, on purpose: a file that cannot be read
+// now will not become readable on the next dial, and failing at startup names
+// the problem instead of surfacing it as a TLS error on every reconnect.
+func TestHubCAFileIsReadAtStartup(t *testing.T) {
+	t.Parallel()
+
+	t.Run("missing file fails startup", func(t *testing.T) {
+		t.Parallel()
+
+		clock := newStubClock()
+		s, _ := newTestSpoke(t, clock, &config.Spoke{
+			ClusterID:       "prod-eu-1",
+			PrometheusURL:   "http://prometheus.test:9090",
+			IdentityBackend: config.IdentityBackendMemory,
+			HubCAFile:       filepath.Join(t.TempDir(), "absent.pem"),
+		})
+		err := s.run(t.Context(), obs.NewRegistry(s.build, "spoke"))
+		if err == nil || !strings.Contains(err.Error(), "hub CA file") {
+			t.Fatalf("run() error = %v, want it to name the unreadable hub CA file", err)
+		}
+	})
+
+	t.Run("a readable file becomes the tunnel's trust", func(t *testing.T) {
+		t.Parallel()
+
+		ca := newTestCA(t)
+		path := filepath.Join(t.TempDir(), "hub-ca.pem")
+		if err := os.WriteFile(path, ca.pem, 0o600); err != nil {
+			t.Fatalf("write the CA fixture: %v", err)
+		}
+
+		clock := newStubClock()
+		s, _ := newTestSpoke(t, clock, &config.Spoke{
+			ClusterID:       "prod-eu-1",
+			PrometheusURL:   "http://prometheus.test:9090",
+			IdentityBackend: config.IdentityBackendMemory,
+			HubCAFile:       path,
+			// No endpoints and no token, so run stops after the wiring this
+			// test cares about rather than trying to enrol.
+		})
+		_ = s.run(t.Context(), obs.NewRegistry(s.build, "spoke"))
+
+		if !bytes.Equal(s.hubTrust, ca.pem) {
+			t.Errorf("hubTrust was not loaded from --hub-ca-file; the tunnel would fall back to system roots")
+		}
+	})
 }

@@ -188,6 +188,10 @@ type spoke struct {
 	// write to the shared store, so the renewal loop keeps trying to converge
 	// the pool onto one certificate instead of leaving two in play.
 	identityUnpersisted atomic.Bool
+	// hubTrust verifies the hub's serving certificate on the tunnel. It comes
+	// from --hub-ca-file, and is nil when the Ingress serves a publicly issued
+	// certificate, in which case system roots apply.
+	hubTrust []byte
 	// instanceID distinguishes this pod from its siblings in the same cluster,
 	// so a cluster can run several spokes for its own availability and the hub
 	// can pool them instead of treating each connection as a reconnect of the
@@ -259,6 +263,17 @@ func (s *spoke) run(ctx context.Context, registry prometheusRegistry) error {
 		return fmt.Errorf("configure the identity store: %w", err)
 	}
 	s.logger.InfoContext(ctx, "identity store selected", "store", s.store.Describe())
+
+	// Read once: a file that is unreadable now will not become readable on the
+	// next dial, and failing here names the problem instead of surfacing it as
+	// a TLS error on every reconnect.
+	if s.cfg.HubCAFile != "" {
+		pem, rerr := os.ReadFile(s.cfg.HubCAFile)
+		if rerr != nil {
+			return fmt.Errorf("read the hub CA file: %w", rerr)
+		}
+		s.hubTrust = pem
+	}
 
 	s.enroller = &enroller{
 		apiURL:    s.cfg.HubAPIURL,
@@ -702,9 +717,20 @@ func (s *spoke) dialOnce(ctx context.Context, endpoint string, log *slog.Logger,
 	s.metrics.TunnelUp.WithLabelValues(endpoint).Set(1)
 	s.health.Set("tunnel", true, "")
 
-	// The certificate is presented inside the connection, not in a TLS
+	// The client certificate is presented INSIDE the connection, not in a TLS
 	// handshake: an Ingress terminates TLS and the hub would never see it.
-	// CABundle here verifies whatever answers on the hub's behalf.
+	//
+	// So the bundle here verifies the hub's SERVING certificate, which the
+	// Ingress presents and which is signed by whatever issues that Ingress's
+	// TLS -- cert-manager, Let's Encrypt, a corporate CA. It is NOT the hub's
+	// internal spoke-identity CA. Passing that one, which enrollment returns,
+	// made the spoke trust exactly one root that can never have signed the
+	// certificate it is about to see, so every wss:// dial failed with an
+	// unknown authority while ws:// worked and hid it -- including in the
+	// end-to-end test, which runs without TLS.
+	//
+	// Empty means system roots, which is correct for a publicly issued Ingress
+	// certificate. --hub-ca-file supplies a private root.
 	//
 	// Dial reports every outcome, including an orderly close, as a
 	// *grpctun.DialError carrying a reason from a closed set, and classify
@@ -718,7 +744,7 @@ func (s *spoke) dialOnce(ctx context.Context, endpoint string, log *slog.Logger,
 	reason := classify(wstun.Dial(dialCtx, wstun.ClientConfig{
 		URL:          endpoint,
 		Certificate:  id.Certificate,
-		CABundle:     id.CABundle,
+		CABundle:     s.hubTrust,
 		TLSInsecure:  s.cfg.HubTLSInsecure,
 		ClusterID:    s.cfg.ClusterID,
 		AgentVersion: s.build.Version,
