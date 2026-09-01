@@ -33,6 +33,10 @@ type peerCounter struct {
 	now     func() time.Time
 	log     *slog.Logger
 
+	// observe is told every refreshed count, so a gauge can say what this
+	// replica believes the fleet size is. Nil discards it.
+	observe func(int)
+
 	mu       sync.Mutex
 	count    int
 	fetched  time.Time
@@ -50,8 +54,9 @@ const peerCacheTTL = 15 * time.Second
 // newPeerCounter builds a counter for a headless Service FQDN. An empty domain
 // yields a counter that always reports zero, which advertises nothing and
 // leaves spokes on one tunnel per configured endpoint.
-func newPeerCounter(domain string, log *slog.Logger) *peerCounter {
+func newPeerCounter(domain string, log *slog.Logger, observe func(int)) *peerCounter {
 	return &peerCounter{
+		observe: observe,
 		domain:  domain,
 		resolve: net.DefaultResolver.LookupHost,
 		ttl:     peerCacheTTL,
@@ -101,7 +106,13 @@ func (p *peerCounter) refresh() {
 		// idea", which would tell every spoke to stop dialing for full
 		// coverage; a momentary NXDOMAIN during a rolling update must not
 		// silently collapse the fleet onto one replica.
-		p.log.Debug("peer discovery failed; keeping the previous replica count",
+		// Warn, not Debug: a NetworkPolicy that blocks DNS or a deleted
+		// headless Service looks EXACTLY like this, forever, and the spokes'
+		// symptom -- one tunnel to a three-replica hub, two thirds of calls
+		// failing -- carries no alert of its own because the spokes never
+		// learn a count to fall short of. This log line and the discovered-
+		// peers gauge are the only places the failure is visible.
+		p.log.Warn("peer discovery failed; keeping the previous replica count",
 			"domain", p.domain, "count", p.count, "error", err)
 		p.fetched = p.now()
 		return
@@ -138,4 +149,7 @@ func (p *peerCounter) refresh() {
 	}
 	p.count = len(unique)
 	p.fetched = p.now()
+	if p.observe != nil {
+		p.observe(len(unique))
+	}
 }

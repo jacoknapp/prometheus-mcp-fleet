@@ -1,8 +1,8 @@
 // Copyright The prometheus-mcp-fleet Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package mcptools implements the hub's sixteen MCP tools, its four resources
-// and its five prompts.
+// Package mcptools implements the hub's nineteen MCP tools, its four
+// resources and its five prompts.
 //
 // # What it is responsible for
 //

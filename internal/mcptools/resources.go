@@ -14,6 +14,7 @@ import (
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/fleet"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/mcpsurface"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/render"
+	"time"
 )
 
 // Resource URIs published by this hub.
@@ -82,17 +83,30 @@ func (t *Tools) RegisterResources(s *mcpsurface.Server) {
 
 // resourcePrincipal authorises a resource read against the tool whose payload
 // the resource mirrors. A resource is a cheaper way to make the same call, so
-// it must not be a way around the same scope.
-func resourcePrincipal(req *mcpsurface.ResourceRequest, tool string) (*fleet.Principal, error) {
+// every gate the tool path runs -- scope, role tier, the key's own rate
+// limit -- runs here too. Diverged once: resources skipped the rate limiter
+// entirely, so fleet://alerts/firing bought N upstream queries per read on a
+// key whose rateRps claimed to bound it.
+func (t *Tools) resourcePrincipal(req *mcpsurface.ResourceRequest, tool string) (*fleet.Principal, error) {
 	p := req.Principal()
 	if p == nil {
 		return nil, mcpsurface.ProtocolError(mcpsurface.CodeUnauthenticated,
 			"resource %q requires an authenticated principal", req.URI)
 	}
+	if ok, retry := t.rate.allow(p); !ok {
+		return nil, mcpsurface.ProtocolError(mcpsurface.CodeRateLimited,
+			"resource %q refused by this credential's rate limit; retry in %s",
+			req.URI, retry.Round(time.Millisecond))
+	}
 	if !p.Scope.AllowsTool(tool) {
 		return nil, mcpsurface.ProtocolError(mcpsurface.CodeForbidden,
 			"resource %q requires the %q tool, which this credential's scope does not permit",
 			req.URI, tool)
+	}
+	if !roleAllows(p.Scope, tool) {
+		return nil, mcpsurface.ProtocolError(mcpsurface.CodeForbidden,
+			"resource %q mirrors the operational tool %q: this credential's role reaches it "+
+				"only by naming the tool in tools.allow", req.URI, tool)
 	}
 	return p, nil
 }
@@ -101,7 +115,7 @@ func resourcePrincipal(req *mcpsurface.ResourceRequest, tool string) (*fleet.Pri
 func (t *Tools) readClusters(
 	ctx context.Context, req *mcpsurface.ResourceRequest,
 ) (mcpsurface.ResourceContent, error) {
-	p, err := resourcePrincipal(req, ToolListClusters)
+	p, err := t.resourcePrincipal(req, ToolListClusters)
 	if err != nil {
 		return mcpsurface.ResourceContent{}, err
 	}
@@ -120,7 +134,7 @@ func (t *Tools) readClusters(
 func (t *Tools) readCluster(
 	ctx context.Context, req *mcpsurface.ResourceRequest,
 ) (mcpsurface.ResourceContent, error) {
-	p, err := resourcePrincipal(req, ToolDescribeCluster)
+	p, err := t.resourcePrincipal(req, ToolDescribeCluster)
 	if err != nil {
 		return mcpsurface.ResourceContent{}, err
 	}
@@ -163,7 +177,7 @@ type FleetAlert struct {
 func (t *Tools) readFiringAlerts(
 	ctx context.Context, req *mcpsurface.ResourceRequest,
 ) (mcpsurface.ResourceContent, error) {
-	p, err := resourcePrincipal(req, ToolAlerts)
+	p, err := t.resourcePrincipal(req, ToolAlerts)
 	if err != nil {
 		return mcpsurface.ResourceContent{}, err
 	}

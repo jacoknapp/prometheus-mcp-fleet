@@ -102,9 +102,10 @@ func TestRegisteredSurface(t *testing.T) {
 
 	wantTools := []string{
 		"list_clusters", "describe_cluster",
-		"query", "query_range", "explain_promql",
-		"search_metrics", "metric_metadata", "series", "label_names", "label_values",
-		"targets", "rules", "alerts", "tsdb_stats", "runtime_info",
+		"query", "query_range", "explain_promql", "query_exemplars",
+		"search_metrics", "metric_metadata", "target_metadata",
+		"series", "label_names", "label_values",
+		"targets", "rules", "alerts", "alertmanagers", "tsdb_stats", "runtime_info",
 		"fanout_query",
 	}
 	if diff := cmp.Diff(wantTools, s.ToolNames()); diff != "" {
@@ -113,8 +114,8 @@ func TestRegisteredSurface(t *testing.T) {
 	if diff := cmp.Diff(wantTools, ToolNames()); diff != "" {
 		t.Errorf("ToolNames (-want +got):\n%s", diff)
 	}
-	if got := len(wantTools); got != 16 {
-		t.Errorf("tool count = %d, want 16", got)
+	if got := len(wantTools); got != 19 {
+		t.Errorf("tool count = %d, want 19", got)
 	}
 	wantResources := []string{
 		"fleet://clusters", "fleet://alerts/firing", "fleet://promql/cheatsheet",

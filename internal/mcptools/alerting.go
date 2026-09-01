@@ -528,3 +528,79 @@ func ruleTable(rs []RuleInfo) string {
 	return render.Table(
 		[]string{"GROUP", "RULE", "TYPE", "STATE", "HEALTH", "MS", "LAST_ERROR"}, rows)
 }
+
+// AlertmanagersIn is the argument object of alertmanagers.
+type AlertmanagersIn struct {
+	// Cluster names the target.
+	Cluster string `json:"cluster" jsonschema:"Cluster name, exactly as returned by list_clusters."`
+}
+
+// AlertmanagerInfo is one Alertmanager peer this cluster's Prometheus has
+// discovered.
+//
+// There is deliberately no URL here, only a host. An Alertmanager discovered
+// through a static config or service discovery can carry basic-auth
+// credentials in its URL's userinfo, the same way a scrape target can, so it
+// is reduced the same way: see [redactedAlertmanagerFields].
+type AlertmanagerInfo struct {
+	// Host is the alertmanager's host and port, with scheme, path, userinfo
+	// and query string discarded.
+	Host string `json:"host,omitempty"`
+	// Dropped marks a peer discovery found but Prometheus is not currently
+	// sending alerts to, as distinct from one actively in use.
+	Dropped bool `json:"dropped,omitempty"`
+}
+
+// AlertmanagersOut is the result of alertmanagers.
+type AlertmanagersOut struct {
+	Envelope
+	// Alertmanagers are the discovered peers, active ones first.
+	Alertmanagers []AlertmanagerInfo `json:"alertmanagers,omitempty"`
+	// ActiveCount and DroppedCount summarise Alertmanagers without requiring
+	// the caller to filter it.
+	ActiveCount  int `json:"activeCount,omitempty"`
+	DroppedCount int `json:"droppedCount,omitempty"`
+	// Redacted names the upstream field this hub removed.
+	Redacted []string `json:"redacted,omitempty"`
+}
+
+// redactedAlertmanagerFields is what never leaves the hub, named in the
+// result so an operator comparing against a raw curl is not left wondering.
+var redactedAlertmanagerFields = []string{"url"}
+
+// upstreamAlertmanagers is the /api/v1/alertmanagers payload.
+type upstreamAlertmanagers struct {
+	ActiveAlertmanagers []struct {
+		URL string `json:"url"`
+	} `json:"activeAlertmanagers"`
+	DroppedAlertmanagers []struct {
+		URL string `json:"url"`
+	} `json:"droppedAlertmanagers"`
+}
+
+// alertmanagers reports the Alertmanager peers this cluster's Prometheus has
+// discovered, which decides whether "why was I not paged" is even a sensible
+// question to ask about this cluster.
+func (t *Tools) alertmanagers(
+	ctx context.Context, p *fleet.Principal, in AlertmanagersIn,
+) (*AlertmanagersOut, *ToolError) {
+	c, terr := t.resolveCluster(p, in.Cluster)
+	if terr != nil {
+		return nil, terr
+	}
+	var raw upstreamAlertmanagers
+	if terr := t.status(ctx, p, c.ID, promapi.EndpointAlertmanagers, &raw); terr != nil {
+		return nil, terr
+	}
+	out := &AlertmanagersOut{Envelope: untrusted(), Redacted: redactedAlertmanagerFields}
+	for _, a := range raw.ActiveAlertmanagers {
+		out.Alertmanagers = append(out.Alertmanagers, AlertmanagerInfo{Host: hostOnly(a.URL)})
+	}
+	out.ActiveCount = len(raw.ActiveAlertmanagers)
+	for _, a := range raw.DroppedAlertmanagers {
+		out.Alertmanagers = append(out.Alertmanagers,
+			AlertmanagerInfo{Host: hostOnly(a.URL), Dropped: true})
+	}
+	out.DroppedCount = len(raw.DroppedAlertmanagers)
+	return out, nil
+}

@@ -187,7 +187,16 @@ func (l *listener) attach(ctx context.Context, conn net.Conn, id tunnel.Identity
 	sess, err := l.newSession(ctx, conn, id)
 	if err != nil {
 		l.release()
-		l.log.WarnContext(ctx, "tunnel setup failed",
+		// A peer that vanished between authenticating and the session
+		// becoming ready is routine, not alarming: it is what a spoke's
+		// coverage probe does by design, once a minute per spoke -- connect,
+		// hear the hello, hang up. At WARN, a hundred spokes bury a real
+		// setup failure under a hundred lines a minute of expected ones.
+		level := slog.LevelWarn
+		if errors.Is(err, errPeerGoneBeforeReady) {
+			level = slog.LevelInfo
+		}
+		l.log.LogAttrs(ctx, level, "tunnel setup failed",
 			slog.String("remote", id.RemoteAddr),
 			slog.String("cluster", id.ClusterID),
 			slog.Any("err", err))
@@ -282,6 +291,12 @@ func (l *listener) newSession(ctx context.Context, raw net.Conn, id tunnel.Ident
 	return sess, nil
 }
 
+// errPeerGoneBeforeReady marks the peer hanging up between authenticating and
+// the session becoming ready. Sentinel rather than prose because the caller
+// logs it at a lower level: a spoke's coverage probe produces exactly this,
+// deliberately, about once a minute per spoke.
+var errPeerGoneBeforeReady = errors.New("client connection ended before becoming ready")
+
 // waitReady blocks until the ClientConn reaches READY or ctx expires.
 func waitReady(ctx context.Context, cc *grpc.ClientConn) error {
 	for {
@@ -289,9 +304,9 @@ func waitReady(ctx context.Context, cc *grpc.ClientConn) error {
 		case connectivity.Ready:
 			return nil
 		case connectivity.Shutdown:
-			return errors.New("client connection shut down before becoming ready")
+			return fmt.Errorf("%w: shut down", errPeerGoneBeforeReady)
 		case connectivity.TransientFailure:
-			return errors.New("client connection failed before becoming ready")
+			return fmt.Errorf("%w: transport failure", errPeerGoneBeforeReady)
 		default:
 			if !cc.WaitForStateChange(ctx, st) {
 				return fmt.Errorf("wait for ready: %w", ctx.Err())

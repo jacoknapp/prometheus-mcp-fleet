@@ -4,6 +4,7 @@
 package hubapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -142,16 +143,38 @@ func (s *server) guard(w http.ResponseWriter, r *http.Request) bool {
 // whose level is set above info.
 func (s *server) security(r *http.Request, event string, attrs ...slog.Attr) {
 	actor := authn.PrincipalFrom(r.Context())
-	all := make([]slog.Attr, 0, len(attrs)+4)
+	securityEvent(r.Context(), s.log, s.metrics, event,
+		actor.String(), string(actorClass(actor)),
+		append([]slog.Attr{slog.String("remote_addr", authn.SourceAddr(r))}, attrs...)...)
+}
+
+// systemActor is the actor recorded for a security event no operator request
+// caused. The hub's own background enforcement is the only thing that uses it,
+// and naming it explicitly keeps an audit reader from having to interpret an
+// empty actor field.
+const systemActor = "system"
+
+// securityEvent writes one audit record and counts it.
+//
+// It is the single place the shape of a security line is decided, so a record
+// emitted off a background loop is indistinguishable in structure from one
+// emitted by a request handler -- the actor differs, the fields do not.
+func securityEvent(
+	ctx context.Context,
+	log *slog.Logger,
+	m Metrics,
+	event, actor, class string,
+	attrs ...slog.Attr,
+) {
+	all := make([]slog.Attr, 0, len(attrs)+3)
 	all = append(all,
 		slog.String("event", event),
-		slog.String("actor", actor.String()),
-		slog.String("actor_class", string(actorClass(actor))),
-		slog.String("remote_addr", authn.SourceAddr(r)),
+		slog.String("actor", actor),
+		slog.String("actor_class", class),
 	)
 	all = append(all, attrs...)
-	s.log.LogAttrs(r.Context(), slog.LevelWarn, "security event", all...)
-	s.metrics.SecurityEvent(event)
+	log.LogAttrs(ctx, slog.LevelWarn, "security event", all...)
+	m.SecurityEvent(event)
 }
 
 // actorClass returns the acting principal's class, or the empty class when the
@@ -233,9 +256,52 @@ func printable(s string) bool {
 	return true
 }
 
-// resolveTTL applies the default and the maximum for a credential class.
+// resolveExpiry turns a request's lifetime fields into the absolute instant a
+// credential stops being usable. The zero time means never.
 //
-// A request above the maximum is refused rather than clamped: silently
+// noExpiry is restricted to agent keys. An admin key is the credential that
+// mints other credentials and drives CA rotation, and an enrollment token is
+// how a new cluster joins; neither should be capable of outliving the operator
+// who created it. An agent key is different in kind: its holder is an AI
+// agent's configuration file, which cannot re-enrol itself when the key lapses,
+// so expiry there buys little and costs an outage nobody scheduled.
+func resolveExpiry(
+	want fleet.Duration,
+	noExpiry bool,
+	class fleet.KeyClass,
+	max time.Duration,
+	now time.Time,
+) (time.Time, error) {
+	if !noExpiry {
+		ttl, err := resolveTTL(want, max)
+		if err != nil {
+			return time.Time{}, err
+		}
+		return now.Add(ttl), nil
+	}
+	if class != fleet.ClassAgent {
+		return time.Time{}, fmt.Errorf("only an %s key may be minted with no expiry, not %s", fleet.ClassAgent, class)
+	}
+	if want != 0 {
+		// Refusing beats picking a winner: the request asked for both a
+		// lifetime and no lifetime, and guessing which was meant produces a
+		// credential whose expiry nobody can predict from the request.
+		return time.Time{}, errors.New("ttl and noExpiry are mutually exclusive")
+	}
+	return time.Time{}, nil
+}
+
+// expiryLabel renders an expiry for a security log line, where the zero time
+// has to read as a deliberate choice rather than a missing value.
+func expiryLabel(t time.Time) string {
+	if t.IsZero() {
+		return "never"
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
+// resolveTTL applies the default and the maximum for a credential class. A
+// request above the maximum is refused rather than clamped: silently
 // shortening a lifetime an operator explicitly asked for produces a credential
 // that expires at a time nobody expects.
 func resolveTTL(want fleet.Duration, def time.Duration) (time.Duration, error) {

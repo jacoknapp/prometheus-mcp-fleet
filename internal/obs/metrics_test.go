@@ -23,6 +23,7 @@ func touchHub(m *HubMetrics) {
 	m.EnrollmentsTotal.WithLabelValues("ok").Inc()
 	m.SecurityEventsTotal.WithLabelValues("enrollment_burned").Inc()
 	m.StateBytes.Set(12345)
+	m.DiscoveredPeers.Set(3)
 	m.ProxyRequestsTotal.WithLabelValues("prod-us-east-1", "query", "200").Inc()
 	m.ProxyDuration.WithLabelValues("prod-us-east-1", "query").Observe(0.1)
 	m.ProxyInflight.WithLabelValues("prod-us-east-1").Set(2)
@@ -32,6 +33,10 @@ func touchHub(m *HubMetrics) {
 	m.AuthnFailuresTotal.WithLabelValues("expired").Inc()
 	m.SpokeCertExpiry.WithLabelValues("prod-us-east-1").Set(86400)
 	m.CACertExpiry.Set(864000)
+	m.CARotationPhase.WithLabelValues("steady").Set(1)
+	m.CARotationPhaseStart.Set(1756000000)
+	m.CAOutgoingRootSessions.Set(0)
+	m.CARotationTransitionsTotal.WithLabelValues("publishing").Inc()
 	m.StoreOpDuration.WithLabelValues("put_key", "ok").Observe(0.001)
 }
 
@@ -45,6 +50,8 @@ func touchSpoke(m *SpokeMetrics) {
 	m.FactsRefreshTotal.WithLabelValues("ok").Inc()
 	m.ClientCertExpiry.Set(1209600)
 	m.InflightRequests.Set(0)
+	m.HubReplicas.WithLabelValues("hub.example.com:8443").Set(3)
+	m.TunnelsCovered.WithLabelValues("hub.example.com:8443").Set(3)
 }
 
 // gatheredLabels maps each gathered metric family name to its sorted label
@@ -76,21 +83,28 @@ func TestNewHubMetricsNamesAndLabels(t *testing.T) {
 	touchHub(NewHubMetrics(r))
 
 	want := map[string][]string{
-		"promfleet_hub_spoke_connected":           {"cluster"},
-		"promfleet_hub_spokes_connected":          {},
-		"promfleet_hub_enrollments_total":         {"result"},
-		"promfleet_hub_security_events_total":     {"event"},
-		"promfleet_hub_state_bytes":               {},
-		"promfleet_hub_proxy_requests_total":      {"cluster", "code", "endpoint"},
-		"promfleet_hub_proxy_duration_seconds":    {"cluster", "endpoint"},
-		"promfleet_hub_proxy_inflight":            {"cluster"},
-		"promfleet_hub_proxy_response_bytes":      {},
-		"promfleet_hub_mcp_tool_calls_total":      {"result", "tool"},
-		"promfleet_hub_mcp_tool_duration_seconds": {"tool"},
-		"promfleet_hub_authn_failures_total":      {"reason"},
-		"promfleet_hub_spoke_cert_expiry_seconds": {"cluster"},
-		"promfleet_hub_ca_cert_expiry_seconds":    {},
-		"promfleet_hub_store_op_duration_seconds": {"op", "result"},
+		"promfleet_hub_spoke_connected":                           {"cluster"},
+		"promfleet_hub_spokes_connected":                          {},
+		"promfleet_hub_enrollments_total":                         {"result"},
+		"promfleet_hub_security_events_total":                     {"event"},
+		"promfleet_hub_state_bytes":                               {},
+		"promfleet_hub_proxy_requests_total":                      {"cluster", "code", "endpoint"},
+		"promfleet_hub_proxy_duration_seconds":                    {"cluster", "endpoint"},
+		"promfleet_hub_proxy_inflight":                            {"cluster"},
+		"promfleet_hub_proxy_response_bytes":                      {},
+		"promfleet_hub_discovered_peers":                          {},
+		"promfleet_hub_revocation_refresh_timestamp_seconds":      {},
+		"promfleet_hub_mcp_tool_calls_total":                      {"result", "tool"},
+		"promfleet_hub_mcp_tool_duration_seconds":                 {"tool"},
+		"promfleet_hub_authn_failures_total":                      {"reason"},
+		"promfleet_hub_spoke_cert_expiry_seconds":                 {"cluster"},
+		"promfleet_hub_ca_cert_expiry_seconds":                    {},
+		"promfleet_hub_ca_trust_roots":                            {},
+		"promfleet_hub_ca_rotation_phase":                         {"phase"},
+		"promfleet_hub_ca_rotation_phase_start_timestamp_seconds": {},
+		"promfleet_hub_ca_outgoing_root_sessions":                 {},
+		"promfleet_hub_ca_rotation_transitions_total":             {"to"},
+		"promfleet_hub_store_op_duration_seconds":                 {"op", "result"},
 	}
 	if diff := cmp.Diff(want, gatheredLabels(t, r)); diff != "" {
 		t.Errorf("hub metric set mismatch (-want +got):\n%s", diff)
@@ -112,6 +126,8 @@ func TestNewSpokeMetricsNamesAndLabels(t *testing.T) {
 		"promfleet_spoke_facts_refresh_total":        {"result"},
 		"promfleet_spoke_client_cert_expiry_seconds": {},
 		"promfleet_spoke_inflight_requests":          {},
+		"promfleet_spoke_hub_replicas":               {"endpoint"},
+		"promfleet_spoke_tunnels_covered":            {"endpoint"},
 	}
 	if diff := cmp.Diff(want, gatheredLabels(t, r)); diff != "" {
 		t.Errorf("spoke metric set mismatch (-want +got):\n%s", diff)

@@ -38,7 +38,12 @@ var osHostname = os.Hostname
 // What survives from the old listener is the part that was never about TLS:
 // the revocation predicate, consulted on every connection.
 func (h *hub) newTunnelServer(ctx context.Context) (*wstun.Server, error) {
-	revoked, err := h.revokedSerials(ctx)
+	// One predicate, shared with the revocation enforcer. Building a second
+	// here would mean two independent pollers of the state Secret, two caches
+	// and two epochs -- so the handshake and the eviction sweep could disagree
+	// about whether a certificate is revoked, which is the one thing they must
+	// not do.
+	revoked, err := h.revocationPredicate(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -54,21 +59,51 @@ func (h *hub) newTunnelServer(ctx context.Context) (*wstun.Server, error) {
 	// Peer discovery is what makes replicas: N work behind a single Ingress
 	// hostname; see peerCounter. Nil-safe: an empty domain reports zero, which
 	// advertises nothing.
-	peers := newPeerCounter(h.cfg.PeerDiscoveryDomain, h.logger)
+	var observePeers func(int)
+	if h.metrics != nil {
+		observePeers = h.metrics.DiscoveredPeers
+	}
+	peers := newPeerCounter(h.cfg.PeerDiscoveryDomain, h.logger, observePeers)
+
+	// Verification goes through the issuer tracker rather than straight to the
+	// authority. It verifies exactly the same way and additionally records
+	// which root admitted each cluster, which is the evidence the last step of
+	// a CA rotation is gated on -- and the handshake is the only place the
+	// spoke's leaf certificate is ever in scope.
+	h.caIssuers = newCAIssuerTracker(h.authority, h.registry.LiveCertSerials)
 
 	srv, err := wstun.NewServer(wstun.ServerConfig{
-		Verify:      h.authority.VerifyChain,
+		Verify:      h.caIssuers.Verify,
 		IsRevoked:   revoked,
 		Logger:      h.logger,
 		MaxSessions: h.cfg.MaxSpokes,
 		ServerID:    serverID,
-		Replicas:    peers.Count,
+		Replicas:    h.advertisedReplicas(peers),
 		Path:        h.cfg.TunnelPath,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("build the tunnel server: %w", err)
 	}
 	return srv, nil
+}
+
+// advertisedReplicas is what the hello tells every spoke about the fleet
+// size, and the zero is meaningful: it means "unknown, keep probing".
+//
+// With no discovery domain configured the count is not unknown -- this
+// replica coordinates with nobody, and the only replica a spoke can ever
+// reach through this process is this one -- so it advertises exactly 1.
+// Advertising 0 there would have every spoke probe forever for a count that
+// is never coming. With discovery configured, a cold or failed cache really
+// is "unknown": the spoke keeps its probe running until a populated answer
+// arrives, which is what closes the bootstrap hole where the FIRST spoke to
+// dial a freshly started hub heard zero, kept a single tunnel forever, and
+// no alert could see it.
+func (h *hub) advertisedReplicas(peers *peerCounter) func() int {
+	if h.cfg.PeerDiscoveryDomain == "" {
+		return func() int { return 1 }
+	}
+	return peers.Count
 }
 
 // revokedSerials returns a predicate consulted on every tunnel handshake.
@@ -81,9 +116,15 @@ func (h *hub) newTunnelServer(ctx context.Context) (*wstun.Server, error) {
 // refresh interval at worst.
 func (h *hub) revokedSerials(ctx context.Context) (func(serial string) bool, error) {
 	d := &revocationCache{store: h.store, ttl: 30 * time.Second}
+	if h.metrics != nil {
+		d.refreshed = h.metrics.RevocationRefreshed
+	}
 	if err := d.refresh(ctx); err != nil {
 		return nil, fmt.Errorf("load the revocation list: %w", err)
 	}
+	// The enforcer ticks this on its own timer, so the list and its
+	// staleness gauge stay current on a replica no spoke has dialed.
+	h.revocationRefresh = func(ctx context.Context) { _ = d.refresh(ctx) }
 	return d.isRevoked, nil
 }
 
@@ -91,6 +132,11 @@ func (h *hub) revokedSerials(ctx context.Context) (func(serial string) bool, err
 type revocationCache struct {
 	store store.Store
 	ttl   time.Duration
+	// refreshed is told the time of every successful refresh. Nil in tests
+	// that do not observe it. It is invoked while refreshM is held, which is
+	// safe for a gauge setter and would self-deadlock for a callback that
+	// re-entered refresh -- do not hand it anything cleverer than a Set.
+	refreshed func(time.Time)
 
 	mu       sync.RWMutex
 	serials  []string
@@ -119,9 +165,15 @@ func (c *revocationCache) isRevoked(serial string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := c.refresh(ctx); err != nil {
-		// Fail closed on the data we have rather than failing the handshake.
-		// A store outage must not disconnect the entire fleet; the certificate
-		// lifetime remains the backstop.
+		// Serve the last good data rather than failing the handshake: a store
+		// outage must not disconnect the entire fleet. Be precise about what
+		// that trades away -- for a serial revoked DURING the outage this is
+		// fail-OPEN, and the documented revocation bound holds only while
+		// refreshes succeed. That is why refresh success is exported as
+		// promfleet_hub_revocation_refresh_timestamp_seconds and alerted on:
+		// the operator gets "revocations are not landing on this replica" as
+		// a page, instead of as a forensic discovery. The certificate
+		// lifetime remains the outer backstop.
 		return revoked
 	}
 
@@ -136,6 +188,17 @@ func (c *revocationCache) refresh(ctx context.Context) error {
 	c.refreshM.Lock()
 	defer c.refreshM.Unlock()
 
+	// Re-check freshness AFTER acquiring the refresh lock: a fleet-wide
+	// reconnect just past the TTL queues many handshakes here, and without
+	// this each of them would issue its own store round trip for a list the
+	// first one already fetched.
+	c.mu.RLock()
+	fresh := time.Since(c.fetched) < c.ttl
+	c.mu.RUnlock()
+	if fresh {
+		return nil
+	}
+
 	epoch, err := c.store.Epoch(ctx)
 	if err != nil {
 		return err
@@ -145,9 +208,13 @@ func (c *revocationCache) refresh(ctx context.Context) error {
 	unchanged := epoch == c.epoch && !c.fetched.IsZero()
 	c.mu.RUnlock()
 	if unchanged {
+		now := time.Now()
 		c.mu.Lock()
-		c.fetched = time.Now()
+		c.fetched = now
 		c.mu.Unlock()
+		if c.refreshed != nil {
+			c.refreshed(now)
+		}
 		return nil
 	}
 
@@ -167,5 +234,26 @@ func (c *revocationCache) refresh(ctx context.Context) error {
 	c.mu.Lock()
 	c.serials, c.epoch, c.fetched = serials, epoch, now
 	c.mu.Unlock()
+	if c.refreshed != nil {
+		c.refreshed(now)
+	}
 	return nil
+}
+
+// revocationPredicate returns the shared revocation check, building it once.
+//
+// It is consulted on every tunnel handshake and by the enforcer that evicts
+// live sessions, and they must read the same list: a handshake that admits a
+// certificate the enforcer is about to evict, or the reverse, is a flapping
+// spoke nobody can explain.
+func (h *hub) revocationPredicate(ctx context.Context) (func(serial string) bool, error) {
+	if h.isRevoked != nil {
+		return h.isRevoked, nil
+	}
+	fn, err := h.revokedSerials(ctx)
+	if err != nil {
+		return nil, err
+	}
+	h.isRevoked = fn
+	return fn, nil
 }

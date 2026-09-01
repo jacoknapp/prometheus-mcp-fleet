@@ -72,6 +72,71 @@ func TestScopeDeniesEveryTool(t *testing.T) {
 	}
 }
 
+// TestRoleTierGatesOperationalTools proves the second authorization check: a
+// viewer's "*" wildcard does not include the operational surfaces, an operator
+// role does, and naming the tool in tools.allow overrides the tier for either.
+// Non-operational tools are untouched by role entirely.
+func TestRoleTierGatesOperationalTools(t *testing.T) {
+	t.Parallel()
+
+	scope := func(role fleet.Role, allow ...string) *fleet.Scope {
+		return &fleet.Scope{
+			Role:     role,
+			Clusters: fleet.ClusterScope{Allow: []string{"*"}},
+			Tools:    fleet.ToolScope{Allow: allow},
+		}
+	}
+
+	for name := range operationalTools {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			t.Run("viewer wildcard is refused", func(t *testing.T) {
+				t.Parallel()
+				h := newHarness(t)
+				err := callTool(t, h, name, principal(scope(fleet.RoleViewer, "*")))
+				code, ok := mcpsurface.ErrorCode(err)
+				if !ok || code != mcpsurface.CodeForbidden {
+					t.Fatalf("err = %v, want a forbidden protocol error", err)
+				}
+				if got := len(h.prom.calls); got != 0 {
+					t.Errorf("%d upstream calls made for a role-denied tool, want 0", got)
+				}
+			})
+
+			t.Run("viewer naming the tool is allowed", func(t *testing.T) {
+				t.Parallel()
+				h := newHarness(t)
+				if err := callTool(t, h, name, principal(scope(fleet.RoleViewer, name))); err != nil {
+					if code, ok := mcpsurface.ErrorCode(err); ok && code == mcpsurface.CodeForbidden {
+						t.Fatalf("an explicit by-name allow was refused: %v", err)
+					}
+				}
+			})
+
+			t.Run("operator wildcard is allowed", func(t *testing.T) {
+				t.Parallel()
+				h := newHarness(t)
+				if err := callTool(t, h, name, principal(scope(fleet.RoleOperator, "*"))); err != nil {
+					if code, ok := mcpsurface.ErrorCode(err); ok && code == mcpsurface.CodeForbidden {
+						t.Fatalf("an operator wildcard was refused: %v", err)
+					}
+				}
+			})
+		})
+	}
+
+	t.Run("a viewer wildcard still reaches a non-operational tool", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t)
+		if err := callTool(t, h, ToolListClusters, principal(scope(fleet.RoleViewer, "*"))); err != nil {
+			if code, ok := mcpsurface.ErrorCode(err); ok && code == mcpsurface.CodeForbidden {
+				t.Fatalf("role tier leaked onto a non-operational tool: %v", err)
+			}
+		}
+	})
+}
+
 // TestUnauthenticatedIsProtocolError proves a missing principal never becomes a
 // tool result either.
 func TestUnauthenticatedIsProtocolError(t *testing.T) {
@@ -154,12 +219,18 @@ func callTool(t *testing.T, h *harness, name string, p *fleet.Principal) error {
 	case ToolExplainPromQL:
 		_, _, err = run(h.tools, name, func() *ExplainPromQLOut { return &ExplainPromQLOut{} },
 			h.tools.explainPromQL)(c, req, ExplainPromQLIn{Query: "up"})
+	case ToolQueryExemplars:
+		_, _, err = run(h.tools, name, func() *QueryExemplarsOut { return &QueryExemplarsOut{} },
+			h.tools.queryExemplars)(c, req, QueryExemplarsIn{Cluster: okCluster, Query: "up"})
 	case ToolSearchMetrics:
 		_, _, err = run(h.tools, name, func() *SearchMetricsOut { return &SearchMetricsOut{} },
 			h.tools.searchMetrics)(c, req, SearchMetricsIn{Cluster: okCluster, Pattern: "up"})
 	case ToolMetricMetadata:
 		_, _, err = run(h.tools, name, func() *MetricMetadataOut { return &MetricMetadataOut{} },
 			h.tools.metricMetadata)(c, req, MetricMetadataIn{Cluster: okCluster})
+	case ToolTargetMetadata:
+		_, _, err = run(h.tools, name, func() *TargetMetadataOut { return &TargetMetadataOut{} },
+			h.tools.targetMetadata)(c, req, TargetMetadataIn{Cluster: okCluster})
 	case ToolSeries:
 		_, _, err = run(h.tools, name, func() *SeriesOut { return &SeriesOut{} },
 			h.tools.series)(c, req, SeriesIn{Cluster: okCluster, Matchers: []string{"up"}})
@@ -178,6 +249,9 @@ func callTool(t *testing.T, h *harness, name string, p *fleet.Principal) error {
 	case ToolAlerts:
 		_, _, err = run(h.tools, name, func() *AlertsOut { return &AlertsOut{} },
 			h.tools.alerts)(c, req, AlertsIn{Cluster: okCluster})
+	case ToolAlertmanagers:
+		_, _, err = run(h.tools, name, func() *AlertmanagersOut { return &AlertmanagersOut{} },
+			h.tools.alertmanagers)(c, req, AlertmanagersIn{Cluster: okCluster})
 	case ToolTSDBStats:
 		_, _, err = run(h.tools, name, func() *TSDBStatsOut { return &TSDBStatsOut{} },
 			h.tools.tsdbStats)(c, req, TSDBStatsIn{Cluster: okCluster})
@@ -2057,5 +2131,18 @@ func TestAlertsFiringFirst(t *testing.T) {
 		} else if seenPending {
 			t.Fatalf("a firing alert sorted after a pending one: %+v", out.Alerts)
 		}
+	}
+}
+
+// TestRoleAllowsNilScope pins the guard's independence from call order: the
+// dispatch path happens to nil-check through AllowsTool first, but roleAllows
+// must not panic if that ordering ever changes.
+func TestRoleAllowsNilScope(t *testing.T) {
+	t.Parallel()
+	if roleAllows(nil, ToolTargets) {
+		t.Error("roleAllows(nil) = true, want false: a scopeless principal has no tier")
+	}
+	if roleAllows(nil, ToolQuery) {
+		t.Error("roleAllows(nil) granted a non-operational tool to a scopeless principal")
 	}
 }

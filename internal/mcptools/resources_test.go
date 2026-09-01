@@ -469,3 +469,58 @@ func TestResourceURIs(t *testing.T) {
 		t.Errorf("ResourceURIs (-want +got):\n%s", diff)
 	}
 }
+
+// TestResourceGatesMatchTheToolPath pins the rule resourcePrincipal exists
+// for: a resource is a cheaper way to make the same call, so every gate the
+// tool path runs -- the key's rate limit and the role tier included -- runs
+// on a resource read too. The rate limiter was bypassed here once, which made
+// fleet://alerts/firing cost N upstream queries per read on a credential
+// whose rateRps claimed to bound it.
+func TestResourceGatesMatchTheToolPath(t *testing.T) {
+	t.Parallel()
+
+	t.Run("rate limit applies to resource reads", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t)
+		limited := principal(&fleet.Scope{
+			Role:     fleet.RoleViewer,
+			Clusters: fleet.ClusterScope{Allow: []string{"*"}},
+			Tools:    fleet.ToolScope{Allow: []string{"*"}},
+			Limits:   fleet.Limits{RateRPS: 0.001, RateBurst: 1},
+		})
+		if _, err := h.tools.readClusters(ctx(t), resourceRequest(ResourceClusters, limited)); err != nil {
+			t.Fatalf("first read within the burst: %v", err)
+		}
+		_, err := h.tools.readClusters(ctx(t), resourceRequest(ResourceClusters, limited))
+		code, ok := mcpsurface.ErrorCode(err)
+		if !ok || code != mcpsurface.CodeRateLimited {
+			t.Fatalf("second read err = %v (code %d), want CodeRateLimited", err, code)
+		}
+	})
+
+	t.Run("role tier applies when a resource mirrors an operational tool", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t)
+		// No shipped resource mirrors an operational tool today; the guard is
+		// there so the NEXT resource cannot be a role-tier hole. Driven
+		// directly, since resourcePrincipal takes the mirrored tool by name.
+		viewer := principal(&fleet.Scope{
+			Role:     fleet.RoleViewer,
+			Clusters: fleet.ClusterScope{Allow: []string{"*"}},
+			Tools:    fleet.ToolScope{Allow: []string{"*"}},
+		})
+		_, err := h.tools.resourcePrincipal(resourceRequest("fleet://hypothetical", viewer), ToolTargets)
+		code, ok := mcpsurface.ErrorCode(err)
+		if !ok || code != mcpsurface.CodeForbidden {
+			t.Fatalf("viewer wildcard err = %v (code %d), want CodeForbidden", err, code)
+		}
+		named := principal(&fleet.Scope{
+			Role:     fleet.RoleViewer,
+			Clusters: fleet.ClusterScope{Allow: []string{"*"}},
+			Tools:    fleet.ToolScope{Allow: []string{ToolTargets}},
+		})
+		if _, err := h.tools.resourcePrincipal(resourceRequest("fleet://hypothetical", named), ToolTargets); err != nil {
+			t.Fatalf("an explicit by-name allow was refused: %v", err)
+		}
+	})
+}

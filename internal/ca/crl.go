@@ -37,6 +37,9 @@ func (c *CA) CRL(revoked []RevokedEntry, thisUpdate time.Time, validity time.Dur
 	if validity <= 0 {
 		return nil, fmt.Errorf("%w: crl validity %s must be positive", ErrInvalidOptions, validity)
 	}
+	// One read, for the same reason CA.sign takes one: the CRL's issuer field
+	// and its signature must come from the same root.
+	m := c.current()
 	if thisUpdate.IsZero() {
 		thisUpdate = c.now()
 	}
@@ -62,7 +65,7 @@ func (c *CA) CRL(revoked []RevokedEntry, thisUpdate time.Time, validity time.Dur
 		ThisUpdate:                thisUpdate.UTC(),
 		NextUpdate:                thisUpdate.Add(validity).UTC(),
 	}
-	der, err := caCreateRevocationList(rand.Reader, tmpl, c.cert, c.key)
+	der, err := caCreateRevocationList(rand.Reader, tmpl, m.cert, m.key)
 	if err != nil {
 		return nil, fmt.Errorf("sign crl: %w", err)
 	}

@@ -320,6 +320,46 @@ func (s *State) RevokeKey(kid, reason string, at time.Time, now func() time.Time
 	return true, nil
 }
 
+// ReplaceKey stores fresh and revokes the key it replaces as one mutation.
+// See [Store.ReplaceKey].
+//
+// Rotation used to be two calls, and the gap between them was a real failure
+// mode: mint committed, revoke failed, and the caller got an error for an
+// operation that had half-happened -- a live replacement credential whose raw
+// token was already gone, because the token exists only in the response body.
+// One document mutation means one CAS write: either both records change or
+// neither does.
+func (s *State) ReplaceKey(fresh *fleet.Key, oldKID, reason string, at time.Time, now func() time.Time) (bool, error) {
+	old, ok := s.Keys[oldKID]
+	if !ok {
+		return false, fmt.Errorf("key %s: %w", oldKID, ErrNotFound)
+	}
+	if old.Key.RevokedAt != nil {
+		// A replay of a rotation that already happened. Minting again would
+		// strand another credential; refusing lets the caller report which
+		// key superseded this one, which is written in the revocation reason.
+		return false, fmt.Errorf("key %s is already revoked (%s): %w", oldKID, old.Key.RevokedReason, ErrRevoked)
+	}
+	if _, err := s.PutKey(fresh); err != nil {
+		return false, err
+	}
+	// The revocation is applied directly rather than through RevokeKey: its
+	// two failure modes -- a missing record and an already-revoked one --
+	// were both refused above, inside this same mutation, so calling it
+	// would leave an error branch nothing can reach. PutKey cannot unseat
+	// the record: it refuses a taken KID.
+	when := at
+	if when.IsZero() {
+		when = now()
+	}
+	old.Key.RevokedAt = &when
+	old.Key.RevokedReason = reason
+	s.Keys[oldKID] = old
+	// No second bump: PutKey above already moved the epoch, and this is ONE
+	// logical mutation -- readers gate on movement, not on a count.
+	return true, nil
+}
+
 // DeleteKey removes a key. See [Store.DeleteKey].
 func (s *State) DeleteKey(kid string) (bool, error) {
 	if _, ok := s.Keys[kid]; !ok {

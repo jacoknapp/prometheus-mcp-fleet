@@ -47,6 +47,25 @@
 //     handler that consulted r.TLS here would work in a lab and refuse every
 //     renewal in production, which is exactly what it did once.
 //
+// # Revocation is enforced, not only recorded
+//
+// Adding a serial to the revocation list stops the next tunnel handshake. It
+// does nothing to the tunnel that serial already holds, which during a
+// compromise is the only one that matters, so this package closes it too.
+//
+// POST /admin/v1/certs/{serial}/revoke closes the sessions that certificate
+// admitted on the replica serving the request ([Options.Sessions]), and
+// [RevocationEnforcer] closes them on every other replica: a session is pinned
+// to the hub that accepted it, there is no hub-to-hub forwarding, and the
+// revocation list is the only thing the replicas share. Both record
+// [EventSessionRevoked], which is the audit evidence that a spoke was
+// disconnected rather than merely listed.
+//
+// The enforcer is the one thing here that is not an HTTP handler. It lives in
+// this package because what it enforces is a credential lifecycle decision
+// this package took, and because the audit record it writes has to be the same
+// record the handler writes.
+//
 // # Importers and concurrency
 //
 // Layer L2. It imports internal/fleet, internal/token, internal/ca,

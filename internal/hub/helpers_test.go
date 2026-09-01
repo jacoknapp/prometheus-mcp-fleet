@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -173,9 +174,10 @@ type wireSec struct {
 
 // fakeObject is one stored Secret.
 type fakeObject struct {
-	data    map[string][]byte
-	labels  map[string]string
-	version int
+	data        map[string][]byte
+	labels      map[string]string
+	annotations map[string]string
+	version     int
 }
 
 // fakeAPI is an in-memory stand-in for the Kubernetes API server's Secret
@@ -233,10 +235,32 @@ func (f *fakeAPI) clientIn(t *testing.T, ns string) *kube.Client {
 // put installs an object directly, bypassing the handler, so a test can set up
 // the state another replica would have left behind.
 func (f *fakeAPI) put(name string, data map[string][]byte) {
+	f.putAnnotated(name, data, nil)
+}
+
+// putAnnotated installs an object with annotations. The CA rotation's operator
+// trigger is an annotation, so a test has to be able to set one the way
+// `kubectl annotate` would.
+func (f *fakeAPI) putAnnotated(name string, data map[string][]byte, annotations map[string]string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.objects[name] = &fakeObject{data: cloneData(data), version: f.nextRV}
+	f.objects[name] = &fakeObject{
+		data:        cloneData(data),
+		annotations: maps.Clone(annotations),
+		version:     f.nextRV,
+	}
 	f.nextRV++
+}
+
+// annotationsOf reads an object's annotations directly.
+func (f *fakeAPI) annotationsOf(name string) map[string]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	obj := f.objects[name]
+	if obj == nil {
+		return nil
+	}
+	return maps.Clone(obj.annotations)
 }
 
 // get reads an object's data directly.
@@ -376,7 +400,12 @@ func (f *fakeAPI) servePost(w http.ResponseWriter, r *http.Request) {
 		f.writeStatus(w, http.StatusConflict, "AlreadyExists", `secrets "`+name+`" already exists`)
 		return
 	}
-	obj := &fakeObject{data: cloneData(in.Data), labels: in.Metadata.Labels, version: f.nextRV}
+	obj := &fakeObject{
+		data:        cloneData(in.Data),
+		labels:      in.Metadata.Labels,
+		annotations: maps.Clone(in.Metadata.Annotations),
+		version:     f.nextRV,
+	}
 	f.nextRV++
 	f.objects[name] = obj
 	out := renderSecret(name, obj)
@@ -418,6 +447,7 @@ func (f *fakeAPI) servePut(w http.ResponseWriter, r *http.Request, name string) 
 		return
 	}
 	obj.data = cloneData(in.Data)
+	obj.annotations = maps.Clone(in.Metadata.Annotations)
 	obj.version = f.nextRV
 	f.nextRV++
 	out := renderSecret(name, obj)
@@ -433,6 +463,7 @@ func renderSecret(name string, obj *fakeObject) wireSec {
 	out.Metadata.Namespace = testNamespace
 	out.Metadata.ResourceVersion = strconv.Itoa(obj.version)
 	out.Metadata.Labels = obj.labels
+	out.Metadata.Annotations = maps.Clone(obj.annotations)
 	out.Data = cloneData(obj.data)
 	return out
 }

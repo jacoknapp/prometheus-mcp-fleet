@@ -115,6 +115,18 @@ func (s *Scope) AllowsCluster(id string, labels map[string]string) bool {
 	return slices.Contains(s.Clusters.Allow, "*") || slices.Contains(s.Clusters.Allow, id)
 }
 
+// ToolExplicitlyAllowed reports whether the tool is allowed BY NAME rather
+// than through the "*" wildcard. The distinction carries authorization weight:
+// the role tier gates operational tools out of a wildcard grant, and an
+// operator writing the tool's name into the allow list is the deliberate act
+// that overrides the tier. Deny still wins over both.
+func (s *Scope) ToolExplicitlyAllowed(name string) bool {
+	if s == nil || !s.AllowsTool(name) {
+		return false
+	}
+	return slices.Contains(s.Tools.Allow, name)
+}
+
 // AllowsTool reports whether the scope permits calling the named MCP tool.
 func (s *Scope) AllowsTool(name string) bool {
 	if s == nil {

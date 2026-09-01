@@ -1,0 +1,13 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "cluster": {
+      "description": "Cluster name, exactly as returned by list_clusters.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "cluster"
+  ],
+  "type": "object"
+}

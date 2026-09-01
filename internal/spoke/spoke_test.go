@@ -176,6 +176,7 @@ type stubStore struct {
 	mu                  sync.Mutex
 	key, cert, ca       []byte
 	loadErr, saveErr    error
+	loadErrOnce         error // returned by the FIRST Load only, then cleared
 	loads, saves        int
 	savedKey, savedCert []byte
 }
@@ -184,6 +185,11 @@ func (s *stubStore) Load(context.Context) (key, cert, ca []byte, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.loads++
+	if s.loadErrOnce != nil {
+		err := s.loadErrOnce
+		s.loadErrOnce = nil
+		return nil, nil, nil, err
+	}
 	if s.loadErr != nil {
 		return nil, nil, nil, s.loadErr
 	}
@@ -234,6 +240,36 @@ func newEstablishFixture(t *testing.T, tokenFileContent string) *establishFixtur
 	s.store = store
 	s.enroller = e
 	return &establishFixture{spoke: s, logs: logs, store: store, hub: hub, clock: clock}
+}
+
+// TestEstablishIdentityRefusesAForeignConvergenceRead covers the last window
+// a wrongly shared identity Secret can slip through: this pod's own enrollment
+// succeeds, its save fails, and the settle-the-pool re-read then surfaces an
+// identity some OTHER cluster's pod wrote. Adopting it would leave this pod
+// renewing that cluster's certificate forever while every handshake fails.
+func TestEstablishIdentityRefusesAForeignConvergenceRead(t *testing.T) {
+	t.Parallel()
+
+	f := newEstablishFixture(t, "pmf_enr_token")
+	foreign := f.hub.ca.identityOver(t, "stage-us-2",
+		f.clock.Now().Add(-time.Hour), f.clock.Now().Add(10*time.Hour))
+	f.store.mu.Lock()
+	// Empty on the first read, so this pod enrolls; the foreign identity is
+	// what the re-read finds; the failed save keeps it from being replaced.
+	f.store.loadErrOnce = ErrNoIdentity
+	f.store.key, f.store.cert, f.store.ca = foreign.KeyPEM, foreign.CertPEM, foreign.CABundle
+	f.store.saveErr = errors.New("apiserver briefly unavailable")
+	f.store.mu.Unlock()
+
+	err := f.spoke.establishIdentity(t.Context())
+	if err == nil {
+		t.Fatal("establishIdentity adopted another cluster's identity from the convergence re-read")
+	}
+	for _, want := range []string{"stage-us-2", "prod-eu-1"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %q, want it to mention %q", err, want)
+		}
+	}
 }
 
 // TestEstablishIdentityUsesAStoredIdentity is the ordinary restart: the spoke
@@ -916,7 +952,7 @@ func TestDialOnceRefusesWithoutAnIdentity(t *testing.T) {
 	t.Parallel()
 
 	s, logs := newTestSpoke(t, newStubClock(), nil)
-	if got := s.dialOnce(t.Context(), "wss://hub.test/tunnel", quiet(), newCoverage()); got != "no-identity" {
+	if got := s.dialOnce(t.Context(), "wss://hub.test/tunnel", quiet(), newCoverage(true)); got != "no-identity" {
 		t.Errorf("dialOnce with no identity = %q, want no-identity", got)
 	}
 	if got := logs.metric(t, "promfleet_spoke_tunnel_up", "endpoint=wss://hub.test/tunnel"); got != 0 {
@@ -948,7 +984,7 @@ func TestDialOnceServesTheHubOverARealTunnel(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	reason := make(chan string, 1)
-	go func() { reason <- s.dialOnce(ctx, hub.url, quiet(), newCoverage()) }()
+	go func() { reason <- s.dialOnce(ctx, hub.url, quiet(), newCoverage(true)) }()
 
 	session := hub.awaitSession(t)
 	if got := session.Identity().ClusterID; got != "prod-eu-1" {
@@ -1020,7 +1056,7 @@ func TestDialOnceDropsTheTunnelOnAReconnectSignal(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	reason := make(chan string, 1)
-	go func() { reason <- s.dialOnce(ctx, hub.url, quiet(), newCoverage()) }()
+	go func() { reason <- s.dialOnce(ctx, hub.url, quiet(), newCoverage(true)) }()
 
 	session := hub.awaitSession(t)
 	s.signalReconnect()
@@ -1050,7 +1086,7 @@ func TestDialOnceClassifiesAFailedDial(t *testing.T) {
 	s, _ := newTestSpoke(t, clock, &config.Spoke{ClusterID: "prod-eu-1"})
 	s.setIdentity(ca.identityOver(t, "prod-eu-1", clock.Now().Add(-time.Hour), clock.Now().Add(24*time.Hour)))
 
-	got := s.dialOnce(t.Context(), "ws://"+deadAddr(t)+"/tunnel", quiet(), newCoverage())
+	got := s.dialOnce(t.Context(), "ws://"+deadAddr(t)+"/tunnel", quiet(), newCoverage(true))
 	if got != "dial" {
 		t.Errorf("dialOnce against nothing = %q, want dial", got)
 	}
@@ -1064,7 +1100,10 @@ func TestDialLoopStopsOnAnEndpointItCannotUse(t *testing.T) {
 
 	s, logs := newTestSpoke(t, newStubClock(), nil)
 	done := make(chan struct{})
-	go func() { defer close(done); s.dialLoop(context.Background(), "ftp://hub.test/tunnel", newCoverage()) }()
+	go func() {
+		defer close(done)
+		s.dialLoop(context.Background(), "ftp://hub.test/tunnel", newCoverage(true), nil)
+	}()
 
 	select {
 	case <-done:
@@ -1093,7 +1132,7 @@ func TestDialLoopNormalisesTheEndpoint(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { defer close(done); s.dialLoop(ctx, deadAddr(t), newCoverage()) }()
+	go func() { defer close(done); s.dialLoop(ctx, deadAddr(t), newCoverage(true), nil) }()
 
 	eventually(t, "the normalised endpoint to be logged", func() bool {
 		return logs.has("hub endpoint normalised")
@@ -1117,7 +1156,7 @@ func TestDialLoopStopsDuringTheOpeningStagger(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { defer close(done); s.dialLoop(ctx, "ws://hub.test/tunnel", newCoverage()) }()
+	go func() { defer close(done); s.dialLoop(ctx, "ws://hub.test/tunnel", newCoverage(true), nil) }()
 	time.Sleep(10 * time.Millisecond)
 	cancel()
 
@@ -1148,7 +1187,7 @@ func TestDialLoopStopsDuringTheBackoff(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { defer close(done); s.dialLoop(ctx, "ws://"+deadAddr(t)+"/tunnel", newCoverage()) }()
+	go func() { defer close(done); s.dialLoop(ctx, "ws://"+deadAddr(t)+"/tunnel", newCoverage(true), nil) }()
 
 	// The line is logged immediately before the sleep starts.
 	eventually(t, "the loop to reach its backoff", func() bool {
@@ -1183,7 +1222,7 @@ func TestDialLoopReconnectsAndCounts(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { defer close(done); s.dialLoop(ctx, hub.url, newCoverage()) }()
+	go func() { defer close(done); s.dialLoop(ctx, hub.url, newCoverage(true), nil) }()
 
 	// Hang up on the spoke twice: the loop has to come back both times.
 	for i := range 2 {
@@ -1236,7 +1275,7 @@ func TestDialLoopResetsBackoffOnlyAfterAConnectionThatLasted(t *testing.T) {
 	endpoint := "ws://" + deadAddr(t) + "/tunnel"
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { defer close(done); s.dialLoop(ctx, endpoint, newCoverage()) }()
+	go func() { defer close(done); s.dialLoop(ctx, endpoint, newCoverage(true), nil) }()
 
 	// Phase one: the clock does not move, so no connection ever "lasts" and
 	// the window keeps doubling.
@@ -1288,7 +1327,7 @@ func TestDialLoopDoesNotResetBackoffAtExactlyTheThreshold(t *testing.T) {
 	endpoint := "ws://" + deadAddr(t) + "/tunnel"
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { defer close(done); s.dialLoop(ctx, endpoint, newCoverage()) }()
+	go func() { defer close(done); s.dialLoop(ctx, endpoint, newCoverage(true), nil) }()
 	defer func() {
 		cancel()
 		<-done
@@ -1327,6 +1366,119 @@ func maxLoggedDelay(logs *spokeProbe) time.Duration {
 		}
 	}
 	return worst
+}
+
+// ---------------------------------------------------------------------------
+// redundantCeiling
+// ---------------------------------------------------------------------------
+
+// TestRedundantCeiling pins every boundary in the redundant-pacing decision:
+// (covered >= want && want > 0) || redundant >= redundantSearchLimit. Each
+// case moves exactly one clause across its edge so a boundary mutant in that
+// clause -- and only that clause -- flips the result.
+func TestRedundantCeiling(t *testing.T) {
+	t.Parallel()
+
+	const (
+		minBackoff = time.Second
+		maxBackoff = 100 * time.Second
+		slow       = 10 * time.Second
+		fast       = redundantSearchMultiple * minBackoff // 8s, below maxBackoff: the cap does not bite here.
+	)
+
+	tests := []struct {
+		name                     string
+		covered, want, redundant int
+		wantCeiling              time.Duration
+	}{
+		{
+			name: "one short of full coverage stays fast",
+			// covered == want-1: "covered >= want" must read false here, not
+			// true -- the ">=" boundary mutant (">" ) reads it correctly by
+			// accident, but the boundary the other way ("<=" of the inverse)
+			// would not.
+			covered: 1, want: 2, redundant: 0, wantCeiling: fast,
+		},
+		{
+			name: "full coverage goes slow",
+			// covered == want exactly: this is the ">=" boundary itself. A
+			// mutant reading "covered > want" stays fast here, wrongly.
+			covered: 2, want: 2, redundant: 0, wantCeiling: slow,
+		},
+		{
+			name:    "coverage the wrong way past want still goes slow",
+			covered: 3, want: 2, redundant: 0, wantCeiling: slow,
+		},
+		{
+			name: "an unknown want stays fast even though covered >= 0 always holds",
+			// want == 0 is UNKNOWN, not "trivially satisfied": "want > 0"
+			// must gate the covered/want comparison. A mutant reading
+			// "want >= 0" would go slow immediately, before any replica was
+			// ever actually confirmed covered.
+			covered: 0, want: 0, redundant: 0, wantCeiling: fast,
+		},
+		{
+			name:    "an unknown want stays fast right up to the streak limit",
+			covered: 5, want: 0, redundant: redundantSearchLimit - 1, wantCeiling: fast,
+		},
+		{
+			name: "an unknown want with a streak at the limit goes slow anyway",
+			// The second clause fires independently of the first: a stuck
+			// search must not stay fast forever just because want is unknown.
+			covered: 5, want: 0, redundant: redundantSearchLimit, wantCeiling: slow,
+		},
+		{
+			name:    "a streak one short of the limit, coverage incomplete, stays fast",
+			covered: 0, want: 5, redundant: redundantSearchLimit - 1, wantCeiling: fast,
+		},
+		{
+			name: "a streak exactly at the limit, coverage incomplete, goes slow",
+			// This is the "redundant >= redundantSearchLimit" boundary
+			// itself: a mutant reading "redundant > redundantSearchLimit"
+			// stays fast here, wrongly.
+			covered: 0, want: 5, redundant: redundantSearchLimit, wantCeiling: slow,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := redundantCeiling(tc.covered, tc.want, tc.redundant, minBackoff, maxBackoff, slow); got != tc.wantCeiling {
+				t.Errorf("redundantCeiling(covered=%d, want=%d, redundant=%d) = %s, want %s",
+					tc.covered, tc.want, tc.redundant, got, tc.wantCeiling)
+			}
+		})
+	}
+}
+
+// TestRedundantCeilingFastPaceIsCappedAtMaxBackoff pins the arithmetic behind
+// the fast pace: redundantSearchMultiple times the minimum backoff, but never
+// more than the configured maximum -- a futile search must stay bounded by
+// the operator's own ceiling, not just by the multiple.
+func TestRedundantCeilingFastPaceIsCappedAtMaxBackoff(t *testing.T) {
+	t.Parallel()
+
+	const minBackoff = 50 * time.Second // 8x this (400s) exceeds maxBackoff.
+	const maxBackoff = 100 * time.Second
+
+	got := redundantCeiling(0, 5, 0, minBackoff, maxBackoff, time.Hour)
+	if got != maxBackoff {
+		t.Fatalf("redundantCeiling() = %s while searching with an oversized minimum backoff, want the cap %s", got, maxBackoff)
+	}
+}
+
+// TestRedundantCeilingFastPaceIsTheConfiguredMultiple pins the exact
+// multiplier: not a hardcoded 8s, and not min divided by anything.
+func TestRedundantCeilingFastPaceIsTheConfiguredMultiple(t *testing.T) {
+	t.Parallel()
+
+	const minBackoff = 3 * time.Second
+	const maxBackoff = time.Hour
+	want := redundantSearchMultiple * minBackoff
+
+	got := redundantCeiling(0, 5, 0, minBackoff, maxBackoff, time.Hour)
+	if got != want {
+		t.Fatalf("redundantCeiling() = %s while searching, want %d * %s = %s", got, redundantSearchMultiple, minBackoff, want)
+	}
 }
 
 // ---------------------------------------------------------------------------

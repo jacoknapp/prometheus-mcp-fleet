@@ -481,6 +481,19 @@ func (c *logCapture) find(want string) (slog.Record, bool) {
 	return slog.Record{}, false
 }
 
+// count reports how many records' messages contain want.
+func (c *logCapture) count(want string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for _, r := range c.records {
+		if strings.Contains(r.Message, want) {
+			n++
+		}
+	}
+	return n
+}
+
 // has reports whether any record's message contains want.
 func (c *logCapture) has(want string) bool {
 	_, ok := c.find(want)

@@ -53,6 +53,25 @@
 // and the cluster is genuinely unknown again. Set DisconnectGrace to a
 // negative value to disable the window and forget on disconnect.
 //
+// # Revocation
+//
+// The registry is also where a revoked certificate stops being served.
+// Revocation is checked at the tunnel handshake, which only ever stops the
+// *next* connection: a session that is already up would keep answering
+// queries until its certificate expired. [Registry.CloseRevoked] closes the
+// live sessions a set of serials admitted, and [Registry.CloseRevokedBy] does
+// the same for whatever a predicate calls revoked, which is how a hub replica
+// enforces a revocation performed on a different replica -- sessions are
+// pinned to one replica and there is no hub-to-hub forwarding, so each one
+// polls the shared revocation list it already consults at handshake time.
+//
+// Both remove the slot from its cluster's pool before closing anything, under
+// the same write lock [Registry.OnSession] and the release function take, so
+// no further query is routed to a revoked spoke even if the transport is slow
+// to hang up. A session that was displaced or released while the predicate ran
+// is left alone: the slot identity is re-checked under the lock, so a
+// revocation sweep can never close the session that replaced its target.
+//
 // # Facts polling
 //
 // Each live session gets one goroutine that polls [tunnel.Session.Describe] on

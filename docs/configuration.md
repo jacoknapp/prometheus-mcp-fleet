@@ -65,6 +65,10 @@ startup error naming the rule you are missing.
 | `--trust-domain` | `fleet.local` | Authority component of spoke certificate URI SANs (`pmf://<domain>/spoke/<id>`). Lowercase DNS name. |
 | `--ca-cert-file` | — | Internal CA certificate. Empty self-initialises inside `--data-dir`. |
 | `--ca-key-file` | — | Private key for the above. Both must be set or neither. |
+| `--ca-trust-bundle-file` | — | Additional root certificates accepted on spoke chains alongside the active signer. **Every root in this file can mint any spoke identity in the fleet** — it is not "the CA my Ingress uses", and pointing it at a corporate CA would let anyone holding a client cert from that CA authenticate as any cluster. Normal rotations never need it: the hub carries its outgoing root through the CA Secret on its own. It exists for recovery — rejoining a hub to a fleet whose Secret was restored from a backup taken before a rotation. Empty trusts only the signer. |
+| `--ca-rotation-enabled` | `true` | Let the hub rotate its own signing root: publish the successor, switch signing once every spoke trusts it, and retire the outgoing root only when no live session still chains to it. Requires `--state-backend=secret`. See [ADR-0015](adr/0015-ca-rotation.md). |
+| `--ca-rotate-at-remaining-fraction` | `0.2` | Fraction of the signing root's life remaining at which rotation begins. |
+| `--ca-rotation-poll-interval` | `5m` | How often each replica re-reads the CA Secret to notice a rotation another replica started. |
 | `--spoke-cert-ttl` | `336h` (14d) | Lifetime of an issued spoke certificate. Spokes renew at half life with jitter. |
 | `--renew-grace` | `720h` (30d) | How long after expiry `/renew` still accepts a spoke's certificate, given a valid possession proof and an unrevoked serial. `0` restores strict expiry. See [Renewing an expired certificate](spoke-enrollment.md#renewing-an-expired-certificate). |
 
@@ -73,7 +77,8 @@ startup error naming the rule you are missing.
 | Flag / `PMF_` variable | Default | Description |
 |---|---|---|
 | `--enrollment-token-ttl` | `15m` | Lifetime of an enrollment token. Applies whether the token is reusable (the default) or `--single-use`; a reusable token still expires, it just can be redeemed more than once before it does. |
-| `--agent-key-ttl` | `720h` (30d) | Default lifetime of a minted agent key. |
+| `--agent-key-ttl` | `2160h` (90d) | Default lifetime of a minted agent key, and the maximum a create request may ask for. Nothing rotates agent keys automatically, so expiry here is an outage on a timer; a key may also be minted with no expiry at all (`--no-expiry`, agent keys only). |
+| `--admin-key-ttl` | `2160h` (90d) | Default and maximum lifetime of a minted admin key, including the bootstrap key printed on first start. Separate from `--agent-key-ttl` on purpose: relaxing agent expiry must not silently relax the credential that mints credentials, and unlike an agent key an admin key can never be minted without an expiry. |
 | `--pepper-file` | `<data-dir>/pepper.key` | Out-of-database HMAC pepper. Generated on first start. |
 
 ### Limits
@@ -88,7 +93,7 @@ widen them past what is set here.
 | `--range-query-timeout` | `120s` | Range queries. |
 | `--max-response-bytes` | `32Mi` | Maximum accepted from one upstream response, enforced **during** the read and applied to the decompressed size. |
 | `--max-inflight-per-cluster` | `8` | Per-cluster in-flight limit. Over it returns a retryable "busy", not an unbounded queue. |
-| `--max-response-budget-bytes` | `256Mi` | Process-wide in-flight response byte budget. This is what stops 100 concurrent large results from OOM-killing the hub. |
+| `--max-response-budget-bytes` | `256Mi` | Process-wide budget for response bytes actively IN TRANSFER. It is reserved before the upstream call and released the moment it returns, so it does not cover the decoded and rendered copies a tool call still holds afterwards — set the pod memory limit to several times this, not equal to it. |
 | `--max-spokes` | `0` | Optional cap on concurrent spoke sessions per hub replica. `0` means no limit. It counts sessions, not clusters — a cluster holds one per spoke pod. |
 | `--facts-poll-interval` | `60s` | How often cluster facts are refreshed. Unchanged facts cost about 40 bytes. |
 | `--enable-status-config` | `false` | Ungates `/api/v1/status/config`. **Leave this off** unless you have audited your scrape configurations — they routinely contain bearer tokens in plain text. |

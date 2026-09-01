@@ -412,6 +412,10 @@ func validForm(e promapi.Endpoint) url.Values {
 		return url.Values{
 			"query": {"up"}, "start": {"1756000000"}, "end": {"1756003600"}, "step": {"1m"},
 		}
+	case promapi.EndpointQueryExemplars:
+		// Same required-parameter shape as its query siblings; added when the
+		// endpoint was, so this table stays exhaustive.
+		return url.Values{"query": {"up"}, "start": {"1756000000"}, "end": {"1756003600"}}
 	case promapi.EndpointSeries:
 		return url.Values{"match[]": {`up{job="api"}`}}
 	default:

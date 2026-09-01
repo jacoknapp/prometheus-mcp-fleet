@@ -21,7 +21,10 @@ every cluster, with the hub handling routing, discovery, authorization and the
 budget enforcement that keeps a curious model from melting a production TSDB or
 its own context window.
 
-It is built for roughly 100 clusters. The spoke idles at about 20 MiB, and
+It is built for roughly 100 clusters. The spoke is intentionally lightweight —
+its own idle heap footprint is small enough to regression-test directly
+(`go test ./test/bench`, the same treatment as the token-reduction figure
+below), and its chart requests 64Mi of pod memory by default. And
 **there is no database and no PersistentVolumeClaim anywhere** — the fleet is
 self-registering, so the only durable state is a little credential material in a
 Kubernetes Secret.
@@ -256,17 +259,22 @@ Full walkthrough: [docs/deployment/quickstart.md](docs/deployment/quickstart.md)
 
 ## What the agent can do
 
-Sixteen tools covering the Prometheus surface, all read-only:
+Nineteen tools covering the Prometheus surface, all read-only:
 
 | | |
 |---|---|
-| **Discover** | `list_clusters` · `describe_cluster` · `search_metrics` · `metric_metadata` |
-| **Query** | `query` · `query_range` · `series` · `label_names` · `label_values` |
-| **Operate** | `targets` · `rules` · `alerts` · `tsdb_stats` · `runtime_info` |
+| **Discover** | `list_clusters` · `describe_cluster` · `search_metrics` · `metric_metadata` · `target_metadata` |
+| **Query** | `query` · `query_range` · `query_exemplars` · `series` · `label_names` · `label_values` |
+| **Operate** | `targets` · `rules` · `alerts` · `alertmanagers` · `tsdb_stats` · `runtime_info` |
 | **Fleet** | `fanout_query` — one PromQL across many clusters, partial failure reported explicitly |
 | **Assist** | `explain_promql` — validate a query without executing it |
 
-Plus MCP resources (`fleet://clusters`, `fleet://alerts/firing`) and five prompt
+The operational surfaces (`targets`, `target_metadata`, `alertmanagers`,
+`tsdb_stats`, `runtime_info`) sit behind the key's role tier: an `operator`
+key gets them with `tools: "*"`, a `viewer` key must name them explicitly.
+
+Plus MCP resources (`fleet://clusters`, `fleet://clusters/{name}`,
+`fleet://alerts/firing`, `fleet://promql/cheatsheet`) and five prompt
 templates for common SRE tasks. Every tool's JSON schema, defaults, caps and
 error codes: [docs/mcp-tools.md](docs/mcp-tools.md).
 

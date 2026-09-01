@@ -4,6 +4,8 @@
 package ca
 
 import (
+	"bytes"
+	"crypto/x509"
 	"fmt"
 	"regexp"
 	"time"
@@ -59,6 +61,22 @@ type Options struct {
 	// Clock supplies the current time. It exists so tests can drive expiry
 	// boundaries deterministically. Defaults to time.Now.
 	Clock func() time.Time
+	// AdditionalRootsPEM names roots that must be trusted alongside the active
+	// signer, as one or more concatenated PEM CERTIFICATE blocks. Unset or
+	// blank means the active signer is the only trust anchor, which is the
+	// steady state; the field exists so that during a root rotation the
+	// outgoing and incoming roots can both be accepted while the fleet
+	// migrates. See docs/adr/0015-ca-rotation.md.
+	//
+	// It is additive on purpose. A field that replaced the trust bundle
+	// outright could be set to a list that omits the active signer, and an
+	// authority that does not trust its own signer issues certificates it will
+	// then refuse -- silently, until the first spoke reconnects. Adding the
+	// signer unconditionally makes that state unreachable.
+	//
+	// Order does not matter and repeats are ignored, so pointing this at a
+	// bundle file that already contains the active signer is safe.
+	AdditionalRootsPEM []byte
 }
 
 // withDefaults returns a copy of o with every unset field filled in.
@@ -76,6 +94,18 @@ func (o Options) withDefaults() Options {
 		o.Clock = time.Now
 	}
 	return o
+}
+
+// additionalRoots parses [Options.AdditionalRootsPEM]. A blank value is not an
+// error: it is the steady state in which the active signer is the only root.
+// Anything else must parse into at least one certificate-signing CA, because a
+// value that was set and yields no roots is a truncated file or the wrong
+// ConfigMap key, never an intention.
+func (o Options) additionalRoots() ([]*x509.Certificate, error) {
+	if len(bytes.TrimSpace(o.AdditionalRootsPEM)) == 0 {
+		return nil, nil
+	}
+	return ParseTrustBundlePEM(o.AdditionalRootsPEM)
 }
 
 // validate reports whether o, after defaulting, describes a usable CA.

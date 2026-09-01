@@ -1,0 +1,11 @@
+{
+  "status": "success",
+  "data": {
+    "activeAlertmanagers": [
+      { "url": "http://alertmanager.monitoring.svc:9093/api/v2/alerts" }
+    ],
+    "droppedAlertmanagers": [
+      { "url": "http://amuser:am-s3cr3t-pass@old-alertmanager.monitoring.svc:9093/api/v2/alerts" }
+    ]
+  }
+}

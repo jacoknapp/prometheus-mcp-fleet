@@ -85,6 +85,21 @@ func TestHubValidate(t *testing.T) {
 			"below --max-response-bytes",
 		},
 		{"facts poll interval", func(c *Hub) { c.FactsPollInterval = 0 }, "--facts-poll-interval"},
+		{
+			"ca rotate fraction above one",
+			func(c *Hub) { c.CARotateAtRemainingFraction = 1.5 },
+			"--ca-rotate-at-remaining-fraction",
+		},
+		{
+			"ca rotate fraction negative",
+			func(c *Hub) { c.CARotateAtRemainingFraction = -0.1 },
+			"--ca-rotate-at-remaining-fraction",
+		},
+		{
+			"ca rotation poll interval",
+			func(c *Hub) { c.CARotationPollInterval = 0 },
+			"--ca-rotation-poll-interval",
+		},
 		{"drain delay negative", func(c *Hub) { c.ShutdownDrainDelay = -time.Second }, "--shutdown-drain-delay"},
 		{"shutdown grace", func(c *Hub) { c.ShutdownGrace = 0 }, "--shutdown-grace"},
 		{"sample ratio high", func(c *Hub) { c.TraceSampleRatio = 1.5 }, "--trace-sample-ratio"},
@@ -431,5 +446,34 @@ func TestSpokeValidateAccumulates(t *testing.T) {
 	}
 	if n := len(joined.Unwrap()); n != 3 {
 		t.Errorf("Validate() reported %d problems, want 3:\n%v", n, err)
+	}
+}
+
+// TestCARotationRunway pins the floor under the rotation trigger. It is two
+// waits the hub cannot shorten: one certificate lifetime with the successor
+// published and the old root still signing, then a lifetime plus the renewal
+// grace with the successor signing and the old root still trusted. A signer
+// with less life left than this cannot see a rotation through, so the trigger
+// never starts one it could not finish.
+func TestCARotationRunway(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		ttl   time.Duration
+		grace time.Duration
+		want  time.Duration
+	}{
+		{"defaults", 14 * 24 * time.Hour, 30 * 24 * time.Hour, 58 * 24 * time.Hour},
+		{"no renewal grace", 24 * time.Hour, 0, 48 * time.Hour},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := &Hub{SpokeCertTTL: tc.ttl, RenewGrace: tc.grace}
+			if got := c.CARotationRunway(); got != tc.want {
+				t.Errorf("CARotationRunway() = %s, want %s", got, tc.want)
+			}
+		})
 	}
 }

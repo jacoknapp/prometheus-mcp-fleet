@@ -562,13 +562,16 @@ func TestRotateKeyEdgeCases(t *testing.T) {
 // let an agent rotation mint itself the ninety-day admin lifetime.
 func TestRotateKeyUsesTheCeilingForItsOwnClass(t *testing.T) {
 	t.Parallel()
-	h := newHarness(t, nil)
+	// The shipped defaults are now equal (90 days each), so distinct ceilings
+	// are configured explicitly: the point of this test is which ceiling a
+	// rotation consults, not what the defaults happen to be.
+	h := newHarness(t, func(o *Options) {
+		o.AgentKeyTTL = 30 * 24 * time.Hour
+		o.AdminKeyTTL = 90 * 24 * time.Hour
+	})
 
-	// Between DefaultAgentKeyTTL (30 days) and DefaultAdminKeyTTL (90 days).
+	// Between the agent ceiling (30 days) and the admin ceiling (90 days).
 	between := fleet.Duration(60 * 24 * time.Hour)
-	if time.Duration(between) <= DefaultAgentKeyTTL || time.Duration(between) >= DefaultAdminKeyTTL {
-		t.Fatalf("the chosen TTL %s no longer sits between the two ceilings", time.Duration(between))
-	}
 
 	var admin MintedKeyResponse
 	decode(t, h.adminDo(http.MethodPost, "/admin/v1/keys",

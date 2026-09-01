@@ -92,6 +92,19 @@ func run[In any, Out toolOut](
 				mcpsurface.CodeForbidden,
 				"tool %q is not permitted by this credential's scope", name)
 		}
+		if !roleAllows(p.Scope, name) {
+			tl.log.WarnContext(ctx, "mcptools: operational tool denied by role tier",
+				"principal", p.String(), "tool", name, "role", string(p.Scope.Role))
+			tl.metrics.ToolCall(name, "FORBIDDEN")
+			tl.metrics.ToolDuration(name, tl.now().Sub(start))
+			var none Out
+			return none, mcpsurface.ErrorResult, mcpsurface.ProtocolError(
+				mcpsurface.CodeForbidden,
+				"tool %q is an operational surface: this credential's role is %q, "+
+					"and its scope reaches the tool only through the \"*\" wildcard. "+
+					"Grant role operator, or name the tool in tools.allow.",
+				name, string(p.Scope.Role))
+		}
 
 		out, terr := fn(ctx, p, in)
 		result := "ok"
@@ -109,6 +122,25 @@ func run[In any, Out toolOut](
 		}
 		return out, mcpsurface.OKResult, nil
 	}
+}
+
+// roleAllows applies the role tier to one tool call. Only operational tools
+// are gated, only when reached through the "*" wildcard, and only for roles
+// below operator: naming the tool in tools.allow is the deliberate grant that
+// overrides the tier, and deny always beat both before this is reached.
+func roleAllows(s *fleet.Scope, name string) bool {
+	if s == nil {
+		// Unreachable behind AllowsTool's own nil check, but this function
+		// must not depend on its caller's ordering to avoid a panic.
+		return false
+	}
+	if !operationalTools[name] {
+		return true
+	}
+	if s.Role == fleet.RoleOperator || s.Role == fleet.RoleAdmin {
+		return true
+	}
+	return s.ToolExplicitlyAllowed(name)
 }
 
 // resolveCluster maps a caller-supplied cluster name onto a registry entry.

@@ -335,6 +335,117 @@ func TestListKeysCopiesEnrollmentGrants(t *testing.T) {
 	}
 }
 
+// TestReplaceKeyState drives the document-level rotation primitive directly,
+// including the branches the shared backend suite reaches only through a
+// backend: the zero revocation time falling back to the clock, and the exact
+// field mutations on the outgoing record.
+func TestReplaceKeyState(t *testing.T) {
+	t.Parallel()
+
+	t.Run("replaces and revokes as one mutation", func(t *testing.T) {
+		t.Parallel()
+		s := NewState()
+		if _, err := s.PutKey(agentKey("agent0001", tBase)); err != nil {
+			t.Fatalf("PutKey: %v", err)
+		}
+		at := tBase.Add(time.Hour)
+		changed, err := s.ReplaceKey(agentKey("agent0002", at), "agent0001", "rotated (replaced by agent0002)", at, clockAt(tBase))
+		if err != nil || !changed {
+			t.Fatalf("ReplaceKey = %v, %v; want a change", changed, err)
+		}
+		old, err := s.GetKey("agent0001")
+		if err != nil {
+			t.Fatalf("GetKey(old): %v", err)
+		}
+		if old.RevokedAt == nil || !old.RevokedAt.Equal(at) || old.RevokedReason != "rotated (replaced by agent0002)" {
+			t.Errorf("old record = revokedAt %v reason %q, want %s and the rotation reason", old.RevokedAt, old.RevokedReason, at)
+		}
+		if fresh, err := s.GetKey("agent0002"); err != nil || fresh.Revoked() {
+			t.Errorf("fresh record = %v, %v; want live", fresh, err)
+		}
+	})
+
+	t.Run("a zero revocation time takes the clock", func(t *testing.T) {
+		t.Parallel()
+		s := NewState()
+		if _, err := s.PutKey(agentKey("agent0001", tBase)); err != nil {
+			t.Fatalf("PutKey: %v", err)
+		}
+		now := tBase.Add(2 * time.Hour)
+		if _, err := s.ReplaceKey(agentKey("agent0002", tBase), "agent0001", "rotated", time.Time{}, clockAt(now)); err != nil {
+			t.Fatalf("ReplaceKey: %v", err)
+		}
+		old, err := s.GetKey("agent0001")
+		if err != nil {
+			t.Fatalf("GetKey: %v", err)
+		}
+		if old.RevokedAt == nil || !old.RevokedAt.Equal(now) {
+			t.Errorf("RevokedAt = %v, want the clock's %s", old.RevokedAt, now)
+		}
+	})
+
+	t.Run("missing source is ErrNotFound", func(t *testing.T) {
+		t.Parallel()
+		s := NewState()
+		if _, err := s.ReplaceKey(agentKey("agent0002", tBase), "agent-none", "rotated", tBase, clockAt(tBase)); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("err = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("revoked source is ErrRevoked, never ErrAlreadyExists", func(t *testing.T) {
+		t.Parallel()
+		s := NewState()
+		if _, err := s.PutKey(agentKey("agent0001", tBase)); err != nil {
+			t.Fatalf("PutKey: %v", err)
+		}
+		if _, err := s.RevokeKey("agent0001", "rotated (replaced by agent0009)", tBase, clockAt(tBase)); err != nil {
+			t.Fatalf("RevokeKey: %v", err)
+		}
+		_, err := s.ReplaceKey(agentKey("agent0002", tBase), "agent0001", "rotated", tBase, clockAt(tBase))
+		if !errors.Is(err, ErrRevoked) || errors.Is(err, ErrAlreadyExists) {
+			t.Fatalf("err = %v, want ErrRevoked and not ErrAlreadyExists", err)
+		}
+		if !strings.Contains(err.Error(), "agent0009") {
+			t.Errorf("err = %q, want the recorded reason naming the replacement", err)
+		}
+	})
+
+	t.Run("a taken fresh KID changes nothing", func(t *testing.T) {
+		t.Parallel()
+		s := NewState()
+		if _, err := s.PutKey(agentKey("agent0001", tBase)); err != nil {
+			t.Fatalf("PutKey: %v", err)
+		}
+		if _, err := s.PutKey(agentKey("agent0002", tBase)); err != nil {
+			t.Fatalf("PutKey: %v", err)
+		}
+		if _, err := s.ReplaceKey(agentKey("agent0002", tBase), "agent0001", "rotated", tBase, clockAt(tBase)); !errors.Is(err, ErrAlreadyExists) {
+			t.Fatalf("err = %v, want ErrAlreadyExists", err)
+		}
+		old, err := s.GetKey("agent0001")
+		if err != nil {
+			t.Fatalf("GetKey: %v", err)
+		}
+		if old.Revoked() {
+			t.Error("the old key was revoked by a failed ReplaceKey")
+		}
+	})
+
+	t.Run("an invalid fresh key changes nothing", func(t *testing.T) {
+		t.Parallel()
+		s := NewState()
+		if _, err := s.PutKey(agentKey("agent0001", tBase)); err != nil {
+			t.Fatalf("PutKey: %v", err)
+		}
+		if _, err := s.ReplaceKey(&fleet.Key{}, "agent0001", "rotated", tBase, clockAt(tBase)); err == nil {
+			t.Fatal("ReplaceKey accepted an invalid fresh key")
+		}
+		if old, _ := s.GetKey("agent0001"); old.Revoked() {
+			t.Error("the old key was revoked by a failed ReplaceKey")
+		}
+	})
+}
+
 func TestRevokeKeyIdempotence(t *testing.T) {
 	t.Parallel()
 	s := NewState()

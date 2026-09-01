@@ -24,6 +24,7 @@ reasoning that turned out to be wrong is often the most useful part.
 | [0012](0012-token-efficient-tool-output.md) | Tool output is token-efficient by default | Accepted |
 | [0013](0013-no-hub-peer-forwarding.md) | No hub-to-hub forwarding | Accepted |
 | [0014](0014-websocket-tunnel-through-standard-ingress.md) | Tunnel over WebSocket through a standard Ingress | Accepted |
+| [0015](0015-ca-rotation.md) | The CA separates its active signer from its trust bundle, and rotates itself | Accepted |
 
 ## Template
 

@@ -405,6 +405,13 @@ func (s *Store) ListKeys(ctx context.Context, class fleet.KeyClass) ([]*fleet.Ke
 	return st.ListKeys(class), nil
 }
 
+// ReplaceKey implements store.Store.
+func (s *Store) ReplaceKey(ctx context.Context, fresh *fleet.Key, oldKID, reason string, at time.Time) error {
+	return s.mutate(ctx, func(st *store.State) (bool, error) {
+		return st.ReplaceKey(fresh, oldKID, reason, at, s.now)
+	})
+}
+
 // RevokeKey implements store.Store.
 func (s *Store) RevokeKey(ctx context.Context, kid, reason string, at time.Time) error {
 	return s.mutate(ctx, func(st *store.State) (bool, error) {

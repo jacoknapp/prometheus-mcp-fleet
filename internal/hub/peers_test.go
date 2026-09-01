@@ -6,6 +6,7 @@ package hub
 import (
 	"context"
 	"errors"
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/config"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -105,7 +106,7 @@ func TestPeerCounterEmptyDomainNeverResolves(t *testing.T) {
 	t.Parallel()
 
 	logger, _ := newLogSink()
-	p := newPeerCounter("", logger)
+	p := newPeerCounter("", logger, nil)
 	p.resolve = panicResolve(t)
 
 	for i := range 3 {
@@ -138,7 +139,13 @@ func TestPeerCounterFirstCallTriggersABackgroundRefresh(t *testing.T) {
 	g := newGatedResolve()
 	g.set([]string{"10.0.0.1", "10.0.0.2"}, nil)
 
-	p := newPeerCounter("hub-headless.monitoring.svc", logger)
+	var observed []int
+	var observedMu sync.Mutex
+	p := newPeerCounter("hub-headless.monitoring.svc", logger, func(n int) {
+		observedMu.Lock()
+		observed = append(observed, n)
+		observedMu.Unlock()
+	})
 	p.resolve = g.resolve
 
 	if got := p.Count(); got != 0 {
@@ -149,6 +156,15 @@ func TestPeerCounterFirstCallTriggersABackgroundRefresh(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if p.Count() == 2 {
+			// The observer is the discovered-peers gauge: it must have been
+			// told the same count the spokes will be, or the one alert for a
+			// broken discovery watches a number nothing updates.
+			observedMu.Lock()
+			got := append([]int(nil), observed...)
+			observedMu.Unlock()
+			if len(got) == 0 || got[len(got)-1] != 2 {
+				t.Fatalf("observer saw %v, want a final 2", got)
+			}
 			return
 		}
 		time.Sleep(time.Millisecond)
@@ -166,7 +182,7 @@ func TestPeerCounterServesACachedValueWhileFresh(t *testing.T) {
 	now := time.Now()
 	clock := func() time.Time { return now }
 
-	p := newPeerCounter("hub-headless.monitoring.svc", logger)
+	p := newPeerCounter("hub-headless.monitoring.svc", logger, nil)
 	p.now = clock
 	p.ttl = time.Minute
 	p.count = 3
@@ -176,6 +192,47 @@ func TestPeerCounterServesACachedValueWhileFresh(t *testing.T) {
 	if got := p.Count(); got != 3 {
 		t.Fatalf("Count() = %d, want the cached 3", got)
 	}
+}
+
+// TestPeerCounterFreshnessBoundaryIsInclusive pins the exact instant the
+// cache flips from fresh to stale: one tick before the TTL has elapsed the
+// cached value must be served with no DNS lookup, and AT the TTL a refresh
+// must already be started. TestPeerCounterServesACachedValueWhileFresh (zero
+// elapsed) and the stale-cache test (two TTLs elapsed) both sit far enough
+// from this line that a CONDITIONALS_BOUNDARY mutant turning "<" into "<="
+// would pass either unnoticed.
+func TestPeerCounterFreshnessBoundaryIsInclusive(t *testing.T) {
+	t.Parallel()
+
+	logger, _ := newLogSink()
+	now := time.Now()
+
+	// One tick before the TTL has elapsed: still fresh, so resolve must
+	// never be consulted.
+	before := newPeerCounter("hub-headless.monitoring.svc", logger, nil)
+	before.now = func() time.Time { return now }
+	before.ttl = time.Minute
+	before.count = 3
+	before.fetched = now.Add(-(time.Minute - time.Nanosecond))
+	before.resolve = panicResolve(t)
+	if got := before.Count(); got != 3 {
+		t.Fatalf("Count() = %d, want the cached 3 one tick before the TTL", got)
+	}
+
+	// Exactly at the TTL: stale, so a background refresh must start.
+	g := newGatedResolve()
+	g.set([]string{"10.0.0.1"}, nil)
+	at := newPeerCounter("hub-headless.monitoring.svc", logger, nil)
+	at.now = func() time.Time { return now }
+	at.ttl = time.Minute
+	at.count = 3
+	at.fetched = now.Add(-time.Minute)
+	at.resolve = g.resolve
+	if got := at.Count(); got != 3 {
+		t.Fatalf("Count() = %d, want the still-cached 3 while the refresh runs", got)
+	}
+	waitForCalls(t, g, 1)
+	g.letThrough()
 }
 
 // TestPeerCounterStaleCacheTriggersExactlyOneRefreshUnderConcurrency is the
@@ -196,7 +253,7 @@ func TestPeerCounterStaleCacheTriggersExactlyOneRefreshUnderConcurrency(t *testi
 	g := newGatedResolve()
 	g.set([]string{"10.0.0.1"}, nil)
 
-	p := newPeerCounter("hub-headless.monitoring.svc", logger)
+	p := newPeerCounter("hub-headless.monitoring.svc", logger, nil)
 	p.now = clock
 	p.ttl = time.Minute
 	p.resolve = g.resolve
@@ -235,7 +292,7 @@ func TestPeerCounterCountNeverBlocksOnDNS(t *testing.T) {
 	logger, _ := newLogSink()
 	g := newGatedResolve() // never released during this test
 
-	p := newPeerCounter("hub-headless.monitoring.svc", logger)
+	p := newPeerCounter("hub-headless.monitoring.svc", logger, nil)
 	p.resolve = g.resolve
 
 	done := make(chan int, 1)
@@ -251,6 +308,38 @@ func TestPeerCounterCountNeverBlocksOnDNS(t *testing.T) {
 	}
 }
 
+// TestPeerCounterRefreshBudgetsAFiveSecondTimeout pins that the context
+// refresh hands to resolve carries the full 5-second budget the code
+// comments its way to, not merely "a" budget. An ARITHMETIC_BASE mutant
+// turning "5*time.Second" into "5/time.Second" collapses it to zero, so the
+// context would already be expired the instant resolve receives it.
+func TestPeerCounterRefreshBudgetsAFiveSecondTimeout(t *testing.T) {
+	t.Parallel()
+
+	logger, _ := newLogSink()
+	p := newPeerCounter("hub-headless.monitoring.svc", logger, nil)
+	entered := make(chan struct{})
+	p.resolve = func(ctx context.Context, _ string) ([]string, error) {
+		close(entered)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		p.refresh()
+	}()
+
+	<-entered
+	select {
+	case <-finished:
+		t.Fatal("refresh returned almost immediately; its context was already expired")
+	case <-time.After(200 * time.Millisecond):
+		// Still running with roughly 4.8s of budget left, as it must be.
+	}
+}
+
 // TestPeerCounterResolveErrorKeepsThePreviousCount is deliberate: zero means
 // "no idea", which would tell every spoke to stop dialing for full coverage,
 // so a momentary NXDOMAIN during a rolling update must not collapse the fleet
@@ -259,7 +348,7 @@ func TestPeerCounterResolveErrorKeepsThePreviousCount(t *testing.T) {
 	t.Parallel()
 
 	logger, sink := newLogSink()
-	p := newPeerCounter("hub-headless.monitoring.svc", logger)
+	p := newPeerCounter("hub-headless.monitoring.svc", logger, nil)
 	p.count = 3
 	p.resolve = immediateResolve(nil, errors.New("lookup hub-headless.monitoring.svc: no such host"))
 
@@ -280,7 +369,7 @@ func TestPeerCounterDeduplicatesAddresses(t *testing.T) {
 	t.Parallel()
 
 	logger, _ := newLogSink()
-	p := newPeerCounter("hub-headless.monitoring.svc", logger)
+	p := newPeerCounter("hub-headless.monitoring.svc", logger, nil)
 	p.resolve = immediateResolve([]string{"10.0.0.1", "10.0.0.1", "10.0.0.2"}, nil)
 
 	p.refresh()
@@ -296,7 +385,7 @@ func TestPeerCounterLogsAChangedCount(t *testing.T) {
 	t.Parallel()
 
 	logger, sink := newLogSink()
-	p := newPeerCounter("hub-headless.monitoring.svc", logger)
+	p := newPeerCounter("hub-headless.monitoring.svc", logger, nil)
 	p.count = 1
 	p.resolve = immediateResolve([]string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}, nil)
 
@@ -320,7 +409,7 @@ func TestPeerCounterDoesNotLogAnUnchangedCount(t *testing.T) {
 	t.Parallel()
 
 	logger, sink := newLogSink()
-	p := newPeerCounter("hub-headless.monitoring.svc", logger)
+	p := newPeerCounter("hub-headless.monitoring.svc", logger, nil)
 	p.count = 2
 	p.resolve = immediateResolve([]string{"10.0.0.1", "10.0.0.2"}, nil)
 
@@ -339,7 +428,7 @@ func TestNewPeerCounterWiresRealDefaults(t *testing.T) {
 	t.Parallel()
 
 	logger, _ := newLogSink()
-	p := newPeerCounter("hub-headless.monitoring.svc", logger)
+	p := newPeerCounter("hub-headless.monitoring.svc", logger, nil)
 
 	if p.domain != "hub-headless.monitoring.svc" {
 		t.Errorf("domain = %q, want the configured value", p.domain)
@@ -352,5 +441,28 @@ func TestNewPeerCounterWiresRealDefaults(t *testing.T) {
 	}
 	if p.ttl != peerCacheTTL {
 		t.Errorf("ttl = %s, want %s", p.ttl, peerCacheTTL)
+	}
+}
+
+// TestAdvertisedReplicas pins the meaning of the hello's replica count. Zero
+// is reserved for "unknown, keep probing" -- so a hub with NO discovery
+// domain, whose only reachable replica is itself, must advertise exactly 1,
+// or every spoke would probe forever for a count that is never coming. With
+// discovery configured, the count comes from the resolver, cold cache and
+// all: that zero is the one that closes the bootstrap hole.
+func TestAdvertisedReplicas(t *testing.T) {
+	t.Parallel()
+
+	logger, _ := newLogSink()
+
+	h := &hub{cfg: &config.Hub{}}
+	if got := h.advertisedReplicas(newPeerCounter("", logger, nil))(); got != 1 {
+		t.Errorf("no discovery domain: advertised = %d, want 1", got)
+	}
+
+	h2 := &hub{cfg: &config.Hub{PeerDiscoveryDomain: "hub-peers.ns.svc"}}
+	p := newPeerCounter("hub-peers.ns.svc", logger, nil)
+	if got := h2.advertisedReplicas(p)(); got != 0 {
+		t.Errorf("cold discovery cache: advertised = %d, want 0 (unknown)", got)
 	}
 }

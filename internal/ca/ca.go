@@ -18,7 +18,9 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -70,11 +72,41 @@ var (
 // MarshalJSON method: the private key must not be reachable through any
 // formatting verb, panic trace or log field.
 type CA struct {
-	opts    Options
-	cert    *x509.Certificate
-	key     *ecdsa.PrivateKey
-	certPEM []byte
+	opts Options
+	// material is the signer and the trust bundle, published as one
+	// immutable snapshot behind an atomic pointer.
+	//
+	// A CA used to be immutable outright, which is what made every method on
+	// it safe for concurrent use without a lock. That property is kept, one
+	// level down: a [caMaterial] is never mutated after it is published, every
+	// method reads it exactly once, and a rotation swaps the whole snapshot in
+	// a single store. What changes is that the *handle* now outlives the
+	// material, so a rotation reaches everything holding a *CA without any of
+	// them being rebuilt -- which is the difference between rotating the root
+	// and restarting the process to rotate the root. See
+	// [CA.AdoptPEM] and docs/adr/0015-ca-rotation.md.
+	material atomic.Pointer[caMaterial]
 }
+
+// caMaterial is one immutable snapshot of what a CA signs with and what it
+// trusts. Nothing here is written after [newMaterial] returns.
+type caMaterial struct {
+	// cert and key are the active signer: the one keypair that signs every
+	// certificate this authority issues.
+	cert *x509.Certificate
+	key  *ecdsa.PrivateKey
+	// roots is the trust bundle: every root a presented certificate may chain
+	// to, active signer first. During a rotation it holds the outgoing root as
+	// well, which is the whole reason issuance and verification are separate
+	// fields rather than one.
+	roots     []*x509.Certificate
+	bundlePEM []byte
+}
+
+// current returns the snapshot in force. Callers that need two fields to agree
+// -- the signer certificate and the key that must match it, above all -- must
+// call this once and read both from the result, never call it twice.
+func (c *CA) current() *caMaterial { return c.material.Load() }
 
 // now returns the current time according to the configured clock.
 func (c *CA) now() time.Time { return c.opts.Clock() }
@@ -176,19 +208,54 @@ func Load(certPath, keyPath string, opts Options) (*CA, error) {
 		return nil, fmt.Errorf("read ca key %s: %w", keyPath, err)
 	}
 
+	cert, key, additional, err := parseMaterial(certPEM, keyPEM, opts)
+	if err != nil {
+		// Neither certPEM nor keyPEM is included in the message: one of them
+		// is the private key. The paths are, because they are what the
+		// operator has to go and look at.
+		return nil, fmt.Errorf("ca at %s and %s: %w", certPath, keyPath, err)
+	}
+	return newCA(opts, cert, key, additional), nil
+}
+
+// Parse builds a CA from PEM material already in memory.
+//
+// It is [Load] without the filesystem: the same certificate, key and trust
+// bundle checks, applied to bytes that came from somewhere other than a file.
+// The hub's durable state is a Kubernetes Secret (ADR-0005), so a rotation
+// reads and writes PEM and never wants a path; the key-file permission check
+// [Load] performs has no meaning here and is the only thing missing.
+func Parse(certPEM, keyPEM []byte, opts Options) (*CA, error) {
+	opts = opts.withDefaults()
+	if err := opts.validate(); err != nil {
+		return nil, err
+	}
+	cert, key, additional, err := parseMaterial(certPEM, keyPEM, opts)
+	if err != nil {
+		return nil, err
+	}
+	return newCA(opts, cert, key, additional), nil
+}
+
+// parseMaterial validates a signer keypair and the additional roots in opts.
+func parseMaterial(certPEM, keyPEM []byte, opts Options) (*x509.Certificate, *ecdsa.PrivateKey, []*x509.Certificate, error) {
 	cert, err := parseCertificatePEM(certPEM)
 	if err != nil {
-		return nil, fmt.Errorf("ca certificate %s: %w", certPath, err)
+		return nil, nil, nil, fmt.Errorf("ca certificate: %w", err)
 	}
 	key, err := parsePrivateKeyPEM(keyPEM)
 	if err != nil {
 		// keyPEM is never included in the message: it is the key.
-		return nil, fmt.Errorf("ca key %s: %w", keyPath, err)
+		return nil, nil, nil, fmt.Errorf("ca key: %w", err)
 	}
 	if err := checkCAUsable(cert, key); err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
-	return newCA(opts, cert, key), nil
+	additional, err := opts.additionalRoots()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return cert, key, additional, nil
 }
 
 // Create writes a brand new self-signed CA to certPath and keyPath.
@@ -209,6 +276,10 @@ func Create(certPath, keyPath string, opts Options) (*CA, error) {
 	if err := opts.validate(); err != nil {
 		return nil, err
 	}
+	additional, err := opts.additionalRoots()
+	if err != nil {
+		return nil, err
+	}
 	// Fast path: refuse before spending a key generation. This is advisory
 	// only; the link below is the authoritative exclusion.
 	for _, p := range []string{certPath, keyPath} {
@@ -221,13 +292,34 @@ func Create(certPath, keyPath string, opts Options) (*CA, error) {
 		}
 	}
 
+	cert, key, certPEM, keyPEM, err := mintRoot(opts)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := linkFileExclusive(keyPath, keyPEM, 0o600); err != nil {
+		return nil, err
+	}
+	if err := linkFileExclusive(certPath, certPEM, 0o644); err != nil {
+		// Do not leave a key behind with no certificate.
+		_ = caRemove(keyPath)
+		return nil, err
+	}
+	return newCA(opts, cert, key, additional), nil
+}
+
+// mintRoot generates one self-signed root and returns it both parsed and PEM
+// encoded. It touches no filesystem, which is what lets a rotation mint a
+// successor straight into the Secret that is the only durable state this
+// system has (ADR-0005).
+func mintRoot(opts Options) (*x509.Certificate, *ecdsa.PrivateKey, []byte, []byte, error) {
 	key, err := caGenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return nil, fmt.Errorf("generate ca key: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("generate ca key: %w", err)
 	}
 	serial, err := newSerial()
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, nil, err
 	}
 	now := opts.Clock()
 	tmpl := &x509.Certificate{
@@ -249,58 +341,92 @@ func Create(certPath, keyPath string, opts Options) (*CA, error) {
 	}
 	der, err := caCreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
-		return nil, fmt.Errorf("self-sign ca certificate: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("self-sign ca certificate: %w", err)
 	}
 	// x509.CreateCertificate's successful output and this supported key type
 	// are valid by construction; neither standard-library conversion can fail.
 	cert, _ := x509.ParseCertificate(der)
 	keyDER, _ := x509.MarshalPKCS8PrivateKey(key)
-
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: pemTypeCertificate, Bytes: der})
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: pemTypePrivateKey, Bytes: keyDER})
-
-	if err := linkFileExclusive(keyPath, keyPEM, 0o600); err != nil {
-		return nil, err
-	}
-	if err := linkFileExclusive(certPath, certPEM, 0o644); err != nil {
-		// Do not leave a key behind with no certificate.
-		_ = caRemove(keyPath)
-		return nil, err
-	}
-	return newCA(opts, cert, key), nil
+	return cert,
+		key,
+		pem.EncodeToMemory(&pem.Block{Type: pemTypeCertificate, Bytes: der}),
+		pem.EncodeToMemory(&pem.Block{Type: pemTypePrivateKey, Bytes: keyDER}),
+		nil
 }
 
 // newCA assembles a CA from already-validated material.
-func newCA(opts Options, cert *x509.Certificate, key *ecdsa.PrivateKey) *CA {
-	return &CA{
-		opts:    opts,
-		cert:    cert,
-		key:     key,
-		certPEM: pem.EncodeToMemory(&pem.Block{Type: pemTypeCertificate, Bytes: cert.Raw}),
-	}
+//
+// The active signer is always the first root in the trust bundle and can never
+// be dropped from it, which is why the additional roots are additive rather
+// than a replacement list: an authority that could be configured not to trust
+// its own signer would issue certificates it then refuses, and would do so
+// silently until the first spoke reconnected.
+//
+// Duplicates are dropped rather than rejected. Concatenating the outgoing and
+// incoming roots into one bundle file and pointing both hub settings at it is
+// the obvious way to run a rotation, and it necessarily names the active
+// signer twice.
+func newCA(opts Options, cert *x509.Certificate, key *ecdsa.PrivateKey, additional []*x509.Certificate) *CA {
+	c := &CA{opts: opts}
+	c.material.Store(newMaterial(cert, key, additional))
+	return c
 }
 
-// Certificate returns the CA's own certificate. The returned value is shared;
-// callers must treat it as read-only.
-func (c *CA) Certificate() *x509.Certificate { return c.cert }
+// newMaterial assembles one immutable snapshot. It is shared by construction
+// and by [CA.AdoptPEM] so a rotated authority is assembled by exactly the same
+// rules as a freshly loaded one.
+func newMaterial(cert *x509.Certificate, key *ecdsa.PrivateKey, additional []*x509.Certificate) *caMaterial {
+	roots := make([]*x509.Certificate, 0, 1+len(additional))
+	var bundle bytes.Buffer
+	appendRoot := func(root *x509.Certificate) {
+		if slices.ContainsFunc(roots, func(have *x509.Certificate) bool { return bytes.Equal(have.Raw, root.Raw) }) {
+			return
+		}
+		roots = append(roots, root)
+		bundle.Write(pem.EncodeToMemory(&pem.Block{Type: pemTypeCertificate, Bytes: root.Raw}))
+	}
+	appendRoot(cert)
+	for _, root := range additional {
+		appendRoot(root)
+	}
+	return &caMaterial{cert: cert, key: key, roots: roots, bundlePEM: bundle.Bytes()}
+}
 
-// BundlePEM returns the PEM encoding of the CA certificate, which is what a
-// spoke is handed at enrollment so it can verify the hub's tunnel listener. It
-// contains no private material. Each call returns a fresh copy.
-func (c *CA) BundlePEM() []byte { return bytes.Clone(c.certPEM) }
+// Certificate returns the active signer's certificate -- the issuer of every
+// certificate this authority mints from now on, which during a rotation is not
+// the only root it trusts. The returned value is shared; callers must treat it
+// as read-only. Use [CA.TrustBundle] for what is trusted.
+func (c *CA) Certificate() *x509.Certificate { return c.current().cert }
 
-// Pool returns a certificate pool trusting only this CA. A fresh pool is built
-// on every call so that a caller adding roots to it cannot widen the trust of
-// anything else.
+// BundlePEM returns the PEM trust bundle a spoke should be configured with:
+// every root this authority accepts, active signer first, and no private
+// material. Each call returns a fresh copy.
+//
+// During a rotation this is both roots, which is the point. A spoke holding
+// this bundle keeps verifying the hub whichever root signed the certificate it
+// is presented, so the fleet can be moved across without a flag day. The
+// active signer comes first so that a consumer which reads only the first
+// block still lands on the root that is issuing today.
+func (c *CA) BundlePEM() []byte { return bytes.Clone(c.current().bundlePEM) }
+
+// Pool returns a certificate pool trusting every root in this authority's
+// trust bundle. A fresh pool is built on every call so that a caller adding
+// roots to it cannot widen the trust of anything else.
 func (c *CA) Pool() *x509.CertPool {
 	p := x509.NewCertPool()
-	p.AddCert(c.cert)
+	for _, root := range c.current().roots {
+		p.AddCert(root)
+	}
 	return p
 }
 
-// NotAfter returns the CA certificate's expiry. The hub reports itself not
+// NotAfter returns the active signer's expiry. The hub reports itself not
 // ready once this is less than 24h away.
-func (c *CA) NotAfter() time.Time { return c.cert.NotAfter }
+//
+// It deliberately ignores the rest of the trust bundle. An outgoing root that
+// is being retired may well expire first, and that is the plan, not an
+// incident; what matters for readiness is the root that has to keep issuing.
+func (c *CA) NotAfter() time.Time { return c.current().cert.NotAfter }
 
 // TrustDomain returns the trust domain this CA issues for.
 func (c *CA) TrustDomain() string { return c.opts.TrustDomain }
@@ -329,15 +455,25 @@ func newSerial() (*big.Int, error) {
 	return n.Add(n, big.NewInt(1)), nil
 }
 
-// parseCertificatePEM decodes the first PEM block and requires it to be a
-// certificate.
+// parseCertificatePEM decodes exactly one PEM certificate block.
+//
+// More than one block is refused rather than ignored. The signer certificate
+// file is the file an operator reaches for when told to "serve both roots", and
+// before this check a concatenated old-and-new file loaded cleanly while
+// everything after the first block was silently discarded -- the rotation would
+// appear to have been performed and would have changed nothing. Additional
+// roots belong in Options.AdditionalRootsPEM, and saying so loudly here is the
+// only place that mistake can still be caught.
 func parseCertificatePEM(b []byte) (*x509.Certificate, error) {
-	blk, _ := pem.Decode(b)
+	blk, rest := pem.Decode(b)
 	if blk == nil {
 		return nil, fmt.Errorf("%w: no PEM block", ErrInvalidCA)
 	}
 	if blk.Type != pemTypeCertificate {
 		return nil, fmt.Errorf("%w: PEM block is %q, want %q", ErrInvalidCA, blk.Type, pemTypeCertificate)
+	}
+	if extra, _ := pem.Decode(rest); extra != nil {
+		return nil, fmt.Errorf("%w: holds more than one PEM block; the active signer certificate is exactly one certificate and further trust anchors belong in the trust bundle", ErrInvalidCA)
 	}
 	cert, err := x509.ParseCertificate(blk.Bytes)
 	if err != nil {
@@ -380,14 +516,26 @@ func parsePrivateKeyPEM(b []byte) (*ecdsa.PrivateKey, error) {
 	return key, nil
 }
 
+// caSigningDefect describes why cert cannot serve as a trust anchor for this
+// fleet, or returns "" if it can. It is shared by the active signer's checks
+// and the trust bundle's so the two can never drift into disagreeing about
+// what counts as a root.
+func caSigningDefect(cert *x509.Certificate) string {
+	switch {
+	case !cert.IsCA:
+		return "certificate is not a CA"
+	case cert.KeyUsage&x509.KeyUsageCertSign == 0:
+		return "certificate lacks the certSign key usage"
+	default:
+		return ""
+	}
+}
+
 // checkCAUsable verifies that cert really is a signing CA and that key is its
 // private half.
 func checkCAUsable(cert *x509.Certificate, key *ecdsa.PrivateKey) error {
-	if !cert.IsCA {
-		return fmt.Errorf("%w: certificate is not a CA", ErrInvalidCA)
-	}
-	if cert.KeyUsage&x509.KeyUsageCertSign == 0 {
-		return fmt.Errorf("%w: certificate lacks the certSign key usage", ErrInvalidCA)
+	if defect := caSigningDefect(cert); defect != "" {
+		return fmt.Errorf("%w: %s", ErrInvalidCA, defect)
 	}
 	pub, ok := cert.PublicKey.(*ecdsa.PublicKey)
 	if !ok {

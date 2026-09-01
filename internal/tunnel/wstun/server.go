@@ -330,12 +330,23 @@ func (s *Server) authenticate(conn net.Conn, remote string) (tunnel.Identity, er
 	}
 	leaf := chain[0]
 	if id.CertSerial == "" && leaf.SerialNumber != nil {
-		id.CertSerial = fmt.Sprintf("%x", leaf.SerialNumber)
+		// TrimPrefix mirrors ca.SerialHex (not importable here: wstun is a
+		// transport and depends on no CA). %x keeps a minus sign on a
+		// negative serial; every other formatter of this value strips it,
+		// and a serial spelled two ways is two different registry keys.
+		id.CertSerial = strings.TrimPrefix(fmt.Sprintf("%x", leaf.SerialNumber), "-")
 	}
 	if id.CertNotAfter.IsZero() {
 		id.CertNotAfter = leaf.NotAfter
 	}
 	if auth.InstanceID != "" {
+		// Self-reported and authenticates nothing, but it becomes a registry
+		// map key, a per-session goroutine, and a log field -- so its size
+		// and character set are bounded here. A spoke sending anything else
+		// is not a version skew to tolerate; it is broken or hostile.
+		if err := validInstanceID(auth.InstanceID); err != nil {
+			return tunnel.Identity{}, fmt.Errorf("%w: instanceId: %w", ErrHandshakeFailed, err)
+		}
 		id.InstanceID = auth.InstanceID
 	}
 	if s.cfg.IsRevoked != nil && s.cfg.IsRevoked(id.CertSerial) {
@@ -345,7 +356,14 @@ func (s *Server) authenticate(conn net.Conn, remote string) (tunnel.Identity, er
 	// Possession of the private key, over a nonce this hub chose for this
 	// connection. Everything before this proves only that the peer holds a
 	// copy of a certificate, which is public.
-	if err := certproof.Verify(leaf, auth.Signature, nonce, auth.ProtocolVersion, auth.ClusterID); err != nil {
+	//
+	// The transcript is verified against the hub's OWN protocol version, not
+	// the string the peer sent. compatibleVersion above is strict equality
+	// today, so the two are the same bytes -- but the moment a skew policy
+	// accepts more than one version, an echoed field would hand the peer a
+	// choice of transcript, and a domain-separation field the attacker
+	// selects is not domain separation.
+	if err := certproof.Verify(leaf, auth.Signature, nonce, ProtocolVersion, auth.ClusterID); err != nil {
 		return tunnel.Identity{}, err
 	}
 
@@ -513,4 +531,23 @@ var _ io.Closer = (*sessionConn)(nil)
 func (c *sessionConn) Close() error {
 	c.once.Do(func() { close(c.done) })
 	return c.Conn.Close()
+}
+
+// maxInstanceIDLen bounds the self-reported instance identifier. Real values
+// are pod names plus a short suffix; 128 leaves room for any sane naming
+// scheme while keeping a hostile 64 KiB value out of the registry and logs.
+const maxInstanceIDLen = 128
+
+// validInstanceID enforces the bound above and a printable character set,
+// because the value is stored as a map key and printed into structured logs.
+func validInstanceID(v string) error {
+	if len(v) > maxInstanceIDLen {
+		return fmt.Errorf("longer than %d bytes", maxInstanceIDLen)
+	}
+	for _, r := range v {
+		if r < 0x21 || r > 0x7e {
+			return fmt.Errorf("contains a byte outside printable ASCII")
+		}
+	}
+	return nil
 }

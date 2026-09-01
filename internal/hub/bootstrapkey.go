@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/fleet"
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/hubapi"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/token"
 )
 
@@ -95,15 +96,16 @@ func (h *hub) bootstrapAdminKey(ctx context.Context) error {
 	return nil
 }
 
-// bootstrapTTL is how long the automatically minted admin key lives. It matches
-// the configured admin lifetime where one is set, and otherwise defaults to the
-// agent key TTL, so the bootstrap credential is never longer-lived than the
-// credentials it is used to create.
+// bootstrapTTL is how long the automatically minted admin key lives: the
+// configured admin key lifetime. It used to fall back to the AGENT key TTL,
+// which meant an operator relaxing agent expiry -- a knob that now allows
+// years, or no expiry at all -- was silently relaxing the lifetime of the
+// most powerful credential in the fleet.
 func (h *hub) bootstrapTTL() time.Duration {
-	if h.cfg.AgentKeyTTL > 0 {
-		return h.cfg.AgentKeyTTL
+	if h.cfg.AdminKeyTTL > 0 {
+		return h.cfg.AdminKeyTTL
 	}
-	return 720 * time.Hour
+	return hubapi.DefaultAdminKeyTTL
 }
 
 // clock returns the current time. It exists so tests can pin it.

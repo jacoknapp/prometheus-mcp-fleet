@@ -88,6 +88,15 @@ const (
 	EventCertIssued = "cert.issued"
 	// EventCertRevoked is a certificate revocation.
 	EventCertRevoked = "cert.revoked"
+	// EventSessionRevoked is one or more live spoke tunnels torn down because
+	// the certificate that admitted them was revoked. It is recorded
+	// separately from EventCertRevoked because the two are different facts:
+	// the revocation is a change to a list, this is the connection it
+	// actually ended. A revocation of a serial that holds no live session
+	// records only EventCertRevoked, so the presence of this event is the
+	// evidence that a compromised spoke was disconnected rather than merely
+	// listed.
+	EventSessionRevoked = "session.revoked"
 	// EventCertRenewed is a successful certificate renewal.
 	EventCertRenewed = "cert.renewed"
 	// EventRenewalUnproven is a renewal that presented a trusted, unrevoked

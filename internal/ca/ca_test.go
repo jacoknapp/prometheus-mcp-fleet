@@ -262,7 +262,7 @@ func TestCreateThenLoadRoundTrip(t *testing.T) {
 	if diff := cmp.Diff(created.BundlePEM(), loaded.BundlePEM()); diff != "" {
 		t.Errorf("bundle differs after reload (-created +loaded):\n%s", diff)
 	}
-	if !created.key.PublicKey.Equal(&loaded.key.PublicKey) {
+	if !created.current().key.PublicKey.Equal(&loaded.current().key.PublicKey) {
 		t.Error("loaded key does not match created key")
 	}
 	// LoadOrCreate on an existing pair must load, not recreate.
@@ -281,7 +281,7 @@ func TestBundleAndPoolAreDefensiveCopies(t *testing.T) {
 	c := mustCA(t, Options{})
 	b1 := c.BundlePEM()
 	b1[0] ^= 0xff
-	if diff := cmp.Diff(c.BundlePEM(), c.certPEM); diff != "" {
+	if diff := cmp.Diff(c.BundlePEM(), c.current().bundlePEM); diff != "" {
 		t.Errorf("mutating BundlePEM changed the CA (-got +want):\n%s", diff)
 	}
 	p1, p2 := c.Pool(), c.Pool()
@@ -786,7 +786,7 @@ func TestLoadAcceptsSEC1Key(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sec1, err := x509.MarshalECPrivateKey(c.key)
+	sec1, err := x509.MarshalECPrivateKey(c.current().key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -797,7 +797,7 @@ func TestLoadAcceptsSEC1Key(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load with SEC1 key: %v", err)
 	}
-	if !loaded.key.PublicKey.Equal(&c.key.PublicKey) {
+	if !loaded.current().key.PublicKey.Equal(&c.current().key.PublicKey) {
 		t.Error("SEC1 key round trip produced a different key")
 	}
 }
@@ -1023,6 +1023,22 @@ func TestCAOperationalFailures(t *testing.T) {
 		certPath, keyPath := paths(t)
 		got, err := Create(certPath, keyPath, Options{})
 		assertBoom(t, got, err)
+		caGenerateKey = origGenerateKey
+	})
+
+	// NewRootPEM mints the successor a rotation begins with. A CSPRNG failure
+	// there must surface as an error and no material, because the caller is
+	// about to write whatever it is handed into the Secret the whole fleet
+	// reads.
+	t.Run("successor root key generation", func(t *testing.T) {
+		caGenerateKey = func(elliptic.Curve, io.Reader) (*ecdsa.PrivateKey, error) { return nil, boom }
+		certPEM, keyPEM, err := NewRootPEM(Options{})
+		if !errors.Is(err, boom) {
+			t.Fatalf("NewRootPEM() error = %v, want one wrapping boom", err)
+		}
+		if certPEM != nil || keyPEM != nil {
+			t.Error("NewRootPEM returned material alongside an error")
+		}
 		caGenerateKey = origGenerateKey
 	})
 

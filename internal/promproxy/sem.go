@@ -150,6 +150,7 @@ func (s *byteSem) release(n int64) {
 func (s *byteSem) grantLocked() {
 	for len(s.waiters) > 0 && s.waiters[0].n <= s.free {
 		w := s.waiters[0]
+		s.waiters[0] = nil
 		s.waiters = s.waiters[1:]
 		s.free -= w.n
 		close(w.ready)

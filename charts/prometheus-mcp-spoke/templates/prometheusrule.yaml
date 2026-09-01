@@ -118,9 +118,13 @@ spec:
             runbook_url: {{ $runbook }}prometheusmcpspokepartialcoverage
         {{- end }}
         {{- if .Values.metrics.prometheusRule.rules.tunnelFlapping }}
+        {{/* redundant-replica is excluded: the coverage probe deliberately
+             cycles one extra connection about once a minute, and during a
+             coverage search wrong guesses are redialed on purpose. Counting
+             either as flapping would page every healthy spoke, permanently. */}}
         - alert: PrometheusMCPSpokeTunnelFlapping
           expr: >-
-            sum(increase(promfleet_spoke_tunnel_reconnects_total{ {{ $sel }} }[1h]))
+            sum(increase(promfleet_spoke_tunnel_reconnects_total{ {{ $sel }}, reason!="redundant-replica" }[1h]))
             > {{ $t.reconnectsPerHour | int64 }}
           for: 15m
           labels:

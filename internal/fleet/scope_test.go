@@ -418,3 +418,30 @@ func TestClusterHealthy(t *testing.T) {
 		})
 	}
 }
+
+// TestToolExplicitlyAllowed pins the by-name/wildcard distinction the role
+// tier rides on: only a literal name in Allow is "explicit", and Deny beats
+// an explicit allow the same way it beats everything else.
+func TestToolExplicitlyAllowed(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name  string
+		scope *Scope
+		tool  string
+		want  bool
+	}{
+		{"nil scope", nil, "targets", false},
+		{"named", &Scope{Tools: ToolScope{Allow: []string{"targets"}}}, "targets", true},
+		{"wildcard is not explicit", &Scope{Tools: ToolScope{Allow: []string{"*"}}}, "targets", false},
+		{"absent", &Scope{Tools: ToolScope{Allow: []string{"query"}}}, "targets", false},
+		{"deny beats an explicit allow", &Scope{Tools: ToolScope{Allow: []string{"targets"}, Deny: []string{"targets"}}}, "targets", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := tc.scope.ToolExplicitlyAllowed(tc.tool); got != tc.want {
+				t.Errorf("ToolExplicitlyAllowed(%q) = %v, want %v", tc.tool, got, tc.want)
+			}
+		})
+	}
+}

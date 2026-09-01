@@ -501,6 +501,24 @@
         "publicURL": {
           "description": "PMF_PUBLIC_URL. Canonical external MCP URL for the OAuth PRM document.",
           "type": "string"
+        },
+        "caRotationEnabled": {
+          "description": "PMF_CA_ROTATION_ENABLED. Let the hub rotate its own signing root. Requires state.backend=secret and the CA the hub generates for itself.",
+          "type": "boolean"
+        },
+        "caRotateAtRemainingFraction": {
+          "description": "PMF_CA_ROTATE_AT_REMAINING_FRACTION. Fraction of the signing root's life remaining at which rotation begins. A floor of 2*spokeCertTTL+renewGrace applies underneath it.",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "caRotationPollInterval": {
+          "description": "PMF_CA_ROTATION_POLL_INTERVAL. How often each replica re-reads the CA Secret to notice a rotation.",
+          "type": "string"
+        },
+        "adminKeyTTL": {
+          "description": "PMF_ADMIN_KEY_TTL. Default and maximum lifetime of a minted admin key, including the bootstrap key.",
+          "type": "string"
         }
       }
     },
@@ -1003,6 +1021,22 @@
                 "restartLoop": {
                   "description": "PrometheusMCPHubRestartLoop. Requires kube-state-metrics.",
                   "type": "boolean"
+                },
+                "stateSecretLarge": {
+                  "description": "Render the PrometheusMCPHubStateSecretLarge rule.",
+                  "type": "boolean"
+                },
+                "caRotationStalled": {
+                  "description": "PrometheusMCPHubCARotationStalled.",
+                  "type": "boolean"
+                },
+                "revocationStale": {
+                  "type": "boolean",
+                  "description": "Render the PrometheusMCPHubRevocationStale rule."
+                },
+                "peerDiscoveryBroken": {
+                  "type": "boolean",
+                  "description": "Render the PrometheusMCPHubPeerDiscoveryBroken rule (only rendered with peerDiscovery.enabled and replicaCount > 1)."
                 }
               }
             },
@@ -1037,6 +1071,21 @@
                   "description": "Container restarts in one hour.",
                   "type": "integer",
                   "minimum": 0
+                },
+                "stateBytes": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "State document bytes above which PrometheusMCPHubStateSecretLarge fires."
+                },
+                "caRotationStalledSeconds": {
+                  "description": "Seconds a CA rotation phase may last before PrometheusMCPHubCARotationStalled fires.",
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "revocationStaleSeconds": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "Seconds since the last successful revocation refresh above which the alert fires."
                 }
               }
             },

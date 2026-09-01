@@ -91,9 +91,13 @@ func (c *CA) IssueSpokeFromCSR(csrDER []byte, clusterID string) (certPEM []byte,
 // sign fills in the parts of tmpl that are never the caller's business
 // (serial, validity window, issuer) and signs it.
 func (c *CA) sign(tmpl *x509.Certificate, pub any, ttl time.Duration) ([]byte, *x509.Certificate, error) {
+	// One read. A rotation can promote a successor between any two statements
+	// here, and a certificate signed by one root but issued in the name of
+	// another verifies nowhere.
+	m := c.current()
 	now := c.now()
-	if !now.Before(c.cert.NotAfter) {
-		return nil, nil, fmt.Errorf("%w at %s", ErrCAExpired, c.cert.NotAfter.UTC().Format(time.RFC3339))
+	if !now.Before(m.cert.NotAfter) {
+		return nil, nil, fmt.Errorf("%w at %s", ErrCAExpired, m.cert.NotAfter.UTC().Format(time.RFC3339))
 	}
 	serial, err := newSerial()
 	if err != nil {
@@ -101,16 +105,16 @@ func (c *CA) sign(tmpl *x509.Certificate, pub any, ttl time.Duration) ([]byte, *
 	}
 	notBefore := now.Add(-clockSkew)
 	notAfter := now.Add(ttl)
-	if notAfter.After(c.cert.NotAfter) {
+	if notAfter.After(m.cert.NotAfter) {
 		// A leaf that outlives its issuer is unverifiable for the remainder of
 		// its nominal life, which is worse than a short one.
-		notAfter = c.cert.NotAfter
+		notAfter = m.cert.NotAfter
 	}
 	tmpl.SerialNumber = serial
 	tmpl.NotBefore = notBefore
 	tmpl.NotAfter = notAfter
 
-	der, err := caCreateCertificate(rand.Reader, tmpl, c.cert, pub, c.key)
+	der, err := caCreateCertificate(rand.Reader, tmpl, m.cert, pub, m.key)
 	if err != nil {
 		return nil, nil, fmt.Errorf("sign certificate: %w", err)
 	}

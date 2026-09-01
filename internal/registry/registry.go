@@ -31,6 +31,12 @@ const (
 	// ReplacedReason is the close reason recorded on a session displaced by a
 	// newer generation of the same spoke.
 	ReplacedReason = "replaced-by-newer-session"
+	// RevokedReason is the close reason recorded on a session torn down
+	// because the certificate that admitted it has been revoked. It is a
+	// constant rather than a caller-supplied string so that the operator's
+	// own revocation reason -- which belongs in the hub's audit log -- is
+	// never handed to the spoke being revoked.
+	RevokedReason = "certificate-revoked"
 )
 
 // Options configures a [Registry]. The zero value is usable: every field has a
@@ -441,6 +447,19 @@ func (r *Registry) applyFacts(id, key string, sl *slot, facts tunnel.Facts) {
 		r.noteReportedID(id, facts.Cluster.ID, sl.certSerial)
 	}
 	now := r.now()
+	// The same merge the admission path applies, or the periodic refresh is a
+	// back door: a spoke that could not self-select into an operator's label
+	// scope at connect time could simply report the coveted label on its next
+	// Describe and have this path store it verbatim. Computed BEFORE the lock:
+	// the authoritative-labels callback may consult the credential store, and
+	// a store stall must slow this one refresh, not every registry reader.
+	var merged map[string]string
+	if facts.Changed {
+		// Cloned first, as the admission path does: with no authoritative
+		// labels configured, mergeLabels returns its argument, and the
+		// registry must never retain a map the tunnel layer still owns.
+		merged = r.mergeLabels(id, maps.Clone(facts.Cluster.Labels))
+	}
 	r.mu.Lock()
 	e, ok := r.entries[id]
 	if !ok || e.slots[key] != sl {
@@ -456,6 +475,7 @@ func (r *Registry) applyFacts(id, key string, sl *slot, facts tunnel.Facts) {
 	connectedSince := sl.facts.ConnectedSince
 	c := copyCluster(facts.Cluster)
 	c.ID = id
+	c.Labels = merged
 	c.CertNotAfter = certNotAfter
 	c.ConnectedSince = connectedSince
 	c.LastSeen = now
@@ -487,9 +507,27 @@ func (r *Registry) release(id, key string, sl *slot) {
 		r.mu.Unlock()
 		return
 	}
+	poolSize := r.detachLocked(id, e, key, sl, now)
+	n := r.connectedLocked()
+	r.mu.Unlock()
+
+	r.metrics.SpokeConnected(id, poolSize > 0)
+	r.metrics.SpokesConnected(n)
+	r.reportSessions(id, poolSize)
+	r.log.Info("registry: session detached", "cluster", id, "generation", sl.generation, "pool_size", poolSize)
+}
+
+// detachLocked removes sl from cluster id's pool and returns the pool's
+// remaining size. Emptying the pool freezes the entry's public view as
+// [fleet.StateDisconnected] and starts the disconnect grace window, or forgets
+// the cluster outright when the window is disabled.
+//
+// Callers hold the write lock and must already have established that
+// e.slots[key] == sl, which is what keeps a slow detach from evicting the
+// session that replaced it.
+func (r *Registry) detachLocked(id string, e *entry, key string, sl *slot, now time.Time) int {
 	delete(e.slots, key)
-	poolSize := len(e.slots)
-	if poolSize == 0 {
+	if len(e.slots) == 0 {
 		last := copyCluster(sl.facts)
 		last.State = fleet.StateDisconnected
 		last.LastSeen = now
@@ -499,13 +537,140 @@ func (r *Registry) release(id, key string, sl *slot) {
 			delete(r.entries, id)
 		}
 	}
+	return len(e.slots)
+}
+
+// CloseRevoked closes every live session that was admitted by one of the given
+// certificate serials. It is how a revocation stops the connection it is
+// revoking rather than only the next one.
+//
+// It returns one cluster ID per session closed, sorted; a cluster running
+// several pods on the same revoked certificate therefore appears once per pod,
+// so len is the session count and the set is the affected clusters. Nothing is
+// closed, and nil returned, for a serial that holds no live session -- revoking
+// a decommissioned spoke is not an error.
+//
+// A session with no certificate serial is never matched, so an empty serial in
+// serials cannot close an anonymous session.
+//
+// It returns only once every matching session's [tunnel.Session.Close] has
+// returned, so a caller that answers an operator afterwards is not claiming a
+// teardown that has not happened. Routing stops earlier still: the slot leaves
+// its cluster's pool under the same lock every other read path takes, before
+// any Close is attempted.
+func (r *Registry) CloseRevoked(serials ...string) []string {
+	if len(serials) == 0 {
+		return nil
+	}
+	return r.CloseRevokedBy(func(serial string) bool { return slices.Contains(serials, serial) })
+}
+
+// CloseRevokedBy closes every live session whose admitting certificate serial
+// isRevoked reports revoked, and is what lets a hub replica act on a
+// revocation that was performed on a different replica: the predicate is the
+// same one the tunnel handshake consults, so both admission and eviction read
+// one revocation list. A nil predicate closes nothing.
+//
+// The predicate is called with no registry lock held and at most once per
+// distinct serial, because a real implementation may reach the credential
+// store. See [Registry.CloseRevoked] for the return value and the ordering
+// guarantee.
+func (r *Registry) CloseRevokedBy(isRevoked func(serial string) bool) []string {
+	if isRevoked == nil {
+		return nil
+	}
+
+	// Snapshot first, judge second: the predicate must not run under a lock,
+	// and a slot that is displaced or released while it runs is dropped by the
+	// identity check below rather than closed out from under its successor.
+	r.mu.RLock()
+	candidates := make([]victim, 0, len(r.entries))
+	for id, e := range r.entries {
+		for key, sl := range e.slots {
+			if sl.certSerial == "" {
+				continue
+			}
+			candidates = append(candidates, victim{id: id, key: key, slot: sl})
+		}
+	}
+	r.mu.RUnlock()
+
+	verdict := make(map[string]bool, len(candidates))
+	victims := make([]victim, 0, len(candidates))
+	for _, c := range candidates {
+		revoked, judged := verdict[c.slot.certSerial]
+		if !judged {
+			revoked = isRevoked(c.slot.certSerial)
+			verdict[c.slot.certSerial] = revoked
+		}
+		if revoked {
+			victims = append(victims, c)
+		}
+	}
+	return r.closeVictims(victims)
+}
+
+// victim is one session selected for revocation teardown, together with the
+// slot identity that proves it is still the one holding that slot when the
+// write lock is finally taken.
+type victim struct {
+	id   string
+	key  string
+	slot *slot
+}
+
+// closeVictims detaches and closes the selected sessions, returning one cluster
+// ID per session actually closed, sorted.
+func (r *Registry) closeVictims(victims []victim) []string {
+	if len(victims) == 0 {
+		return nil
+	}
+	now := r.now()
+
+	type closure struct {
+		victim
+		poolSize int
+	}
+	closures := make([]closure, 0, len(victims))
+	r.mu.Lock()
+	for _, v := range victims {
+		e, ok := r.entries[v.id]
+		if !ok || e.slots[v.key] != v.slot {
+			// Released, displaced by a reconnect, or swept by Close between
+			// the snapshot and here. Whoever replaced it owns the slot now,
+			// and closing it would take down a session that is not revoked.
+			continue
+		}
+		closures = append(closures, closure{victim: v, poolSize: r.detachLocked(v.id, e, v.key, v.slot, now)})
+	}
 	n := r.connectedLocked()
 	r.mu.Unlock()
+	if len(closures) == 0 {
+		return nil
+	}
 
-	r.metrics.SpokeConnected(id, poolSize > 0)
+	var wg sync.WaitGroup
+	out := make([]string, 0, len(closures))
+	for _, c := range closures {
+		out = append(out, c.id)
+		// Cancel the facts poller before the close so it cannot log a failed
+		// Describe against a session that is being torn down deliberately.
+		c.slot.cancel()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r.closeSession(c.slot.session, c.id, RevokedReason)
+		}()
+		r.metrics.SpokeConnected(c.id, c.poolSize > 0)
+		r.reportSessions(c.id, c.poolSize)
+		r.log.Warn("registry: closing session for a revoked certificate",
+			"cluster", c.id, "cert_serial", c.slot.certSerial, "pool_size", c.poolSize)
+	}
 	r.metrics.SpokesConnected(n)
-	r.reportSessions(id, poolSize)
-	r.log.Info("registry: session detached", "cluster", id, "generation", sl.generation, "pool_size", poolSize)
+	wg.Wait()
+
+	slices.Sort(out)
+	return out
 }
 
 // closeSession closes s, logging rather than propagating the error: nothing
@@ -694,6 +859,31 @@ func (r *Registry) filter(keep func(fleet.Cluster) bool) []fleet.Cluster {
 // tunnel. This counts clusters, not sessions, so a cluster running several
 // pods for its own availability still counts once. Degraded clusters count:
 // some tunnel is up, only its Prometheus is not.
+// LiveCertSerials reports the certificate serial of every session currently
+// attached to this replica, as a set.
+//
+// It exists for the CA rotation evidence gate, and the unit is deliberately
+// the SESSION's certificate rather than the cluster: sibling pods of one
+// cluster converge on a shared identity asynchronously, so for a while one
+// sibling can be connected on the renewed certificate and another on the old
+// one. A per-cluster answer collapses that window to whichever connected
+// last, and the collapsed entry is exactly the one that would have named the
+// outgoing root. Serials collapse only sessions holding the SAME certificate,
+// which really are indistinguishable for this purpose.
+func (r *Registry) LiveCertSerials() map[string]bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make(map[string]bool)
+	for _, e := range r.entries {
+		for _, sl := range e.slots {
+			if sl.certSerial != "" {
+				out[sl.certSerial] = true
+			}
+		}
+	}
+	return out
+}
+
 func (r *Registry) ConnectedCount() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

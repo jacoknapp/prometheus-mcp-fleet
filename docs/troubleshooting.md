@@ -193,11 +193,32 @@ interval.
 
 ## Nothing here matches
 
-Turn up the logs and watch one request end to end:
+Turn up the logs and watch one request end to end. **Do not `kubectl set env
+deploy/pmf-hub PMF_LOG_LEVEL=debug`.** `PMF_LOG_LEVEL` comes from the chart's
+ConfigMap (`config.logLevel`, rendered via `envFrom`); a patch applied straight
+to the Deployment is exactly the drift Argo CD/Flux self-heal exists to
+reverse. Under an Application with automated self-heal it can be undone within
+one reconcile — sometimes under a minute, sometimes mid-incident — and nothing
+warns you it happened; the logs just quietly go back to `info` while you are
+still staring at them.
 
-```bash
-kubectl -n prometheus-mcp-hub set env deploy/pmf-hub PMF_LOG_LEVEL=debug
-```
+Change it the way the rest of the fleet's state changes:
+
+1. Set `config.logLevel: debug` in the values file (or values override) that
+   this release's Application/Kustomization actually points at, and commit it.
+2. Force the sync rather than waiting for the poll interval —
+   `argocd app sync <app>` or `flux reconcile helmrelease <name> --with-source`
+   — so the pod restarts with debug logging now, not in five minutes.
+3. Revert the commit once you have what you need. Leaving `debug` in git is how
+   a hundred spokes end up shipping request bodies to your log pipeline
+   indefinitely.
+
+If a PR-and-sync round trip is too slow for the incident you're in, suspend
+reconciliation for *this* Application only before touching anything imperatively
+(`argocd app set <app> --sync-policy none`, or `flux suspend helmrelease
+<name>`) — and put resuming it on your incident checklist. An imperative patch
+left in place under a suspended Application survives; the same patch under an
+Application still auto-syncing does not, and you will not get a second warning.
 
 Debug logs one line per request with a `request_id` that also appears in the
 spoke's logs for the same call, so you can follow it across the tunnel. Secrets

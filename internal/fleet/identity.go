@@ -39,10 +39,15 @@ func (c KeyClass) Valid() bool {
 type Role string
 
 const (
-	// RoleViewer may read metrics through the MCP tools it is scoped to.
+	// RoleViewer may read metrics through the MCP tools it is scoped to. A
+	// viewer's "*" tool wildcard excludes the operational surfaces (scrape
+	// targets, runtime and TSDB internals); naming such a tool in the allow
+	// list grants it regardless of role, because writing the name is the
+	// deliberate act the tier exists to require.
 	RoleViewer Role = "viewer"
-	// RoleOperator additionally sees operational surfaces such as scrape
-	// targets and runtime configuration.
+	// RoleOperator additionally receives the operational surfaces through a
+	// "*" wildcard: scrape targets, Alertmanager discovery, TSDB statistics,
+	// runtime configuration and per-target metadata.
 	RoleOperator Role = "operator"
 	// RoleAdmin administers the hub. Only ever held by a ClassAdmin key.
 	RoleAdmin Role = "admin"

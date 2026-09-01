@@ -111,7 +111,10 @@ signed certificate challenge.
 
 ### spoke
 
-One Deployment per cluster, about 20 MiB resident per pod. It listens for
+One Deployment per cluster, small enough that its idle heap is
+regression-tested directly (`go test ./test/bench`); the chart requests 64Mi.
+Resident memory has never been measured, so no figure is claimed here. It
+listens for
 nothing but its own metrics and health. A cluster may run more than one spoke
 pod for its own availability: the hub pools their sessions rather than
 electing a leader (see [Discovery and the registry](#discovery-and-the-registry)),
@@ -403,7 +406,11 @@ like `hub` and `spoke`, not a library anything else depends on.
 
 ## Capacity
 
-Measured and reasoned figures for a 100-spoke fleet on one hub replica.
+Figures for a 100-spoke fleet on one hub replica, REASONED from component sizes
+rather than measured. They are arithmetic on buffer and struct sizes, and they
+are here to size a memory limit, not to report an observation. The one footprint
+this repository actually measures is the spoke's idle heap, in
+`go test ./test/bench`.
 
 **Per idle tunnel on the hub:** about 86 KiB — 16 KiB each of gRPC read and
 write buffer, roughly 20 KiB of TLS buffers, about 10 KiB of transport
@@ -421,12 +428,24 @@ pre-warmed, there is no per-request handshake, no auth round trip and no service
 discovery on the hot path.
 
 **The real risk is concurrent bulk, not idle.** A hundred agents each pulling a
-32 MiB result would be 3.2 GiB if the hub buffered whole results. A global
-response-byte semaphore (256 MiB by default) plus a per-cluster in-flight limit
-of 8 bounds it; over budget returns `ErrBusy` with a retry hint. Bounded and
-observable beats OOM-killed.
+32 MiB result would be 3.2 GiB if the hub buffered whole results with nothing
+in front of it. A global response-byte semaphore (256 MiB by default) plus a
+per-cluster in-flight limit of 8 bounds *that*: over budget returns `ErrBusy`
+with a retry hint. What it bounds precisely is bytes actively being read off a
+tunnel — `Proxy.Do` reserves a call's worst case before dialling and releases
+it the moment `Do` returns. It does not bound retained memory: `Do`'s caller
+still holds the released body, then decodes it into a Prometheus API envelope
+and renders that into the tool's output shape, so a single completed call can
+have the raw body, the decoded structure and the rendered result alive at
+once — some multiple of that call's share of the budget, not equal to it. Size
+the hub's memory limit off that multiple, not off the budget directly.
 
 **Suggested requests and limits:** hub `250m / 256Mi` requests, `1Gi` memory
-limit, **no CPU limit** — CFS throttling on a tunnel terminator is self-inflicted
-latency. Spoke `25m / 64Mi` requests, `256Mi` memory limit; expect about 18 MiB
-resident, since it parses nothing.
+limit — roughly 4x the 256 MiB response budget, to cover the decoded-and-
+rendered copies the semaphore stops tracking once `Do` returns — **no CPU
+limit**, since CFS throttling on a tunnel terminator is self-inflicted latency.
+Spoke `25m / 64Mi` requests, `256Mi` memory limit. Process RSS has not been
+measured in a real pod and no figure is claimed here; what IS pinned is the
+idle Go heap, which `test/bench` holds under 48 MiB as a regression test. The
+spoke parses nothing, so the requests above are sized to the transport, not
+to any payload.

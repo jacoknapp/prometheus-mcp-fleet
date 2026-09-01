@@ -29,6 +29,15 @@ type CreateKeyRequest struct {
 	// above the configured maximum is refused rather than silently clamped, so
 	// an operator is never surprised by a credential that expires early.
 	TTL fleet.Duration `json:"ttl,omitempty"`
+	// NoExpiry mints a credential that never expires. It is a separate field
+	// rather than a sentinel TTL because an absent or zero TTL means "the
+	// class default": a credential must never become immortal because a field
+	// was omitted, only because someone asked for it in as many words.
+	//
+	// Agent keys only. Revocation remains the way such a key is withdrawn, and
+	// it is enforced on live sessions, so a key with no expiry is still
+	// killable -- it just is not killed by the passage of time.
+	NoExpiry bool `json:"noExpiry,omitempty"`
 	// Scope is the authorization document. Required for an agent key and
 	// refused for an admin key, whose authority is not scope-evaluated.
 	Scope *fleet.Scope `json:"scope,omitempty"`

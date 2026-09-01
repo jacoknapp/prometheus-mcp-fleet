@@ -47,7 +47,12 @@ var (
 	// ErrInvalidCA is returned when the material on disk parses but is not a
 	// usable CA: not a certificate, not an ECDSA P-256 key, the key does not
 	// match the certificate, or the certificate is not a certificate-signing
-	// CA.
+	// CA. It also covers a malformed trust bundle -- a block that is not a
+	// certificate, a certificate that is not a certificate-signing CA, or a
+	// bundle that names no root at all -- and a signer certificate file
+	// holding more than one certificate, which is the shape an operator
+	// produces when they try to serve two roots by concatenating them into the
+	// wrong file.
 	ErrInvalidCA = errors.New("ca: invalid certificate authority material")
 
 	// ErrCAExpired is returned when the CA certificate has expired, or has so

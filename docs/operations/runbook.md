@@ -14,17 +14,27 @@ untouched — your own alerting still works, and a human on-call is unaffected.
 This is a convenience-tier outage, not a monitoring outage. Do not page harder
 than that warrants.
 
+**Read this before you're paged, not during.** A hub-side root cause pages you
+once. It also independently pages every spoke's own on-call, once per cluster.
+See [Alert topology](#alert-topology-one-root-cause-many-pages) below — the
+fix (correlating those pages) has to be set up ahead of time; there is nothing
+to do about it mid-incident except recognize the pattern.
+
 ## Contents
 
+- [Alert topology: one root cause, many pages](#alert-topology-one-root-cause-many-pages)
 - [Quick triage](#quick-triage)
 - [PrometheusMCPHubDown](#prometheusmcphubdown)
 - [PrometheusMCPSpokesDisconnected](#prometheusmcpspokesdisconnected)
 - [PrometheusMCPSpokeTunnelDown](#prometheusmcpspoketunneldown)
 - [PrometheusMCPHubCACertExpiringSoon](#prometheusmcphubcacertexpiringsoon)
+- [PrometheusMCPHubCARotationStalled](#prometheusmcphubcarotationstalled)
 - [PrometheusMCPSpokeCertExpiringSoon](#prometheusmcpspokecertexpiringsoon)
 - [PrometheusMCPHubProxyErrorRatioHigh](#prometheusmcphubproxyerrorratiohigh)
 - [PrometheusMCPHubRestartLoop](#prometheusmcphubrestartloop)
 - [PrometheusMCPHubStateSecretLarge](#prometheusmcphubstatesecretlarge)
+- [PrometheusMCPHubRevocationStale](#prometheusmcphubrevocationstale)
+- [PrometheusMCPHubPeerDiscoveryBroken](#prometheusmcphubpeerdiscoverybroken)
 - [PrometheusMCPHubSpokeCertExpiringSoon](#prometheusmcphubspokecertexpiringsoon)
 - [PrometheusMCPSpokeDown](#prometheusmcpspokedown)
 - [PrometheusMCPSpokePrometheusDown](#prometheusmcpspokeprometheusdown)
@@ -34,6 +44,73 @@ than that warrants.
 - [PrometheusMCPSpokeFactsRefreshFailing](#prometheusmcpspokefactsrefreshfailing)
 - [Security events](#security-events)
 - [Disaster recovery](#disaster-recovery)
+
+## Alert topology: one root cause, many pages
+
+**This alone is not obvious from the alert names, so read it before the fleet
+is 100 clusters and you're finding it out live.**
+
+Every spoke's `PrometheusRule` is deployed *inside that monitored cluster* and
+evaluated by *that cluster's own Prometheus*, firing into *that cluster's own
+Alertmanager* — the chart puts it there on purpose, since that is the only
+Prometheus that has both `promfleet_spoke_tunnel_up` and an on-call already
+configured for that cluster. The hub's own `PrometheusRule`
+(`PrometheusMCPHubDown`, `PrometheusMCPSpokesDisconnected`, and the cert/proxy
+alerts) is deployed once, centrally, next to the hub.
+
+Nothing ties these together. So when the fault is on the hub side — the
+Ingress stops routing `/tunnel`, a certificate rotation goes wrong, a
+LoadBalancer loses its address — here is what actually happens across a
+hundred-cluster fleet:
+
+1. Within 5 minutes, up to 100 independent Alertmanagers each fire their own
+   `PrometheusMCPSpokeTunnelDown`, because each spoke genuinely has lost its
+   tunnel. Each one pages whoever is on call for *that* cluster.
+2. Five minutes after that, the hub's own Alertmanager fires exactly one
+   `PrometheusMCPSpokesDisconnected` — the fleet-wide summary — into whatever
+   receiver the hub's chart is configured with.
+3. Nothing links 2 back to 1. Every spoke on-call sees a cluster-specific
+   tunnel alert with no indication it is one of ninety-nine identical pages
+   firing at the same moment for an unrelated reason.
+
+**What to expect, so you recognize it fast:** a sudden burst of
+`PrometheusMCPSpokeTunnelDown` pages landing within the same couple of minutes,
+across clusters that share nothing operationally, is *itself* the signature of
+a hub-side fault — and it shows up *before* `PrometheusMCPSpokesDisconnected`
+does, since the per-spoke alert's `for: 5m` is shorter than the fleet alert's
+`for: 10m`. Don't wait for the hub alert to confirm what a five-minute burst of
+unrelated tunnel alerts has already told you. Go straight to
+[PrometheusMCPSpokesDisconnected](#prometheusmcpspokesdisconnected).
+
+**What fixes this is set up ahead of time, not during the incident** — this
+repo ships the per-cluster and hub-side rules, but not a correlation layer,
+because that layer has to live somewhere that can see every cluster's alerts
+at once, which no single component here is:
+
+- **Federate alerts into one shared Alertmanager.** Add a second target to
+  every spoke Prometheus's `alerting.alertmanagers` list — the cluster's own
+  Alertmanager stays first (so local on-call keeps working unchanged), and a
+  fleet-wide Alertmanager is added alongside it. The hub's Prometheus should
+  point at the same shared instance. Inhibition rules only apply within a
+  single Alertmanager's alert set, so this step is what makes inhibition
+  possible at all:
+  ```yaml
+  inhibit_rules:
+    - source_matchers:
+        - alertname = "PrometheusMCPSpokesDisconnected"
+      target_matchers:
+        - alertname = "PrometheusMCPSpokeTunnelDown"
+      equal: []   # deliberately no shared label: one fleet-wide cause
+                  # suppresses N per-cluster symptoms with no cluster in common
+  ```
+- **If a shared Alertmanager isn't reachable from every cluster** (independent
+  network paths, no shared egress), a dashboard that lists every cluster's
+  Alertmanager side by side — Karma is the common choice — at least turns a
+  hundred pages into one screen. It does not suppress anything; it only saves
+  you the tab-switching while you triage.
+
+Either way, this has to exist *before* the fleet-wide fault happens. There is
+no way to retrofit correlation onto a hundred pages that have already fired.
 
 ## Quick triage
 
@@ -77,7 +154,10 @@ seconds. There is nothing to restore and no consistency to worry about.
 ## PrometheusMCPSpokesDisconnected
 
 **Means:** more than 10% of enrolled clusters have no live tunnel for 10
-minutes. A fleet-wide symptom, not a per-cluster one.
+minutes. A fleet-wide symptom, not a per-cluster one — and, unless you've set
+up the correlation in [Alert topology](#alert-topology-one-root-cause-many-pages),
+you likely already saw this coming as a burst of unrelated
+`PrometheusMCPSpokeTunnelDown` pages five minutes earlier.
 
 ```promql
 promfleet_hub_spokes_connected
@@ -138,28 +218,149 @@ the underlying cause is fixed.
 
 ## PrometheusMCPHubCACertExpiringSoon
 
-**Means:** the CA certificate expires within 14 days. **This is the most serious
-alert in this document.** When the CA expires, every spoke certificate becomes
-unverifiable and the entire fleet disconnects.
+**Means:** the CA certificate expires within 14 days, and the hub has not
+rotated it. When the CA expires, every spoke certificate becomes unverifiable
+and the entire fleet disconnects.
 
-Rotation is not yet a single command. The procedure is:
+**The hub normally rotates its own CA, and this alert means it has not.** It is
+therefore a question about the rotation controller, not an instruction to
+rotate by hand.
 
-1. Back up the current CA Secret first, without exception:
+### What the hub does on its own
+
+The rotation is a four-state machine persisted in the CA Secret, advanced by
+whichever replica wins a compare-and-swap on it and adopted by the rest. The
+default trigger is the last fifth of the signing root's life, with a floor of
+`2 × spoke-cert-ttl + renew-grace` underneath it so a rotation is never started
+that could not finish before the signer expires.
+
+| Phase | Signs | Trusted | Leaves when |
+|---|---|---|---|
+| `steady` | the one root | that root | the signer enters its last fifth, or you force it |
+| `publishing` | the **old** root | old + new | one full `--spoke-cert-ttl` has passed, so every spoke has renewed onto the two-root bundle and every replica has seen the successor |
+| `signing` | the **new** root | old + new | one `--spoke-cert-ttl` **plus** `--renew-grace`, padded by two poll intervals (a replica that lost the promotion race keeps signing with the old root until its next poll), has passed **and** no replica has seen a live session on the outgoing root recently |
+| `steady` | the new root | that root | — |
+| `unknown` | whatever the Secret says | **everything present** — signer, successor, outgoing | never on its own: this build cannot interpret the recorded phase (usually a rollback mid-rotation, or a hand edit) and freezes rather than guessing. Roll forward to a build that knows the phase, or fix the `phase` key by hand |
+
+The trust bundle is the same set across the promotion — `{old, new}` before and
+after — so no spoke can be disconnected by it. Only the last step narrows what
+is trusted, and it is the only one gated on evidence rather than a clock.
+
+At the defaults (14-day certificates, 30-day renewal grace) a whole rotation
+takes about two months. That is not slowness to be fixed: it is one certificate
+lifetime for the fleet to pick up the new root, and a lifetime plus the grace
+window before the old one can be taken away without stranding a cluster that
+was switched off.
+
+### What to look at
+
+```bash
+# The phase, and how long it has been in it.
+promfleet_hub_ca_rotation_phase                              # 1 on one phase label
+time() - promfleet_hub_ca_rotation_phase_start_timestamp_seconds
+sum(promfleet_hub_ca_outgoing_root_sessions)                 # spokes still on the old root
+promfleet_hub_ca_trust_roots                                 # 1 steady, 2 mid-rotation
+promfleet_hub_ca_cert_expiry_seconds                         # the SIGNER's remaining life
+```
+
+```bash
+# The same thing from the Secret, which is the source of truth.
+kubectl -n $HUB_NS get secret pmf-hub-ca \
+  -o jsonpath='{.data.ca-rotation\.phase}' | base64 -d; echo
+kubectl -n $HUB_NS get secret pmf-hub-ca \
+  -o jsonpath='{.data.ca-rotation\.since}' | base64 -d; echo
+kubectl -n $HUB_NS logs deploy/pmf-hub | grep -E 'CA rotation|adopted rotated CA'
+```
+
+`promfleet_hub_ca_cert_expiry_seconds` tracks the **active signer** only, so it
+keeps falling through `publishing` — nothing has been fixed until the signer
+moves — and jumps to the successor's ten years at the promotion into `signing`.
+That is the correct reading and this alert clears there, not earlier.
+
+### Why it might not be rotating
+
+| Log line at startup | Meaning |
+|---|---|
+| `the CA will not rotate itself ... file state backend` | `state.backend` is `file`. There is no compare-and-swap and no shared state, so rotation is off. Move to the secret backend |
+| `the CA will not rotate itself ... disabled by --ca-rotation-enabled=false` | Somebody turned it off. Set `config.caRotationEnabled: true` |
+| `the CA will not rotate itself ... belongs to whatever supplies it` | You supplied the CA through `bootstrap.existingSecret`. That mount is read-only and the hub will not rotate material it was handed. Rotate it wherever it comes from, or hand the CA over to the hub |
+| `CA rotation poll failed` | The hub cannot read or write the CA Secret. Check the Role — it needs `get` and `update` on this object — and the API server |
+
+If none of those appear and the phase is `steady` with the signer inside its
+last fifth, the trigger is misconfigured: check
+`config.caRotateAtRemainingFraction`.
+
+### Forcing a rotation
+
+For a suspected key compromise, or to start one now for any other reason:
+
+```bash
+kubectl -n $HUB_NS annotate secret pmf-hub-ca \
+  promfleet.io/rotate-now="suspected key compromise" --overwrite
+```
+
+The next poll — within `config.caRotationPollInterval`, five minutes by default
+— mints the successor, enters `publishing`, and consumes the annotation,
+recording `promfleet.io/rotate-accepted` in its place. It is edge triggered:
+re-annotating starts nothing while a rotation is already under way, and the
+annotation is cleared rather than left to fire again months later.
+
+**Forcing does not make the rotation faster.** The gates are unchanged, because
+the thing they are waiting for — the fleet renewing — has not got any quicker.
+If a key is genuinely compromised, the annotation starts the clock; revoking
+the certificates issued under it (`DELETE /admin/v1/keys/...`, and the
+revocation store for spoke serials) is the part that acts immediately.
+
+### What you should not do
+
+Do not edit `ca.crt`/`ca.key` in the Secret by hand. Replacing the CA in place
+disconnects the fleet instantly and requires re-enrolling every cluster. If you
+must intervene, the supported hand controls are: the `promfleet.io/rotate-now`
+annotation, `config.caRotationEnabled: false` to stop the machine where it
+stands (both roots stay trusted), and a restore from your CA Secret backup.
+Everything else is the controller's.
+
+Back the Secret up before you touch anything, without exception:
+
+```bash
+kubectl -n $HUB_NS get secret pmf-hub-ca -o yaml > ca-backup.yaml
+```
+
+## PrometheusMCPHubCARotationStalled
+
+**Means:** a CA rotation has been in `publishing` or `signing` for longer than
+`metrics.prometheusRule.thresholds.caRotationStalledSeconds` (75 days by
+default, against an expected ~58).
+
+**Nothing is broken.** Both roots are trusted for as long as this lasts, every
+spoke verifies, and issuance continues. This is an alert about a job that has
+stopped finishing, not about an outage.
+
+Work through it in this order:
+
+1. **Which phase, and for how long.**
    ```bash
-   kubectl -n $HUB_NS get secret prometheus-mcp-fleet-ca -o yaml > ca-backup.yaml
+   promfleet_hub_ca_rotation_phase
+   time() - promfleet_hub_ca_rotation_phase_start_timestamp_seconds
    ```
-2. Issue a new CA and serve **both** in the trust bundle so spokes accept either
-   during the overlap.
-3. Roll the bundle to every spoke (`hub.caBundle`), and confirm each has picked
-   it up before proceeding.
-4. Once every spoke trusts the new CA, let renewals migrate them onto
-   certificates signed by it. At a 14-day certificate lifetime, full migration
-   takes a fortnight.
-5. Retire the old CA only after `promfleet_hub_spoke_cert_expiry_seconds` shows
-   no certificate still chained to it.
+2. **Is a spoke still holding a certificate from the outgoing root?** This is
+   the usual answer in `signing`, and the gate is doing exactly what it is for
+   — dropping the root while that spoke depends on it disconnects it.
+   ```bash
+   sum(promfleet_hub_ca_outgoing_root_sessions)      # fleet-wide; sum, not max
+   ```
+   A cluster whose spoke cannot renew shows up in
+   [PrometheusMCPHubSpokeCertExpiringSoon](#prometheusmcphubspokecertexpiringsoon)
+   as well. Fix the renewal and the rotation finishes on its own.
+3. **Is the controller running at all?** Check for `CA rotation poll failed` in
+   the hub log; an RBAC or API-server problem stalls every phase equally.
+4. **Is the clock being restarted?** A replica that keeps repairing the phase
+   start logs `CA rotation state recorded ... restarting the phase clock`,
+   which means something is rewriting `ca-rotation.since` in the Secret.
 
-Do not shortcut this by replacing the CA in place. That disconnects the fleet
-instantly and requires re-enrolling all hundred clusters by hand.
+The controller never advances on its own past a gate that has not opened, and
+it never gives up: once the blockage clears, the next poll moves it on. There
+is no "resume" to run.
 
 ## PrometheusMCPSpokeCertExpiringSoon
 
@@ -217,15 +418,17 @@ design. If the hub is restarting, it is failing at startup — see
 
 If it is OOMKilled, raise the memory limit and check
 `promfleet_hub_proxy_response_bytes`. A hundred idle spokes cost about 40 MiB;
-concurrent bulk transfer is what consumes memory, and the global byte budget is
-what bounds it.
+concurrent bulk transfer is what drives memory; the global byte budget only
+bounds bytes actively in transfer, not the decoded and rendered copies a call
+retains after the proxy returns — size the memory limit to several times the
+budget (roughly 4x here: a 1Gi limit against a 256Mi budget), not to the budget
+itself.
 
 ## PrometheusMCPHubStateSecretLarge
 
-No PrometheusRule ships for this today — `promfleet_hub_state_bytes` exists but
-nothing alerts on it yet, so this section is here for when you wire that alert
-yourself, or when someone notices the metric climbing during triage for
-something else.
+Ships in the chart (`rules.stateSecretLarge`, threshold
+`thresholds.stateBytes`, default 500 KiB) and fires while there is still a
+200 KiB margin under the hub's write ceiling.
 
 **Means:** `promfleet_hub_state_bytes` is approaching the 700 KiB write ceiling.
 A Kubernetes Secret caps at 1 MiB, and the hub refuses writes past 700 KiB
@@ -257,6 +460,59 @@ that, the state backend needs to change — open an issue rather than raising th
 ceiling.
 
 
+
+## PrometheusMCPHubRevocationStale
+
+**Means:** this hub replica has not successfully refreshed its revoked-serial
+list for `thresholds.revocationStaleSeconds` (default 300s — ten refresh
+intervals). The replica is healthy and serving, deliberately: a credential
+store outage must not disconnect the fleet. What it is NOT doing is learning
+about new revocations, so a spoke certificate revoked since the last refresh
+is still admitted by this replica for as long as the alert is firing.
+
+**Check the hub's access to its state Secret.** The refresh is a read of the
+same Secret every credential operation uses, so this alert rarely comes alone:
+
+```bash
+kubectl -n $HUB_NS logs deploy/pmf-hub | grep -i "revocation\|state"
+kubectl -n $HUB_NS auth can-i get secrets --as system:serviceaccount:$HUB_NS:pmf-hub
+```
+
+Usual causes, in order: the kube-apiserver is degraded (the alert fires on
+every replica at once), the hub's RBAC was changed (fires on every replica,
+starting at the next rollout), or one node's network is broken (fires on one).
+
+**While it fires,** a revocation you commit still lands in the store and is
+enforced by every replica that can read it; only the affected replica keeps
+serving its last good list. If you must sever a specific compromised spoke NOW
+and this alert is firing on the replica holding its tunnel, delete that hub
+pod: the spoke's reconnect lands on a healthy replica, which checks the store.
+
+## PrometheusMCPHubPeerDiscoveryBroken
+
+**Means:** this hub replica's headless-Service lookup resolves fewer replicas
+than the chart deployed. The number it resolves is the number every spoke is
+told in the tunnel handshake, and spokes size their tunnel pools from it — so
+while it is low, spokes hold too few tunnels and a share of tool calls answer
+"cluster not connected". The spokes' own `PartialCoverage` alert cannot catch
+this case: they never learn a count to fall short of.
+
+**Check, in order:**
+
+```bash
+# Does the headless Service exist and select every hub pod?
+kubectl -n $HUB_NS get endpoints pmf-hub-peers -o wide
+# Can a hub pod resolve it? (DNS egress is the usual culprit)
+kubectl -n $HUB_NS exec deploy/pmf-hub -- getent hosts pmf-hub-peers.$HUB_NS.svc
+# The hub logs every failed lookup at WARN:
+kubectl -n $HUB_NS logs deploy/pmf-hub | grep "peer discovery failed"
+```
+
+Usual causes: a NetworkPolicy that blocks DNS from the hub pods, the headless
+Service deleted or renamed out from under `--peer-discovery-domain`, or a
+selector drift so the Service matches no pods. Fixing the lookup is the whole
+fix — spokes pick the new count up within about a minute through their
+coverage probes.
 
 ## PrometheusMCPHubSpokeCertExpiringSoon
 
@@ -340,7 +596,12 @@ facts, and agents see intermittent failures rather than a clear one.
 kubectl -n <ns> logs deploy/<spoke> | grep -E 'tunnel closed|reason='
 ```
 
-The reason label is a closed set and names the cause directly. An Ingress with
+The reason label is a closed set and names the cause directly. One reason is
+excluded from the alert itself: `redundant-replica` is the spoke's own
+coverage machinery working as designed — the once-a-minute probe cycle, and
+deliberate redials during a coverage search — so it never counts as flapping.
+If you are staring at raw counter increases rather than the alert, subtract
+that reason first. An Ingress with
 an idle timeout shorter than the 10-second keepalive is the classic one: the
 proxy closes a quiet tunnel, the spoke redials, and the cycle repeats. Raise
 the proxy's timeout rather than lowering the keepalive.
@@ -438,9 +699,17 @@ cost.
 - Without a backup: generate a new CA, roll the new trust bundle to all hundred
   clusters, mint a hundred fresh enrollment tokens, and re-enroll.
 
+Self-service rotation does not help here and cannot: the whole state machine
+lives in this Secret, so losing it loses the rotation as well as the root.
+Restoring a backup taken mid-rotation is safe — the phase, its start time and
+both roots come back together, and the controller carries on from whichever
+phase the backup recorded.
+
 ```bash
-# Do this now, not during the incident
-kubectl -n $HUB_NS get secret prometheus-mcp-fleet-ca -o yaml > ca-backup.yaml
+# Do this now, not during the incident. The Secret is <release fullname>-ca
+# under the chart (pmf-hub-ca with the quickstart's values); the unprefixed
+# prometheus-mcp-fleet-ca default applies only outside the chart.
+kubectl -n $HUB_NS get secret pmf-hub-ca -o yaml > ca-backup.yaml
 ```
 
 Test the restore quarterly. An untested backup is not a backup.

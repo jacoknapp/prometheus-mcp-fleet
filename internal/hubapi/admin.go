@@ -10,10 +10,13 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
+	"errors"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/ca"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/fleet"
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/store"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/token"
 )
 
@@ -126,13 +129,13 @@ func (s *server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 		// switch has no default, so omitting it is a lint failure and, more
 		// to the point, a fourth KeyClass would then be accepted silently.
 	}
-	ttl, err := resolveTTL(req.TTL, maxTTL)
+	expiresAt, err := resolveExpiry(req.TTL, req.NoExpiry, req.Class, maxTTL, s.clock())
 	if err != nil {
 		s.fail(w, r, CodeInvalidRequest, err.Error())
 		return
 	}
 
-	key, raw, err := s.mintKey(r.Context(), req.Class, req.Name, req.Owner, ttl, req.Scope, nil)
+	key, raw, err := s.mintKey(r.Context(), req.Class, req.Name, req.Owner, expiresAt, req.Scope, nil)
 	if err != nil {
 		s.failInternal(w, r, "mint key", err)
 		return
@@ -141,7 +144,7 @@ func (s *server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 		slog.String("kid", key.KID),
 		slog.String("class", string(key.Class)),
 		slog.String("name", key.Name),
-		slog.String("ttl", ttl.String()))
+		slog.String("expires_at", expiryLabel(key.ExpiresAt)))
 	s.writeJSON(w, r, http.StatusCreated, mintedResponse(key, raw, s.clock()))
 }
 
@@ -222,6 +225,10 @@ type rotateRequest struct {
 	// TTL overrides the replacement credential's lifetime. Empty reuses the
 	// class default.
 	TTL fleet.Duration `json:"ttl,omitempty"`
+	// NoExpiry mints the replacement with no expiry. Agent keys only. It is
+	// not inherited from the credential being replaced: rotating a key is the
+	// moment to restate that choice, not to carry it forward silently.
+	NoExpiry bool `json:"noExpiry,omitempty"`
 	// Reason is recorded against the credential being replaced.
 	Reason string `json:"reason,omitempty"`
 }
@@ -229,9 +236,10 @@ type rotateRequest struct {
 // handleRotateKey mints a replacement credential with the same identity and
 // scope, then revokes the original.
 //
-// The order matters: the new credential is stored before the old one is
-// revoked, so a failure between the two leaves the caller with two working
-// credentials rather than none. Overlap is recoverable; an outage is not.
+// The mint and the revocation commit as ONE store mutation (ReplaceKey), so a
+// rotation can never half-happen: before this, a revoke failing after the mint
+// succeeded left a live replacement credential whose raw token was already
+// unrecoverable, because the token exists only in the response body.
 func (s *server) handleRotateKey(w http.ResponseWriter, r *http.Request) {
 	if !s.guard(w, r) {
 		return
@@ -253,11 +261,22 @@ func (s *server) handleRotateKey(w http.ResponseWriter, r *http.Request) {
 			"an enrollment token is single use and is not rotated: mint a new one")
 		return
 	}
+	if old.Revoked() {
+		// Rotating a revoked credential would mint it back into life under a
+		// routine-looking audit event -- and a replayed rotation would strand
+		// a second replacement whose raw token nobody ever saw. The recorded
+		// reason names the replacement when this revocation was itself a
+		// rotation. ReplaceKey enforces the same refusal atomically for the
+		// race this check cannot see.
+		s.fail(w, r, CodeConflict,
+			fmt.Sprintf("key %s is revoked (%s) and cannot be rotated: mint a new key instead", old.KID, old.RevokedReason))
+		return
+	}
 	maxTTL := s.agentKeyTTL
 	if old.Class == fleet.ClassAdmin {
 		maxTTL = s.adminKeyTTL
 	}
-	ttl, err := resolveTTL(req.TTL, maxTTL)
+	expiresAt, err := resolveExpiry(req.TTL, req.NoExpiry, old.Class, maxTTL, s.clock())
 	if err != nil {
 		s.fail(w, r, CodeInvalidRequest, err.Error())
 		return
@@ -271,13 +290,26 @@ func (s *server) handleRotateKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fresh, raw, err := s.mintKey(r.Context(), old.Class, old.Name, old.Owner, ttl, old.Scope, nil)
-	if err != nil {
-		s.failInternal(w, r, "mint rotated key", err)
+	fresh, raw, err := s.mintKeyWith(r.Context(), old.Class, old.Name, old.Owner, expiresAt, old.Scope, nil,
+		func(ctx context.Context, k *fleet.Key) error {
+			return s.store.ReplaceKey(ctx, k, old.KID, reason+" (replaced by "+k.KID+")", s.clock())
+		})
+	switch {
+	case err == nil:
+	case errors.Is(err, store.ErrRevoked):
+		// The race the pre-flight check above cannot see: the key was revoked
+		// between loading it and committing the replacement. The same 409 as
+		// the pre-flight, not a 500 -- the caller did nothing internal-error
+		// about, and the recorded reason names any replacement.
+		s.fail(w, r, CodeConflict,
+			fmt.Sprintf("key %s was revoked while rotating: %s", old.KID, err.Error()))
 		return
-	}
-	if err := s.store.RevokeKey(r.Context(), old.KID, reason+" (replaced by "+fresh.KID+")", s.clock()); err != nil {
-		s.failInternal(w, r, "revoke rotated key", err)
+	case s.isNotFound(err):
+		// Deleted in the same window. Gone is gone.
+		s.fail(w, r, CodeNotFound, fmt.Sprintf("key %s no longer exists", old.KID))
+		return
+	default:
+		s.failInternal(w, r, "rotate key", err)
 		return
 	}
 	s.security(r, EventKeyRotated,
@@ -344,7 +376,7 @@ func (s *server) handleCreateEnrollment(w http.ResponseWriter, r *http.Request) 
 		Reusable:       req.Reusable,
 		MaxRedemptions: req.MaxRedemptions,
 	}
-	key, raw, err := s.mintKey(r.Context(), fleet.ClassEnrollment, name, req.Owner, ttl, nil, grant)
+	key, raw, err := s.mintKey(r.Context(), fleet.ClassEnrollment, name, req.Owner, s.clock().Add(ttl), nil, grant)
 	if err != nil {
 		s.failInternal(w, r, "mint enrollment", err)
 		return
@@ -438,7 +470,40 @@ func (s *server) handleRevokeCert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.security(r, EventCertRevoked, slog.String("serial", serial), slog.String("reason", req.Reason))
+	// After the store, never before: the list is the durable record, and a
+	// session closed against a revocation that was not persisted would come
+	// straight back on the spoke's next reconnect.
+	s.closeRevokedSessions(r, serial)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// closeRevokedSessions tears down any live tunnel the just-revoked certificate
+// admitted on this replica, and records it.
+//
+// This is the half of revocation that the revocation list cannot do on its
+// own. The list is consulted at the tunnel handshake, so without this a
+// revoked spoke keeps serving the connection it already holds until its
+// certificate expires -- which during a compromise is the whole of the window
+// that matters.
+//
+// Only this replica's sessions are reachable from here: a session is pinned to
+// the hub that accepted it and there is deliberately no hub-to-hub forwarding.
+// The other replicas close theirs from [RevocationEnforcer], off the same
+// revocation list.
+func (s *server) closeRevokedSessions(r *http.Request, serial string) {
+	if s.sessions == nil {
+		return
+	}
+	closed := s.sessions.CloseRevoked(serial)
+	if len(closed) == 0 {
+		// Nothing was connected here. That is the common case -- the spoke may
+		// be on another replica or already gone -- and it is not an event.
+		return
+	}
+	s.security(r, EventSessionRevoked,
+		slog.String("serial", serial),
+		slog.Int("sessions", len(closed)),
+		slog.String("clusters", strings.Join(uniqueSorted(closed), ",")))
 }
 
 // handleListRevokedCerts lists the revocation entries.
@@ -474,10 +539,35 @@ func (s *server) mintKey(
 	ctx context.Context,
 	class fleet.KeyClass,
 	name, owner string,
-	ttl time.Duration,
+	expiresAt time.Time,
 	scope *fleet.Scope,
 	grant *fleet.EnrollmentGrant,
 ) (*fleet.Key, string, error) {
+	return s.mintKeyWith(ctx, class, name, owner, expiresAt, scope, grant, s.store.PutKey)
+}
+
+// mintKeyWith is mintKey with the caller choosing how the record is committed,
+// so a rotation can commit its mint and its revocation as one store mutation
+// rather than two -- the gap between two was a real failure mode, in which the
+// revocation failed after the mint succeeded and the caller received an error
+// for a rotation that had half-happened.
+func (s *server) mintKeyWith(
+	ctx context.Context,
+	class fleet.KeyClass,
+	name, owner string,
+	expiresAt time.Time,
+	scope *fleet.Scope,
+	grant *fleet.EnrollmentGrant,
+	commit func(context.Context, *fleet.Key) error,
+) (*fleet.Key, string, error) {
+	// The zero expiresAt means the credential never expires, and only an
+	// agent key is ever allowed that. resolveExpiry enforces this for every
+	// route; asserting it here too makes the invariant structural, so a
+	// future caller cannot mint an immortal admin credential by passing the
+	// zero value directly.
+	if expiresAt.IsZero() && class != fleet.ClassAgent {
+		return nil, "", fmt.Errorf("a %s credential must carry an expiry", class)
+	}
 	now := s.clock()
 	var lastErr error
 	for attempt := range mintRetries {
@@ -494,9 +584,9 @@ func (s *server) mintKey(
 			Scope:      scope,
 			Enrollment: grant,
 			CreatedAt:  now,
-			ExpiresAt:  now.Add(ttl),
+			ExpiresAt:  expiresAt,
 		}
-		if err := s.store.PutKey(ctx, key); err != nil {
+		if err := commit(ctx, key); err != nil {
 			lastErr = err
 			if s.isConflict(err) {
 				// A key identifier collision. Retrying is correct; the

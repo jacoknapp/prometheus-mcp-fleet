@@ -40,7 +40,7 @@ internal/clusterfacts       90   # measured 93.94; 10 equivalent: sentinels over
 internal/config             95   # measured 98.70
 internal/fleet              97   # measured 100.00
 internal/httpx              97   # measured 100.00
-internal/hub                94   # measured 97.00; 2 equivalent (capacity hint, cert-expiry tie needs an injectable clock), 1 unkillable
+internal/hub                96   # measured 97.20; 6 equivalent: two capacity hints, a threshold<=runway no-op at equality, and three wall-clock tie boundaries (cert expiry, revocation cache freshness x2) with no injectable clock
 internal/hubapi             97   # measured 100.00
 internal/kube               95   # measured 98.59; 1 unobservable: dialer KeepAlive inside a discarded closure, no exported hook
 internal/mcpsurface         93   # measured 96.77; 2 equivalent: guarded nil-to-nil passthrough assignment
@@ -50,8 +50,8 @@ internal/promapi            94   # measured 97.62
 internal/promclient         90   # measured 93.86; 5 equivalent (min-assign no-ops), 2 impractical: dialer timeouts in a discarded closure
 internal/promproxy          94   # measured 97.62
 internal/registry           90   # measured 93.42; 5 equivalent: s[:n] at len n is a no-op; levenshtein arg swap only picks the smaller row
-internal/render             91   # measured 94.76; 10 equivalent: boundaries already excluded by a redundant guard in the same function
-internal/spoke              93   # measured 96.58; 5 equivalent: if x<L {x=L} is a no-op exactly at L
+internal/render             90   # measured 91.53; 20 equivalent, each documented in mutation_edges_test.go: guarded boundaries excluded by earlier invariants, and the roundSignificant group proven by exhaustive sweep or bit-identity (only lo bits are lost, unreachable within the promised exactness range)
+internal/spoke              95   # measured 96.70; 7 equivalent, documented in util_test.go: if x<L {x=L} no-ops exactly at L, plus fullJitter bounds masked by invariants established earlier in the function
 internal/store              96   # measured 99.07
 internal/store/filestore    97   # measured 100.00
 internal/store/secretstore  94   # measured 97.62; 1 equivalent: backoff cap assigns maxBackoff either way at the tie
@@ -60,5 +60,5 @@ internal/token              97   # measured 100.00
 internal/tunnel             95   # measured 98.35
 internal/tunnel/grpctun     94   # measured 97.00
 internal/tunnel/memtun      93   # measured 96.97
-internal/tunnel/wstun       97   # measured 100.00
+internal/tunnel/wstun       97   # measured 98.88; 1 equivalent: hello.Replicas 0 under omitempty is indistinguishable from unset. 23 timeouts make this score jittery; floor kept wide
 internal/version            93   # measured 96.67

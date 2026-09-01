@@ -158,6 +158,9 @@ type fakeHub struct {
 
 	// nonce, when non-nil, is served instead of a fresh challenge.
 	nonce []byte
+	// enrollStatus, when non-zero, is returned by /enroll instead of issuing.
+	// It exists to model a token another pod of the same cluster already spent.
+	enrollStatus int
 	// renewStatus, when non-zero, is returned by /renew instead of a
 	// certificate.
 	renewStatus int
@@ -256,7 +259,12 @@ func (f *fakeHub) enroll(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	f.lastEnrollBody = string(raw)
 	f.lastEnrollAuth = r.Header.Get("Authorization")
+	status := f.enrollStatus
 	f.mu.Unlock()
+	if status != 0 {
+		http.Error(w, "enrollment refused", status)
+		return
+	}
 
 	var req enrollRequest
 	if err := strictDecode(bytes.NewReader(raw), &req); err != nil {

@@ -59,6 +59,23 @@ func TestEnrollmentLabelsAreTheOperatorsIntent(t *testing.T) {
 		cluster: "prod-eu-1",
 		want:    nil,
 	}, {
+		// Revocation withdraws the label authority with everything else: a
+		// token revoked because it leaked must not keep deciding which
+		// scopes select this cluster. The next-newest live token speaks.
+		name: "a revoked token's labels are withdrawn",
+		keys: []*fleet.Key{
+			grant("prod-eu-1", base, map[string]string{"env": "staging"}),
+			func() *fleet.Key {
+				k := grant("prod-eu-1", base.Add(time.Hour), map[string]string{"env": "prod"})
+				at := base.Add(2 * time.Hour)
+				k.RevokedAt = &at
+				k.RevokedReason = "leaked"
+				return k
+			}(),
+		},
+		cluster: "prod-eu-1",
+		want:    map[string]string{"env": "staging"},
+	}, {
 		name:    "a cluster with no token keeps its own labels",
 		keys:    nil,
 		cluster: "prod-eu-1",

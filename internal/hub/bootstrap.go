@@ -44,9 +44,20 @@ type bootstrapper struct {
 	logger *slog.Logger
 }
 
-// caMaterial is the CA keypair plus the pepper.
+// caMaterial is the CA keypair plus the pepper, and the other root of a
+// rotation if one is in flight.
 type caMaterial struct {
 	certPEM, keyPEM, pepper []byte
+	// extraRoots is the successor or the outgoing root, whichever the recorded
+	// rotation phase says must be trusted alongside the signer. Empty in the
+	// steady state.
+	//
+	// It is read here, at startup, and not only by the rotation controller,
+	// because a hub restarted in the middle of a rotation must come back
+	// trusting exactly what it trusted before it went down. Loading only
+	// ca.crt would narrow the trust bundle to one root on every restart and
+	// disconnect whichever half of the fleet is on the other one.
+	extraRoots []byte
 }
 
 // empty reports whether nothing at all is stored.
@@ -77,19 +88,27 @@ func (b *bootstrapper) prepare(ctx context.Context, cfg *config.Hub) (*ca.CA, *t
 		return nil, nil, fmt.Errorf("create scratch dir %s: %w", b.dir, err)
 	}
 
-	stored, err := b.load(ctx)
-	if err != nil {
-		return nil, nil, err
+	stored, lerr := b.load(ctx)
+	if lerr != nil {
+		return nil, nil, lerr
 	}
 	if err := b.materialise(stored, cfg); err != nil {
 		return nil, nil, err
 	}
 
+	baseRoots, err := readTrustBundle(cfg.CATrustBundleFile)
+	if err != nil {
+		return nil, nil, err
+	}
 	// LoadOrCreate is atomic and refuses to overwrite, so if two replicas start
 	// together the loser adopts the winner's files rather than clobbering them.
+	// The roots a rotation in flight added come from the Secret, so a hub
+	// restarted mid-rotation comes back trusting what it trusted before.
+	roots := joinRootsPEM(baseRoots, stored.extraRoots)
 	authority, err := ca.LoadOrCreate(cfg.CACertFile, cfg.CAKeyFile, ca.Options{
-		TrustDomain:  cfg.TrustDomain,
-		SpokeCertTTL: cfg.SpokeCertTTL,
+		TrustDomain:        cfg.TrustDomain,
+		SpokeCertTTL:       cfg.SpokeCertTTL,
+		AdditionalRootsPEM: roots,
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("load or create the CA: %w", err)
@@ -109,6 +128,9 @@ func (b *bootstrapper) prepare(ctx context.Context, cfg *config.Hub) (*ca.CA, *t
 		// winner's material. Everything loaded above is now stale — continuing
 		// with it would mean signing spoke certificates with a CA no other
 		// replica trusts, and verifying API keys against the wrong pepper.
+		// An adoption race is only reachable on first boot, when the Secret is
+		// being created for the first time and no rotation can be in flight;
+		// the operator's configured roots are therefore the whole bundle.
 		if authority, err = reloadAfterAdoption(cfg); err != nil {
 			return nil, nil, fmt.Errorf("reload the adopted CA: %w", err)
 		}
@@ -155,6 +177,11 @@ func (b *bootstrapper) load(ctx context.Context) (caMaterial, error) {
 		certPEM: sec.Data[secretKeyCACert],
 		keyPEM:  sec.Data[secretKeyCAKey],
 		pepper:  sec.Data[secretKeyPepper],
+		// The phase decides which of ca-next.crt and ca-previous.crt is the
+		// live second root, so it is read through the same interpretation the
+		// rotation controller uses rather than by guessing from which key
+		// happens to be present.
+		extraRoots: readCARotation(sec).additionalRoots(nil),
 	}, nil
 }
 
@@ -274,9 +301,14 @@ func (b *bootstrapper) persist(
 // reloadAfterAdoption re-loads the CA from disk. It is used after a lost
 // create race, where the material on disk changed underneath the first load.
 func reloadAfterAdoption(cfg *config.Hub) (*ca.CA, error) {
+	roots, err := readTrustBundle(cfg.CATrustBundleFile)
+	if err != nil {
+		return nil, err
+	}
 	return ca.Load(cfg.CACertFile, cfg.CAKeyFile, ca.Options{
-		TrustDomain:  cfg.TrustDomain,
-		SpokeCertTTL: cfg.SpokeCertTTL,
+		TrustDomain:        cfg.TrustDomain,
+		SpokeCertTTL:       cfg.SpokeCertTTL,
+		AdditionalRootsPEM: roots,
 	})
 }
 
@@ -329,4 +361,24 @@ func (b *bootstrapper) complete(
 	// the ones we did fill are ours. Nothing to re-adopt.
 	_ = stored
 	return false, nil
+}
+
+// readTrustBundle loads the additional roots a CA rotation needs the hub to
+// trust alongside its signer.
+//
+// Empty is the steady state: one root, the one that signs. Validation happens
+// here rather than at CA load so a malformed bundle names itself at startup
+// instead of surfacing as every spoke failing to verify.
+func readTrustBundle(path string) ([]byte, error) {
+	if path == "" {
+		return nil, nil
+	}
+	pem, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read the CA trust bundle: %w", err)
+	}
+	if _, err := ca.ParseTrustBundlePEM(pem); err != nil {
+		return nil, fmt.Errorf("the CA trust bundle at %s is unusable: %w", path, err)
+	}
+	return pem, nil
 }

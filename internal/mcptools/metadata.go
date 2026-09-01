@@ -292,6 +292,147 @@ func (t *Tools) metadataOf(
 	return out, nil
 }
 
+// TargetMetadataIn is the argument object of target_metadata.
+type TargetMetadataIn struct {
+	// Cluster names the target.
+	Cluster string `json:"cluster" jsonschema:"Cluster name, exactly as returned by list_clusters."`
+	// MatchTarget scopes the lookup to targets whose labels match.
+	MatchTarget string `json:"matchTarget,omitempty" jsonschema:"Selector matching targets by their own labels, e.g. {job=\"api\",instance=\"10.0.0.1:9100\"}. Omit to match every target."`
+	// Metric restricts the answer to one metric.
+	Metric string `json:"metric,omitempty" jsonschema:"Single metric name. Omit to list every metric each matched target reports, which is how you catch a canary and a stable rollout disagreeing on a metric's type."`
+	// Limit caps the returned entries.
+	Limit int `json:"limit,omitempty" jsonschema:"Maximum entries to return."`
+}
+
+// TargetMetadataEntry is one target's metadata for one metric.
+//
+// This differs from metric_metadata in exactly one way: metric_metadata
+// aggregates one entry per metric across the whole cluster, which silently
+// picks a winner when two targets disagree. This tool keeps every target's
+// answer separate, which is the only way to see that disagreement at all —
+// the case that actually matters is a mixed-version rollout where the same
+// metric name means two different things depending which pod answered.
+type TargetMetadataEntry struct {
+	// Target is the reporting target's own labels.
+	Target map[string]string `json:"target,omitempty"`
+	// Metric is the metric name this entry describes.
+	Metric string `json:"metric,omitempty"`
+	// Type is the exposition type.
+	Type string `json:"type,omitempty"`
+	// Unit is the declared unit, when the exposition carried one.
+	Unit string `json:"unit,omitempty"`
+	// Help is the help string, clipped and sanitised. It is remote data.
+	Help string `json:"help,omitempty"`
+}
+
+// TargetMetadataOut is the result of target_metadata.
+type TargetMetadataOut struct {
+	Envelope
+	// Metadata are the entries, ordered by metric name then target.
+	Metadata []TargetMetadataEntry `json:"metadata,omitempty"`
+	// Total is how many entries existed before truncation.
+	Total int `json:"total,omitempty"`
+	// Truncated is set when entries were dropped.
+	Truncated *render.Truncation `json:"truncated,omitempty"`
+}
+
+// upstreamTargetMetadata is the /api/v1/targets/metadata payload. Metric is
+// present only when the request did not itself filter by metric; when it did,
+// every entry describes that one metric and Metric arrives empty.
+type upstreamTargetMetadata []struct {
+	Target map[string]string `json:"target"`
+	Metric string            `json:"metric"`
+	Type   string            `json:"type"`
+	Help   string            `json:"help"`
+	Unit   string            `json:"unit"`
+}
+
+// targetMetadata reports metric metadata as individual targets report it,
+// rather than aggregated across the cluster.
+func (t *Tools) targetMetadata(
+	ctx context.Context, p *fleet.Principal, in TargetMetadataIn,
+) (*TargetMetadataOut, *ToolError) {
+	c, terr := t.resolveCluster(p, in.Cluster)
+	if terr != nil {
+		return nil, terr
+	}
+	if in.Metric != "" && !metricNameRE.MatchString(in.Metric) {
+		return nil, newError(CodeInvalidArgument,
+			fmt.Sprintf("%q is not a valid metric name", render.ClipRunes(in.Metric, 128)),
+			false).WithInput(map[string]any{"cluster": c.ID, "metric": render.ClipRunes(in.Metric, 128)}).
+			WithHint("Call search_metrics to find the exact name.")
+	}
+	matchers, terr := validateMatchers([]string{in.MatchTarget}, c.ID, false)
+	if terr != nil {
+		return nil, terr
+	}
+
+	form := url.Values{}
+	if len(matchers) > 0 {
+		form.Set("match_target", matchers[0])
+	}
+	if in.Metric != "" {
+		form.Set("metric", in.Metric)
+	}
+
+	env, _, terr := t.fetch(ctx, p, promproxy.Call{
+		ClusterID: c.ID,
+		Endpoint:  promapi.EndpointTargetsMetadata,
+		Form:      form,
+	}, kindSelector)
+	if terr != nil {
+		return nil, terr
+	}
+	var raw upstreamTargetMetadata
+	if terr := decodeData(env, c.ID, &raw); terr != nil {
+		return nil, terr
+	}
+
+	entries := make([]TargetMetadataEntry, 0, len(raw))
+	for _, e := range raw {
+		name := e.Metric
+		if name == "" {
+			name = in.Metric
+		}
+		if name == "" || !metricNameRE.MatchString(name) {
+			// A metric name outside the grammar cannot have come from a
+			// well-formed exposition, and an empty one means neither the
+			// request nor the response named it.
+			continue
+		}
+		entries = append(entries, TargetMetadataEntry{
+			Target: render.Labels(e.Target),
+			Metric: name,
+			Type:   render.ClipRunes(e.Type, 32),
+			Unit:   render.ClipRunes(e.Unit, 32),
+			Help:   render.Help(e.Help),
+		})
+	}
+	slices.SortStableFunc(entries, func(a, b TargetMetadataEntry) int {
+		if v := strings.Compare(a.Metric, b.Metric); v != 0 {
+			return v
+		}
+		return strings.Compare(labelsText(a.Target), labelsText(b.Target))
+	})
+
+	out := &TargetMetadataOut{Envelope: untrusted(), Total: len(entries)}
+	limit := clampInt(in.Limit, 100, 1, 1000)
+	kept, trunc := render.TruncateItems(entries, limit,
+		"Pass metric or matchTarget to narrow rather than raising limit.")
+	out.Truncated = trunc
+	fitted, hit := render.FitTokens(kept, t.tokenCeiling, func(m []TargetMetadataEntry) any {
+		return &TargetMetadataOut{Metadata: m}
+	})
+	if hit {
+		out.Truncated = trunc.Escalate(len(fitted), render.ReasonTokenCeiling,
+			fmt.Sprintf("The hub caps a result at about %d estimated tokens regardless of limit. "+
+				"Pass metric or matchTarget to narrow.", t.tokenCeiling))
+		out.Truncated.Total = len(entries)
+	}
+	out.Metadata = fitted
+	return out, nil
+}
+
 // SeriesIn is the argument object of series.
 type SeriesIn struct {
 	// Cluster names the target.

@@ -198,10 +198,33 @@ config:
   spokeCertTTL: 336h
   # -- `PMF_ENROLLMENT_TOKEN_TTL`. Lifetime of a `pmf_enr_` token. The 15 minute default suits an imperative install where a human mints a token and uses it immediately. A GitOps rollout wants a reusable token with a much longer TTL, because the credential is reconciled from git rather than handed over once.
   enrollmentTokenTTL: 15m
+  # -- `PMF_CA_ROTATION_ENABLED`. Let the hub rotate its own signing root instead of an operator
+  # running a runbook. It mints a successor, publishes it to the trust bundle, promotes it to
+  # signer and retires the outgoing root, each step gated on evidence and coordinated between
+  # replicas by a compare-and-swap on the CA Secret. It needs `state.backend: secret` and the CA
+  # the hub generates for itself; a CA you supply through `bootstrap.existingSecret` is yours to
+  # rotate, and the hub says so in its log and declines. See `docs/adr/0015-ca-rotation.md`.
+  caRotationEnabled: true
+  # -- `PMF_CA_ROTATE_AT_REMAINING_FRACTION`. How much of the signing root's life must be left
+  # before a rotation starts: `0.2` begins in its last fifth. A root lives ten years and a
+  # rotation takes about two months at the default certificate TTL and renewal grace, so the
+  # default leaves two years of runway for a job needing one thirtieth of it. There is a floor
+  # underneath this that no value can lower — `2 × spokeCertTTL + renewGrace`, the time a
+  # rotation cannot finish in less than — so setting this small does not let the hub start a
+  # rotation it could not complete before the signer expires.
+  caRotateAtRemainingFraction: 0.2
+  # -- `PMF_CA_ROTATION_POLL_INTERVAL`. How often each replica re-reads the CA Secret to notice a
+  # rotation, its own or another replica's. There is no PVC and no channel between replicas, so
+  # this poll is the only way one learns what another did. It costs one GET per replica per
+  # interval and correctness does not depend on it being short: a replica lagging a poll behind
+  # is still trusting every root the fleet trusts.
+  caRotationPollInterval: 5m
   # -- `PMF_RENEW_GRACE`. How long after a spoke certificate expires the hub will still renew it, given proof the spoke still holds the private key. A spoke renews at half its certificate's life, so an expired certificate means the cluster was unreachable for half a lifetime; without this it is locked out permanently, because `/renew` refuses the expired certificate and its enrollment token was burned at install. Nothing else is relaxed: the chain must still verify, the certificate must not be revoked, and the possession proof must still pass. Set to `0` to require an unexpired certificate.
   renewGrace: 720h
-  # -- `PMF_AGENT_KEY_TTL`. Default lifetime of a minted `pmf_agt_` agent key.
-  agentKeyTTL: 720h
+  # -- `PMF_AGENT_KEY_TTL`. Default lifetime of a minted `pmf_agt_` agent key, and the maximum a create request may ask for. Nothing rotates agent keys automatically (the holder is an AI agent's configuration, not a process that can re-enrol itself), so expiry is an outage on a timer. A key may be minted with no expiry at all via the no-expiry flag of `hub keys create`; revocation is then how it is withdrawn.
+  agentKeyTTL: 2160h
+  # -- `PMF_ADMIN_KEY_TTL`. Default and maximum lifetime of a minted `pmf_adm_` admin key, including the bootstrap key printed on first start. A separate knob from agentKeyTTL on purpose: relaxing agent expiry must not silently relax the credential that mints credentials.
+  adminKeyTTL: 2160h
   # -- `PMF_MAX_SPOKES`. Optional cap on concurrent spoke sessions on one hub replica. `0`, the
   # default, means no limit. A cap here refuses spokes rather than shedding load: it is applied
   # before the WebSocket upgrade, so an over-limit spoke gets a 503 and its cluster silently
@@ -461,8 +484,16 @@ metrics:
       spokeCertExpiringSoon: true
       # -- `PrometheusMCPHubProxyErrorRatioHigh` — 5xx ratio of proxied Prometheus requests above `thresholds.proxyErrorRatio`.
       proxyErrorRatioHigh: true
+      # -- `PrometheusMCPHubStateSecretLarge` — `promfleet_hub_state_bytes` above `thresholds.stateBytes`. The hub refuses writes at 700 KiB, so this fires while there is still room to prune.
+      stateSecretLarge: true
+      # -- `PrometheusMCPHubRevocationStale` — no successful revoked-serial cache refresh for `thresholds.revocationStaleSeconds`. While this fires, a revocation committed elsewhere is NOT being enforced by the affected replica.
+      revocationStale: true
+      # -- `PrometheusMCPHubPeerDiscoveryBroken` — peer discovery resolves fewer replicas than are deployed. Spokes then never learn the true count, hold too few tunnels, and their own partial-coverage alert cannot fire because they have no count to fall short of.
+      peerDiscoveryBroken: true
       # -- `PrometheusMCPHubRestartLoop` — container restarts above `thresholds.restartsPerHour`. Requires kube-state-metrics.
       restartLoop: true
+      # -- `PrometheusMCPHubCARotationStalled` — a self-service CA rotation has been in `publishing` or `signing` for longer than `thresholds.caRotationStalledSeconds`. The rotation is deliberately slow, so this fires only when it has stopped making progress; both roots stay trusted meanwhile, so it is a warning, not an outage.
+      caRotationStalled: true
     thresholds:
       # -- Fraction of enrolled spokes that may be disconnected before `PrometheusMCPSpokesDisconnected` fires.
       spokesDisconnectedRatio: 0.10
@@ -474,6 +505,12 @@ metrics:
       proxyErrorRatio: 0.10
       # -- Container restarts in one hour above which `PrometheusMCPHubRestartLoop` fires.
       restartsPerHour: 3
+      # -- Encoded state document size in bytes above which `PrometheusMCPHubStateSecretLarge` fires. 500 KiB against the hub's hard 700 KiB write ceiling, so the alert leads the failure by a wide margin.
+      stateBytes: 512000
+      # -- Seconds since the last successful revoked-serial refresh above which `PrometheusMCPHubRevocationStale` fires. Refreshes normally land at least every 30s (the cache TTL), so 300 is ten missed refreshes.
+      revocationStaleSeconds: 300
+      # -- Seconds a CA rotation phase may last before `PrometheusMCPHubCARotationStalled` fires. 75 days against the default `2 × spokeCertTTL + renewGrace` of 58 days, so a healthy rotation never trips it. Raise it if you lengthen `config.spokeCertTTL` or `config.renewGrace`.
+      caRotationStalledSeconds: 6480000
     # -- Extra rule groups appended verbatim to `spec.groups`.
     additionalGroups: []
 tests:

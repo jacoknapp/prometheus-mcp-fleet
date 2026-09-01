@@ -13,7 +13,8 @@ The default answer is `k8s.io/client-go`. It is correct, well maintained and
 universally understood. It also brings `k8s.io/api`, `k8s.io/apimachinery`,
 `k8s.io/klog`, a large slice of `gogo/protobuf` and a long transitive tail — tens
 of megabytes of module and a meaningful slice of binary size, for a project whose
-spoke is supposed to idle at about 20 MiB and whose dependency budget is
+spoke is meant to stay small — its idle heap is regression-tested and the
+chart requests 64Mi — and whose dependency budget is
 deliberately closed ([ADR-0010](0010-dependency-budget.md)).
 
 It is worth being precise about what we actually need. Three verbs on one

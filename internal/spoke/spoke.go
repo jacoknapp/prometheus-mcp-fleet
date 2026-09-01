@@ -77,6 +77,32 @@ const maxFirstDialDelay = 5 * time.Second
 // per tick is comparing two integers.
 const defaultCoverageInterval = 10 * time.Second
 
+// defaultCoverageProbe is the probe dialer's backoff CEILING. The delay is a
+// full-jitter uniform draw, so the mean cycle is about half this -- one extra
+// handshake per endpoint per minute -- which is the bound on how long a hub
+// scale-up goes unnoticed by a settled spoke. At a hundred spokes that is
+// under two handshakes a second fleet-wide.
+const defaultCoverageProbe = 2 * time.Minute
+
+// redundantSearchLimit is how many CONSECUTIVE redundant dials a searching
+// dialer makes at the fast pace before conceding that the search is not
+// converging and dropping to the probe pace. A load balancer with session
+// affinity pins every dial to one replica, so coverage never completes and,
+// without this, every surplus dialer would run full handshakes at the fast
+// ceiling for the life of the pod. Ten fast guesses find an uncovered
+// replica with high probability whenever finding one is possible at all.
+const redundantSearchLimit = 10
+
+// siblingIdentityWait bounds how long a pod that lost the enrollment race waits
+// for the winner to publish the shared identity. Long enough to cover an
+// enrollment round trip plus the Secret write on a busy API server, short
+// enough that a genuinely spent token still surfaces as an error while an
+// operator is watching the rollout.
+const siblingIdentityWait = 90 * time.Second
+
+// siblingIdentityPoll is how often it re-reads the Secret while waiting.
+const siblingIdentityPoll = 2 * time.Second
+
 // reasonRedundantTunnel marks a connection this dialer dropped on purpose
 // because it reached a hub replica another dialer already covers. It is a
 // reconnect reason like any other for metrics, but the dial loop exempts it
@@ -108,6 +134,11 @@ type timings struct {
 	// coverageInterval is how often an endpoint supervisor re-checks whether
 	// the hub has advertised more replicas than it has dialers for.
 	coverageInterval time.Duration
+	// coverageProbe is the pace of the probe dialer once coverage is
+	// complete: how often a settled spoke performs one extra handshake to
+	// hear the hub's current replica count. It bounds how long a hub
+	// scale-up goes unnoticed.
+	coverageProbe time.Duration
 }
 
 // newTimings derives the loop periods from configuration.
@@ -126,6 +157,7 @@ func newTimings(cfg *config.Spoke) timings {
 		renewCheck:       renewCheckInterval,
 		dialStagger:      maxFirstDialDelay,
 		coverageInterval: defaultCoverageInterval,
+		coverageProbe:    defaultCoverageProbe,
 	}
 }
 
@@ -143,7 +175,10 @@ func Run(ctx context.Context, cfg *config.Spoke) error {
 	registry := obs.NewRegistry(build, "spoke")
 	metrics := obs.NewSpokeMetrics(registry)
 	health := obs.NewHealth(logger)
-	health.Set("tunnel", false, "no tunnel established yet")
+	// One health component PER ENDPOINT, registered by each endpoint's
+	// supervisor: a single shared "tunnel" component was last-writer-wins
+	// across endpoints, so whichever endpoint changed most recently decided
+	// readiness for all of them.
 	health.Set("prometheus", false, "not probed yet")
 
 	shutdownTracing, err := obs.InitTracing(ctx, obs.TracingConfig{
@@ -369,6 +404,12 @@ func (s *spoke) establishIdentity(ctx context.Context) error {
 			// cluster whose pod has almost certainly restarted too.
 			s.logger.WarnContext(ctx, "stored certificate has expired; attempting renewal within the hub's grace window",
 				"not_after", id.Leaf.NotAfter.Format(time.RFC3339))
+			if aerr := s.assertOwnCluster(id); aerr != nil {
+				// Renewing a foreign certificate would adopt the wrong
+				// identity for the pod's whole life; refuse before touching
+				// the hub.
+				return aerr
+			}
 			renewed, rerr := s.enroller.renew(ctx, id)
 			if rerr != nil {
 				s.logger.WarnContext(ctx, "renewal of the expired certificate was refused, re-enrolling",
@@ -382,6 +423,9 @@ func (s *spoke) establishIdentity(ctx context.Context) error {
 			s.logger.InfoContext(ctx, "recovered an expired certificate by renewal; no enrollment token was needed",
 				"not_after", renewed.Leaf.NotAfter.Format(time.RFC3339))
 			return nil
+		}
+		if aerr := s.assertOwnCluster(id); aerr != nil {
+			return aerr
 		}
 		s.setIdentity(id)
 		s.logger.InfoContext(ctx, "loaded stored identity",
@@ -397,6 +441,28 @@ func (s *spoke) establishIdentity(ctx context.Context) error {
 		return err
 	}
 	id, err := s.enroller.enroll(ctx, s.cfg.ClusterID, token)
+	if errors.Is(err, ErrTokenAlreadyUsed) {
+		// A sibling pod of this same cluster got there first.
+		//
+		// Several spoke pods share one identity Secret and start together, so
+		// on a fresh cluster they all find it empty and all enrol. Whichever
+		// loses that race sees the token already spent -- which is not an error
+		// here, it is the expected outcome for two of three pods when the
+		// token is single use. Crashing would take the pod through
+		// CrashLoopBackOff and turn an ordinary GitOps first sync into a
+		// Degraded application that recovers only because the restart happens
+		// to find the Secret populated. Wait for the winner's write instead.
+		if adopted := s.awaitSiblingIdentity(ctx); adopted != nil {
+			if aerr := s.assertOwnCluster(adopted); aerr != nil {
+				return aerr
+			}
+			s.setIdentity(adopted)
+			s.logger.InfoContext(ctx, "adopted the identity a sibling pod enrolled",
+				"serial", adopted.Leaf.SerialNumber.Text(16),
+				"not_after", adopted.Leaf.NotAfter.Format(time.RFC3339))
+			return nil
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -420,7 +486,66 @@ func (s *spoke) establishIdentity(ctx context.Context) error {
 	if stored := s.storedIdentity(ctx); stored != nil {
 		id = stored
 	}
+	// The enrollment response's certificate is bound to s.cfg.ClusterID by the
+	// hub, but the Secret re-read above can surface a SIBLING's write -- and
+	// if this Secret is wrongly shared between two clusters' Deployments,
+	// that sibling may not be a sibling at all.
+	if aerr := s.assertOwnCluster(id); aerr != nil {
+		return aerr
+	}
 	s.setIdentity(id)
+	return nil
+}
+
+// publishTunnelSignals derives the endpoint's health component and tunnel_up
+// gauge from coverage, so the signals survive any individual dialer's
+// connection ending -- the probe's does, by design, once a minute.
+//
+// The gauge means "at least one live tunnel", because that is what the series
+// has always meant and the TunnelDown alert is calibrated to it. READINESS is
+// stricter: with a known replica count it requires full coverage, because a
+// rollout gates on Ready and replacing a fully-covered pod with a
+// one-of-three pod silently degrades two thirds of that cluster's calls. With
+// the count still unknown (a cold hub cache advertises zero), one tunnel is
+// the most that can be asked. Each endpoint owns its own component, so one
+// endpoint's outage cannot be overwritten by another's good news.
+func (s *spoke) publishTunnelSignals(endpoint string, cov *coverage) {
+	covered, want := cov.state()
+	if covered > 0 {
+		s.metrics.TunnelUp.WithLabelValues(endpoint).Set(1)
+	} else {
+		s.metrics.TunnelUp.WithLabelValues(endpoint).Set(0)
+	}
+	switch {
+	case covered == 0:
+		s.health.Set(tunnelComponent(endpoint), false, "no tunnel to "+endpoint)
+	case want > 0 && covered < want:
+		s.health.Set(tunnelComponent(endpoint), false,
+			fmt.Sprintf("covering %d of %d hub replicas via %s", covered, want, endpoint))
+	default:
+		s.health.Set(tunnelComponent(endpoint), true, "")
+	}
+}
+
+// tunnelComponent names an endpoint's health component.
+func tunnelComponent(endpoint string) string { return "tunnel:" + endpoint }
+
+// assertOwnCluster refuses an identity whose certificate names a different
+// cluster than this pod is configured for. The mismatch has exactly one
+// cause worth designing for: two spoke Deployments for different clusters
+// pointed at the same identity Secret, where the loser of the enrollment race
+// adopts the winner's certificate and then renews it forever while every
+// tunnel handshake fails with a cluster mismatch -- a silent permanent outage.
+// It fails closed at the hub either way; failing HERE names the actual
+// misconfiguration in this pod's own log at startup.
+func (s *spoke) assertOwnCluster(id *Identity) error {
+	got := clusterIDFromCert(id.Leaf)
+	if got != s.cfg.ClusterID {
+		return fmt.Errorf(
+			"the identity certificate names cluster %q but this spoke is configured as %q: "+
+				"two clusters are almost certainly sharing one identity Secret -- give each its own",
+			got, s.cfg.ClusterID)
+	}
 	return nil
 }
 
@@ -612,16 +737,28 @@ func (s *spoke) probeLoop(ctx context.Context) {
 // KiB until the process restarts. Tearing dialers down on a transient count
 // change would be more code and more risk than the memory is worth.
 func (s *spoke) superviseEndpoint(ctx context.Context, endpoint string) {
-	cov := newCoverage()
+	cov := newCoverage(len(s.cfg.HubEndpoints) <= 1)
 	var wg sync.WaitGroup
-	running := 0
+	// active counts live dial loops. A loop retires itself when the pool
+	// exceeds what coverage wants (see dialLoop), so after a hub scale-down
+	// the pool shrinks back to want+1 rather than every historical surplus
+	// loop living on as another probe -- eight probes per spoke after an
+	// 8-to-1 scale-down is eight times the handshake load the design costs.
+	var active atomic.Int64
+
+	// Registered before the first dial so a spoke with an unreachable
+	// endpoint is NotReady for the right reason, not silently missing the
+	// component.
+	s.health.Set(tunnelComponent(endpoint), false, "no tunnel established yet")
 
 	for ctx.Err() == nil {
-		for want := cov.dialers(); running < want; running++ {
+		for want := cov.dialers(); int(active.Load()) < want; {
+			active.Add(1)
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				s.dialLoop(ctx, endpoint, cov)
+				defer active.Add(-1)
+				s.dialLoop(ctx, endpoint, cov, &active)
 			}()
 		}
 		// Re-check periodically rather than on a signal: the replica count
@@ -634,7 +771,41 @@ func (s *spoke) superviseEndpoint(ctx context.Context, endpoint string) {
 	wg.Wait()
 }
 
-func (s *spoke) dialLoop(ctx context.Context, endpoint string, cov *coverage) {
+// redundantSearchMultiple bounds the fast pace's growth while coverage is
+// still incomplete: mild growth capped at eight times the minimum backoff, so
+// a futile search settles at seconds, not milliseconds, without ever running
+// as hot as a genuine failure's backoff would allow.
+const redundantSearchMultiple = 8
+
+// redundantCeiling picks the backoff ceiling for one redundant redial, given
+// coverage's state and the CONSECUTIVE redundant streak so far.
+//
+// While coverage is INCOMPLETE (want == 0 counts as incomplete: it is
+// "unknown", not "trivially satisfied", so a cold-cached hub does not
+// accidentally look done) this dialer is searching: coverage is reached by
+// redialing until the load balancer hands out an uncovered replica, so the
+// first few guesses must stay quick -- but not free to run hot forever,
+// because a replica the balancer never offers would keep every surplus dialer
+// hammering full handshakes for the life of the pod. minBackoff*
+// redundantSearchMultiple, capped at maxBackoff, is that mild growth's cap.
+//
+// Once coverage is COMPLETE this dialer is the probe: the one deliberate
+// extra in the pool whose slow cycle of connect, hear the hub's current
+// replica count, step aside is the only way a settled spoke ever learns the
+// hub scaled up. slow is its pace, so the steady-state cost is one handshake
+// per spoke per interval and a scale-up is noticed within about one interval
+// rather than never. A long redundant streak with coverage still incomplete
+// gets the same slow ceiling: it means the search is not converging (an
+// affinity-pinned balancer, a replica nothing routes to), and hammering will
+// not change that.
+func redundantCeiling(covered, want, redundant int, minBackoff, maxBackoff, slow time.Duration) time.Duration {
+	if (covered >= want && want > 0) || redundant >= redundantSearchLimit {
+		return slow
+	}
+	return min(redundantSearchMultiple*minBackoff, maxBackoff)
+}
+
+func (s *spoke) dialLoop(ctx context.Context, endpoint string, cov *coverage, active *atomic.Int64) {
 	log := s.logger.With("endpoint", endpoint)
 
 	// Normalise once, so the log line and the error an operator sees name a
@@ -649,6 +820,9 @@ func (s *spoke) dialLoop(ctx context.Context, endpoint string, cov *coverage) {
 		log.InfoContext(ctx, "hub endpoint normalised", "url", target)
 	}
 	attempt := 0
+	// redundant counts CONSECUTIVE dials that landed on an already-covered
+	// replica, separately from the failure backoff.
+	redundant := 0
 
 	// Stagger the very first dial so a fleet-wide rollout does not arrive at
 	// the hub in one burst.
@@ -659,8 +833,11 @@ func (s *spoke) dialLoop(ctx context.Context, endpoint string, cov *coverage) {
 	for ctx.Err() == nil {
 		connected := s.now()
 		reason := s.dialOnce(ctx, target, log, cov)
-		s.metrics.TunnelUp.WithLabelValues(target).Set(0)
-		s.health.Set("tunnel", false, "no tunnel to "+target)
+		// No signal writes here: health and the tunnel_up gauge are derived
+		// from COVERAGE, published where coverage changes (join and leave in
+		// dialOnce). Written here, the probe's routine step-aside would clear
+		// signals other dialers' live tunnels had earned -- every spoke
+		// NotReady and a critical TunnelDown firing while perfectly healthy.
 
 		if ctx.Err() != nil {
 			return
@@ -680,11 +857,28 @@ func (s *spoke) dialLoop(ctx context.Context, endpoint string, cov *coverage) {
 		// had least left to find. At ten replicas that turned seconds into
 		// minutes, and a rolling hub upgrade stopped being transparent.
 		if reason == reasonRedundantTunnel {
-			if !sleepCtx(ctx, fullJitter(s.cfg.ReconnectMinBackoff, s.cfg.ReconnectMinBackoff, 0)) {
+			// A redundant ending is also the safe moment to retire: this
+			// loop holds no tunnel right now, so if the pool exceeds what
+			// coverage wants -- a hub scale-down, or a transient inflated
+			// count -- exiting here shrinks it without dropping anything.
+			// The supervisor respawns if coverage grows again.
+			if active != nil && int(active.Load()) > cov.dialers() {
+				log.InfoContext(ctx, "retiring a surplus dialer", "pool", active.Load(), "want", cov.dialers())
+				return
+			}
+			// The pace of a redundant redial depends on why it was redundant;
+			// see [redundantCeiling].
+			covered, want := cov.state()
+			ceiling := redundantCeiling(covered, want, redundant,
+				s.cfg.ReconnectMinBackoff, s.cfg.ReconnectMaxBackoff, s.timing.coverageProbe)
+			delay := fullJitter(s.cfg.ReconnectMinBackoff, ceiling, redundant)
+			redundant++
+			if !sleepCtx(ctx, delay) {
 				return
 			}
 			continue
 		}
+		redundant = 0
 
 		// Reset the backoff only after a connection that actually lasted. A
 		// connection that dies immediately must not reset the counter, or a
@@ -727,6 +921,7 @@ func (s *spoke) dialOnce(ctx context.Context, endpoint string, log *slog.Logger,
 			cov.leave(joined)
 			covered, _ := cov.state()
 			s.metrics.TunnelsCovered.WithLabelValues(endpoint).Set(float64(covered))
+			s.publishTunnelSignals(endpoint, cov)
 		}
 	}()
 	go func() {
@@ -736,9 +931,6 @@ func (s *spoke) dialOnce(ctx context.Context, endpoint string, log *slog.Logger,
 		case <-dialCtx.Done():
 		}
 	}()
-
-	s.metrics.TunnelUp.WithLabelValues(endpoint).Set(1)
-	s.health.Set("tunnel", true, "")
 
 	// The client certificate is presented INSIDE the connection, not in a TLS
 	// handshake: an Ingress terminates TLS and the hub would never see it.
@@ -783,6 +975,7 @@ func (s *spoke) dialOnce(ctx context.Context, endpoint string, log *slog.Logger,
 			joined = hub.ServerID
 			covered, want := cov.state()
 			s.metrics.TunnelsCovered.WithLabelValues(endpoint).Set(float64(covered))
+			s.publishTunnelSignals(endpoint, cov)
 			if duplicate {
 				// Two tunnels to one replica while another has none is the one
 				// state this design must not settle into, and the load
@@ -937,5 +1130,34 @@ func (s *spoke) adoptStoredIdentity(ctx context.Context) *Identity {
 		!stored.Leaf.NotAfter.After(current.Leaf.NotAfter) {
 		return nil
 	}
+	if err := s.assertOwnCluster(stored); err != nil {
+		// The startup paths refuse a foreign identity and exit; here the pod
+		// is mid-life with a working identity of its own, so the right move
+		// is to keep it and shout. Adopting would trade a working pod for
+		// one that renews another cluster's certificate forever while every
+		// handshake fails with a cluster mismatch.
+		s.logger.ErrorContext(ctx, "refusing to adopt the stored identity", "error", err)
+		return nil
+	}
 	return stored
+}
+
+// awaitSiblingIdentity waits for another pod of this cluster to write the
+// shared identity Secret, and returns what it wrote.
+//
+// It is bounded: a spoke that waits forever is indistinguishable from one that
+// is broken, and the enrollment token really might be spent with no sibling
+// coming. Returning nil lets the caller report the original enrollment failure,
+// which is the honest error in that case.
+func (s *spoke) awaitSiblingIdentity(ctx context.Context) *Identity {
+	deadline := s.now().Add(siblingIdentityWait)
+	for s.now().Before(deadline) {
+		if !sleepCtx(ctx, jitter(siblingIdentityPoll)) {
+			return nil
+		}
+		if id := s.storedIdentity(ctx); id != nil {
+			return id
+		}
+	}
+	return nil
 }

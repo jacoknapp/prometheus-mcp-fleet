@@ -385,3 +385,61 @@ func TestLabelsWithSDLC(t *testing.T) {
 		})
 	}
 }
+
+// Equivalent-mutant proofs.
+//
+// Each boundary mutant below is left alive deliberately, with the argument
+// for why no test can distinguish it recorded here rather than faked with a
+// contrived assertion. Compare internal/render's mutation_edges_test.go,
+// which documents the same kind of finding for that package.
+//
+//   - util.go:26 ("if d <= 0" in jitter) widening to "< " only changes
+//     behaviour at d == 0, where the guarded "return d" (0) and falling
+//     through to "time.Duration(float64(d) * factor)" (0 * factor == 0)
+//     produce the identical value.
+//
+//   - util.go:39 ("if base <= 0" in fullJitter) is NOT equivalent: at
+//     base == 0 the narrowed "< " skips the 500ms default, leaving base and
+//     therefore window at 0, and rand.Int64N(0) panics. Already killed by
+//     TestFullJitterDefaultsRepairAMisconfiguredBackoff's "no base falls
+//     back to 500ms" case.
+//
+//   - util.go:42 ("if max <= 0 || max < base") widening the first clause to
+//     "< " only changes behaviour at max == 0. By this point base is always
+//     > 0 (the base <= 0 branch above already defaulted it), so
+//     "max < base" is unconditionally true whenever max == 0 and the second
+//     clause fires regardless of the first — the widened clause can never be
+//     the one that mattered.
+//
+//   - util.go:45 ("if max < base", the fallback-cap repair) widening to
+//     "<= " only changes behaviour at max == base exactly, where the
+//     assignment "max = base" is a no-op.
+//
+//   - util.go:54 ("if window >= max" in the doubling loop) narrowing to "> "
+//     only changes behaviour at window == max exactly, where the guarded
+//     "window = max" assigns the value window already holds. Any overshoot
+//     the narrowed check misses gets corrected on the very next doubling
+//     (window is by then > max, and "> " and ">= " agree on that), so the
+//     final window used to draw the delay is unaffected either way.
+//
+//   - coverage.go:80 ("if replicas > maxAdvertisedReplicas") widening to
+//     ">= " only changes behaviour at replicas == maxAdvertisedReplicas
+//     exactly, where the guarded "replicas = maxAdvertisedReplicas" assigns
+//     the value replicas already holds.
+//
+//   - coverage.go:123 ("if want < 1" in dialers) narrowing to "<= " only
+//     changes behaviour at want == 1, where the guarded "return 2" and the
+//     fallthrough "return want + 1" (1 + 1 == 2) produce the identical
+//     value.
+//
+//   - spoke.go:151 ("if probe < minProbeInterval" in newTimings) widening to
+//     "<= " only changes behaviour at probe == minProbeInterval exactly,
+//     where the guarded "probe = minProbeInterval" assigns the value probe
+//     already holds.
+//
+//   - spoke.go:1053 ("make(map[string]string, len(labels)+1)" in
+//     labelsWithSDLC) an ARITHMETIC_BASE turning "+1" into "-1" only changes
+//     the map's pre-allocation size HINT, which Go accepts even when
+//     negative (it is clamped, not validated) and which is not observable
+//     through any Go API: the resulting map's contents, length and iteration
+//     are identical regardless of the hint that built it.

@@ -90,6 +90,37 @@ spec:
               also reports NotReady once the CA is inside 24h of expiry.
             runbook_url: {{ $runbook }}prometheusmcphubcacertexpiringsoon
         {{- end }}
+        {{- if .Values.metrics.prometheusRule.rules.caRotationStalled }}
+        {{/*
+          The hub rotates its own CA, so this alert is about a rotation that has
+          stopped moving rather than one that is under way: a healthy rotation
+          spends weeks in publishing and signing on purpose. The phase gauge is
+          1 on exactly one label, and the start gauge is a UNIX TIMESTAMP, not
+          seconds remaining, so this one really is `time() - ...`.
+        */}}
+        - alert: PrometheusMCPHubCARotationStalled
+          expr: >-
+            (max(promfleet_hub_ca_rotation_phase{ {{ $sel }}, phase!="steady" }) == 1)
+            and on()
+            ((time() - max(promfleet_hub_ca_rotation_phase_start_timestamp_seconds{ {{ $sel }} }))
+            > {{ $t.caRotationStalledSeconds | int64 }})
+          for: 1h
+          labels:
+            severity: warning
+            {{- with .Values.metrics.prometheusRule.additionalRuleLabels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: The hub's CA rotation has not advanced for {{ div $t.caRotationStalledSeconds 86400 }} days
+            description: >-
+              A CA rotation entered its current phase
+              {{ printf "{{ $value | humanizeDuration }}" }} ago and has not moved on.
+              Nothing is broken yet -- both the outgoing and the incoming root are
+              trusted for as long as this lasts -- but the rotation is not finishing.
+              The usual cause is a spoke that still holds a certificate from the
+              outgoing root; check sum(promfleet_hub_ca_outgoing_root_sessions).
+            runbook_url: {{ $runbook }}prometheusmcphubcarotationstalled
+        {{- end }}
         {{- if .Values.metrics.prometheusRule.rules.spokeCertExpiringSoon }}
         - alert: PrometheusMCPHubSpokeCertExpiringSoon
           expr: promfleet_hub_spoke_cert_expiry_seconds{ {{ $sel }} } < {{ $t.spokeCertExpirySeconds | int64 }}
@@ -125,6 +156,74 @@ spec:
               cluster {{ printf "{{ $labels.cluster }}" }} returned 5xx over the last 5
               minutes. Check that cluster's Prometheus and the spoke's logs.
             runbook_url: {{ $runbook }}prometheusmcphubproxyerrorratiohigh
+        {{- end }}
+        {{- if .Values.metrics.prometheusRule.rules.stateSecretLarge }}
+        - alert: PrometheusMCPHubStateSecretLarge
+          expr: promfleet_hub_state_bytes{ {{ $sel }} } > {{ $t.stateBytes | int64 }}
+          for: 1h
+          labels:
+            severity: warning
+            {{- with .Values.metrics.prometheusRule.additionalRuleLabels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: The hub's persisted state is approaching the 700 KiB Secret write ceiling
+            description: >-
+              The encoded state document is {{ printf "{{ $value | humanize1024 }}" }}B.
+              The hub refuses writes past 700 KiB rather than discovering the
+              Kubernetes 1 MiB Secret cap during an enrollment, at which point
+              minting and enrolling fail. Prune expired keys, burned enrollment
+              records and lapsed certificate revocations through the admin API.
+            runbook_url: {{ $runbook }}prometheusmcphubstatesecretlarge
+        {{- end }}
+        {{- if .Values.metrics.prometheusRule.rules.revocationStale }}
+        {{/* This one legitimately compares against time(): the series is the unix
+             time of the last SUCCESSFUL refresh, not a seconds-remaining gauge. */}}
+        - alert: PrometheusMCPHubRevocationStale
+          expr: >-
+            (time() - promfleet_hub_revocation_refresh_timestamp_seconds{ {{ $sel }} })
+            > {{ $t.revocationStaleSeconds | int64 }}
+          for: 5m
+          labels:
+            severity: warning
+            {{- with .Values.metrics.prometheusRule.additionalRuleLabels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: A hub replica has not refreshed its revocation list
+            description: >-
+              No successful revoked-serial refresh for
+              {{ printf "{{ $value | humanizeDuration }}" }}. The replica keeps serving
+              its last good list rather than disconnecting the fleet, which means a
+              certificate revoked SINCE then is still being admitted by this replica.
+              Check the hub's access to its state Secret.
+            runbook_url: {{ $runbook }}prometheusmcphubrevocationstale
+        {{- end }}
+        {{- if and .Values.metrics.prometheusRule.rules.peerDiscoveryBroken .Values.peerDiscovery.enabled (gt (int .Values.replicaCount) 1) }}
+        {{/* Rendered only when discovery is on and more than one replica is
+             deployed: with either off, a low count is not a defect. The
+             deployed count is baked in at render time, which is exactly what
+             the gauge should equal. */}}
+        - alert: PrometheusMCPHubPeerDiscoveryBroken
+          expr: promfleet_hub_discovered_peers{ {{ $sel }} } < {{ .Values.replicaCount | int64 }}
+          for: 15m
+          labels:
+            severity: warning
+            {{- with .Values.metrics.prometheusRule.additionalRuleLabels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: Hub peer discovery resolves fewer replicas than are deployed
+            description: >-
+              This replica's headless-Service lookup finds
+              {{ printf "{{ $value }}" }} replicas of {{ .Values.replicaCount }} deployed.
+              Spokes learn the replica count from this number: while it is low they
+              hold too few tunnels, a share of tool calls fail with "cluster not
+              connected", and the spokes' own partial-coverage alert cannot fire
+              because they never learn a count to fall short of. Check DNS egress
+              from the hub pods and that the headless Service exists and selects
+              every hub pod.
+            runbook_url: {{ $runbook }}prometheusmcphubpeerdiscoverybroken
         {{- end }}
         {{- if .Values.metrics.prometheusRule.rules.restartLoop }}
         {{/* Requires kube-state-metrics. The hub is a Deployment, so its pods are

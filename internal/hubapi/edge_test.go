@@ -182,7 +182,7 @@ func TestMintKeyRejectsUnknownClass(t *testing.T) {
 	if bogus.Valid() {
 		t.Fatal("test setup: this class must be invalid")
 	}
-	key, raw, err := s.mintKey(t.Context(), bogus, "name", "owner", time.Hour, nil, nil)
+	key, raw, err := s.mintKey(t.Context(), bogus, "name", "owner", time.Now().Add(time.Hour), nil, nil)
 	if err == nil {
 		t.Fatal("mintKey accepted an unknown key class")
 	}
@@ -387,6 +387,107 @@ func TestMintRetriesAreBounded(t *testing.T) {
 
 // TestMutationStoreFailures covers the write paths that only fail after the
 // record has been read.
+// TestMintKeyRefusesImmortalNonAgent pins the structural guard inside the
+// mint path itself: resolveExpiry already refuses no-expiry for admin and
+// enrollment classes at every route, but a future caller passing the zero
+// time directly must hit a wall here rather than persist an immortal admin
+// credential.
+func TestMintKeyRefusesImmortalNonAgent(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+	s, err := newServer(Options{Store: h.store, Hasher: h.hasher, CA: h.ca, Verifier: h.verifier})
+	if err != nil {
+		t.Fatalf("newServer: %v", err)
+	}
+	for _, class := range []fleet.KeyClass{fleet.ClassAdmin, fleet.ClassEnrollment} {
+		if _, _, err := s.mintKey(t.Context(), class, "name", "owner", time.Time{}, nil, nil); err == nil {
+			t.Errorf("mintKey minted an immortal %s credential", class)
+		}
+	}
+}
+
+// TestRotateRevokedKeyRefused pins the replay refusal: rotating an
+// already-revoked key must not mint it back into life, because the retry of a
+// rotation whose response was lost would otherwise strand a second live
+// replacement whose raw token nobody ever saw.
+func TestRotateRevokedKeyRefused(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+	var created MintedKeyResponse
+	decode(t, h.adminDo(http.MethodPost, "/admin/v1/keys",
+		CreateKeyRequest{Class: fleet.ClassAgent, Name: "rotate-once", Scope: validScope()}), &created)
+
+	var first MintedKeyResponse
+	resp := h.adminDo(http.MethodPost, "/admin/v1/keys/"+created.Key.KID+"/rotate", nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("first rotation status = %d, want %d", resp.StatusCode, http.StatusCreated)
+	}
+	decode(t, resp, &first)
+
+	// The replay. The refusal must name the replacement, which the operator
+	// needs precisely because its raw token was in the response they lost.
+	replay := h.adminDo(http.MethodPost, "/admin/v1/keys/"+created.Key.KID+"/rotate", nil)
+	if replay.StatusCode != http.StatusConflict {
+		t.Fatalf("replayed rotation status = %d, want %d (%s)", replay.StatusCode, http.StatusConflict, decode(t, replay, nil))
+	}
+	env := envelopeOf(t, replay)
+	if env.Error.Code != CodeConflict {
+		t.Errorf("code = %q, want %q", env.Error.Code, CodeConflict)
+	}
+	if !strings.Contains(env.Error.Message, first.Key.KID) {
+		t.Errorf("refusal %q does not name the replacement key %s", env.Error.Message, first.Key.KID)
+	}
+
+	var after KeyListResponse
+	decode(t, h.adminDo(http.MethodGet, "/admin/v1/keys?class=agt", nil), &after)
+	var replacements int
+	for _, k := range after.Keys {
+		if k.Name == "rotate-once" && !k.Revoked {
+			replacements++
+		}
+	}
+	if replacements != 1 {
+		t.Errorf("live keys named rotate-once = %d, want exactly 1: the replay minted a ghost", replacements)
+	}
+}
+
+// TestRotateFailureChangesNothing pins the atomicity that replaced the old
+// two-phase rotate: when the single ReplaceKey mutation fails, the original
+// key is still live and no replacement exists. Before this, a revoke failing
+// after the mint succeeded stranded a live credential whose raw token was
+// already unrecoverable.
+func TestRotateFailureChangesNothing(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+	var created MintedKeyResponse
+	decode(t, h.adminDo(http.MethodPost, "/admin/v1/keys",
+		CreateKeyRequest{Class: fleet.ClassAgent, Name: "victim", Scope: validScope()}), &created)
+	h.store.inject(t, func(f *fakeStore) { f.errPut = errors.New("the secret is unwritable") })
+
+	resp := h.adminDo(http.MethodPost, "/admin/v1/keys/"+created.Key.KID+"/rotate", nil)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d (%s)", resp.StatusCode, http.StatusInternalServerError, decode(t, resp, nil))
+	}
+
+	h.store.inject(t, func(f *fakeStore) { f.errPut = nil })
+	var after KeyListResponse
+	decode(t, h.adminDo(http.MethodGet, "/admin/v1/keys?class=agt", nil), &after)
+	// The harness mints its own agent key, so assert on the victim by name:
+	// exactly one key carries it, it is the original, and it is still live.
+	var victims []KeyView
+	for _, k := range after.Keys {
+		if k.Name == "victim" {
+			victims = append(victims, k)
+		}
+	}
+	if len(victims) != 1 {
+		t.Fatalf("keys named victim after failed rotation = %d, want 1: a failed rotation minted or destroyed something", len(victims))
+	}
+	if got := victims[0]; got.KID != created.Key.KID || got.Revoked {
+		t.Errorf("original key after failed rotation = %+v, want %s live and unrevoked", got, created.Key.KID)
+	}
+}
+
 func TestMutationStoreFailures(t *testing.T) {
 	t.Parallel()
 	boom := errors.New("state secret unwritable")
@@ -416,13 +517,6 @@ func TestMutationStoreFailures(t *testing.T) {
 		{
 			name:   "rotate: mint fails",
 			inject: func(f *fakeStore) { f.errPut = boom },
-			method: http.MethodPost,
-			path:   func(kid string) string { return "/admin/v1/keys/" + kid + "/rotate" },
-			class:  fleet.ClassAgent,
-		},
-		{
-			name:   "rotate: revoking the original fails",
-			inject: func(f *fakeStore) { f.errRevokeKey = boom },
 			method: http.MethodPost,
 			path:   func(kid string) string { return "/admin/v1/keys/" + kid + "/rotate" },
 			class:  fleet.ClassAgent,
@@ -781,4 +875,51 @@ func TestLimitsAcceptExactlyTheDocumentedValue(t *testing.T) {
 			t.Errorf("a CSR field of MaxCSRBytes+4 (%d) was accepted", MaxCSRBytes+4)
 		}
 	})
+}
+
+// TestRotateRaceErrorsKeepTheirMeaning covers the window the pre-flight check
+// cannot see: the source key revoked or deleted between loading it and the
+// atomic ReplaceKey. Those are conflicts and disappearances, not server
+// faults, and a 500 would send an operator hunting hub logs for a race that
+// resolved exactly as designed.
+func TestRotateRaceErrorsKeepTheirMeaning(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		inject     error
+		wantStatus int
+		wantCode   string
+	}{
+		{
+			name:       "revoked in the window is a conflict",
+			inject:     fmt.Errorf("kid X is already revoked (leaked): %w", store.ErrRevoked),
+			wantStatus: http.StatusConflict,
+			wantCode:   CodeConflict,
+		},
+		{
+			name:       "deleted in the window is not found",
+			inject:     fmt.Errorf("kid X: %w", ErrNotFound),
+			wantStatus: http.StatusNotFound,
+			wantCode:   CodeNotFound,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t, nil)
+			var created MintedKeyResponse
+			decode(t, h.adminDo(http.MethodPost, "/admin/v1/keys",
+				CreateKeyRequest{Class: fleet.ClassAgent, Name: "raced", Scope: validScope()}), &created)
+			h.store.inject(t, func(f *fakeStore) { f.errReplace = tc.inject })
+
+			resp := h.adminDo(http.MethodPost, "/admin/v1/keys/"+created.Key.KID+"/rotate", nil)
+			if resp.StatusCode != tc.wantStatus {
+				t.Fatalf("status = %d, want %d (%s)", resp.StatusCode, tc.wantStatus, decode(t, resp, nil))
+			}
+			if env := envelopeOf(t, resp); env.Error.Code != tc.wantCode {
+				t.Errorf("code = %q, want %q", env.Error.Code, tc.wantCode)
+			}
+		})
+	}
 }

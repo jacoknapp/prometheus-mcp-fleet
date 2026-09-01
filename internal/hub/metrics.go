@@ -127,6 +127,71 @@ func (a *metricsAdapter) CACertExpiry(notAfter time.Time) {
 	a.m.CACertExpiry.Set(time.Until(notAfter).Seconds())
 }
 
+// DiscoveredPeers records what peer discovery resolved.
+func (a *metricsAdapter) DiscoveredPeers(n int) { a.m.DiscoveredPeers.Set(float64(n)) }
+
+// RevocationRefreshed records a successful revoked-serial cache refresh. The
+// alert on this series is what turns "revocations silently stopped landing on
+// this replica" from a forensic discovery into a page.
+func (a *metricsAdapter) RevocationRefreshed(at time.Time) {
+	a.m.RevocationRefreshTimestamp.Set(float64(at.Unix()))
+}
+
+// CATrustRoots records how many roots the hub accepts on a spoke chain. Two
+// means a rotation is in progress; see docs/adr/0015-ca-rotation.md.
+func (a *metricsAdapter) CATrustRoots(n int) { a.m.CATrustRoots.Set(float64(n)) }
+
+// CARotationPhase records which phase of a CA rotation the fleet is in and
+// when it entered it.
+//
+// It is a set of gauges, one per phase with exactly one of them at 1, rather
+// than a single number: a phase is a name, and encoding names as 0, 1, 2 makes
+// every dashboard and every alert carry a copy of the mapping. The start time
+// is a separate gauge because "how long has it been stuck there" is the
+// question an operator actually asks, and a timestamp answers it without
+// needing the series to have been scraped when the phase changed.
+func (a *metricsAdapter) CARotationPhase(phase string, since time.Time) {
+	// "unknown" is in the enum for the frozen state: a recorded phase this
+	// build does not recognise. The stalled alert excludes only "steady", so
+	// a fleet frozen on an unknown phase pages the same way a stuck
+	// rotation does.
+	names := make([]string, 0, len(caPhases)+1)
+	for _, p := range caPhases {
+		names = append(names, string(p))
+	}
+	names = append(names, "unknown")
+	for _, name := range names {
+		v := 0.0
+		if name == phase {
+			v = 1
+		}
+		a.m.CARotationPhase.WithLabelValues(name).Set(v)
+	}
+	if since.IsZero() {
+		a.m.CARotationPhaseStart.Set(0)
+		return
+	}
+	a.m.CARotationPhaseStart.Set(float64(since.Unix()))
+}
+
+// CAOutgoingRootSessions records how many live sessions on this replica still
+// present a certificate issued by the root a rotation is retiring.
+//
+// Sum it across replicas: no single replica sees the whole fleet, because a
+// tunnel terminates on exactly one of them. While this is above zero anywhere,
+// the outgoing root cannot be dropped without disconnecting somebody.
+func (a *metricsAdapter) CAOutgoingRootSessions(n int) {
+	a.m.CAOutgoingRootSessions.Set(float64(n))
+}
+
+// CARotationTransition counts one advance of the rotation state machine. It is
+// a counter rather than a log line because the interesting question -- did a
+// rotation happen at all in the last year -- is not answerable from logs that
+// have rolled over.
+func (a *metricsAdapter) CARotationTransition(to string) {
+	a.m.CARotationTransitionsTotal.WithLabelValues(to).Inc()
+}
+
 // StateBytes records the encoded size of the credential state document.
 func (a *metricsAdapter) StateBytes(n int) { a.m.StateBytes.Set(float64(n)) }
 

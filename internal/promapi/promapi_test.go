@@ -277,6 +277,32 @@ func TestValidate(t *testing.T) {
 			form: url.Values{"match[]": {"   "}}, wantErr: ErrInvalidParam,
 		},
 		{
+			name: "query_exemplars needs query start and end", endpoint: EndpointQueryExemplars,
+			form:    url.Values{"query": {"http_request_duration_seconds_bucket"}},
+			wantErr: ErrInvalidParam,
+		},
+		{
+			name: "query_exemplars complete", endpoint: EndpointQueryExemplars,
+			form: url.Values{
+				"query": {"http_request_duration_seconds_bucket"},
+				"start": {"0"}, "end": {"60"},
+			},
+		},
+		{
+			name:     "targets_metadata with no parameters lists everything",
+			endpoint: EndpointTargetsMetadata, form: url.Values{},
+		},
+		{
+			name:     "targets_metadata with a target selector and metric",
+			endpoint: EndpointTargetsMetadata,
+			form:     url.Values{"match_target": {`{job="prometheus"}`}, "metric": {"up"}},
+		},
+		{
+			name:     "targets_metadata rejects an invalid metric name",
+			endpoint: EndpointTargetsMetadata,
+			form:     url.Values{"metric": {"has-a-dash"}}, wantErr: ErrInvalidParam,
+		},
+		{
 			name: "unknown endpoint", endpoint: "nope", wantErr: ErrUnknownEndpoint,
 		},
 	}
@@ -315,6 +341,8 @@ func TestLookup(t *testing.T) {
 		{"label values", "GET", "/api/v1/label/job/values", true, EndpointLabelValues, "job"},
 		{"label values percent-encoded", "GET", "/api/v1/label/my_label/values", true, EndpointLabelValues, "my_label"},
 		{"targets", "GET", "/api/v1/targets", true, EndpointTargets, ""},
+		{"targets metadata", "GET", "/api/v1/targets/metadata", true, EndpointTargetsMetadata, ""},
+		{"query exemplars", "POST", "/api/v1/query_exemplars", true, EndpointQueryExemplars, ""},
 		{"trailing slash is not the same route", "POST", "/api/v1/query/", false, "", ""},
 		{"prefix is not enough", "POST", "/api/v1/query_extra", false, "", ""},
 		{"relative traversal", "POST", "/api/v1/query/../../admin", false, "", ""},

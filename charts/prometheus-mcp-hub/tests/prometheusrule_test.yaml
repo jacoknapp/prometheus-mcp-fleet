@@ -23,10 +23,36 @@ tests:
           pattern: "promfleet_hub_ca_cert_expiry_seconds"
       - matchRegex:
           path: spec.groups[0].rules[3].expr
-          pattern: "promfleet_hub_spoke_cert_expiry_seconds"
+          pattern: "promfleet_hub_ca_rotation_phase"
       - matchRegex:
           path: spec.groups[0].rules[4].expr
+          pattern: "promfleet_hub_spoke_cert_expiry_seconds"
+      - matchRegex:
+          path: spec.groups[0].rules[5].expr
           pattern: "promfleet_hub_proxy_requests_total"
+      - matchRegex:
+          path: spec.groups[0].rules[6].expr
+          pattern: "promfleet_hub_state_bytes"
+      - equal:
+          path: spec.groups[0].rules[6].alert
+          value: PrometheusMCPHubStateSecretLarge
+      - matchRegex:
+          path: spec.groups[0].rules[7].expr
+          pattern: "promfleet_hub_revocation_refresh_timestamp_seconds"
+      - equal:
+          path: spec.groups[0].rules[7].alert
+          value: PrometheusMCPHubRevocationStale
+      - matchRegex:
+          path: spec.groups[0].rules[8].expr
+          pattern: "promfleet_hub_discovered_peers"
+      - equal:
+          path: spec.groups[0].rules[8].alert
+          value: PrometheusMCPHubPeerDiscoveryBroken
+      # The deployed replica count is baked into the expression at render
+      # time; the chart default is 3.
+      - matchRegex:
+          path: spec.groups[0].rules[8].expr
+          pattern: "< 3"
 
   - it: compares the expiry gauges as seconds remaining, never against time()
     asserts:
@@ -37,13 +63,33 @@ tests:
           path: spec.groups[0].rules[2].expr
           pattern: "time\\(\\)"
       - notMatchRegex:
-          path: spec.groups[0].rules[3].expr
+          path: spec.groups[0].rules[4].expr
           pattern: "time\\(\\)"
+
+  # The rotation phase start IS a unix timestamp -- it is the one gauge in this
+  # rule set that must be compared with time(), and the one place the seconds-
+  # remaining convention above does not apply.
+  - it: measures the rotation phase age against time(), because that gauge is a timestamp
+    asserts:
+      - matchRegex:
+          path: spec.groups[0].rules[3].expr
+          pattern: "time\\(\\) - max\\(promfleet_hub_ca_rotation_phase_start_timestamp_seconds"
+      - matchRegex:
+          path: spec.groups[0].rules[3].expr
+          pattern: "phase!=\"steady\""
+
+  # The revocation refresh gauge is also a unix timestamp: staleness is its
+  # whole point, so it too is measured against time().
+  - it: measures revocation refresh staleness against time(), because that gauge is a timestamp
+    asserts:
+      - matchRegex:
+          path: spec.groups[0].rules[7].expr
+          pattern: "time\\(\\) - promfleet_hub_revocation_refresh_timestamp_seconds"
 
   - it: matches Deployment pod names, not StatefulSet ordinals
     asserts:
       - matchRegex:
-          path: spec.groups[0].rules[5].expr
+          path: spec.groups[0].rules[9].expr
           pattern: "pod=~\"RELEASE-NAME-prometheus-mcp-hub-\\[a-z0-9\\]\\+-\\[a-z0-9\\]\\+\""
 
   - it: renders nothing when disabled

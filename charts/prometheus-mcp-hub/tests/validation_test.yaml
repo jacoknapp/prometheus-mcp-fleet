@@ -79,10 +79,12 @@ tests:
       - failedTemplate:
           errorPattern: "ports.mcp and ports.admin must differ"
 
-  # config.logLevel, config.logFormat, autoUpdate.cohort, state.backend and
-  # service.sessionAffinity are closed enums in values.schema.json, so an invalid
-  # one is rejected before a template ever runs. The matching `fail` guards stay
-  # in _helpers.tpl as defence for anyone rendering with --skip-schema-validation.
+  # config.logLevel, config.logFormat, state.backend and service.sessionAffinity
+  # are closed enums in values.schema.json, so an invalid one is rejected before
+  # a template ever runs. The matching `fail` guards stay in _helpers.tpl as
+  # defence for anyone rendering with --skip-schema-validation.
+  # (autoUpdate.cohort used to be in this list; the in-cluster auto-updater was
+  # removed along with the rest of autoUpdate.*, so there is no such enum left.)
 
   - it: refuses a file state backend with no file path
     set:

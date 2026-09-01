@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/fleet"
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/hubapi"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/store"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/testutil"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/token"
@@ -101,8 +102,8 @@ func TestBootstrapAdminKeyMintsExactlyOneCredentialAndPrintsItOnce(t *testing.T)
 	if got.Name != bootstrapKeyName {
 		t.Fatalf("name = %q, want %q", got.Name, bootstrapKeyName)
 	}
-	if !got.ExpiresAt.Equal(pinned.Add(h.cfg.AgentKeyTTL)) {
-		t.Fatalf("expires at %s, want %s", got.ExpiresAt, pinned.Add(h.cfg.AgentKeyTTL))
+	if !got.ExpiresAt.Equal(pinned.Add(h.cfg.AdminKeyTTL)) {
+		t.Fatalf("expires at %s, want %s", got.ExpiresAt, pinned.Add(h.cfg.AdminKeyTTL))
 	}
 	if n := sink.count("BOOTSTRAP ADMIN TOKEN — shown once, store it now"); n != 1 {
 		t.Fatalf("the bootstrap token was printed %d times, want exactly 1", n)
@@ -288,17 +289,22 @@ func TestTwoReplicasRacingOnAnEmptyStoreMintOneKeyBetweenThem(t *testing.T) {
 	}
 }
 
-func TestBootstrapTTLNeverOutlivesTheKeysItMints(t *testing.T) {
+// TestBootstrapTTLFollowsTheAdminKnob pins which knob governs the bootstrap
+// credential: --admin-key-ttl, never --agent-key-ttl. The distinction exists
+// because agent expiry may be relaxed to years or to nothing, and the most
+// powerful credential in the fleet must not inherit that relaxation silently.
+func TestBootstrapTTLFollowsTheAdminKnob(t *testing.T) {
 	t.Parallel()
 
 	h, _ := newKeyHub(t, newFileStore(t))
-	h.cfg.AgentKeyTTL = 48 * time.Hour
+	h.cfg.AdminKeyTTL = 48 * time.Hour
+	h.cfg.AgentKeyTTL = 87600 * time.Hour // a relaxed agent policy must not leak in
 	if got := h.bootstrapTTL(); got != 48*time.Hour {
-		t.Fatalf("bootstrapTTL = %s, want the configured agent key TTL", got)
+		t.Fatalf("bootstrapTTL = %s, want the configured admin key TTL", got)
 	}
-	h.cfg.AgentKeyTTL = 0
-	if got := h.bootstrapTTL(); got != 720*time.Hour {
-		t.Fatalf("bootstrapTTL = %s, want the 720h fallback", got)
+	h.cfg.AdminKeyTTL = 0
+	if got := h.bootstrapTTL(); got != hubapi.DefaultAdminKeyTTL {
+		t.Fatalf("bootstrapTTL = %s, want hubapi.DefaultAdminKeyTTL", got)
 	}
 }
 

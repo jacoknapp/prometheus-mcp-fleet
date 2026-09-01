@@ -81,7 +81,7 @@ bearer token — there is no bypass for `kubectl exec`. So losing this token
 **before** minting a replacement with it is not casually recoverable: without
 any usable admin credential you cannot authenticate a call to mint another
 one. Recovery then means waiting for this bootstrap credential to expire (tied
-to `--agent-key-ttl`, 30 days by default) and restarting the hub, which mints
+to `--agent-key-ttl`, 90 days by default) and restarting the hub, which mints
 a fresh one only once none of the stored admin keys are still usable. Keep
 this one, and mint a properly scoped replacement with it soon after — see
 [step 4](#4-mint-an-agent-key) for the `hub keys create` invocation and pass
@@ -120,6 +120,26 @@ scope. `--clusters '*' --tools '*'` is for a demo, not for production.
 
 Note `--clusters 'env=prod'` selects by **label**, which means the clusters must
 be enrolled with that label in the next step.
+
+**Lifetime.** An agent key lasts 90 days by default (`--agent-key-ttl`). Nothing
+rotates it: the holder is an AI agent's configuration file, not a process that
+can re-enrol itself, so a lapsed key is an outage on a timer rather than a
+credential that quietly renews. Where that trade is not worth making, mint the
+key with no expiry:
+
+```bash
+hub keys create --class agent --name sre-oncall-bot --no-expiry ...
+```
+
+`--no-expiry` is refused for admin keys and enrollment tokens: an admin key
+mints other credentials and drives CA rotation, and an enrollment token admits
+new clusters, so neither should be able to outlive the operator who created it.
+It is also refused alongside `--ttl`, rather than one silently winning.
+
+A key with no expiry is still withdrawable: every MCP call authenticates
+independently, so a revocation blocks the very next call within the hub's
+60-second key cache. It is a key that outlives the calendar, not one that
+outlives your control.
 
 ## 5. Enroll each cluster
 

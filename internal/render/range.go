@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"math"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -290,13 +289,205 @@ func factorShared(series []RangeSeries) (map[string]string, []RangeSeries) {
 }
 
 // round reduces v to [ValueSignificantDigits] significant digits.
+//
+// This used to format v to a decimal string and parse it back
+// (strconv.FormatFloat then strconv.ParseFloat), which is correct but costs
+// two allocations per call. round runs up to MaxSeries*MaxPoints times per
+// range result, plus once more per point every time FitTokens re-renders a
+// shrinking candidate, so those allocations were the hottest ones in the
+// package. roundSignificant below gets the same answer with float64
+// arithmetic only.
+//
+// It is bit-for-bit identical to the string round trip for every value with
+// 1e-17 <= |v| < 1e28 (round_test.go's TestRoundMatchesStringOracle proves
+// this against millions of generated samples) — a span that covers every
+// value Prometheus could plausibly emit by many orders of magnitude in both
+// directions. Outside that span (denormals, and magnitudes past roughly
+// 1e28) math.Pow10 itself stops being exact, and the two implementations can
+// differ by a handful of ULPs; see the doc comment on roundSignificant and
+// the test for why that is understood and accepted rather than papered over.
 func round(v float64) float64 {
 	if v == 0 || math.IsNaN(v) || math.IsInf(v, 0) {
 		return v
 	}
-	s := strconv.FormatFloat(v, 'g', ValueSignificantDigits, 64)
-	out, _ := strconv.ParseFloat(s, 64)
-	return out
+	return roundSignificant(v)
+}
+
+// sigLoBound and sigHiBound are 10^(ValueSignificantDigits-1) and
+// 10^ValueSignificantDigits: roundSignificant normalizes the magnitude it is
+// rounding into [sigLoBound, sigHiBound) before rounding to the nearest
+// integer, the same way %g's digit-count logic does.
+var (
+	sigLoBound = math.Pow10(ValueSignificantDigits - 1)
+	sigHiBound = math.Pow10(ValueSignificantDigits)
+)
+
+// pow10ChunkExp is the largest power of ten roundSignificant will ask
+// math.Pow10 for directly. Splitting a bigger shift into chunks this size
+// keeps math.Pow10 from ever being asked for an out-of-range power, which
+// would silently hand back +Inf or 0 and poison the result with a NaN
+// instead of a rounded number — the one outcome that would be worse than an
+// imprecise-but-present value at these already-extreme magnitudes.
+const pow10ChunkExp = 300
+
+// minNormalFloat64 is the smallest positive normal float64 (2^-1022).
+// Subnormal values below it have already lost most of their mantissa bits,
+// which throws off the exponent math.Log10 estimates for them badly enough
+// to send roundSignificant's scaling wildly out of range. Multiplying a
+// subnormal by an exact power of two first — subnormalRescale — repositions
+// its existing bits into the normal range at no precision cost, and dividing
+// the same power back out at the end undoes it.
+const (
+	minNormalFloat64 = 0x1p-1022
+	subnormalRescale = 0x1p60
+)
+
+// roundSignificant reduces v (which is neither zero, NaN, nor infinite) to
+// [ValueSignificantDigits] significant digits.
+//
+// The approach is the textbook one — scale the magnitude into
+// [sigLoBound, sigHiBound), round to the nearest integer, scale back — but
+// with two corrections a naive version of it gets wrong:
+//
+//  1. Scaling by multiplying by 10^k when k is negative multiplies by the
+//     inexact binary approximation of, say, 1e-9 instead of dividing by the
+//     exact 1e9; scaleUp/scaleDown always multiply or divide by a positive
+//     power of ten, whichever the sign of the shift calls for, so the
+//     lossless direction is always the one used.
+//  2. A single multiply or divide still rounds once when it produces hi, and
+//     then math.Round rounds again — two roundings can disagree with the one
+//     correctly-rounded answer strconv would give. exactProduct/
+//     exactQuotient recover the rounding error FMA would otherwise discard
+//     as lo, and folding it back in before the final decision corrects the
+//     rare case where double rounding picked the wrong side of a tie.
+//
+// Because av is always non-negative and math.Round breaks exact ties away
+// from zero, the recovered error (delta below) can only ever need to pull
+// the tentative answer down, never push it up further than math.Round
+// already did — the case that needs correcting is "this looked like an
+// exact .5 tie, or looked like it safely rounded down, but the bits we
+// discarded show the true value was actually lower still or is an exact
+// tie that resolves to the even neighbour"; there is no symmetric case on
+// the other side. See TestRound's "exact tie" and "double rounding" cases
+// for the two shapes this takes.
+func roundSignificant(v float64) float64 {
+	sign := 1.0
+	av := v
+	if av < 0 {
+		sign, av = -1, -av
+	}
+
+	boosted := av < minNormalFloat64
+	if boosted {
+		av *= subnormalRescale
+	}
+
+	exp := int(math.Floor(math.Log10(av)))
+	k := ValueSignificantDigits - 1 - exp
+
+	scale := func(k int) (hi, lo float64) {
+		if k >= 0 {
+			return scaleUp(av, k)
+		}
+		return scaleDown(av, -k)
+	}
+
+	hi, lo := scale(k)
+	// math.Log10 is a floating-point estimate of the decimal exponent and is
+	// occasionally off by one right at a power-of-ten boundary; correct it
+	// so the scaled magnitude always lands in [sigLoBound, sigHiBound).
+	switch {
+	case hi >= sigHiBound:
+		exp++
+		k = ValueSignificantDigits - 1 - exp
+		hi, lo = scale(k)
+	case hi < sigLoBound:
+		exp--
+		k = ValueSignificantDigits - 1 - exp
+		hi, lo = scale(k)
+	}
+
+	r := math.Round(hi)
+	switch delta := (hi - r) + lo; {
+	case delta < -0.5:
+		// The discarded bits show the true value is further from r than hi
+		// alone let on, past the point where r is still the nearest integer.
+		r--
+	case delta == -0.5 && math.Mod(r, 2) != 0:
+		// hi was an exact tie, which math.Round always resolves upward; if
+		// that leaves r odd, the correctly-rounded (round-half-to-even)
+		// answer is the even neighbour below it instead.
+		r--
+	}
+
+	var result float64
+	if k >= 0 {
+		result = unscaleDown(r, k)
+	} else {
+		result = unscaleUp(r, -k)
+	}
+	if boosted {
+		result /= subnormalRescale
+	}
+	return sign * result
+}
+
+// exactProduct returns hi and lo such that hi+lo == a*b exactly, as real
+// numbers: hi is the correctly-rounded a*b a plain multiply would give, and
+// lo is the rounding error that multiply discarded, recovered losslessly via
+// one fused multiply-add.
+func exactProduct(a, b float64) (hi, lo float64) {
+	hi = a * b
+	lo = math.FMA(a, b, -hi)
+	return hi, lo
+}
+
+// exactQuotient is exactProduct's counterpart for division: hi is a/b and lo
+// is the correction recovering the precision hi's own rounding lost,
+// computed from the exact remainder a-hi*b via FMA.
+func exactQuotient(a, b float64) (hi, lo float64) {
+	hi = a / b
+	lo = math.FMA(-hi, b, a) / b
+	return hi, lo
+}
+
+// scaleUp and scaleDown return av*10^k and av/10^k respectively (k >= 0), as
+// an exact hi/lo pair. Both chunk the exponent by pow10ChunkExp first so
+// that no single math.Pow10 call is ever asked for a power large enough to
+// overflow to +Inf — which, fed into exactProduct/exactQuotient, would
+// otherwise turn a merely-imprecise extreme value into a NaN.
+func scaleUp(av float64, k int) (hi, lo float64) {
+	for k > pow10ChunkExp {
+		av, _ = exactProduct(av, 1e300)
+		k -= pow10ChunkExp
+	}
+	return exactProduct(av, math.Pow10(k))
+}
+
+func scaleDown(av float64, k int) (hi, lo float64) {
+	for k > pow10ChunkExp {
+		av, _ = exactQuotient(av, 1e300)
+		k -= pow10ChunkExp
+	}
+	return exactQuotient(av, math.Pow10(k))
+}
+
+// unscaleDown and unscaleUp invert scaleUp/scaleDown's magnitude shift once
+// r has been rounded, chunked the same way and for the same reason.
+func unscaleDown(r float64, k int) float64 {
+	for k > pow10ChunkExp {
+		r /= 1e300
+		k -= pow10ChunkExp
+	}
+	return r / math.Pow10(k)
+}
+
+func unscaleUp(r float64, k int) float64 {
+	for k > pow10ChunkExp {
+		r *= 1e300
+		k -= pow10ChunkExp
+	}
+	return r * math.Pow10(k)
 }
 
 // sanitizeAll cleans a slice of untrusted strings, dropping empties.

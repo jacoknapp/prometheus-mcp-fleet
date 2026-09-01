@@ -418,6 +418,71 @@ func TestSanitizesRuleAndMetadataText(t *testing.T) {
 	}
 }
 
+// TestSanitizesExemplarAndTargetMetadataText covers the two remaining
+// remote-text paths this change adds. An exemplar's labels are chosen by
+// whoever instruments the monitored application, and a target's own labels
+// and help text are exposition data exactly like metric_metadata's — neither
+// is any more trustworthy for arriving through a different endpoint.
+func TestSanitizesExemplarAndTargetMetadataText(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+
+	exemplars, err := json.Marshal(map[string]any{
+		"status": "success",
+		"data": []any{
+			map[string]any{
+				"seriesLabels": map[string]string{"__name__": "up", "job": hostileText},
+				"exemplars": []any{
+					map[string]any{
+						"labels":    map[string]string{"trace_id": hostileText},
+						"value":     "1",
+						"timestamp": 1756468800.0,
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.prom.set(string(promapi.EndpointQueryExemplars), fakeResponse{body: exemplars})
+	eout, terr := h.tools.queryExemplars(ctx(t), h.p, QueryExemplarsIn{Cluster: okCluster, Query: "up"})
+	if terr != nil {
+		t.Fatalf("queryExemplars: %v", terr)
+	}
+	assertSanitised(t, mustJSON(t, eout))
+
+	targetMeta, err := json.Marshal(map[string]any{
+		"status": "success",
+		"data": []any{
+			map[string]any{
+				"target": map[string]string{"job": "x", "bad label": "dropped"},
+				"metric": "up",
+				"type":   "gauge",
+				"help":   hostileText + strings.Repeat("D", 500),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.prom.set(string(promapi.EndpointTargetsMetadata), fakeResponse{body: targetMeta})
+	tout, terr := h.tools.targetMetadata(ctx(t), h.p, TargetMetadataIn{Cluster: okCluster})
+	if terr != nil {
+		t.Fatalf("targetMetadata: %v", terr)
+	}
+	encoded := mustJSON(t, tout)
+	assertSanitised(t, encoded)
+	if strings.Contains(encoded, "bad label") {
+		t.Error("a target label outside the grammar became a result key")
+	}
+	if len([]rune(tout.Metadata[0].Help)) >
+		render.MaxHelpRunes+len([]rune(render.ClipMarker)) {
+		t.Errorf("help was not clipped to %d runes: %q",
+			render.MaxHelpRunes, tout.Metadata[0].Help)
+	}
+}
+
 // TestSanitizesClusterFacts proves an operator-supplied display name from a
 // monitored cluster is treated as remote data too.
 func TestSanitizesClusterFacts(t *testing.T) {

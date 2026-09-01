@@ -73,7 +73,18 @@ data:
   PMF_SPOKE_CERT_TTL: {{ .Values.config.spokeCertTTL | quote }}
   PMF_ENROLLMENT_TOKEN_TTL: {{ .Values.config.enrollmentTokenTTL | quote }}
   PMF_RENEW_GRACE: {{ .Values.config.renewGrace | quote }}
+  {{/*
+    The hub rotates its own CA (ADR-0015). The phase, the successor's key
+    material and the compare-and-swap that keeps replicas from advancing the
+    same step twice all live in the CA Secret, so rotation is only wired up
+    when state.backend is "secret"; with the file backend the binary declines
+    on its own and says why.
+  */}}
+  PMF_CA_ROTATION_ENABLED: {{ .Values.config.caRotationEnabled | quote }}
+  PMF_CA_ROTATE_AT_REMAINING_FRACTION: {{ .Values.config.caRotateAtRemainingFraction | quote }}
+  PMF_CA_ROTATION_POLL_INTERVAL: {{ .Values.config.caRotationPollInterval | quote }}
   PMF_AGENT_KEY_TTL: {{ .Values.config.agentKeyTTL | quote }}
+  PMF_ADMIN_KEY_TTL: {{ .Values.config.adminKeyTTL | quote }}
   PMF_MAX_SPOKES: {{ .Values.config.maxSpokes | int64 | quote }}
   PMF_QUERY_TIMEOUT: {{ .Values.config.queryTimeout | quote }}
   PMF_RANGE_QUERY_TIMEOUT: {{ .Values.config.rangeQueryTimeout | quote }}

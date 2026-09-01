@@ -61,6 +61,23 @@ const (
 	// inside DataDir when no CA is supplied.
 	CACertFileName = "ca.crt"
 	CAKeyFileName  = "ca.key"
+
+	// DefaultCARotateAtRemainingFraction is the point in the signing root's
+	// life at which the hub starts rotating it: the last fifth.
+	//
+	// A root lives ten years by default and a rotation takes about a month
+	// (see Hub.CARotationPollInterval), so the last fifth is two years of
+	// runway for a job that needs one thirtieth of it. That asymmetry is the
+	// point. The cost of starting early is a second trusted root for a month
+	// every eight years; the cost of starting late is a fleet-wide outage on a
+	// deadline nobody can move. There is also a floor underneath this
+	// fraction that no configuration can lower -- see
+	// [Hub.CARotationRunway] -- so setting it small does not let the hub
+	// begin a rotation it cannot finish.
+	DefaultCARotateAtRemainingFraction = 0.2
+	// DefaultCARotationPollInterval is how often each replica re-reads the CA
+	// Secret to notice a rotation, its own or another replica's.
+	DefaultCARotationPollInterval = 5 * time.Minute
 )
 
 // stateBackends is the closed set accepted by --state-backend.
@@ -119,6 +136,46 @@ type Hub struct {
 	CACertFile string
 	// CAKeyFile is the private key matching CACertFile.
 	CAKeyFile string
+	// CATrustBundleFile holds ADDITIONAL root certificates the hub will accept
+	// on a spoke's chain, beyond the one it signs with. Empty is the steady
+	// state and trusts only the signer.
+	//
+	// It exists so a CA can be rotated without re-enrolling a hundred clusters.
+	// During a rotation both roots are trusted at once: the outgoing root keeps
+	// verifying certificates already in the field while the incoming one starts
+	// issuing, and the old root is dropped only when nothing chains to it any
+	// more. Additive on purpose -- the signer is always trusted and cannot be
+	// configured out, because a hub that refuses the certificates it just
+	// issued fails silently until the next reconnect.
+	//
+	// See docs/adr/0015-ca-rotation.md for the procedure.
+	CATrustBundleFile string
+	// CARotationEnabled lets the hub rotate its own signing root: mint a
+	// successor, publish it to the trust bundle, promote it to signer, and
+	// retire the outgoing root, each step gated on evidence rather than on a
+	// human running a runbook.
+	//
+	// It requires the secret state backend. The phase, the time it was
+	// entered and the successor's key material all live in the CA Secret,
+	// whose resourceVersion is the compare-and-swap that stops two replicas
+	// advancing the same step twice; the file backend has no such primitive
+	// and is a single-process development mode, so rotation is simply off
+	// there. See docs/adr/0015-ca-rotation.md.
+	CARotationEnabled bool
+	// CARotateAtRemainingFraction is the fraction of the signing root's total
+	// life at which rotation begins. 0.2 starts it once four fifths of the
+	// root's life is gone. Zero leaves only the runway floor below.
+	CARotateAtRemainingFraction float64
+	// CARotationPollInterval is how often each replica re-reads the CA Secret.
+	//
+	// It bounds two things: how long a replica can keep serving a trust
+	// bundle a rotation has already widened, and how long one can keep
+	// signing with a root a rotation has already retired. Both are safe for
+	// far longer than this -- the retired root stays trusted for a full
+	// certificate lifetime afterwards, which is what makes the lag harmless
+	// -- so the interval is set by politeness to the API server, not by
+	// correctness. One GET per replica per interval.
+	CARotationPollInterval time.Duration
 	// TrustDomain is the authority component of spoke certificate URI SANs.
 	TrustDomain string
 	// PeerDiscoveryDomain is a headless Service FQDN that resolves to one
@@ -148,8 +205,20 @@ type Hub struct {
 	RenewGrace time.Duration
 	// EnrollmentTokenTTL bounds how long a single-use enrollment token lives.
 	EnrollmentTokenTTL time.Duration
-	// AgentKeyTTL is the default lifetime of a newly minted agent key.
+	// AgentKeyTTL is the default lifetime of a newly minted agent key, and
+	// the ceiling a create request may ask for. Nothing rotates agent keys
+	// automatically: the holder is an AI agent's configuration, not a process
+	// that can re-enrol itself, so expiry here is an outage on a timer. The
+	// default is deliberately long for that reason, and a key may be minted
+	// with no expiry at all (see hubapi.CreateKeyRequest.NoExpiry).
 	AgentKeyTTL time.Duration
+	// AdminKeyTTL is the default and maximum lifetime of a minted admin key,
+	// including the bootstrap key printed on first start. It is a separate
+	// knob from AgentKeyTTL because the two credentials deserve opposite
+	// pressure: an agent key's expiry is an outage on a timer, while an admin
+	// key mints other credentials and must not quietly inherit whatever the
+	// agent policy was relaxed to.
+	AdminKeyTTL time.Duration
 	// MaxSpokes optionally caps concurrent spoke sessions on this replica.
 	// Zero, the default, means no limit.
 	//
@@ -229,6 +298,14 @@ func LoadHub(args []string, getenv func(string) string) (*Hub, error) {
 	l.str(&c.PepperFile, "pepper-file", "", "HMAC pepper file; defaults to <data-dir>/"+PepperFileName)
 	l.str(&c.CACertFile, "ca-cert-file", "", "internal CA certificate; empty self-initialises in <data-dir>")
 	l.str(&c.CAKeyFile, "ca-key-file", "", "internal CA private key; empty self-initialises in <data-dir>")
+	l.str(&c.CATrustBundleFile, "ca-trust-bundle-file", "",
+		"additional root certificates to trust alongside the signer, for CA rotation; empty trusts only the signer")
+	l.boolean(&c.CARotationEnabled, "ca-rotation-enabled", true,
+		"let the hub rotate its own signing root; requires --state-backend=secret")
+	l.ratio(&c.CARotateAtRemainingFraction, "ca-rotate-at-remaining-fraction", DefaultCARotateAtRemainingFraction,
+		"fraction of the signing root's life remaining at which rotation begins")
+	l.duration(&c.CARotationPollInterval, "ca-rotation-poll-interval", DefaultCARotationPollInterval,
+		"how often each replica re-reads the CA Secret to notice a rotation")
 	l.str(&c.TrustDomain, "trust-domain", DefaultTrustDomain, "trust domain in spoke certificate URI SANs")
 	l.str(&c.PeerDiscoveryDomain, "peer-discovery-domain", "",
 		"headless Service FQDN resolving to one address per hub replica; enables multi-replica HA behind one hostname")
@@ -237,7 +314,8 @@ func LoadHub(args []string, getenv func(string) string) (*Hub, error) {
 	l.duration(&c.EnrollmentTokenTTL, "enrollment-token-ttl", 15*time.Minute, "lifetime of a single-use enrollment token")
 	l.duration(&c.RenewGrace, "renew-grace", 30*24*time.Hour,
 		"how long after expiry a spoke certificate may still be renewed; 0 to require an unexpired certificate")
-	l.duration(&c.AgentKeyTTL, "agent-key-ttl", 720*time.Hour, "default lifetime of a minted agent key")
+	l.duration(&c.AgentKeyTTL, "agent-key-ttl", 2160*time.Hour, "default and maximum lifetime of a minted agent key (90d)")
+	l.duration(&c.AdminKeyTTL, "admin-key-ttl", 2160*time.Hour, "default and maximum lifetime of a minted admin key, including the bootstrap key (90d)")
 	l.integer(&c.MaxSpokes, "max-spokes", 0, "optional cap on concurrent spoke sessions on this replica; 0 means no limit")
 
 	l.duration(&c.QueryTimeout, "query-timeout", 30*time.Second, "timeout for instant and metadata queries")
@@ -331,6 +409,7 @@ func (c *Hub) Validate() error {
 	add(checkPositive("enrollment-token-ttl", c.EnrollmentTokenTTL))
 	add(checkNonNegative("renew-grace", c.RenewGrace))
 	add(checkPositive("agent-key-ttl", c.AgentKeyTTL))
+	add(checkPositive("admin-key-ttl", c.AdminKeyTTL))
 	add(checkNonNegativeInt("max-spokes", c.MaxSpokes))
 
 	add(checkPositive("query-timeout", c.QueryTimeout))
@@ -344,6 +423,8 @@ func (c *Hub) Validate() error {
 			c.MaxResponseBudgetBytes, c.MaxResponseBytes))
 	}
 	add(checkPositive("facts-poll-interval", c.FactsPollInterval))
+	add(checkRatio("ca-rotate-at-remaining-fraction", c.CARotateAtRemainingFraction))
+	add(checkPositive("ca-rotation-poll-interval", c.CARotationPollInterval))
 
 	add(checkNonNegative("shutdown-drain-delay", c.ShutdownDrainDelay))
 	add(checkPositive("shutdown-grace", c.ShutdownGrace))
@@ -376,6 +457,7 @@ func (c *Hub) LogValue() slog.Value {
 		slog.Duration("spoke_cert_ttl", c.SpokeCertTTL),
 		slog.Duration("enrollment_token_ttl", c.EnrollmentTokenTTL),
 		slog.Duration("agent_key_ttl", c.AgentKeyTTL),
+		slog.Duration("admin_key_ttl", c.AdminKeyTTL),
 		slog.Int("max_spokes", c.MaxSpokes),
 		slog.Duration("query_timeout", c.QueryTimeout),
 		slog.Duration("range_query_timeout", c.RangeQueryTimeout),
@@ -383,6 +465,9 @@ func (c *Hub) LogValue() slog.Value {
 		slog.Int("max_inflight_per_cluster", c.MaxInflightPerCluster),
 		slog.Int64("max_response_budget_bytes", c.MaxResponseBudgetBytes),
 		slog.Duration("facts_poll_interval", c.FactsPollInterval),
+		slog.Bool("ca_rotation_enabled", c.CARotationEnabled),
+		slog.Float64("ca_rotate_at_remaining_fraction", c.CARotateAtRemainingFraction),
+		slog.Duration("ca_rotation_poll_interval", c.CARotationPollInterval),
 		slog.Duration("shutdown_drain_delay", c.ShutdownDrainDelay),
 		slog.Duration("shutdown_grace", c.ShutdownGrace),
 		slog.Bool("pprof_enabled", c.PprofEnabled),
@@ -391,4 +476,29 @@ func (c *Hub) LogValue() slog.Value {
 		slog.Float64("trace_sample_ratio", c.TraceSampleRatio),
 		slog.String("public_url", redactURL(c.PublicURL)),
 	)
+}
+
+// CARotationRunway is the shortest life a signing root must have left for a
+// rotation started now to finish before it expires.
+//
+// A rotation is two waits, each of which the hub cannot shorten. The first --
+// the new root trusted, the old root still signing -- runs a full certificate
+// lifetime, because that is how long it takes for every spoke to have renewed
+// at least once onto the two-root bundle. The second -- the new root signing,
+// the old root still trusted -- runs a certificate lifetime plus the renewal
+// grace, because until then a spoke that has been switched off can still come
+// back with a certificate the outgoing root issued and expect to renew it.
+//
+// The outgoing root must stay VALID for both, not merely present: an expired
+// root verifies nothing, so the certificates chained to it would fail on the
+// day it lapsed regardless of whether the trust bundle still named it. This
+// is therefore a hard floor under
+// [Hub.CARotateAtRemainingFraction] -- a fraction that computes to less than
+// this is raised to it -- because starting a rotation that cannot finish is
+// strictly worse than starting one early.
+func (c *Hub) CARotationRunway() time.Duration {
+	// The poll-interval terms mirror the retirement gate's padding (a losing
+	// replica keeps signing with the old root until its next poll) plus one
+	// interval of transition overshoot per phase boundary.
+	return 2*c.SpokeCertTTL + c.RenewGrace + 4*c.CARotationPollInterval
 }

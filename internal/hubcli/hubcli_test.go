@@ -442,6 +442,25 @@ func TestKeysCreateValidation(t *testing.T) {
 // TestKeyClassAcceptsWireSpellings pins that keyClass accepts both the
 // friendly command-line spelling and the wire value directly, for both
 // classes, since a caller might reasonably script either.
+// TestKeysCreateRejectsTTLWithNoExpiry pins the contradiction at the CLI, so
+// the operator is told in the flag spellings they typed rather than by a round
+// trip that reports the wire field names.
+func TestKeysCreateRejectsTTLWithNoExpiry(t *testing.T) {
+	t.Parallel()
+	var stdout bytes.Buffer
+	err := Run(context.Background(),
+		[]string{"keys", "create", "--class=agent", "--name=sre-bot", "--ttl=2h", "--no-expiry"},
+		env(nil), &stdout, fakeDoer{
+			do: func(*http.Request) (*http.Response, error) {
+				t.Fatal("a contradictory request still reached the network")
+				return nil, nil
+			},
+		})
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("error = %v, want a mutual-exclusion complaint", err)
+	}
+}
+
 func TestKeyClassAcceptsWireSpellings(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -489,6 +508,14 @@ func TestKeysCreateRequestBody(t *testing.T) {
 			args: []string{"--class=agent", "--name=sre-bot"},
 			want: hubapi.CreateKeyRequest{
 				Class: fleet.ClassAgent, Name: "sre-bot",
+				Scope: &fleet.Scope{Role: fleet.RoleViewer},
+			},
+		},
+		{
+			name: "agent key with no expiry",
+			args: []string{"--class=agent", "--name=sre-bot", "--no-expiry"},
+			want: hubapi.CreateKeyRequest{
+				Class: fleet.ClassAgent, Name: "sre-bot", NoExpiry: true,
 				Scope: &fleet.Scope{Role: fleet.RoleViewer},
 			},
 		},
@@ -1017,8 +1044,11 @@ func TestReportOutput(t *testing.T) {
 			t.Fatalf("report: %v", err)
 		}
 		out := stdout.String()
-		if strings.Contains(out, "expires:") {
-			t.Errorf("report output = %q, an admin key with no expiry must not print one", out)
+		// A zero expiry means the credential never expires, which is stated
+		// rather than omitted: a missing line would be indistinguishable from
+		// a field the hub simply did not return.
+		if !strings.Contains(out, "expires: never") {
+			t.Errorf("report output = %q, a key with no expiry must say so", out)
 		}
 		if strings.Contains(out, "cluster:") {
 			t.Errorf("report output = %q, a non-enrollment key must not print a cluster line", out)

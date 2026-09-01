@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # MCP tools
 
-Sixteen tools, all read-only. Every argument table here is derived from the
+Nineteen tools, all read-only. Every argument table here is derived from the
 golden input schemas in `internal/mcptools/testdata/schemas/`, which CI verifies
 against the running server — so if this document and the server disagree, the
 build fails rather than the document quietly rotting.
@@ -182,6 +182,22 @@ This never returns an error — invalid input *is* the answer. Use it before an
 expensive `query_range`: fixing a query here costs a few hundred tokens instead
 of a failed multi-megabyte call.
 
+### `query_exemplars`
+
+Exemplars for a series selector: individual sample values tagged with the
+trace or span that produced them.
+
+| Argument | Default | Notes |
+|---|---|---|
+| `cluster`* · `query`* | — | `query` is a raw selector (e.g. a histogram bucket), not an aggregation — exemplars attach to a series, not to the result of `rate()` or `sum()` |
+| `start` / `end` | `now-1h` / `now` | |
+| `limit` | `100` | Across every matching series, most recent first |
+
+**An empty result is the common case, not evidence that nothing happened.**
+Exemplar storage is an opt-in Prometheus feature and most instrumentation never
+attaches trace context, so most fleets answer empty here regardless of whether
+anything is wrong.
+
 ## Metadata
 
 ### `label_names` / `label_values`
@@ -207,7 +223,33 @@ Type, help and unit.
 | `metric` | all |
 | `limit` | `100` |
 
+### `target_metadata`
+
+Metric metadata as individual targets report it, rather than aggregated across
+the cluster.
+
+| Argument | Default | Notes |
+|---|---|---|
+| `cluster`* | — | |
+| `matchTarget` | all targets | Selector matching targets by their own labels, e.g. `{job="api"}` |
+| `metric` | all metrics | |
+| `limit` | `100` | |
+
+`metric_metadata` collapses every target's answer into one entry per metric,
+silently picking a winner when two targets disagree. This tool keeps every
+target's answer separate, which is the only way to see a canary and a stable
+rollout reporting a metric's type or help text differently.
+
 ## Operations
+
+Five tools are the **operational surfaces** -- `targets`, `alertmanagers`,
+`tsdb_stats`, `runtime_info`, and [`target_metadata`](#target_metadata) above:
+they describe how monitoring is wired rather than what the metrics say. They
+sit behind the key's role tier -- an `operator` key receives them through a
+`tools.allow: ["*"]` wildcard, a `viewer` key reaches one only by naming it in
+`tools.allow`. `rules` and `alerts` are not gated: what is firing and what
+would fire is monitoring output, not wiring. See
+[Authorization in docs/security.md](security.md#authorization).
 
 ### `targets`
 
@@ -251,6 +293,21 @@ credentials in URL parameters.
 
 Annotations are attacker-influenced free text. They are sanitised and clipped,
 and they arrive inside the `_untrusted` envelope.
+
+### `alertmanagers`
+
+The Alertmanager peers this cluster's Prometheus has discovered, active and
+dropped.
+
+| Argument | Default |
+|---|---|
+| `cluster`* | — |
+
+Call this before treating a firing alert as "someone was paged": a cluster
+with no active Alertmanager can evaluate and fire rules all day without
+notifying anyone. URLs are never returned, only the host — an Alertmanager
+discovered through static configuration can carry basic-auth credentials in
+its URL the same way a scrape target can.
 
 ### `tsdb_stats`
 

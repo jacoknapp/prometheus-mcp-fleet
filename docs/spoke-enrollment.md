@@ -184,6 +184,19 @@ one cluster, so a leak buys one cluster's identity and not the fleet's; it still
 expires; it is still revocable; it can be capped with `--max-redemptions`; and
 the hub still ignores what the CSR asks for and mints its own subject and SAN.
 
+There is also a failure a reusable token quietly absorbs that a single-use one
+cannot: **the lost response.** Redemption is two effects -- the hub records
+the redemption, the spoke receives the certificate -- and only the first is
+atomic. If the network eats the response after the store commits, a reusable
+token simply retries and gets a fresh certificate; a single-use token is now
+burned with nobody holding what it bought, the retry gets the 409 below, and
+recovery is minting a new token. The spoke's sibling wait bounds how long that
+retry hopes for a sibling (90 seconds) before surfacing the real error --
+which is also the honest cost of a burn being ambiguous: the hub cannot tell
+"a sibling redeemed this moments ago" from "this token was spent last week".
+An expired or revoked token is *not* ambiguous and fails immediately with 401,
+with no wait.
+
 Once a cluster has enrolled, the token is largely idle: the certificate lives in
 that cluster's identity Secret and is renewed with the certificate itself, not
 the token. It matters again on a rebuild, when the Secret is gone.
@@ -397,7 +410,108 @@ The cluster disappears from `list_clusters` once its grace window elapses. The
 registry is in memory and self-registering, so there is nothing else to clean
 up — no database row, no stale entry.
 
-## When it goes wrong
+### Offboarding in a GitOps fleet
+
+State the risk plainly: **in a GitOps fleet, "remove a cluster" usually means
+deleting a folder in git.** Argo CD or Flux prunes the resulting orphaned
+resources, which runs the equivalent of `helm uninstall` and drops the
+identity Secret. That is step one of three above. Nothing deletes the folder
+*and* revokes the certificate *and* nobody is alerted that revocation didn't
+happen — so the default GitOps offboarding path silently leaves a valid
+credential outstanding for up to 14 days, and there is no
+`PrometheusMCPClusterOffboardedUnrevoked`-style alert anywhere in this repo to
+catch it. If that cluster (or its old identity Secret, e.g. from a backup) is
+compromised in that window, nothing stops it dialing back in.
+
+Two things fix this, and they cover different failure modes — use both:
+
+**1. Make revocation part of the deletion, not a step after it.** Attach the
+revoke call to the same Argo CD delete as a `PreDelete` resource hook in that
+cluster's own Application, so a folder deletion *is* the complete decommission
+— one action, not three:
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pmf-spoke-revoke
+  annotations:
+    argocd.argoproj.io/hook: PreDelete
+    argocd.argoproj.io/hook-delete-policy: HookSucceeded
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: pmf-spoke-revoke   # read-only on the identity Secret; nothing else
+      containers:
+        - name: revoke
+          image: alpine/openssl:3.4
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              apk add --no-cache curl >/dev/null
+              serial=$(kubectl get secret pmf-spoke-identity -n prometheus-mcp \
+                -o jsonpath='{.data.tls\.crt}' | base64 -d | \
+                openssl x509 -noout -serial | cut -d= -f2 | tr 'A-F' 'a-f')
+              curl -sS -f -X POST \
+                "https://pmf.example.com/admin/v1/certs/${serial}/revoke" \
+                -H "Authorization: Bearer $(cat /var/run/pmf/admin-token)" \
+                -H 'Content-Type: application/json' \
+                -d '{"reason":"gitops folder deleted"}'
+```
+
+This runs *in the cluster being deleted*, before Argo CD prunes it, while the
+identity Secret still exists to read the serial from. It needs its own admin
+credential mounted into that cluster and network egress to the hub's admin
+listener — both a real cost, since it means every spoke cluster now holds a
+credential capable of calling the admin API, not just an enrollment token
+scoped to itself. Give that ServiceAccount/ExternalSecret only what this Job
+needs, expect it to be revocation-only in practice, and treat it with the same
+care as the enrollment token it sits next to.
+
+**2. Assume the hook sometimes doesn't run, and catch that centrally.** A
+force-deleted Application, a cluster that's gone before the hook can dial out,
+or someone bypassing the PreDelete path entirely (a manual `helm uninstall`) —
+all skip step 1 above the same way the original three-step process did. Run a
+periodic reconciliation on the **hub side**, where the admin credential
+already safely lives, comparing what git declares against what the hub still
+trusts:
+
+```bash
+# Clusters git says should exist
+git -C fleet-inventory ls-tree -d --name-only HEAD clusters/ | sort -u > declared.txt
+
+# GET /admin/v1/enrollments returns every enrollment-class key, i.e. {"keys":
+# [{"enrollment": {"clusterId": ..., "certSerial": ...}}, ...]} — not a flat
+# "enrollments" array. Pair each cluster with the serial of the certificate it
+# last had issued, so it can be checked against the revocation list below.
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
+  localhost:9090/admin/v1/enrollments | \
+  jq -r '.keys[] | select(.enrollment.certSerial) | "\(.enrollment.clusterId) \(.enrollment.certSerial)"' \
+  > enrolled.tsv
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
+  localhost:9090/admin/v1/certs/revoked | jq -r '.revoked[].serial' \
+  > revoked_serials.txt
+
+# Cluster ID, for every cluster the hub knows about that git no longer
+# declares AND whose certificate is not already revoked — i.e. offboarding
+# stopped after `helm uninstall` and never reached revocation.
+while read -r cluster serial; do
+  grep -qxF "$cluster" declared.txt && continue        # still declared: fine
+  grep -qxF "$serial" revoked_serials.txt && continue  # already revoked: fine
+  echo "$cluster"                                      # neither: page on it
+done < enrolled.tsv
+```
+
+Anything that prints is a cluster git no longer knows about *and* whose
+certificate is still valid — offboarding stopped after `helm uninstall`. Page
+on it rather than auto-revoking — a stale inventory checkout or a rename can
+produce a false positive, and revocation is exactly the kind of action you
+don't want a cron job getting wrong unattended. There is no shipped alert or
+CLI subcommand for this today (`hub enroll create` and `hub keys create` are
+still the only administrative subcommands); this reconciliation
+has to be a script you own, run on a schedule against the admin API above.
 
 | Symptom | Cause | Fix |
 |---|---|---|

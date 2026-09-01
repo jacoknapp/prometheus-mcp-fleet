@@ -134,6 +134,7 @@ func keysCreate(ctx context.Context, args []string, getenv func(string) string, 
 		name      = fs.String("name", "", "operator label such as sre-oncall-bot (required)")
 		owner     = fs.String("owner", "", "free-form contact information")
 		ttl       = fs.Duration("ttl", 0, "key lifetime; zero means the class default")
+		noExpiry  = fs.Bool("no-expiry", false, "mint an agent key that never expires; revocation is then the only way to withdraw it")
 		clusters  = fs.String("clusters", "", `comma-separated cluster selectors an agent key may reach, or "*"`)
 		tools     = fs.String("tools", "", `comma-separated tool names an agent key may call, or "*"`)
 		quiet     = fs.Bool("quiet", false, "print only the token, for scripting")
@@ -150,7 +151,12 @@ func keysCreate(ctx context.Context, args []string, getenv func(string) string, 
 	if err != nil {
 		return err
 	}
-	body := hubapi.CreateKeyRequest{Class: cls, Name: *name, Owner: *owner}
+	if *noExpiry && *ttl > 0 {
+		// Caught here as well as at the hub so the contradiction is reported
+		// before a round trip, with the flag spellings the operator typed.
+		return errors.New("--ttl and --no-expiry are mutually exclusive")
+	}
+	body := hubapi.CreateKeyRequest{Class: cls, Name: *name, Owner: *owner, NoExpiry: *noExpiry}
 	if *ttl > 0 {
 		body.TTL = fleet.Duration(*ttl)
 	}
@@ -332,7 +338,12 @@ func report(stdout io.Writer, out hubapi.MintedKeyResponse, quiet bool) error {
 	fmt.Fprintf(&b, "token:   %s\n", out.Token)
 	fmt.Fprintf(&b, "kid:     %s\n", out.Key.KID)
 	fmt.Fprintf(&b, "class:   %s\n", out.Key.Class)
-	if !out.Key.ExpiresAt.IsZero() {
+	// Printed unconditionally: a key that never expires is a deliberate and
+	// consequential choice, so "never" is stated rather than left to be
+	// inferred from a missing line.
+	if out.Key.ExpiresAt.IsZero() {
+		fmt.Fprintf(&b, "expires: never\n")
+	} else {
 		fmt.Fprintf(&b, "expires: %s\n", out.Key.ExpiresAt.UTC().Format(time.RFC3339))
 	}
 	if e := out.Key.Enrollment; e != nil {

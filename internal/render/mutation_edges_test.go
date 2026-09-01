@@ -498,3 +498,68 @@ func TestEncodeRangeFactorsLabelsAcrossEverySeries(t *testing.T) {
 //     (0 + BytesPerToken - 1) / BytesPerToken. With BytesPerToken == 4 that
 //     is 3/4 == 0 under Go's truncating integer division — the same value
 //     the guarded "return 0" would have produced.
+//
+// roundSignificant's own boundary mutants (verified against the same
+// bit-exact string-oracle bar TestRoundMatchesStringOracle holds the whole
+// function to, not just against the directed cases in TestRound):
+//
+//   - range.go:376 ("if av < 0") widening to "<=" only changes behaviour at
+//     av == 0. round is roundSignificant's only caller and already filters
+//     v == 0 out before calling it, and nothing else in this package calls
+//     roundSignificant directly, so av == 0 never reaches this line at all.
+//
+//   - range.go:380 ("boosted := av < minNormalFloat64") is a genuine
+//     boundary, not equivalent — see TestRoundAtTheSubnormalRescaleBoundary,
+//     which pins it directly with an exact oracle match.
+//
+//   - range.go:389 ("if k >= 0" inside the scale closure) widening to "> "
+//     only changes behaviour at k == 0, where scaleUp(av, 0) and
+//     scaleDown(av, 0) both reduce to exactProduct/exactQuotient against
+//     math.Pow10(0) == 1: multiplying or dividing by an exact 1 is lossless
+//     either way, so both branches return the identical (av, 0) pair.
+//
+//   - range.go:401/402/405 (the log10-estimate correction: "exp++" /
+//     "k = ValueSignificantDigits - 1 - exp" / "exp--") — an
+//     INCREMENT_DECREMENT on line 401 or an ARITHMETIC_BASE on the first "-"
+//     of line 402 are equivalent, verified by an exhaustive sweep (every
+//     exponent from -17 to 27, ±5000 ULPs of the exact power of ten at each,
+//     stepping by 7) against the string oracle: zero mismatches. This branch
+//     only fires when math.Log10's floating-point estimate is off by one,
+//     which only happens within roughly one ULP of an exact power of ten —
+//     far finer than the ~2-decade shift a wrong-direction correction
+//     introduces — so every value that can actually reach this line is
+//     already "clean" well past the sixth significant digit, and any nearby
+//     exponent choice unscales back to the same 6-digit answer. This is NOT
+//     true of line 405 (the mirror "exp--" in the hi < sigLoBound arm) or of
+//     the second "-" on line 402 (the "- exp" term, a sign flip): both of
+//     those are genuine kills — see the two directed TestRound cases "log10
+//     boundary at sigHiBound/sigLoBound, one ULP of real mantissa ...",
+//     which add a real, non-power-of-ten digit right at the same boundaries
+//     so there is something for the wrong correction to actually corrupt.
+//
+//   - range.go:424 ("if k >= 0" choosing unscaleDown vs unscaleUp) widening
+//     to "> " only changes behaviour at k == 0, where unscaleDown(r, 0) and
+//     unscaleUp(r, 0) both divide or multiply by math.Pow10(0) == 1 — the
+//     same identity either way.
+//
+//   - range.go:460/468/478/486 (the "for k > pow10ChunkExp" exponent-chunk
+//     loops in scaleUp/scaleDown/unscaleDown/unscaleUp) widening to ">=" only
+//     changes behaviour at k == pow10ChunkExp exactly, where it makes the
+//     loop run one extra iteration that multiplies (or divides) by 1e300 and
+//     then finishes with Pow10(0) == 1, instead of a single Pow10(300) call.
+//     math.Pow10(300) and the literal 1e300 are bit-identical, and
+//     multiplying by the final 1 is exact, so the returned "hi" is IDENTICAL
+//     either way; only "lo" changes, from the true FMA-recovered rounding
+//     error of the one multiply to 0. lo only ever changes the result
+//     through the tie-break arithmetic ("(hi - r) + lo"), and only when hi
+//     lands within about lo's own magnitude (~2^-52 relative, i.e. ~1e-11 at
+//     the hi ~1e5 scale these functions operate at) of an exact half-integer
+//     tie. Multiple targeted searches for such a value at exactly
+//     k == pow10ChunkExp — a wide random sweep, then a directed search
+//     seeded at every odd/even integer-plus-0.5 in range via 300-bit
+//     math/big arithmetic — found none, and any that exists would differ
+//     from the correctly-rounded answer by at most one part in 1e6 at a
+//     magnitude around 1e-295 or 1e295, which is already outside the
+//     bit-exact bar this suite holds roundSignificant to (see
+//     TestRoundAtExtremeMagnitudes) and orders of magnitude past any
+//     Prometheus sample this package will ever actually round.

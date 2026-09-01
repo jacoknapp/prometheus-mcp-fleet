@@ -620,6 +620,17 @@ func TestRunStopsAtTheFirstStartupStageThatFails(t *testing.T) {
 			want: "configure the registry",
 		},
 		{
+			name: "the revocation enforcer refuses its options",
+			build: func(t *testing.T) *hub {
+				h, _ := newBareHub(t, newHubConfig(t))
+				// The only invalid input run can hand the enforcer: every
+				// other option is wired from fields that always exist.
+				h.revocationInterval = -time.Second
+				return h
+			},
+			want: "configure the revocation enforcer",
+		},
+		{
 			name: "the admin listener cannot bind",
 			build: func(t *testing.T) *hub {
 				h, _ := newBareHub(t, newHubConfig(t))

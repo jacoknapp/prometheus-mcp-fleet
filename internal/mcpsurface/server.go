@@ -269,6 +269,11 @@ const (
 	// world, and a model that sees one as tool output will try to fix it by
 	// editing its query.
 	CodeForbidden int64 = -32003
+	// CodeRateLimited reports that the principal's own configured call rate
+	// is exhausted. A protocol error for the same reason as CodeForbidden: a
+	// model that receives it as tool output rewrites its query, when the only
+	// correct response is to wait.
+	CodeRateLimited int64 = -32005
 	// CodeInvalidParams mirrors the standard JSON-RPC code for arguments that
 	// could not be interpreted at all.
 	CodeInvalidParams int64 = jsonrpc.CodeInvalidParams

@@ -40,6 +40,7 @@ import (
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/ca"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/certproof"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/fleet"
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/store"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/token"
 )
 
@@ -86,6 +87,7 @@ type fakeStore struct {
 	errGet          error
 	errList         error
 	errRevokeKey    error
+	errReplace      error
 	errDelete       error
 	errBurn         error
 	errRevokeCert   error
@@ -195,6 +197,40 @@ func (f *fakeStore) RevokeKey(_ context.Context, kid, reason string, at time.Tim
 	when := at
 	k.RevokedAt = &when
 	k.RevokedReason = reason
+	f.epoch++
+	return nil
+}
+
+func (f *fakeStore) ReplaceKey(ctx context.Context, fresh *fleet.Key, oldKID, reason string, at time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.errReplace != nil {
+		return f.errReplace
+	}
+	old, ok := f.keys[oldKID]
+	if !ok {
+		return fmt.Errorf("kid %s: %w", oldKID, ErrNotFound)
+	}
+	if old.RevokedAt != nil {
+		// The production sentinel, deliberately NOT ErrAlreadyExists: the
+		// route retries identifier collisions on that one, and a replayed
+		// rotation must not loop -- it must be told the work is done.
+		return fmt.Errorf("kid %s is already revoked (%s): %w", oldKID, old.RevokedReason, store.ErrRevoked)
+	}
+	if f.putConflictOnce || f.putAlwaysConflict {
+		f.putConflictOnce = false
+		return fmt.Errorf("kid %s: %w", fresh.KID, ErrAlreadyExists)
+	}
+	if f.errPut != nil {
+		return f.errPut
+	}
+	if _, ok := f.keys[fresh.KID]; ok {
+		return fmt.Errorf("kid %s: %w", fresh.KID, ErrAlreadyExists)
+	}
+	f.keys[fresh.KID] = cloneKey(fresh)
+	when := at
+	old.RevokedAt = &when
+	old.RevokedReason = reason
 	f.epoch++
 	return nil
 }

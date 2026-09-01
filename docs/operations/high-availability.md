@@ -46,6 +46,30 @@ with a `ServerID` naming the replica that answered. The spoke keeps dialing the
 same hostname until it has seen every distinct `ServerID`, then maintains one
 tunnel per replica. No per-replica DNS, no forwarding hop, no leader election.
 
+The spoke keeps one **probe dialer** running above the replica count, from
+the very first dial: about once a minute it performs one extra handshake,
+hears the hub's current count in the hello, and steps aside. That probe is
+how a settled spoke notices a scale-up -- its established tunnels never
+handshake again -- and it is also how the fleet bootstraps: a freshly started
+hub advertises an UNKNOWN count (zero) until its own peer lookup completes,
+and the probe is what comes back a minute later to hear the real number.
+Without it, the first spoke to dial a cold hub would hold a single tunnel
+against a three-replica fleet forever, with both coverage alerts blind to it.
+A scale-up is picked up within about a minute; a scale-down needs no signal --
+the departing replica's tunnels close, and surplus dialers retire themselves
+so the pool shrinks back to count-plus-one rather than accumulating a probe
+per historical replica. The advertised count is clamped at 16 on the spoke,
+so a hostile or misconfigured hub cannot size a goroutine pool with a
+two-billion-replica claim.
+
+**Readiness is full coverage.** A spoke pod reports Ready only once it holds
+a tunnel to every advertised replica (per endpoint, with each endpoint judged
+on its own). One-of-three is deliberately NotReady: a rollout gates on Ready,
+and replacing a fully-covered pod with a partially-covered one would silently
+fail two thirds of that cluster's calls for as long as the search takes. The
+`tunnel_up` gauge keeps its historical meaning -- at least one live tunnel --
+so the TunnelDown alert is unchanged.
+
 ```yaml
 # hub values — this is the default, shown for clarity
 replicaCount: 3
@@ -119,8 +143,15 @@ flowchart LR
 Automatic discovery is the default and needs none of this. Per-replica
 addressing remains supported and is the more predictable option behind a load
 balancer you do not control — notably one whose affinity you cannot disable. To
-use it, list every replica in `hub.endpoints`; the spoke keeps one tunnel per
-configured endpoint and discovery has nothing left to find. You need:
+use it, list every replica in `hub.endpoints`. **Configuring more than one
+endpoint is itself the mode switch**: the spoke then keeps exactly one tunnel
+per configured endpoint, ignores the replica count the hub advertises (a
+pinned hostname can never reach a replica it is not routed to, so searching
+for one would be pure churn), and runs no coverage probe. A scale-up in this
+mode is an operator act — add the new replica's hostname to `hub.endpoints` —
+not something discovery detects. Leaving `peerDiscovery.enabled` on at the
+hub is harmless alongside this; single-endpoint spokes keep using it. You
+need:
 
 1. A distinct external hostname per replica, each routed by the Ingress to that
    replica's pod. Since the tunnel is now ordinary HTTP
@@ -218,7 +249,7 @@ and reconnect, rather than one of them silently failing to enrol.
 |---|---|
 | Simplicity, and can tolerate seconds of agent downtime on upgrade | `replicaCount: 1` on the hub. A deliberate downgrade from the default |
 | Transparent rolling hub upgrades, no single point of failure for agent access | `replicaCount: 3` on the hub with `peerDiscovery.enabled`, behind one hostname, affinity off |
-| A monitored cluster that must not lose agent visibility when one pod restarts | `replicaCount: 2+` on that spoke with `identity.backend: memory` and a reusable token |
+| A monitored cluster that must not lose agent visibility when one pod restarts | `replicaCount: 2+` on that spoke with `identity.backend: secret` (the default; the chart refuses `memory` above one replica, because replicas must share one identity) |
 | Multi-replica behind a load balancer whose affinity you cannot disable | Per-replica hostnames in `hub.endpoints`, as above |
 
 If you are unsure, take one replica. A single hub that restarts in a few seconds

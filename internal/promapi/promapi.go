@@ -56,6 +56,11 @@ const (
 	EndpointQuery Endpoint = "query"
 	// EndpointQueryRange evaluates PromQL over a time range.
 	EndpointQueryRange Endpoint = "query_range"
+	// EndpointQueryExemplars returns exemplars for a selector over a time
+	// range. Exemplars are how a metric sample links to the trace that
+	// produced it, which is the shortest path from "this aggregate looks bad"
+	// to "here is the one request that explains it".
+	EndpointQueryExemplars Endpoint = "query_exemplars"
 	// EndpointSeries lists label sets matching a set of matchers.
 	EndpointSeries Endpoint = "series"
 	// EndpointLabels lists label names.
@@ -68,6 +73,12 @@ const (
 	// by the caller before they reach an agent; scrape URLs routinely embed
 	// credentials in query parameters.
 	EndpointTargets Endpoint = "targets"
+	// EndpointTargetsMetadata returns metric metadata as reported by
+	// individual targets, rather than aggregated across the whole cluster.
+	// This is what surfaces a metric whose type or help text disagrees
+	// between targets, which a cluster-wide /api/v1/metadata call collapses
+	// away.
+	EndpointTargetsMetadata Endpoint = "targets_metadata"
 	// EndpointRules returns recording and alerting rule groups.
 	EndpointRules Endpoint = "rules"
 	// EndpointAlerts returns currently active alerts.
@@ -186,6 +197,15 @@ var routes = map[Endpoint]Route{
 			{Name: "limit", Kind: KindInt},
 		},
 	},
+	EndpointQueryExemplars: {
+		Endpoint: EndpointQueryExemplars, Method: "POST", PathTemplate: "/api/v1/query_exemplars",
+		Summary: "Return exemplars for a PromQL selector over a time range.",
+		Params: []Param{
+			{Name: "query", Kind: KindPromQL, Required: true},
+			{Name: "start", Kind: KindTime, Required: true},
+			{Name: "end", Kind: KindTime, Required: true},
+		},
+	},
 	EndpointSeries: {
 		Endpoint: EndpointSeries, Method: "POST", PathTemplate: "/api/v1/series",
 		Summary: "List label sets matching a set of series selectors.",
@@ -222,6 +242,15 @@ var routes = map[Endpoint]Route{
 		Params: []Param{
 			{Name: "state", Kind: KindEnum, Enum: []string{"active", "dropped", "any"}},
 			{Name: "scrapePool", Kind: KindLabelName},
+		},
+	},
+	EndpointTargetsMetadata: {
+		Endpoint: EndpointTargetsMetadata, Method: "GET", PathTemplate: "/api/v1/targets/metadata",
+		Summary: "Return metric metadata as reported by individual targets, matched by a target label selector.",
+		Params: []Param{
+			{Name: "match_target", Kind: KindMatcher},
+			{Name: "metric", Kind: KindMetricName},
+			{Name: "limit", Kind: KindInt},
 		},
 	},
 	EndpointRules: {

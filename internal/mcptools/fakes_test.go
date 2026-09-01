@@ -91,18 +91,21 @@ func newFakeProm(t *testing.T) *fakeProm {
 		}
 	}
 	for endpoint, file := range map[promapi.Endpoint]string{
-		promapi.EndpointQuery:       "query.json",
-		promapi.EndpointQueryRange:  "query_range.json",
-		promapi.EndpointSeries:      "series.json",
-		promapi.EndpointLabels:      "labels.json",
-		promapi.EndpointMetadata:    "metadata.json",
-		promapi.EndpointTargets:     "targets.json",
-		promapi.EndpointRules:       "rules.json",
-		promapi.EndpointAlerts:      "alerts.json",
-		promapi.EndpointTSDBStatus:  "status_tsdb.json",
-		promapi.EndpointRuntimeInfo: "status_runtimeinfo.json",
-		promapi.EndpointBuildInfo:   "status_buildinfo.json",
-		promapi.EndpointFlags:       "status_flags.json",
+		promapi.EndpointQuery:           "query.json",
+		promapi.EndpointQueryRange:      "query_range.json",
+		promapi.EndpointQueryExemplars:  "exemplars.json",
+		promapi.EndpointSeries:          "series.json",
+		promapi.EndpointLabels:          "labels.json",
+		promapi.EndpointMetadata:        "metadata.json",
+		promapi.EndpointTargets:         "targets.json",
+		promapi.EndpointTargetsMetadata: "targets_metadata.json",
+		promapi.EndpointRules:           "rules.json",
+		promapi.EndpointAlerts:          "alerts.json",
+		promapi.EndpointAlertmanagers:   "alertmanagers.json",
+		promapi.EndpointTSDBStatus:      "status_tsdb.json",
+		promapi.EndpointRuntimeInfo:     "status_runtimeinfo.json",
+		promapi.EndpointBuildInfo:       "status_buildinfo.json",
+		promapi.EndpointFlags:           "status_flags.json",
 	} {
 		f.responses[string(endpoint)] = fakeResponse{body: fixture(t, file)}
 	}

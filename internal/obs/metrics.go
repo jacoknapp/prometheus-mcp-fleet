@@ -88,6 +88,44 @@ type HubMetrics struct {
 	SpokeCertExpiry *prometheus.GaugeVec
 	// CACertExpiry is seconds until the internal CA certificate expires.
 	CACertExpiry prometheus.Gauge
+	// DiscoveredPeers is how many hub replicas this replica's peer discovery
+	// currently believes exist. Compared against the chart's replicaCount it
+	// is the only signal for a broken discovery: the spokes' partial-coverage
+	// alert cannot fire when they never learn a count to fall short of.
+	DiscoveredPeers prometheus.Gauge
+	// RevocationRefreshTimestamp is the unix time of the last SUCCESSFUL
+	// refresh of the revoked-serial cache. The cache serves its last good
+	// data when the store is unreachable -- deliberately, so a store outage
+	// does not disconnect the fleet -- which means the documented revocation
+	// bound holds only while refreshes succeed. This is the series that says
+	// whether they do: alert when time() minus this grows past a few
+	// refresh intervals.
+	RevocationRefreshTimestamp prometheus.Gauge
+	// CATrustRoots is how many root certificates the hub currently accepts on
+	// a spoke's chain.
+	//
+	// One is the steady state. Two means a CA rotation is in progress, and this
+	// is what tells an operator it is: the final step of a rotation is dropping
+	// the outgoing root, and doing that while a spoke still holds a certificate
+	// from it disconnects that spoke. Without this gauge the operator is
+	// guessing at when the overlap can end.
+	CATrustRoots prometheus.Gauge
+	// CARotationPhase is 1 on the label of the phase the CA rotation state
+	// machine is in and 0 on the others. The hub rotates its own root, so this
+	// is how an operator watches it happen without reading the Secret.
+	CARotationPhase *prometheus.GaugeVec
+	// CARotationPhaseStart is the Unix time the current phase was entered, or
+	// 0 if no rotation has ever run. `time() - <this>` is how long the fleet
+	// has been in it, which is the number an alert on a stalled rotation
+	// wants.
+	CARotationPhaseStart prometheus.Gauge
+	// CAOutgoingRootSessions is how many live sessions ON THIS REPLICA still
+	// present a certificate issued by the root a rotation is retiring. Sum it
+	// across replicas for the fleet: a tunnel terminates on exactly one.
+	CAOutgoingRootSessions prometheus.Gauge
+	// CARotationTransitionsTotal counts advances of the rotation state
+	// machine, labelled with the phase entered.
+	CARotationTransitionsTotal *prometheus.CounterVec
 	// StoreOpDuration measures credential-store operations by op and outcome.
 	StoreOpDuration *prometheus.HistogramVec
 }
@@ -154,10 +192,39 @@ func NewHubMetrics(r prometheus.Registerer) *HubMetrics {
 			Namespace: Namespace, Subsystem: SubsystemHub, Name: "spoke_cert_expiry_seconds",
 			Help: "Seconds until each spoke client certificate expires.",
 		}, []string{"cluster"}),
+		DiscoveredPeers: f.NewGauge(prometheus.GaugeOpts{
+			Namespace: Namespace, Subsystem: SubsystemHub, Name: "discovered_peers",
+			Help: "Hub replicas peer discovery currently resolves. Alert when below the deployed replica count.",
+		}),
+		RevocationRefreshTimestamp: f.NewGauge(prometheus.GaugeOpts{
+			Namespace: Namespace, Subsystem: SubsystemHub, Name: "revocation_refresh_timestamp_seconds",
+			Help: "Unix time of the last successful refresh of the revoked-serial cache. Stale means revocations are NOT reaching this replica.",
+		}),
+		CATrustRoots: f.NewGauge(prometheus.GaugeOpts{
+			Namespace: Namespace, Subsystem: SubsystemHub, Name: "ca_trust_roots",
+			Help: "Root certificates accepted on a spoke chain; 1 normally, 2 during a CA rotation.",
+		}),
 		CACertExpiry: f.NewGauge(prometheus.GaugeOpts{
 			Namespace: Namespace, Subsystem: SubsystemHub, Name: "ca_cert_expiry_seconds",
 			Help: "Seconds until the internal CA certificate expires.",
 		}),
+		CARotationPhase: f.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: Namespace, Subsystem: SubsystemHub, Name: "ca_rotation_phase",
+			Help: "1 on the phase of the self-service CA rotation currently in force: steady, publishing or signing.",
+		}, []string{"phase"}),
+		CARotationPhaseStart: f.NewGauge(prometheus.GaugeOpts{
+			Namespace: Namespace, Subsystem: SubsystemHub,
+			Name: "ca_rotation_phase_start_timestamp_seconds",
+			Help: "Unix time the current CA rotation phase was entered; 0 if no rotation has run.",
+		}),
+		CAOutgoingRootSessions: f.NewGauge(prometheus.GaugeOpts{
+			Namespace: Namespace, Subsystem: SubsystemHub, Name: "ca_outgoing_root_sessions",
+			Help: "Live sessions on this replica still presenting a certificate issued by the root being retired.",
+		}),
+		CARotationTransitionsTotal: f.NewCounterVec(prometheus.CounterOpts{
+			Namespace: Namespace, Subsystem: SubsystemHub, Name: "ca_rotation_transitions_total",
+			Help: "Advances of the CA rotation state machine, by the phase entered.",
+		}, []string{"to"}),
 		StoreOpDuration: f.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: Namespace, Subsystem: SubsystemHub, Name: "store_op_duration_seconds",
 			Help: "Credential store operation latency by operation and result.", Buckets: durationBuckets,

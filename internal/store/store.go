@@ -19,6 +19,11 @@ var (
 	// ErrAlreadyExists reports an attempt to create a record whose identifier
 	// is already taken.
 	ErrAlreadyExists = errors.New("already exists")
+	// ErrRevoked reports an operation against a key that has already been
+	// revoked. It is distinct from ErrAlreadyExists so a caller retrying
+	// identifier collisions cannot mistake "this rotation already happened"
+	// for "pick another KID and try again".
+	ErrRevoked = errors.New("key revoked")
 	// ErrEnrollmentUsed reports a second attempt to redeem a single-use
 	// enrollment token. It is a security event, not a retryable condition:
 	// either the token leaked or a spoke is misbehaving.
@@ -98,6 +103,13 @@ type Store interface {
 	// empty. The order is stable: ascending CreatedAt, then ascending KID. An
 	// unrecognised class yields an empty slice rather than an error.
 	ListKeys(ctx context.Context, class fleet.KeyClass) ([]*fleet.Key, error)
+
+	// ReplaceKey atomically stores fresh and revokes oldKID with the given
+	// reason: one mutation, so a rotation can never half-happen. It returns
+	// [ErrNotFound] when oldKID does not exist and [ErrRevoked] when it is
+	// already revoked -- the latter is how a replayed rotation is told the
+	// work is done rather than handed a second replacement.
+	ReplaceKey(ctx context.Context, fresh *fleet.Key, oldKID, reason string, at time.Time) error
 
 	// RevokeKey marks a key revoked at the given time with the given reason,
 	// and bumps the epoch. It is idempotent: revoking an already revoked key

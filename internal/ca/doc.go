@@ -5,8 +5,9 @@
 //
 // # Responsibility
 //
-// The hub is its own root of trust. This package owns a single, offline-shaped
-// root keypair whose production responsibility is signing spoke client
+// The hub is its own root of trust. This package owns one active signing
+// keypair -- and, during a root rotation, a trust bundle wider than that one
+// key -- whose production responsibility is signing spoke client
 // certificates:
 //
 //   - spoke client certificates, minted during enrollment, which are the only
@@ -57,18 +58,59 @@
 //     handshake consults the live revocation store, which is immediate and
 //     cannot be stale. [CA.CRL] exists to publish the same information to
 //     consumers outside the hub.
-//   - The root itself has a 10 year default lifetime and no automated rotation.
-//     Rotating it is a fleet-wide re-enrollment and must be planned; the hub
-//     reports readiness as false once the root is within 24h of expiry so the
-//     situation is loud rather than silent.
+//   - The root itself has a 10 year default lifetime and rotates itself. The
+//     hub runs a state machine over the primitives here -- mint a successor,
+//     trust it, promote it, retire the predecessor -- spanning a couple of
+//     months and needing no operator; see internal/hub and
+//     docs/adr/0015-ca-rotation.md. This package supplies the pieces and holds
+//     no opinion about when they are used. The hub also reports readiness as
+//     false once the active signer is within 24h of expiry, so a rotation that
+//     did not happen is loud rather than silent.
+//
+// # Rotating the root
+//
+// The reason a root rotation is possible at all is that issuance and
+// verification do not share a list. [CA.Certificate] is the *active signer*,
+// the one keypair every new certificate is signed by. [CA.TrustBundle] is the
+// *trust bundle*, every root a presented certificate is allowed to chain to,
+// and [CA.BundlePEM] publishes it verbatim for spokes. In steady state the
+// bundle holds exactly the active signer. During a rotation it holds two roots,
+// so a spoke carrying a certificate from the outgoing root and a spoke carrying
+// one from the incoming root both verify against the same hub.
+//
+// The moving parts are [NewRootPEM], which mints a successor into memory
+// without touching a filesystem, and [CA.AdoptPEM], which installs a signer and
+// a trust bundle atomically. The successor is minted and trusted first; only
+// once the whole fleet has had a certificate lifetime to renew onto the
+// two-root bundle does it become the signer, with the outgoing root still in
+// the bundle. Ordinary renewal migrates the fleet over the following
+// certificate lifetime; when [CA.IssuerFingerprint] no longer reports the old
+// root for any live certificate, it is dropped. Nothing is ever re-enrolled,
+// and no spoke is disconnected. The order of those steps, and the evidence each
+// one waits for, belongs to the hub -- see docs/adr/0015-ca-rotation.md.
+//
+// [Options.AdditionalRootsPEM] is the same widening applied at construction
+// time, for a root an operator wants trusted regardless of any rotation.
+//
+// One thing this deliberately does not do: [CA.CRL] is signed by the active
+// signer only. A CRL is scoped to one issuer, so during an overlap serials
+// issued by the outgoing root are not covered by the published CRL. Revocation
+// in the tunnel does not use the CRL (it consults the live store, keyed on
+// serial, regardless of issuer), so this affects external CRL consumers only.
 //
 // # Concurrency
 //
-// A [CA] is immutable after construction and every method on it is safe for
-// concurrent use. [LoadOrCreate] and [Create] are safe against concurrent
-// processes racing to initialise the same paths: creation reserves both paths
-// with O_EXCL before writing, so exactly one racer wins and the loser observes
-// [ErrCAExists].
+// Every method on a [CA] is safe for concurrent use, without a lock and
+// without a rotation ever being visible half-applied. The signer, its key and
+// the trust bundle are one immutable snapshot behind an atomic pointer: nothing
+// in it is written after it is published, every method reads it exactly once,
+// and [CA.AdoptPEM] replaces the whole snapshot in a single store. A reader
+// therefore always sees a signer together with the bundle that contains it,
+// whether it started before or after a rotation.
+//
+// [LoadOrCreate] and [Create] are safe against concurrent processes racing to
+// initialise the same paths: creation reserves both paths with O_EXCL before
+// writing, so exactly one racer wins and the loser observes [ErrCAExists].
 //
 // # Importers
 //

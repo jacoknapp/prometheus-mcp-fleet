@@ -44,13 +44,13 @@ func TestCoverageJoin(t *testing.T) {
 			wantWant:      3,
 		},
 		{
-			name: "a second join once coverage is complete is not a duplicate",
+			name: "a second join once coverage is complete is the probe, and steps aside",
 			setup: func(c *coverage) {
 				c.join("hub-0", 1)
 			},
 			serverID:      "hub-0",
 			replicas:      1,
-			wantDuplicate: false,
+			wantDuplicate: true,
 			wantCovered:   1,
 			wantWant:      1,
 		},
@@ -70,7 +70,7 @@ func TestCoverageJoin(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			c := newCoverage()
+			c := newCoverage(true)
 			if tc.setup != nil {
 				tc.setup(c)
 			}
@@ -86,14 +86,14 @@ func TestCoverageJoin(t *testing.T) {
 	}
 }
 
-// TestCoverageJoinBecomesCompleteMidStream: the "once every replica is
-// covered" branch has to be evaluated against the coverage that exists at the
-// moment of the join under test, not a snapshot taken earlier -- covering the
-// last replica must itself flip the answer for the next duplicate.
-func TestCoverageJoinBecomesCompleteMidStream(t *testing.T) {
+// TestCoverageJoinCompleteDuplicateIsTheProbe: covering the last replica does
+// not change WHETHER a duplicate steps aside -- it always does -- it changes
+// the pacing dialLoop applies, which reads state(). This pins that state()
+// reports completeness correctly at the moment of the duplicate join.
+func TestCoverageJoinCompleteDuplicateIsTheProbe(t *testing.T) {
 	t.Parallel()
 
-	c := newCoverage()
+	c := newCoverage(true)
 	if dup := c.join("hub-0", 2); dup {
 		t.Fatal("first join of hub-0 reported a duplicate")
 	}
@@ -103,8 +103,12 @@ func TestCoverageJoinBecomesCompleteMidStream(t *testing.T) {
 	if covered, want := c.state(); covered != 2 || want != 2 {
 		t.Fatalf("state() = (%d, %d), want (2, 2)", covered, want)
 	}
-	if dup := c.join("hub-0", 2); dup {
-		t.Error("a redundant join once coverage is complete was told to step aside")
+	if dup := c.join("hub-0", 2); !dup {
+		t.Error("the probe's redundant join was kept; it must step aside to come around again")
+	}
+	c.leave("hub-0")
+	if covered, want := c.state(); covered != 2 || want != 2 {
+		t.Fatalf("state() after the probe left = (%d, %d), want (2, 2): the probe must not dent coverage", covered, want)
 	}
 }
 
@@ -115,7 +119,7 @@ func TestCoverageLeave(t *testing.T) {
 
 	t.Run("decrements a doubled count without removing the replica", func(t *testing.T) {
 		t.Parallel()
-		c := newCoverage()
+		c := newCoverage(true)
 		c.join("hub-0", 2)
 		c.join("hub-0", 2) // two tunnels to the same replica, briefly.
 		if covered, _ := c.state(); covered != 1 {
@@ -135,7 +139,7 @@ func TestCoverageLeave(t *testing.T) {
 
 	t.Run("leave of an unknown id is safe", func(t *testing.T) {
 		t.Parallel()
-		c := newCoverage()
+		c := newCoverage(true)
 		c.leave("never-joined")
 		if covered, want := c.state(); covered != 0 || want != 0 {
 			t.Errorf("state() = (%d, %d), want (0, 0)", covered, want)
@@ -149,7 +153,7 @@ func TestCoverageLeave(t *testing.T) {
 func TestCoverageWantOnlyUpdatesWhenReplicasIsPositive(t *testing.T) {
 	t.Parallel()
 
-	c := newCoverage()
+	c := newCoverage(true)
 	c.join("hub-0", 3)
 	if _, want := c.state(); want != 3 {
 		t.Fatalf("want = %d after replicas=3, want 3", want)
@@ -161,6 +165,24 @@ func TestCoverageWantOnlyUpdatesWhenReplicasIsPositive(t *testing.T) {
 }
 
 // TestCoverageDialers covers the floor of one and the pass-through of want.
+// TestCoverageClampsAdvertisedReplicas pins the ceiling on the one handshake
+// field that sizes a goroutine pool: the count arrives before the hub has
+// proven anything, so a hostile two-billion answer must produce at most
+// maxAdvertisedReplicas dial loops, not an OOM.
+func TestCoverageClampsAdvertisedReplicas(t *testing.T) {
+	t.Parallel()
+	c := newCoverage(true)
+	c.join("hub-0", 2_000_000_000)
+	if got := c.dialers(); got != maxAdvertisedReplicas+1 {
+		t.Fatalf("dialers() = %d after a hostile replica count, want the clamp %d plus the probe", got, maxAdvertisedReplicas+1)
+	}
+	// The clamp is a ceiling, not a floor: a sane count passes through.
+	c.join("hub-1", 3)
+	if got := c.dialers(); got != 4 {
+		t.Fatalf("dialers() = %d, want 3 replicas plus the probe", got)
+	}
+}
+
 func TestCoverageDialers(t *testing.T) {
 	t.Parallel()
 
@@ -169,14 +191,18 @@ func TestCoverageDialers(t *testing.T) {
 		replicas int
 		want     int
 	}{
-		{name: "nothing advertised yet floors to one", replicas: 0, want: 1},
-		{name: "one replica", replicas: 1, want: 1},
-		{name: "several replicas", replicas: 5, want: 5},
+		// Zero is "unknown", and the probe must already exist then: the
+		// established tunnel never handshakes again, so a spoke that dialed a
+		// cold-cached hub would otherwise hold one tunnel forever with both
+		// coverage alerts blind to it.
+		{name: "an unknown count runs one dialer plus the probe", replicas: 0, want: 2},
+		{name: "one replica plus the probe", replicas: 1, want: 2},
+		{name: "several replicas plus the probe", replicas: 5, want: 6},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			c := newCoverage()
+			c := newCoverage(true)
 			if tc.replicas > 0 {
 				c.join("hub-0", tc.replicas)
 			}
@@ -193,7 +219,7 @@ func TestCoverageDialers(t *testing.T) {
 func TestCoverageConcurrentJoinLeaveState(t *testing.T) {
 	t.Parallel()
 
-	c := newCoverage()
+	c := newCoverage(true)
 	const goroutines = 20
 	const iterations = 200
 
@@ -212,4 +238,29 @@ func TestCoverageConcurrentJoinLeaveState(t *testing.T) {
 		}(g)
 	}
 	wg.Wait()
+}
+
+// TestCoverageExplicitEndpointsMode pins the second addressing mode: several
+// configured endpoints mean the operator pinned each hostname to one replica,
+// so the advertised count is ignored, each endpoint wants exactly one tunnel,
+// and no probe runs -- a pinned hostname can never reach a new replica, so
+// probing it is pure churn. Before this mode existed, an explicit-endpoints
+// fleet on default values ran surplus dialers against every pinned hostname
+// forever and paged a false TunnelFlapping for every cluster.
+func TestCoverageExplicitEndpointsMode(t *testing.T) {
+	t.Parallel()
+	c := newCoverage(false)
+	if got := c.dialers(); got != 1 {
+		t.Fatalf("dialers() = %d before any hello, want 1", got)
+	}
+	// The hub advertises three replicas; a pinned endpoint must not care.
+	if dup := c.join("hub-0", 3); dup {
+		t.Fatal("the first join reported a duplicate")
+	}
+	if covered, want := c.state(); covered != 1 || want != 1 {
+		t.Fatalf("state() = (%d, %d), want (1, 1): the advertised count leaked into explicit mode", covered, want)
+	}
+	if got := c.dialers(); got != 1 {
+		t.Fatalf("dialers() = %d, want exactly 1: no probe in explicit mode", got)
+	}
 }

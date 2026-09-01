@@ -23,21 +23,40 @@ const (
 	ToolLabelNames      = "label_names"
 	ToolLabelValues     = "label_values"
 	ToolMetricMetadata  = "metric_metadata"
+	ToolTargetMetadata  = "target_metadata"
 	ToolTargets         = "targets"
 	ToolRules           = "rules"
 	ToolAlerts          = "alerts"
+	ToolAlertmanagers   = "alertmanagers"
 	ToolTSDBStats       = "tsdb_stats"
 	ToolRuntimeInfo     = "runtime_info"
 	ToolFanoutQuery     = "fanout_query"
 	ToolExplainPromQL   = "explain_promql"
+	ToolQueryExemplars  = "query_exemplars"
 )
+
+// operationalTools are the surfaces fleet.RoleOperator exists to gate: they
+// describe how monitoring is wired -- scrape targets, Alertmanager discovery,
+// storage and runtime internals -- rather than what the metrics say. A viewer
+// key reaches them only by naming them in tools.allow; its "*" wildcard does
+// not include them. Until this map existed, Role was documented as a
+// capability tier and enforced nowhere, which is worse than no tier at all:
+// an operator who chose "viewer" believed a restriction that did not exist.
+var operationalTools = map[string]bool{
+	ToolTargets:        true,
+	ToolTargetMetadata: true,
+	ToolAlertmanagers:  true,
+	ToolTSDBStats:      true,
+	ToolRuntimeInfo:    true,
+}
 
 // toolNames is every registered tool, in registration order.
 var toolNames = []string{
 	ToolListClusters, ToolDescribeCluster,
-	ToolQuery, ToolQueryRange, ToolExplainPromQL,
-	ToolSearchMetrics, ToolMetricMetadata, ToolSeries, ToolLabelNames, ToolLabelValues,
-	ToolTargets, ToolRules, ToolAlerts, ToolTSDBStats, ToolRuntimeInfo,
+	ToolQuery, ToolQueryRange, ToolExplainPromQL, ToolQueryExemplars,
+	ToolSearchMetrics, ToolMetricMetadata, ToolTargetMetadata,
+	ToolSeries, ToolLabelNames, ToolLabelValues,
+	ToolTargets, ToolRules, ToolAlerts, ToolAlertmanagers, ToolTSDBStats, ToolRuntimeInfo,
 	ToolFanoutQuery,
 }
 
@@ -230,6 +249,29 @@ func (t *Tools) registerQuery(s *mcpsurface.Server) {
 			},
 		},
 	}, run(t, ToolExplainPromQL, newExplainPromQLOut, t.explainPromQL))
+
+	mcpsurface.AddTool(s, mcpsurface.Tool{
+		Name:  ToolQueryExemplars,
+		Title: "Query exemplars",
+		Description: "Exemplars for a series selector on one cluster: individual sample values " +
+			"tagged with the trace or span that produced them, which is the shortest path from " +
+			"an aggregate metric to the one request that explains it. Pass a raw selector such " +
+			"as a histogram bucket, not an aggregation — exemplars attach to a series, not to " +
+			"the result of rate() or sum(). Most clusters return nothing here: exemplar storage " +
+			"is an opt-in Prometheus feature and most instrumentation never attaches trace " +
+			"context, so an empty result is the common case, not evidence that nothing happened. " +
+			"Returned most-recent-first, since a truncated result should keep the exemplar " +
+			"closest to now.",
+		Idempotent: true,
+		Meta:       clusterHeaderMeta,
+		Constraints: map[string]mcpsurface.Constraint{
+			"limit": intRange(1, 500, 100),
+			"start": {Default: "now-1h"},
+			"end":   {Default: "now"},
+			"query": {Examples: []any{`http_request_duration_seconds_bucket{job="api"}`}},
+		},
+	}, run(t, ToolQueryExemplars,
+		func() *QueryExemplarsOut { return &QueryExemplarsOut{} }, t.queryExemplars))
 }
 
 // registerMetadata registers the discovery tools that read series metadata.
@@ -269,6 +311,27 @@ func (t *Tools) registerMetadata(s *mcpsurface.Server) {
 		},
 	}, run(t, ToolMetricMetadata,
 		func() *MetricMetadataOut { return &MetricMetadataOut{} }, t.metricMetadata))
+
+	mcpsurface.AddTool(s, mcpsurface.Tool{
+		Name:  ToolTargetMetadata,
+		Title: "Target metadata",
+		Description: "Metric metadata as individual targets report it, rather than aggregated " +
+			"across the cluster. metric_metadata collapses every target's answer into one entry " +
+			"per metric, which silently picks a winner when two targets disagree; this tool " +
+			"keeps them separate. Reach for it when a canary and a stable rollout, or two " +
+			"versions of the same exporter, might be reporting a metric's type or help text " +
+			"differently — metric_metadata cannot show you that, this can. Omit both matchTarget " +
+			"and metric to list everything every target reports, which is large; scope with one " +
+			"or both.",
+		Idempotent: true,
+		Meta:       clusterHeaderMeta,
+		Constraints: map[string]mcpsurface.Constraint{
+			"limit":       intRange(1, 1000, 100),
+			"metric":      {Examples: []any{"node_cpu_seconds_total"}},
+			"matchTarget": {Examples: []any{`{job="node-exporter"}`}},
+		},
+	}, run(t, ToolTargetMetadata,
+		func() *TargetMetadataOut { return &TargetMetadataOut{} }, t.targetMetadata))
 
 	mcpsurface.AddTool(s, mcpsurface.Tool{
 		Name:  ToolSeries,
@@ -385,6 +448,21 @@ func (t *Tools) registerOperational(s *mcpsurface.Server) {
 			"severity":           {Examples: []any{"critical", "warning"}},
 		},
 	}, run(t, ToolAlerts, func() *AlertsOut { return &AlertsOut{} }, t.alerts))
+
+	mcpsurface.AddTool(s, mcpsurface.Tool{
+		Name:  ToolAlertmanagers,
+		Title: "Alertmanagers",
+		Description: "The Alertmanager peers this cluster's Prometheus has discovered, active " +
+			"and dropped. Call this before treating a firing alert as \"someone was paged\": a " +
+			"cluster with no active Alertmanager can evaluate and fire alerting rules all day " +
+			"without ever notifying anyone. Costs no arguments beyond the cluster and returns a " +
+			"handful of rows. URLs are never returned, only the host: an Alertmanager configured " +
+			"through static discovery can carry basic-auth credentials in its URL the same way a " +
+			"scrape target can.",
+		Idempotent: true,
+		Meta:       clusterHeaderMeta,
+	}, run(t, ToolAlertmanagers,
+		func() *AlertmanagersOut { return &AlertmanagersOut{} }, t.alertmanagers))
 
 	mcpsurface.AddTool(s, mcpsurface.Tool{
 		Name:  ToolTSDBStats,

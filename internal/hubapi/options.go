@@ -19,12 +19,15 @@ import (
 // Defaults applied by the constructors when the corresponding [Options] field
 // is zero.
 const (
-	// DefaultAgentKeyTTL matches the PMF_AGENT_KEY_TTL default of 30 days.
-	DefaultAgentKeyTTL = 720 * time.Hour
-	// DefaultAdminKeyTTL is 90 days. Admin credentials are the highest-value
-	// secret the hub issues, so they expire sooner than an agent key would be
-	// convenient.
-	DefaultAdminKeyTTL = 90 * 24 * time.Hour
+	// DefaultAgentKeyTTL matches the PMF_AGENT_KEY_TTL default of 90 days.
+	// Deliberately long: nothing rotates an agent key automatically, so a
+	// short lifetime is an outage on a timer, and the controls that actually
+	// bound a leaked key are scope, rate limits and revocation.
+	DefaultAgentKeyTTL = 2160 * time.Hour
+	// DefaultAdminKeyTTL matches the PMF_ADMIN_KEY_TTL default of 90 days.
+	// Admin credentials mint other credentials and drive CA rotation, so
+	// unlike agent keys they can never be minted without an expiry.
+	DefaultAdminKeyTTL = 2160 * time.Hour
 	// DefaultEnrollmentTTL matches the PMF_ENROLLMENT_TOKEN_TTL default. An
 	// enrollment token is handed to an installer and redeemed within seconds;
 	// a long window is a long exposure.
@@ -58,7 +61,7 @@ type RevokedCert = store.RevokedCert
 //
 // It is deliberately wider than [authn.KeyStore]: the admin API mutates what
 // the verifier only reads. It is declared here rather than imported so that
-// the HTTP layer depends on eleven method signatures instead of on a
+// the HTTP layer depends on twelve method signatures instead of on a
 // particular backend, and so the tests can run the real mux against a map.
 //
 // Implementations must be safe for concurrent use. Every mutating method
@@ -76,6 +79,12 @@ type AdminStore interface {
 	ListKeys(ctx context.Context, class fleet.KeyClass) ([]*fleet.Key, error)
 	// RevokeKey marks a key revoked. It is idempotent.
 	RevokeKey(ctx context.Context, kid, reason string, at time.Time) error
+	// ReplaceKey atomically stores fresh and revokes oldKID as one mutation,
+	// so a rotation can never half-happen. Storing the fresh key under a
+	// taken KID fails with an error satisfying [Options.IsConflict]; a
+	// revoked oldKID fails with an error that must NOT satisfy it, or the
+	// rotation route's identifier-collision retry would replay the refusal.
+	ReplaceKey(ctx context.Context, fresh *fleet.Key, oldKID, reason string, at time.Time) error
 	// DeleteKey removes a key entirely, destroying its audit trail.
 	DeleteKey(ctx context.Context, kid string) error
 	// BurnEnrollment atomically redeems a single-use enrollment token for the
@@ -98,6 +107,28 @@ var (
 	_ AdminStore     = (store.Store)(nil)
 	_ authn.KeyStore = (store.Store)(nil)
 )
+
+// SessionCloser terminates live spoke tunnels whose client certificate has
+// been revoked.
+//
+// It is declared here, in terms of nothing but strings, rather than imported
+// from internal/registry: the admin API's business is that a revocation takes
+// effect, not what a session pool looks like. The hub's live registry
+// satisfies it, and a hub built without one leaves [Options.Sessions] nil.
+//
+// Both methods return one cluster ID per session closed, so len is the session
+// count. Implementations must be safe for concurrent use, must not call back
+// into this package, and must return only once the sessions are actually
+// closed.
+type SessionCloser interface {
+	// CloseRevoked closes every live session admitted by one of the given
+	// certificate serials.
+	CloseRevoked(serials ...string) []string
+	// CloseRevokedBy closes every live session whose admitting certificate
+	// serial isRevoked reports revoked. The predicate may be slow: an
+	// implementation must not hold a lock across it.
+	CloseRevokedBy(isRevoked func(serial string) bool) []string
+}
 
 // Metrics is the narrow counter surface this package needs. Implementations
 // must be safe for concurrent use.
@@ -136,6 +167,18 @@ type Options struct {
 	CA *ca.CA
 	// Verifier authenticates the admin and enrollment credentials. Required.
 	Verifier *authn.Verifier
+	// Sessions is the hub's live spoke sessions. When it is set, revoking a
+	// certificate through the admin API also closes any session that
+	// certificate admitted *on this replica*, and records
+	// [EventSessionRevoked].
+	//
+	// Nil means a revocation only stops the next connection, which is what
+	// this hub did before: the certificate's remaining lifetime then bounds
+	// how long a compromised spoke keeps serving. Sessions are pinned to the
+	// replica that accepted them, so this covers a revocation whose admin
+	// request happened to land on the holding replica; every other replica
+	// notices through [RevocationEnforcer].
+	Sessions SessionCloser
 	// Logger receives request and security-event logs. Nil discards them.
 	Logger *slog.Logger
 	// Metrics counts enrollments and security events. Nil means [NopMetrics].
@@ -200,6 +243,7 @@ type server struct {
 	hasher   *token.Hasher
 	ca       *ca.CA
 	verifier *authn.Verifier
+	sessions SessionCloser
 	log      *slog.Logger
 	metrics  Metrics
 	clock    func() time.Time
@@ -279,6 +323,7 @@ func newServer(opts Options) (*server, error) {
 		hasher:            opts.Hasher,
 		ca:                opts.CA,
 		verifier:          opts.Verifier,
+		sessions:          opts.Sessions,
 		log:               opts.Logger,
 		metrics:           opts.Metrics,
 		clock:             opts.Clock,

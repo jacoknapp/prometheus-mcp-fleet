@@ -15,6 +15,7 @@ import (
 
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/fleet"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/store"
+	"strings"
 )
 
 // OpenFunc creates a store for one subtest. It must return an independent,
@@ -50,6 +51,10 @@ func RunSuite(t *testing.T, open OpenFunc) {
 		{"ListKeysOrdering", testListKeysOrdering},
 		{"ListKeysEmpty", testListKeysEmpty},
 		{"RevokeKey", testRevokeKey},
+		{"ReplaceKey", testReplaceKey},
+		{"ReplaceKeyRefusesRevoked", testReplaceKeyRefusesRevoked},
+		{"ReplaceKeyNotFound", testReplaceKeyNotFound},
+		{"ReplaceKeyAtomicOnCollision", testReplaceKeyAtomicOnCollision},
 		{"RevokeKeyIsIdempotent", testRevokeKeyIsIdempotent},
 		{"RevokeKeyNotFound", testRevokeKeyNotFound},
 		{"DeleteKey", testDeleteKey},
@@ -415,6 +420,109 @@ func testListKeysEmpty(t *testing.T, s store.Store) {
 	}
 	if len(got) != 0 {
 		t.Errorf("ListKeys(unknown class) returned %d keys", len(got))
+	}
+}
+
+// testReplaceKey proves the rotation primitive: one call, and afterwards the
+// fresh key is live while the old one is revoked with the given reason.
+func testReplaceKey(t *testing.T, s store.Store) {
+	ctx := t.Context()
+	old := agentKey("agent0030", tBase)
+	mustPut(t, s, old)
+	fresh := agentKey("agent0031", tBase.Add(time.Hour))
+	before := mustEpoch(t, s)
+
+	at := tBase.Add(time.Hour)
+	if err := s.ReplaceKey(ctx, fresh, old.KID, "rotated (replaced by agent0031)", at); err != nil {
+		t.Fatalf("ReplaceKey: %v", err)
+	}
+
+	gotFresh, err := s.GetKey(ctx, fresh.KID)
+	if err != nil {
+		t.Fatalf("GetKey(fresh): %v", err)
+	}
+	if gotFresh.Revoked() {
+		t.Error("the replacement key is revoked")
+	}
+	gotOld, err := s.GetKey(ctx, old.KID)
+	if err != nil {
+		t.Fatalf("GetKey(old): %v", err)
+	}
+	if gotOld.RevokedAt == nil || !gotOld.RevokedAt.Equal(at) {
+		t.Errorf("old RevokedAt = %v, want %s", gotOld.RevokedAt, at)
+	}
+	if gotOld.RevokedReason != "rotated (replaced by agent0031)" {
+		t.Errorf("old RevokedReason = %q", gotOld.RevokedReason)
+	}
+	if after := mustEpoch(t, s); after <= before {
+		t.Errorf("epoch = %d after ReplaceKey, want > %d", after, before)
+	}
+}
+
+// testReplaceKeyRefusesRevoked pins the replay contract: an already-revoked
+// source fails with an error that is NOT the create-collision sentinel, so a
+// caller retrying identifier collisions cannot loop on a finished rotation.
+func testReplaceKeyRefusesRevoked(t *testing.T, s store.Store) {
+	ctx := t.Context()
+	old := agentKey("agent0032", tBase)
+	mustPut(t, s, old)
+	if err := s.RevokeKey(ctx, old.KID, "rotated (replaced by agent0033)", tBase.Add(time.Hour)); err != nil {
+		t.Fatalf("RevokeKey: %v", err)
+	}
+
+	fresh := agentKey("agent0034", tBase)
+	err := s.ReplaceKey(ctx, fresh, old.KID, "rotated again", tBase.Add(2*time.Hour))
+	if err == nil {
+		t.Fatal("ReplaceKey accepted a revoked source key")
+	}
+	if !errors.Is(err, store.ErrRevoked) {
+		t.Errorf("err = %v, want it to wrap store.ErrRevoked", err)
+	}
+	if errors.Is(err, store.ErrAlreadyExists) {
+		t.Error("the refusal wraps ErrAlreadyExists, which a collision-retrying caller would replay")
+	}
+	if !strings.Contains(err.Error(), "agent0033") {
+		t.Errorf("err = %q, want it to carry the recorded reason naming the replacement", err)
+	}
+	if _, err := s.GetKey(ctx, fresh.KID); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("GetKey(fresh) err = %v, want ErrNotFound: the refused replacement was stored", err)
+	}
+}
+
+// testReplaceKeyNotFound: a missing source is ErrNotFound and stores nothing.
+func testReplaceKeyNotFound(t *testing.T, s store.Store) {
+	ctx := t.Context()
+	fresh := agentKey("agent0035", tBase)
+	err := s.ReplaceKey(ctx, fresh, "agent-none", "rotated", tBase)
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+	if _, err := s.GetKey(ctx, fresh.KID); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("GetKey(fresh) err = %v, want ErrNotFound: a failed replace stored the fresh key", err)
+	}
+}
+
+// testReplaceKeyAtomicOnCollision: when the fresh KID is taken, NOTHING
+// changes -- in particular the old key is not revoked. This is the atomicity
+// the primitive exists for.
+func testReplaceKeyAtomicOnCollision(t *testing.T, s store.Store) {
+	ctx := t.Context()
+	old := agentKey("agent0036", tBase)
+	taken := agentKey("agent0037", tBase)
+	mustPut(t, s, old)
+	mustPut(t, s, taken)
+
+	dup := agentKey("agent0037", tBase.Add(time.Hour))
+	err := s.ReplaceKey(ctx, dup, old.KID, "rotated", tBase.Add(time.Hour))
+	if !errors.Is(err, store.ErrAlreadyExists) {
+		t.Fatalf("err = %v, want ErrAlreadyExists", err)
+	}
+	gotOld, err := s.GetKey(ctx, old.KID)
+	if err != nil {
+		t.Fatalf("GetKey(old): %v", err)
+	}
+	if gotOld.Revoked() {
+		t.Error("the old key was revoked by a ReplaceKey that failed: the mutation is not atomic")
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/config"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/obs"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -44,6 +45,8 @@ func TestAdoptStoredIdentity(t *testing.T) {
 	stale := ca.identityOver(t, "prod-eu-1", now.Add(-90*time.Hour), now.Add(-90*time.Hour+100*time.Hour))
 	// One a sibling has just minted: nowhere near renewal.
 	fresh := ca.identityOver(t, "prod-eu-1", now, now.Add(100*time.Hour))
+	// A fresh certificate for a different cluster entirely.
+	foreignIdentity := ca.identityOver(t, "stage-us-2", now, now.Add(100*time.Hour))
 
 	tests := []struct {
 		name    string
@@ -86,6 +89,19 @@ func TestAdoptStoredIdentity(t *testing.T) {
 		store:   &memoryIdentityStore{key: fresh.KeyPEM, cert: fresh.CertPEM, ca: fresh.CABundle},
 		current: fresh,
 		want:    nil,
+	}, {
+		// The shared-Secret misconfiguration, reached mid-life: what appeared
+		// in the Secret is a perfectly valid, fresh certificate -- for some
+		// OTHER cluster. Adopting it would have this pod renew that cluster's
+		// identity forever while every handshake fails; the pod must keep its
+		// own working identity and refuse loudly.
+		name: "refuses another cluster's certificate",
+		store: func() identityStore {
+			o := foreignIdentity
+			return &memoryIdentityStore{key: o.KeyPEM, cert: o.CertPEM, ca: o.CABundle}
+		}(),
+		current: stale,
+		want:    nil,
 	}}
 
 	for _, tc := range tests {
@@ -93,7 +109,7 @@ func TestAdoptStoredIdentity(t *testing.T) {
 			t.Parallel()
 
 			clock := &stubClock{t: now}
-			s, _ := newTestSpoke(t, clock, nil)
+			s, _ := newTestSpoke(t, clock, &config.Spoke{ClusterID: "prod-eu-1"})
 			s.store = tc.store
 			if tc.current != nil {
 				s.setIdentity(tc.current)
@@ -414,15 +430,21 @@ func TestDialLoopRedialsRedundantTunnelsPromptly(t *testing.T) {
 	})
 	s.setIdentity(ca.identityOver(t, "prod-eu-1",
 		clock.Now().Add(-time.Hour), clock.Now().Add(14*24*time.Hour)))
+	// A slow machine can burn through the fast-search allowance before the
+	// assertion samples twice, after which the loop drops to the probe pace
+	// -- which defaults to minutes. Keep that fallback fast too, so the test
+	// times what it means to time.
+	s.timing.coverageProbe = 50 * time.Millisecond
+	s.timing.dialStagger = time.Millisecond
 
-	cov := newCoverage()
+	cov := newCoverage(true)
 	// Pre-cover the only replica this hub can ever answer as, so every
 	// connection the loop makes is a duplicate.
 	cov.join("hub-test-0", 2)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go s.dialLoop(ctx, hub.url, cov)
+	go s.dialLoop(ctx, hub.url, cov, nil)
 
 	// TWO redials, not one. One proves only that a duplicate is detected; the
 	// second proves the loop came back round promptly afterwards, which is the
@@ -453,13 +475,17 @@ func TestDialLoopStopsWhileWaitingToRedialARedundantTunnel(t *testing.T) {
 	})
 	s.setIdentity(ca.identityOver(t, "prod-eu-1",
 		clock.Now().Add(-time.Hour), clock.Now().Add(14*24*time.Hour)))
+	// Pin the first-dial stagger: the assertion below budgets seconds, and
+	// the production stagger plus coverage-instrumented slowness can eat
+	// most of that before the first dial even starts.
+	s.timing.dialStagger = time.Millisecond
 
-	cov := newCoverage()
+	cov := newCoverage(true)
 	cov.join("hub-test-0", 2)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { defer close(done); s.dialLoop(ctx, hub.url, cov) }()
+	go func() { defer close(done); s.dialLoop(ctx, hub.url, cov, nil) }()
 
 	eventually(t, "the redundant tunnel to be dropped", func() bool {
 		return logs.has("redundant tunnel to an already-covered hub replica")
@@ -640,5 +666,204 @@ func TestExpiredCertificateRecoveryToleratesAnUnwritableStore(t *testing.T) {
 	}
 	if !f.logs.has("could not persist the renewed identity") {
 		t.Error("the failed write was not reported; a silent one repeats every restart")
+	}
+}
+
+// TestLosingTheEnrollmentRaceWaitsForTheSibling covers the GitOps first sync.
+//
+// Three spoke pods start together on a fresh cluster, all find the shared
+// identity Secret empty, and all enrol. With a single-use token — which is what
+// the admin API mints when something other than `hub enroll create` asks — two
+// of them lose. Exiting would put those pods through CrashLoopBackOff and make
+// an ordinary Argo CD first sync go Degraded before it settled. They wait for
+// the winner's write instead.
+func TestLosingTheEnrollmentRaceWaitsForTheSibling(t *testing.T) {
+	t.Parallel()
+
+	f := newRenewFixture(t)
+	f.spoke.timing.renewCheck = time.Hour // keep the renew loop out of this
+	f.spoke.cfg.EnrollmentTokenFile = writeFile(t, t.TempDir(), "token", "pmf_enr_token")
+	winner := f.hub.ca.identityOver(t, "prod-eu-1",
+		f.clock.Now(), f.clock.Now().Add(14*24*time.Hour))
+
+	// Nothing stored yet, and the hub refuses enrollment: the token is spent.
+	f.store.mu.Lock()
+	f.store.loadErr = ErrNoIdentity
+	f.store.mu.Unlock()
+	f.hub.mu.Lock()
+	f.hub.enrollStatus = http.StatusConflict
+	f.hub.mu.Unlock()
+
+	// The winner publishes shortly afterwards, as its own enrollment completes.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		f.store.mu.Lock()
+		defer f.store.mu.Unlock()
+		f.store.loadErr = nil
+		f.store.key, f.store.cert, f.store.ca = winner.KeyPEM, winner.CertPEM, winner.CABundle
+	}()
+
+	if err := f.spoke.establishIdentity(t.Context()); err != nil {
+		t.Fatalf("establishIdentity() = %v; a pod that lost the race must wait, not fail", err)
+	}
+	got := f.spoke.currentIdentity()
+	if got == nil || got.Leaf.SerialNumber.Cmp(winner.Leaf.SerialNumber) != 0 {
+		t.Fatal("the sibling's identity was not adopted")
+	}
+	if !f.logs.has("adopted the identity a sibling pod enrolled") {
+		t.Errorf("the adoption was not logged; got %s", f.logs.messages())
+	}
+}
+
+// TestASpentTokenWithNoSiblingStillFails keeps the honest failure. Waiting
+// forever for a sibling that is never coming would be indistinguishable from a
+// broken spoke, so the original enrollment error must still surface.
+func TestASpentTokenWithNoSiblingStillFails(t *testing.T) {
+	t.Parallel()
+
+	f := newRenewFixture(t)
+	f.spoke.timing.renewCheck = time.Hour
+	f.spoke.cfg.EnrollmentTokenFile = writeFile(t, t.TempDir(), "token", "pmf_enr_token")
+	// The context deadline below is what stops this sitting for the production
+	// wait window; the spent token never gets a sibling.
+	f.store.mu.Lock()
+	f.store.loadErr = ErrNoIdentity
+	f.store.mu.Unlock()
+	f.hub.mu.Lock()
+	f.hub.enrollStatus = http.StatusConflict
+	f.hub.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+
+	err := f.spoke.establishIdentity(ctx)
+	if err == nil {
+		t.Fatal("establishIdentity() = nil with a spent token and no sibling, want the enrollment error")
+	}
+	if !errors.Is(err, ErrTokenAlreadyUsed) {
+		t.Errorf("error = %v, want it to report the spent token", err)
+	}
+}
+
+// TestAwaitSiblingIdentityGivesUpAtTheDeadline covers the honest-failure exit:
+// no sibling ever writes the Secret, the wait window lapses, and the caller
+// gets nil so it can report the ORIGINAL enrollment failure instead of a
+// timeout that hides it. The stub clock's step compresses the 90-second
+// window into two observations, so the test pays one poll's real sleep.
+func TestAwaitSiblingIdentityGivesUpAtTheDeadline(t *testing.T) {
+	t.Parallel()
+
+	clock := newStubClock()
+	clock.mu.Lock()
+	clock.step = siblingIdentityWait // every look at the clock crosses the window
+	clock.mu.Unlock()
+
+	s, _ := newTestSpoke(t, clock, nil)
+	s.store = &stubStore{loadErr: ErrNoIdentity}
+
+	if id := s.awaitSiblingIdentity(t.Context()); id != nil {
+		t.Fatalf("awaitSiblingIdentity = %v, want nil after the deadline with no sibling", id)
+	}
+}
+
+// TestEstablishIdentityRefusesAnotherClustersCertificate covers the shared
+// identity Secret misconfiguration: two clusters' Deployments pointed at one
+// Secret, where the loser adopts the winner's certificate and would then renew
+// the WRONG cluster's identity forever while every handshake fails with a
+// mismatch. The pod must instead exit with an error naming both cluster IDs.
+func TestEstablishIdentityRefusesAnotherClustersCertificate(t *testing.T) {
+	t.Parallel()
+
+	f := newRenewFixture(t)
+	// A perfectly valid identity -- for somebody else's cluster.
+	issued := f.clock.Now().Add(-time.Hour)
+	other := f.hub.ca.identityOver(t, "stage-us-2", issued, issued.Add(14*24*time.Hour))
+
+	f.store.mu.Lock()
+	f.store.key, f.store.cert, f.store.ca = other.KeyPEM, other.CertPEM, other.CABundle
+	f.store.mu.Unlock()
+
+	err := f.spoke.establishIdentity(t.Context())
+	if err == nil {
+		t.Fatal("establishIdentity accepted a certificate for another cluster")
+	}
+	for _, want := range []string{"stage-us-2", "prod-eu-1", "identity Secret"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %q, want it to mention %q", err, want)
+		}
+	}
+}
+
+// TestAdoptionRefusesAForeignSibling: the pod loses the enrollment race, waits,
+// and what appears in the Secret belongs to a DIFFERENT cluster -- the shared
+// Secret misconfiguration observed at the adoption path. It must exit naming
+// both cluster IDs, not adopt and renew the wrong identity forever.
+func TestAdoptionRefusesAForeignSibling(t *testing.T) {
+	t.Parallel()
+
+	f := newRenewFixture(t)
+	f.spoke.timing.renewCheck = time.Hour
+	f.spoke.cfg.EnrollmentTokenFile = writeFile(t, t.TempDir(), "token", "pmf_enr_token")
+	foreign := f.hub.ca.identityOver(t, "stage-us-2",
+		f.clock.Now(), f.clock.Now().Add(14*24*time.Hour))
+
+	f.store.mu.Lock()
+	f.store.loadErr = ErrNoIdentity
+	f.store.mu.Unlock()
+	f.hub.mu.Lock()
+	f.hub.enrollStatus = http.StatusConflict
+	f.hub.mu.Unlock()
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		f.store.mu.Lock()
+		defer f.store.mu.Unlock()
+		f.store.loadErr = nil
+		f.store.key, f.store.cert, f.store.ca = foreign.KeyPEM, foreign.CertPEM, foreign.CABundle
+	}()
+
+	err := f.spoke.establishIdentity(t.Context())
+	if err == nil {
+		t.Fatal("establishIdentity adopted a foreign sibling's identity")
+	}
+	for _, want := range []string{"stage-us-2", "prod-eu-1"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %q, want it to mention %q", err, want)
+		}
+	}
+}
+
+// TestExpiredForeignCertificateIsRefusedBeforeRenewal: the startup recovery
+// path renews an expired stored certificate inside the hub's grace window --
+// but if the shared-Secret misconfiguration put ANOTHER cluster's expired
+// certificate there, renewing it would adopt the wrong identity for the pod's
+// whole life. The refusal must come before the hub is ever asked.
+func TestExpiredForeignCertificateIsRefusedBeforeRenewal(t *testing.T) {
+	t.Parallel()
+
+	f := newRenewFixture(t)
+	issued := f.clock.Now().Add(-15 * 24 * time.Hour)
+	foreign := f.hub.ca.identityOver(t, "stage-us-2", issued, issued.Add(14*24*time.Hour))
+
+	f.store.mu.Lock()
+	f.store.key, f.store.cert, f.store.ca = foreign.KeyPEM, foreign.CertPEM, foreign.CABundle
+	f.store.mu.Unlock()
+
+	err := f.spoke.establishIdentity(t.Context())
+	if err == nil {
+		t.Fatal("establishIdentity renewed another cluster's expired certificate")
+	}
+	for _, want := range []string{"stage-us-2", "prod-eu-1"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %q, want it to mention %q", err, want)
+		}
+	}
+	// A renewal starts with a challenge; zero challenges proves the refusal
+	// came before the hub was ever asked.
+	f.hub.mu.Lock()
+	challenges := f.hub.challenges
+	f.hub.mu.Unlock()
+	if challenges != 0 {
+		t.Errorf("the hub was asked for %d renewal challenges, want 0: the refusal must precede the request", challenges)
 	}
 }

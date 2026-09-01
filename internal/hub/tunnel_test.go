@@ -362,3 +362,97 @@ func TestNewTunnelServerReportsItsHostnameOnSuccess(t *testing.T) {
 		t.Fatalf("hub_server_id = %q, want the hostname %q reported by osHostname", got, hostname)
 	}
 }
+
+// TestNewTunnelServerWiresPeerDiscoveryMetrics pins the "h.metrics != nil"
+// guard around observePeers: whenever a hub has metrics wired -- which a
+// running hub always does -- a resolved peer count must reach the
+// discovered_peers gauge. A CONDITIONALS_NEGATION mutant turning it into
+// "== nil" would wire the callback only when metrics are ABSENT: for every
+// real hub this gauge would simply never move, and in the metrics-absent
+// case itself it would bind DiscoveredPeers to a nil *metricsAdapter that
+// panics the instant a resolved count tried to call it.
+func TestNewTunnelServerWiresPeerDiscoveryMetrics(t *testing.T) {
+	t.Parallel()
+
+	const clusterID = "prod"
+	// "localhost" resolves off /etc/hosts (127.0.0.1 and ::1, IPv4
+	// preferred), so this needs no real network access and settles on
+	// exactly one peer.
+	cfg := newHubConfig(t, "--peer-discovery-domain", "localhost")
+	h, _ := newWiredHub(t, cfg)
+	h.tunnel = mustTunnelServer(t, h)
+	public := mustStartPublic(t, h)
+	listener := h.tunnel.Listener()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = h.serveTunnel(ctx, listener) }()
+	go h.registry.Run(ctx)
+
+	dialed := make(chan error, 1)
+	go func() {
+		dialed <- wstun.Dial(ctx, wstun.ClientConfig{
+			URL:         "ws://" + public.Addr() + cfg.TunnelPath,
+			Certificate: issueSpokeCert(t, h, clusterID),
+			ClusterID:   clusterID,
+			Logger:      slog.New(slog.DiscardHandler),
+			Generation:  time.Now().UnixNano(),
+		}, &tunneltest.EchoHandler{})
+	}()
+
+	// The handshake's ServerHello is what calls Replicas(), which is what
+	// drives the peer counter's first refresh.
+	eventually(t, 5*time.Second, "peer discovery to resolve localhost and report a count", func() bool {
+		return metricValue(t, h.promReg, "promfleet_hub_discovered_peers") == 1
+	})
+
+	cancel()
+	select {
+	case <-dialed:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the spoke never returned from Dial")
+	}
+}
+
+// TestRevocationCacheReportsEverySuccessfulRefresh pins the observability the
+// stale-negative trade depends on: the refreshed callback fires on both the
+// full reload and the epoch-unchanged fast path, because either one means
+// "revocations ARE reaching this replica" -- and the alert on the exported
+// timestamp is the only way an operator learns when they stop.
+func TestRevocationCacheReportsEverySuccessfulRefresh(t *testing.T) {
+	t.Parallel()
+
+	var reported []time.Time
+	// A zero TTL defeats the freshness short-circuit, so the second call
+	// reaches the epoch check and takes the unchanged-epoch fast path.
+	c := &revocationCache{
+		store:     newFileStore(t),
+		ttl:       0,
+		refreshed: func(at time.Time) { reported = append(reported, at) },
+	}
+
+	if err := c.refresh(context.Background()); err != nil {
+		t.Fatalf("refresh (full): %v", err)
+	}
+	if err := c.refresh(context.Background()); err != nil {
+		t.Fatalf("refresh (unchanged epoch): %v", err)
+	}
+	if len(reported) != 2 {
+		t.Fatalf("refreshed callback fired %d times, want 2 (full reload and fast path)", len(reported))
+	}
+
+	// Inside a real TTL the refresh is a no-op and must not re-report: the
+	// gauge would otherwise advance without the store being consulted.
+	c.ttl = time.Hour
+	if err := c.refresh(context.Background()); err != nil {
+		t.Fatalf("refresh (fresh): %v", err)
+	}
+	if len(reported) != 2 {
+		t.Fatalf("a fresh cache re-reported: %d callbacks, want still 2", len(reported))
+	}
+	for i, at := range reported {
+		if at.IsZero() {
+			t.Errorf("refresh %d reported the zero time", i)
+		}
+	}
+}

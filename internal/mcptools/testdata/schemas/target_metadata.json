@@ -1,0 +1,34 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "cluster": {
+      "description": "Cluster name, exactly as returned by list_clusters.",
+      "type": "string"
+    },
+    "limit": {
+      "default": 100,
+      "description": "Maximum entries to return.",
+      "maximum": 1000,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "matchTarget": {
+      "description": "Selector matching targets by their own labels, e.g. {job=\"api\",instance=\"10.0.0.1:9100\"}. Omit to match every target.",
+      "examples": [
+        "{job=\"node-exporter\"}"
+      ],
+      "type": "string"
+    },
+    "metric": {
+      "description": "Single metric name. Omit to list every metric each matched target reports, which is how you catch a canary and a stable rollout disagreeing on a metric's type.",
+      "examples": [
+        "node_cpu_seconds_total"
+      ],
+      "type": "string"
+    }
+  },
+  "required": [
+    "cluster"
+  ],
+  "type": "object"
+}

@@ -17,9 +17,16 @@
 //  4. credential store                         — before authentication
 //  5. registry, proxy, API, MCP surface        — the request path
 //  6. listeners                                — last, so nothing is served half-built
+//  7. background controllers                   — revocation enforcement and CA rotation
 //
 // Shutdown runs in reverse, with a drain delay first so that the endpoint
 // controller stops sending traffic before work stops being accepted.
+//
+// Two of those controllers live here rather than a layer down, for the same
+// reason: their whole job is to reconcile a Kubernetes Secret against
+// components wired in this file, and neither has a home below that could see
+// both halves. See caRotator, which advances the CA rotation state machine of
+// ADR-0015, and revocationCache.
 package hub
 
 import (
@@ -117,23 +124,40 @@ func flushTraces(ctx context.Context, logger *slog.Logger, shutdown func(context
 
 // hub holds the wired-up components for one process.
 type hub struct {
-	cfg      *config.Hub
-	logger   *slog.Logger
-	metrics  *metricsAdapter
-	health   *obs.Health
-	build    version.Build
-	promReg  *prometheusRegistry
-	startedA time.Time
+	cfg     *config.Hub
+	logger  *slog.Logger
+	metrics *metricsAdapter
+	// isRevoked is the shared revocation check; see revocationPredicate.
+	isRevoked func(serial string) bool
+	// revocationRefresh re-reads the revocation list; the enforcer ticks it
+	// so an idle replica's list and staleness gauge stay current.
+	revocationRefresh func(ctx context.Context)
+	// revocationInterval overrides the enforcer's sweep interval. Zero, the
+	// only production value, means [hubapi.DefaultRevocationInterval]; tests
+	// set it to sweep faster and to drive the constructor's validation.
+	revocationInterval time.Duration
+	health             *obs.Health
+	build              version.Build
+	promReg            *prometheusRegistry
+	startedA           time.Time
 
 	kube      *kube.Client
 	authority *ca.CA
-	hasher    *token.Hasher
-	store     store.Store
-	verifier  *authn.Verifier
-	registry  *registry.Registry
-	proxy     *promproxy.Proxy
-	mcp       *mcpsurface.Server
-	tunnel    *wstun.Server
+	// caIssuers records which root admitted each live session. It wraps the
+	// authority's chain verification, which is the only place a spoke's leaf
+	// certificate is ever in scope, and the last step of a CA rotation is
+	// gated on what it has seen.
+	caIssuers *caIssuerTracker
+	// caBaseRoots is the operator-configured trust bundle: roots that stay
+	// trusted whatever a rotation is doing.
+	caBaseRoots []byte
+	hasher      *token.Hasher
+	store       store.Store
+	verifier    *authn.Verifier
+	registry    *registry.Registry
+	proxy       *promproxy.Proxy
+	mcp         *mcpsurface.Server
+	tunnel      *wstun.Server
 	// now is injectable for tests; nil means time.Now.
 	now func() time.Time
 	// inCluster resolves the in-cluster Kubernetes client. It is injectable
@@ -194,7 +218,39 @@ func (h *hub) run(ctx context.Context) error {
 	h.logger.InfoContext(ctx, "tunnel endpoint ready",
 		"path", h.cfg.TunnelPath, "addr", public.Addr(), "max_spokes", h.cfg.MaxSpokes)
 
+	// Sessions pin to one replica and there is no hub-to-hub forwarding, so a
+	// revocation performed on another replica has to be noticed here. The
+	// enforcer polls the SHARED predicate the handshake uses, so both agree
+	// about what is revoked, and it starts before the tunnel is served so a
+	// revoked spoke cannot reconnect into a window with no enforcement.
+	enforcer, err := hubapi.NewRevocationEnforcer(hubapi.RevocationEnforcerOptions{
+		Sessions:  h.registry,
+		IsRevoked: h.isRevoked,
+		Refresh:   h.revocationRefresh,
+		Interval:  h.revocationInterval,
+		Logger:    h.logger,
+		Metrics:   h.metrics,
+	})
+	if err != nil {
+		return fmt.Errorf("configure the revocation enforcer: %w", err)
+	}
+
 	group, gctx := errgroup.WithContext(ctx)
+	if rotator, why := h.newCARotator(); rotator != nil {
+		// The CA rotates itself. Nothing below is a step an operator performs:
+		// the successor is minted, published, promoted and the outgoing root
+		// retired by whichever replica wins each compare-and-swap on the CA
+		// Secret, and the others adopt the result. See ADR-0015.
+		h.logger.InfoContext(ctx, "CA rotation controller started",
+			"poll", h.cfg.CARotationPollInterval.String(),
+			"rotate_at_remaining_fraction", h.cfg.CARotateAtRemainingFraction,
+			"runway", h.cfg.CARotationRunway().String())
+		group.Go(func() error { rotator.Run(gctx); return nil })
+	} else {
+		h.logger.WarnContext(ctx, "the CA will not rotate itself; its expiry is yours to manage",
+			"reason", why)
+	}
+	group.Go(func() error { enforcer.Run(gctx); return nil })
 	group.Go(func() error { return h.serveTunnel(gctx, listener) })
 	group.Go(func() error { h.registry.Run(gctx); return nil })
 	group.Go(func() error { h.watchCertExpiry(gctx); return nil })
@@ -251,6 +307,16 @@ func (h *hub) openState(ctx context.Context) error {
 		h.kube = client
 	}
 
+	// Read once, here: a malformed bundle must name itself at startup rather
+	// than surface later as every spoke failing to verify, and the rotator
+	// needs the same bytes to know which roots are the operator's and must
+	// survive every phase.
+	baseRoots, berr := readTrustBundle(h.cfg.CATrustBundleFile)
+	if berr != nil {
+		return berr
+	}
+	h.caBaseRoots = baseRoots
+
 	boot := &bootstrapper{
 		client: h.kube,
 		secret: h.cfg.CASecretName,
@@ -263,6 +329,7 @@ func (h *hub) openState(ctx context.Context) error {
 	}
 	h.authority, h.hasher = authority, hasher
 	h.metrics.CACertExpiry(authority.NotAfter())
+	h.metrics.CATrustRoots(len(authority.TrustBundle()))
 	h.health.Set("ca", true, "")
 	h.logger.InfoContext(ctx, "certificate authority ready",
 		"not_after", authority.NotAfter().Format(time.RFC3339),
@@ -339,13 +406,17 @@ func (h *hub) newProxy() (*promproxy.Proxy, error) {
 // apiOptions is the shared configuration for both HTTP surfaces.
 func (h *hub) apiOptions() hubapi.Options {
 	return hubapi.Options{
-		Store:         h.store,
-		Hasher:        h.hasher,
+		Store:  h.store,
+		Hasher: h.hasher,
+		// Lets a revocation disconnect a live session, not just refuse the
+		// next handshake.
+		Sessions:      h.registry,
 		CA:            h.authority,
 		Verifier:      h.verifier,
 		Logger:        h.logger,
 		Metrics:       h.metrics,
 		AgentKeyTTL:   h.cfg.AgentKeyTTL,
+		AdminKeyTTL:   h.cfg.AdminKeyTTL,
 		EnrollmentTTL: h.cfg.EnrollmentTokenTTL,
 		SpokeCertTTL:  h.cfg.SpokeCertTTL,
 		RenewGrace:    h.cfg.RenewGrace,
@@ -549,6 +620,14 @@ func (h *hub) enrollmentLabels(clusterID string) map[string]string {
 		if k.Enrollment == nil || k.Enrollment.ClusterID != clusterID {
 			continue
 		}
+		if k.Revoked() {
+			// Revocation withdraws everything the token conferred, the label
+			// authority included: a token revoked because it leaked must not
+			// keep deciding which scopes select this cluster. An EXPIRED
+			// token still counts -- expiry ends redemption, not the
+			// operator's intent about the labels.
+			continue
+		}
 		// Several tokens may exist for one cluster over its lifetime -- a
 		// rebuild mints a new one. The most recently created is the current
 		// operator intent.
@@ -561,3 +640,8 @@ func (h *hub) enrollmentLabels(clusterID string) map[string]string {
 	}
 	return newest.Enrollment.Labels
 }
+
+// hubapi deliberately does not import registry, so this is where a signature
+// drift between the two surfaces as a compile error rather than as a nil
+// interface at runtime.
+var _ hubapi.SessionCloser = (*registry.Registry)(nil)

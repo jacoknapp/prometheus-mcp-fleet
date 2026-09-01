@@ -410,6 +410,43 @@ func TestAuthenticateOverAPipe(t *testing.T) {
 		}
 	})
 
+	t.Run("a hostile instance id is refused before it becomes a map key", func(t *testing.T) {
+		t.Parallel()
+		for name, bad := range map[string]string{
+			"oversized":     strings.Repeat("x", maxInstanceIDLen+1),
+			"control bytes": "spoke-\x00\x1b[2J",
+			"whitespace":    "spoke one",
+		} {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+				hub, peer := net.Pipe()
+				t.Cleanup(func() { _ = hub.Close(); _ = peer.Close() })
+
+				cert := ca.issue(t, "prod")
+				go func() {
+					var hello serverHello
+					if err := readMessage(peer, &hello); err != nil {
+						return
+					}
+					auth := signedAuth(t, cert, hello.Nonce, "prod")
+					auth.InstanceID = bad
+					_ = writeMessage(peer, auth)
+				}()
+
+				if _, err := srv.authenticate(hub, "10.0.0.1:1"); !errors.Is(err, ErrHandshakeFailed) {
+					t.Fatalf("authenticate err = %v, want ErrHandshakeFailed", err)
+				}
+			})
+		}
+	})
+
+	t.Run("an instance id at the length bound passes", func(t *testing.T) {
+		t.Parallel()
+		if err := validInstanceID(strings.Repeat("x", maxInstanceIDLen)); err != nil {
+			t.Fatalf("validInstanceID at the bound: %v", err)
+		}
+	})
+
 	t.Run("verifier that reports no serial still yields an auditable identity", func(t *testing.T) {
 		t.Parallel()
 
@@ -445,6 +482,41 @@ func TestAuthenticateOverAPipe(t *testing.T) {
 			t.Errorf("identity = %+v, want the serial and expiry filled in from the leaf", id)
 		}
 	})
+}
+
+// TestValidInstanceIDCharacterBoundsAreExact pins the printable-ASCII range
+// at its edges: 0x20 (space) and 0x7f (DEL) must both be refused, while 0x21
+// ('!') and 0x7e ('~') -- the first and last printable characters -- must
+// both be accepted. The "whitespace"/"control bytes" cases in
+// TestAuthenticateOverAPipe use a literal space and control characters well
+// inside the refused range, so a CONDITIONALS_BOUNDARY mutant on either
+// comparison (< to <=, or > to >=) -- which moves exactly one of these four
+// edges by a single character -- would pass them unnoticed.
+func TestValidInstanceIDCharacterBoundsAreExact(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		r    rune
+		ok   bool
+	}{
+		{"space 0x20 is refused", 0x20, false},
+		{"! 0x21 is the first accepted character", 0x21, true},
+		{"~ 0x7e is the last accepted character", 0x7e, true},
+		{"DEL 0x7f is refused", 0x7f, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := validInstanceID(string(tc.r))
+			if tc.ok && err != nil {
+				t.Errorf("validInstanceID(%q) = %v, want it accepted", tc.r, err)
+			}
+			if !tc.ok && err == nil {
+				t.Errorf("validInstanceID(%q) = nil, want it refused", tc.r)
+			}
+		})
+	}
 }
 
 // TestAuthenticateReportsReplicasInTheServerHello covers ServerConfig.Replicas:

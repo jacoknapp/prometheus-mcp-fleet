@@ -52,9 +52,27 @@ a query.
 | Class | Prefix | Holder | Default lifetime | Powers | Presented to |
 |---|---|---|---|---|---|
 | Admin | `pmf_adm_` | Operator, IaC | 90 days | Mint and revoke keys, mint enrollments, CA operations | Admin listener only |
-| Agent | `pmf_agt_` | AI agent runtime | 30 days | Call the MCP tools its scope permits | MCP listener only |
+| Agent | `pmf_agt_` | AI agent runtime | 90 days, or none when minted `--no-expiry` | Call the MCP tools its scope permits | MCP listener only |
 | Enrollment | `pmf_enr_` | Spoke install | 15 minutes, **reusable when minted by `hub enroll create`** | Exchange a CSR for a certificate | Public listener |
 | Spoke identity | X.509 | Spoke pod | 14 days, auto-renewed | Serve one cluster | Tunnel handshake and `POST /renew` |
+
+**On agent key expiry.** Expiry is a weak control here and is not treated as a
+strong one. Nothing rotates an agent key: its holder is a configuration file
+belonging to an AI agent runtime, not a process that can re-enrol itself, so the
+only thing a short lifetime reliably produces is an outage nobody scheduled --
+and an operator who responds to it by minting a replacement with a longer life.
+A key may therefore be minted with no expiry at all (`--no-expiry`, agent class
+only), and the security posture is unchanged, because the control that bounds a
+leaked key was never the calendar. It is the scope, the rate limit, and
+revocation. An agent key has no long-lived session to terminate -- every MCP
+call is authenticated independently -- so revoking one takes effect at the
+next call, bounded by the verified-key cache TTL of 60 seconds, whether or not
+the key would ever have expired.
+
+Admin keys and enrollment tokens are excluded from `--no-expiry` deliberately:
+an admin key mints other credentials and drives CA rotation, and an enrollment
+token admits new clusters, so neither should be capable of outliving the
+operator who created it.
 
 ### Token format
 
@@ -158,6 +176,15 @@ performed one layer up, and it preserves the properties that matter: the private
 key never transits, and a captured response cannot be replayed against a fresh
 nonce or re-scoped to another cluster.
 
+One disclosure rides along: the hub's hello — the frame carrying the nonce —
+also names the answering replica (its pod hostname, as `ServerID`) and the
+current replica count, and it goes to any peer that completes the WebSocket
+upgrade, before any authentication. Both fields are load-bearing for the
+spoke's multi-replica coverage and the nonce has to be sent first by
+construction, so this is the one thing an unauthenticated scanner learns from
+the tunnel endpoint: that it is a fleet hub, its pod naming scheme, and how
+many replicas serve it.
+
 The Ingress is a plain proxy here: it does not verify client certificates and
 forwards none upstream, so there is no transport-layer identity for the hub to
 inherit. Where an Ingress *can* do that verification, it is the better design
@@ -205,7 +232,15 @@ checked against its redemption cap on every redemption.
 
 **Revocation** is a hub-side denylist keyed on certificate serial, consulted on
 every tunnel handshake and on every renewal (including a grace-period renewal of
-an already-expired certificate), against live state rather than a cached list.
+an already-expired certificate). The handshake reads it through a 30-second
+cache that refreshes immediately when the revocation epoch moves, so a newly
+revoked serial can still be admitted for up to one cache lifetime on a replica
+that has not yet noticed -- the arithmetic in "Revocation terminates live
+sessions" below already includes it. When the credential store is unreachable
+the cache keeps serving its last good list rather than disconnecting the
+fleet, which is fail-open for exactly the serials revoked during the outage;
+`promfleet_hub_revocation_refresh_timestamp_seconds` exists so that state is a
+page (`PrometheusMCPHubRevocationStale`), not a forensic discovery.
 A CRL is published at `/pki/crl`
 for external auditors, but nothing in this system depends on it — a CRL adds
 latency, a distribution problem and a `nextUpdate` gap for no benefit when the
@@ -221,9 +256,33 @@ attacker who renews once and stops.
 
 **Revocation is therefore the only control that closes this.** Set
 `--renew-grace=0` to restore strict expiry as a second line, at the cost of
-stranding any spoke that was offline longer than its certificate's life. And
-note the limit of revocation itself, below: it is checked at handshake, so it
-stops the next connection rather than the current one.
+stranding any spoke that was offline longer than its certificate's life.
+
+**Revocation terminates live sessions.** It used to be checked only at the
+handshake, so it stopped the next connection and left the current one serving —
+which is not what the word means, and is worst precisely during the compromise
+it exists for. Now:
+
+- On the replica serving `POST /admin/v1/certs/{serial}/revoke`, the session is
+  disconnected before the call returns. The store write happens first, so the
+  revocation is durable even if the close is not reached.
+- On every other replica a background enforcer disconnects within its interval
+  (15s) plus the revocation cache TTL (30s) — about 45 seconds worst case
+  fleet-wide. Sessions are pinned to one replica and there is still no
+  hub-to-hub forwarding.
+- The spoke is told `certificate-revoked` and will try to reconnect; the
+  handshake check refuses it. The operator's own reason stays in the audit log
+  and is never handed to the host being revoked.
+
+The audit trail distinguishes the two things: `cert.revoked` is always recorded,
+`session.revoked` only when a live session was actually closed, carrying the
+session count and the cluster set. A `session.revoked` with actor `system` means
+the close happened on a replica other than the one that served the request.
+
+Two honest caveats. A query already in flight on that session is aborted rather
+than completed. And a hub whose enforcer is not running falls back to the old
+handshake-only behaviour, so if you are verifying this, check for the
+`session.revoked` event rather than assuming.
 
 **If the CA key is lost:** existing spokes keep working until their certificates
 expire, at most 14 days, and no renewal succeeds in the meantime. Recovery is
@@ -257,9 +316,33 @@ limits:
 An empty scope authorizes nothing. A scope with neither `allow` nor
 `matchLabels` fails validation rather than defaulting to "everything".
 
+**What `role` does.** The tier gates the operational surfaces -- `targets`,
+`target_metadata`, `alertmanagers`, `tsdb_stats`, `runtime_info` -- out of a
+viewer's `tools.allow: ["*"]` wildcard. An `operator` key receives them
+through the wildcard; a `viewer` key reaches one only by writing its name into
+`tools.allow`, which is the deliberate act the tier exists to require. `deny`
+beats both. Non-operational tools are untouched by role.
+
+**What `matchLabels` trusts.** A cluster's registry labels are the merge of
+what the spoke reports (its chart's `cluster.sdlc` and `cluster.labels` -- by
+design, since the cluster's own values file is where they live) and what the
+operator set on its enrollment token, with the operator winning every
+collision. That means a label the operator did NOT set on the token is the
+spoke's own claim, and a compromised cluster can assert any such label and be
+selected by keys that match on it. For a scope guarding something sensitive,
+either pin the deciding label on the enrollment token (`hub enroll create
+--labels tier=pci`, which no spoke can override) or use an explicit `allow`
+list; `matchLabels` on an unpinned label is a convenience, not a boundary.
+
+**Rate limits are per hub replica.** The token bucket lives in each replica's
+memory -- there is deliberately no shared state store to coordinate one -- so
+with N replicas behind one hostname a key's effective ceiling is N x `rateRps`
+(and N x `rateBurst`), with the load balancer doing the sharding. Set the
+per-key numbers with the replica count in mind; the default chart runs three.
+
 Two independent checks run on every call: the tool layer checks
-`Scope.AllowsTool`, and the proxy layer checks `Scope.AllowsCluster` against the
-registry's labels for that cluster.
+`Scope.AllowsTool` and the role tier, and the proxy layer checks
+`Scope.AllowsCluster` against the registry's labels for that cluster.
 
 Where a scope sets a limit, the proxy takes the **more restrictive** of it and
 the hub's configured default. A scope can tighten a limit; it can never widen
@@ -364,7 +447,7 @@ successful injection worthless than pretend to detect one.
 
 | Attacker | What they get | What stops it going further |
 |---|---|---|
-| **Leaked agent key** | Read metrics in the clusters its scope permits | Prefix enables scanner-triggered revocation; 30-day lifetime; scope confines to a cluster and tool subset; per-key rate limits; revocation lands within 60 seconds |
+| **Leaked agent key** | Read metrics in the clusters its scope permits | Prefix enables scanner-triggered revocation; scope confines to a cluster and tool subset; per-key rate limits (per hub replica -- see the note under Scopes); revocation blocks the next call within the 60-second key cache TTL. There is no session to terminate: every MCP call authenticates independently. Expiry is **not** among these controls: the default is 90 days and a key may be minted with none, so revocation is the control that has to work |
 | **Compromised spoke** | Can serve false metrics for **its own** cluster and probe the hub | Certificate binds to one cluster ID, so it cannot answer for another; 14-day lifetime plus a serial denylist; the tunnel reaches no admin API; response size and shape are bounded by the hub |
 | **Malicious cluster operator** | Injects hostile labels and annotations; tries to exhaust the hub | Per-cluster concurrency and byte quotas, so one cluster cannot starve the other 99; sanitisation and clipping; decompressed-size cap; nothing they send becomes a metric label, so they cannot inflate our cardinality either |
 | **Hub compromise** | Read across the whole fleet; mint certificates | The pepper is stored outside the credential document; the admin API is on a separate listener with separate credentials; every mint, burn and revocation is an immutable audit event; the spoke's independent allow-list still blocks destructive endpoints |
