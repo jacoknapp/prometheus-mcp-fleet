@@ -254,6 +254,7 @@ func (h *hub) run(ctx context.Context) error {
 	group.Go(func() error { return h.serveTunnel(gctx, listener) })
 	group.Go(func() error { h.registry.Run(gctx); return nil })
 	group.Go(func() error { h.watchCertExpiry(gctx); return nil })
+	group.Go(func() error { h.runStatePrune(gctx); return nil })
 
 	<-gctx.Done()
 	// gctx is cancelled by definition on the line above; drain must not inherit it.

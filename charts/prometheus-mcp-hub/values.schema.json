@@ -519,6 +519,14 @@
         "adminKeyTTL": {
           "description": "PMF_ADMIN_KEY_TTL. Default and maximum lifetime of a minted admin key, including the bootstrap key.",
           "type": "string"
+        },
+        "stateRetention": {
+          "type": "string",
+          "description": "PMF_STATE_RETENTION. How long lapsed records are kept before pruning."
+        },
+        "statePruneInterval": {
+          "type": "string",
+          "description": "PMF_STATE_PRUNE_INTERVAL. How often each replica prunes the state document; zero disables."
         }
       }
     },

@@ -284,6 +284,21 @@ func (s *Store) ReplaceKey(ctx context.Context, fresh *fleet.Key, oldKID, reason
 	})
 }
 
+// Prune implements store.Store.
+func (s *Store) Prune(ctx context.Context, retain time.Duration) (store.PruneResult, error) {
+	var res store.PruneResult
+	err := s.mutate(ctx, func(st *store.State) (bool, error) {
+		var changed bool
+		var perr error
+		res, changed, perr = st.Prune(s.now(), retain)
+		return changed, perr
+	})
+	if err != nil {
+		return store.PruneResult{}, err
+	}
+	return res, nil
+}
+
 // RevokeKey implements store.Store.
 func (s *Store) RevokeKey(ctx context.Context, kid, reason string, at time.Time) error {
 	return s.mutate(ctx, func(st *store.State) (bool, error) {

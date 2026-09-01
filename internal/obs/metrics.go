@@ -88,6 +88,10 @@ type HubMetrics struct {
 	SpokeCertExpiry *prometheus.GaugeVec
 	// CACertExpiry is seconds until the internal CA certificate expires.
 	CACertExpiry prometheus.Gauge
+	// StatePrunedTotal counts records dropped from the state document, by
+	// kind. It is how an operator sees that the thing keeping their Secret
+	// under its write ceiling is actually running.
+	StatePrunedTotal *prometheus.CounterVec
 	// DiscoveredPeers is how many hub replicas this replica's peer discovery
 	// currently believes exist. Compared against the chart's replicaCount it
 	// is the only signal for a broken discovery: the spokes' partial-coverage
@@ -192,6 +196,10 @@ func NewHubMetrics(r prometheus.Registerer) *HubMetrics {
 			Namespace: Namespace, Subsystem: SubsystemHub, Name: "spoke_cert_expiry_seconds",
 			Help: "Seconds until each spoke client certificate expires.",
 		}, []string{"cluster"}),
+		StatePrunedTotal: f.NewCounterVec(prometheus.CounterOpts{
+			Namespace: Namespace, Subsystem: SubsystemHub, Name: "state_pruned_total",
+			Help: "Records dropped from the state document because they can no longer affect a decision.",
+		}, []string{"kind"}),
 		DiscoveredPeers: f.NewGauge(prometheus.GaugeOpts{
 			Namespace: Namespace, Subsystem: SubsystemHub, Name: "discovered_peers",
 			Help: "Hub replicas peer discovery currently resolves. Alert when below the deployed replica count.",

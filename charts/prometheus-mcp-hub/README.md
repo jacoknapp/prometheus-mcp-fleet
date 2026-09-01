@@ -1,7 +1,7 @@
 
 # prometheus-mcp-hub
 
-![Version: 0.2.0](https://img.shields.io/badge/Version-0.2.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.1.0](https://img.shields.io/badge/AppVersion-0.1.0-informational?style=flat-square)
+![Version: 0.3.0](https://img.shields.io/badge/Version-0.3.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.8.1](https://img.shields.io/badge/AppVersion-0.8.1-informational?style=flat-square)
 
 MCP server that gives AI agents Prometheus capability across a fleet of Kubernetes clusters, terminating WebSocket tunnels dialled out by prometheus-mcp-spoke through a standard Ingress.
 
@@ -332,6 +332,8 @@ Kubernetes: `>=1.28.0-0`
 | config.shutdownDrainDelay | string | `"5s"` | `PMF_SHUTDOWN_DRAIN_DELAY`. Time `/readyz` reports 503 before work stops, so load balancers notice. |
 | config.shutdownGrace | string | `"30s"` | `PMF_SHUTDOWN_GRACE`. Graceful shutdown budget for in-flight work. |
 | config.spokeCertTTL | string | `"336h"` | `PMF_SPOKE_CERT_TTL`. Lifetime of an issued spoke client certificate. |
+| config.statePruneInterval | string | `"6h"` | `PMF_STATE_PRUNE_INTERVAL`. How often each replica prunes the state document. Zero disables pruning, which leaves the Secret growing toward its 700 KiB write ceiling with only `PrometheusMCPHubStateSecretLarge` to catch it. |
+| config.stateRetention | string | `"720h"` | `PMF_STATE_RETENTION`. How long expired credentials and lapsed certificate revocations are kept before the hub prunes them. A forensics window, not a safety margin: nothing pruned can change an answer, so the only reason to keep it is that an operator investigating last week wants last week's records. |
 | config.trustDomain | string | `"fleet.local"` | `PMF_TRUST_DOMAIN`. Appears in every spoke certificate URI SAN `pmf://<trust-domain>/spoke/<cluster-id>`. Changing it invalidates every issued spoke certificate. |
 | containerSecurityContext.allowPrivilegeEscalation | bool | `false` | Disallow gaining more privileges than the parent process. |
 | containerSecurityContext.capabilities | object | `{"drop":["ALL"]}` | Linux capabilities. |

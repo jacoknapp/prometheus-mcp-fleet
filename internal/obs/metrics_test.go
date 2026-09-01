@@ -23,6 +23,7 @@ func touchHub(m *HubMetrics) {
 	m.EnrollmentsTotal.WithLabelValues("ok").Inc()
 	m.SecurityEventsTotal.WithLabelValues("enrollment_burned").Inc()
 	m.StateBytes.Set(12345)
+	m.StatePrunedTotal.WithLabelValues("key").Inc()
 	m.DiscoveredPeers.Set(3)
 	m.ProxyRequestsTotal.WithLabelValues("prod-us-east-1", "query", "200").Inc()
 	m.ProxyDuration.WithLabelValues("prod-us-east-1", "query").Observe(0.1)
@@ -93,6 +94,7 @@ func TestNewHubMetricsNamesAndLabels(t *testing.T) {
 		"promfleet_hub_proxy_inflight":                            {"cluster"},
 		"promfleet_hub_proxy_response_bytes":                      {},
 		"promfleet_hub_discovered_peers":                          {},
+		"promfleet_hub_state_pruned_total":                        {"kind"},
 		"promfleet_hub_revocation_refresh_timestamp_seconds":      {},
 		"promfleet_hub_mcp_tool_calls_total":                      {"result", "tool"},
 		"promfleet_hub_mcp_tool_duration_seconds":                 {"tool"},

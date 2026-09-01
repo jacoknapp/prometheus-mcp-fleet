@@ -24,8 +24,9 @@ import (
 type keyStub struct {
 	store.Store
 
-	listErr error
-	putErr  error
+	listErr  error
+	putErr   error
+	pruneErr error
 	// beforePut runs after the unusable-record check and before the write,
 	// which is precisely the window another replica can win in.
 	beforePut func()
@@ -36,6 +37,13 @@ func (s *keyStub) ListKeys(ctx context.Context, class fleet.KeyClass) ([]*fleet.
 		return nil, s.listErr
 	}
 	return s.Store.ListKeys(ctx, class)
+}
+
+func (s *keyStub) Prune(ctx context.Context, retain time.Duration) (store.PruneResult, error) {
+	if s.pruneErr != nil {
+		return store.PruneResult{}, s.pruneErr
+	}
+	return s.Store.Prune(ctx, retain)
 }
 
 func (s *keyStub) PutKeyIfNoUsable(

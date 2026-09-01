@@ -51,6 +51,9 @@ func RunSuite(t *testing.T, open OpenFunc) {
 		{"ListKeysOrdering", testListKeysOrdering},
 		{"ListKeysEmpty", testListKeysEmpty},
 		{"RevokeKey", testRevokeKey},
+		{"Prune", testPrune},
+		{"PruneKeepsWhatStillDecides", testPruneKeepsWhatStillDecides},
+		{"PruneRejectsNegativeRetention", testPruneRejectsNegativeRetention},
 		{"ReplaceKey", testReplaceKey},
 		{"ReplaceKeyRefusesRevoked", testReplaceKeyRefusesRevoked},
 		{"ReplaceKeyNotFound", testReplaceKeyNotFound},
@@ -425,6 +428,127 @@ func testListKeysEmpty(t *testing.T, s store.Store) {
 
 // testReplaceKey proves the rotation primitive: one call, and afterwards the
 // fresh key is live while the old one is revoked with the given reason.
+// testPrune covers what a prune is for: records that stopped mattering more
+// than the retention window ago are gone, and the epoch does NOT move,
+// because nothing removed could have changed an answer.
+func testPrune(t *testing.T, s store.Store) {
+	ctx := t.Context()
+	const retain = 24 * time.Hour
+
+	// Long expired: prunable.
+	stale := agentKey("agent0050", tBase.Add(-90*24*time.Hour))
+	stale.ExpiresAt = tBase.Add(-60 * 24 * time.Hour)
+	mustPut(t, s, stale)
+	// Expired, but inside the retention window: kept for the investigator.
+	recent := agentKey("agent0051", tBase.Add(-90*24*time.Hour))
+	recent.ExpiresAt = tBase.Add(-time.Hour)
+	mustPut(t, s, recent)
+	// Live.
+	live := agentKey("agent0052", tBase)
+	live.ExpiresAt = tBase.Add(90 * 24 * time.Hour)
+	mustPut(t, s, live)
+
+	// A revocation whose certificate expired long ago, and one still current.
+	if err := s.RevokeCert(ctx, store.RevokedCert{
+		Serial: "0a", RevokedAt: tBase.Add(-60 * 24 * time.Hour), NotAfter: tBase.Add(-50 * 24 * time.Hour),
+	}); err != nil {
+		t.Fatalf("RevokeCert(stale): %v", err)
+	}
+	if err := s.RevokeCert(ctx, store.RevokedCert{
+		Serial: "0b", RevokedAt: tBase, NotAfter: tBase.Add(14 * 24 * time.Hour),
+	}); err != nil {
+		t.Fatalf("RevokeCert(current): %v", err)
+	}
+
+	before := mustEpoch(t, s)
+	res, err := s.Prune(ctx, retain)
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if res.Keys != 1 || res.RevokedCerts != 1 {
+		t.Fatalf("Prune() = %+v, want exactly one key and one revocation", res)
+	}
+	if _, err := s.GetKey(ctx, "agent0050"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("the long-expired key survived: %v", err)
+	}
+	for _, kid := range []string{"agent0051", "agent0052"} {
+		if _, err := s.GetKey(ctx, kid); err != nil {
+			t.Errorf("GetKey(%s) after prune: %v", kid, err)
+		}
+	}
+	certs, err := s.ListRevokedCerts(ctx)
+	if err != nil {
+		t.Fatalf("ListRevokedCerts: %v", err)
+	}
+	if len(certs) != 1 || certs[0].Serial != "0b" {
+		t.Errorf("revocations after prune = %+v, want only the current one", certs)
+	}
+	// The epoch is the signal that tells every replica to re-read. Nothing
+	// pruned can change an answer, so making them re-read would be pure noise.
+	if after := mustEpoch(t, s); after != before {
+		t.Errorf("epoch moved %d -> %d; a prune must not invalidate every replica's cache", before, after)
+	}
+
+	// Idempotent: a second pass finds nothing and must not write.
+	again, err := s.Prune(ctx, retain)
+	if err != nil {
+		t.Fatalf("Prune (second): %v", err)
+	}
+	if !again.Empty() {
+		t.Errorf("second prune removed %+v, want nothing", again)
+	}
+}
+
+// testPruneKeepsWhatStillDecides is the safety half, and the most important
+// case is the last one: a revoked credential with NO expiry must survive,
+// because its record is the only thing refusing it.
+func testPruneKeepsWhatStillDecides(t *testing.T, s store.Store) {
+	ctx := t.Context()
+
+	// Revoked, not yet expired: the revocation is doing the refusing.
+	revoked := agentKey("agent0060", tBase)
+	revoked.ExpiresAt = tBase.Add(90 * 24 * time.Hour)
+	mustPut(t, s, revoked)
+	if err := s.RevokeKey(ctx, revoked.KID, "leaked", tBase); err != nil {
+		t.Fatalf("RevokeKey: %v", err)
+	}
+	// No expiry at all, and revoked. Pruning this hands a revoked immortal
+	// key its access back: there is no expiry underneath to catch it.
+	immortal := agentKey("agent0061", tBase.Add(-365*24*time.Hour))
+	immortal.ExpiresAt = time.Time{}
+	mustPut(t, s, immortal)
+	if err := s.RevokeKey(ctx, immortal.KID, "leaked", tBase.Add(-300*24*time.Hour)); err != nil {
+		t.Fatalf("RevokeKey(immortal): %v", err)
+	}
+	// A revocation entry with no recorded expiry: unknown, so never dropped.
+	if err := s.RevokeCert(ctx, store.RevokedCert{Serial: "0c", RevokedAt: tBase.Add(-365 * 24 * time.Hour)}); err != nil {
+		t.Fatalf("RevokeCert: %v", err)
+	}
+
+	res, err := s.Prune(ctx, 0)
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if !res.Empty() {
+		t.Fatalf("Prune removed %+v, want nothing: every record here still decides something", res)
+	}
+	got, err := s.GetKey(ctx, "agent0061")
+	if err != nil {
+		t.Fatalf("the revoked no-expiry key was pruned, restoring its access: %v", err)
+	}
+	if !got.Revoked() {
+		t.Error("the surviving record lost its revocation")
+	}
+}
+
+// testPruneRejectsNegativeRetention: a negative window would prune records
+// that have not stopped mattering yet.
+func testPruneRejectsNegativeRetention(t *testing.T, s store.Store) {
+	if _, err := s.Prune(t.Context(), -time.Hour); !errors.Is(err, store.ErrInvalid) {
+		t.Fatalf("Prune(negative) = %v, want ErrInvalid", err)
+	}
+}
+
 func testReplaceKey(t *testing.T, s store.Store) {
 	ctx := t.Context()
 	old := agentKey("agent0030", tBase)

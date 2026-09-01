@@ -878,3 +878,96 @@ func TestListRevokedCertsOrdering(t *testing.T) {
 		t.Error("ListRevokedCerts returned nil for an empty document, want an empty slice")
 	}
 }
+
+// TestStatePrune drives the document-level prune directly, including the
+// branches the shared backend suite reaches only through a backend.
+func TestStatePrune(t *testing.T) {
+	t.Parallel()
+
+	now := tBase.Add(365 * 24 * time.Hour)
+	const retain = 24 * time.Hour
+
+	newSeeded := func(t *testing.T) *State {
+		t.Helper()
+		s := NewState()
+		expired := agentKey("agent0001", tBase)
+		expired.ExpiresAt = now.Add(-48 * time.Hour)
+		if _, err := s.PutKey(expired); err != nil {
+			t.Fatalf("PutKey: %v", err)
+		}
+		if _, err := s.RevokeCert(RevokedCert{
+			Serial: "0a", RevokedAt: tBase, NotAfter: now.Add(-48 * time.Hour),
+		}, clockAt(now)); err != nil {
+			t.Fatalf("RevokeCert: %v", err)
+		}
+		return s
+	}
+
+	t.Run("removes what stopped mattering", func(t *testing.T) {
+		t.Parallel()
+		s := newSeeded(t)
+		res, changed, err := s.Prune(now, retain)
+		if err != nil || !changed {
+			t.Fatalf("Prune() = %+v, %v, %v; want a change", res, changed, err)
+		}
+		if res.Keys != 1 || res.RevokedCerts != 1 {
+			t.Errorf("Prune() = %+v, want one of each", res)
+		}
+	})
+
+	t.Run("retention holds a record back", func(t *testing.T) {
+		t.Parallel()
+		s := newSeeded(t)
+		// Both records lapsed 48h ago; a 72h window keeps them.
+		res, changed, err := s.Prune(now, 72*time.Hour)
+		if err != nil {
+			t.Fatalf("Prune: %v", err)
+		}
+		if changed || !res.Empty() {
+			t.Errorf("Prune() = %+v, changed=%v; the retention window must hold both back", res, changed)
+		}
+	})
+
+	t.Run("an unknown certificate expiry is never dropped", func(t *testing.T) {
+		t.Parallel()
+		s := NewState()
+		if _, err := s.RevokeCert(RevokedCert{Serial: "0b", RevokedAt: tBase}, clockAt(now)); err != nil {
+			t.Fatalf("RevokeCert: %v", err)
+		}
+		res, _, err := s.Prune(now, 0)
+		if err != nil {
+			t.Fatalf("Prune: %v", err)
+		}
+		if res.RevokedCerts != 0 {
+			t.Error("a revocation with no recorded expiry was dropped; nothing proves that certificate is dead")
+		}
+	})
+
+	t.Run("a key with no expiry is never dropped", func(t *testing.T) {
+		t.Parallel()
+		s := NewState()
+		immortal := agentKey("agent0002", tBase)
+		immortal.ExpiresAt = time.Time{}
+		if _, err := s.PutKey(immortal); err != nil {
+			t.Fatalf("PutKey: %v", err)
+		}
+		if _, err := s.RevokeKey(immortal.KID, "leaked", tBase, clockAt(now)); err != nil {
+			t.Fatalf("RevokeKey: %v", err)
+		}
+		res, changed, err := s.Prune(now, 0)
+		if err != nil {
+			t.Fatalf("Prune: %v", err)
+		}
+		if changed || res.Keys != 0 {
+			t.Fatal("a revoked key with no expiry was pruned; its record is the only thing refusing it")
+		}
+	})
+
+	t.Run("negative retention is refused", func(t *testing.T) {
+		t.Parallel()
+		s := NewState()
+		if _, _, err := s.Prune(now, -time.Second); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("Prune(negative) = %v, want ErrInvalid", err)
+		}
+	})
+}

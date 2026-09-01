@@ -225,6 +225,10 @@ config:
   agentKeyTTL: 2160h
   # -- `PMF_ADMIN_KEY_TTL`. Default and maximum lifetime of a minted `pmf_adm_` admin key, including the bootstrap key printed on first start. A separate knob from agentKeyTTL on purpose: relaxing agent expiry must not silently relax the credential that mints credentials.
   adminKeyTTL: 2160h
+  # -- `PMF_STATE_RETENTION`. How long expired credentials and lapsed certificate revocations are kept before the hub prunes them. A forensics window, not a safety margin: nothing pruned can change an answer, so the only reason to keep it is that an operator investigating last week wants last week's records.
+  stateRetention: 720h
+  # -- `PMF_STATE_PRUNE_INTERVAL`. How often each replica prunes the state document. Zero disables pruning, which leaves the Secret growing toward its 700 KiB write ceiling with only `PrometheusMCPHubStateSecretLarge` to catch it.
+  statePruneInterval: 6h
   # -- `PMF_MAX_SPOKES`. Optional cap on concurrent spoke sessions on one hub replica. `0`, the
   # default, means no limit. A cap here refuses spokes rather than shedding load: it is applied
   # before the WebSocket upgrade, so an over-limit spoke gets a 503 and its cluster silently

@@ -104,6 +104,13 @@ type Store interface {
 	// unrecognised class yields an empty slice rather than an error.
 	ListKeys(ctx context.Context, class fleet.KeyClass) ([]*fleet.Key, error)
 
+	// Prune drops records that can no longer affect any decision -- expired
+	// credentials and revocation entries for certificates that have expired
+	// anyway -- keeping each for retain past the moment it stopped mattering.
+	// It returns what it removed. See [State.Prune] for the rules, and in
+	// particular for why a credential with no expiry is never dropped.
+	Prune(ctx context.Context, retain time.Duration) (PruneResult, error)
+
 	// ReplaceKey atomically stores fresh and revokes oldKID with the given
 	// reason: one mutation, so a rotation can never half-happen. It returns
 	// [ErrNotFound] when oldKID does not exist and [ErrRevoked] when it is

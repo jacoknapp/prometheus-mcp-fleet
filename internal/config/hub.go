@@ -219,6 +219,17 @@ type Hub struct {
 	// key mints other credentials and must not quietly inherit whatever the
 	// agent policy was relaxed to.
 	AdminKeyTTL time.Duration
+	// StateRetention is how long a record is kept after it stops being able
+	// to affect a decision -- an expired credential, or a revocation for a
+	// certificate that has expired anyway. It is a forensics window, not a
+	// safety margin: nothing pruned can change an answer, so the only reason
+	// to keep it at all is that an operator investigating last week's
+	// incident wants last week's records still there.
+	StateRetention time.Duration
+	// StatePruneInterval is how often each replica prunes the state
+	// document. Zero disables pruning, which leaves the Secret growing
+	// toward its write ceiling with nothing but the size alert to catch it.
+	StatePruneInterval time.Duration
 	// MaxSpokes optionally caps concurrent spoke sessions on this replica.
 	// Zero, the default, means no limit.
 	//
@@ -316,6 +327,10 @@ func LoadHub(args []string, getenv func(string) string) (*Hub, error) {
 		"how long after expiry a spoke certificate may still be renewed; 0 to require an unexpired certificate")
 	l.duration(&c.AgentKeyTTL, "agent-key-ttl", 2160*time.Hour, "default and maximum lifetime of a minted agent key (90d)")
 	l.duration(&c.AdminKeyTTL, "admin-key-ttl", 2160*time.Hour, "default and maximum lifetime of a minted admin key, including the bootstrap key (90d)")
+	l.duration(&c.StateRetention, "state-retention", 720*time.Hour,
+		"how long expired credentials and lapsed revocations are kept before pruning (30d); a forensics window, not a safety margin")
+	l.duration(&c.StatePruneInterval, "state-prune-interval", 6*time.Hour,
+		"how often each replica prunes the state document; zero disables pruning")
 	l.integer(&c.MaxSpokes, "max-spokes", 0, "optional cap on concurrent spoke sessions on this replica; 0 means no limit")
 
 	l.duration(&c.QueryTimeout, "query-timeout", 30*time.Second, "timeout for instant and metadata queries")
@@ -410,6 +425,12 @@ func (c *Hub) Validate() error {
 	add(checkNonNegative("renew-grace", c.RenewGrace))
 	add(checkPositive("agent-key-ttl", c.AgentKeyTTL))
 	add(checkPositive("admin-key-ttl", c.AdminKeyTTL))
+	if c.StateRetention < 0 {
+		add(problem("state-retention", "must not be negative, got %s", c.StateRetention))
+	}
+	if c.StatePruneInterval < 0 {
+		add(problem("state-prune-interval", "must not be negative (zero disables pruning), got %s", c.StatePruneInterval))
+	}
 	add(checkNonNegativeInt("max-spokes", c.MaxSpokes))
 
 	add(checkPositive("query-timeout", c.QueryTimeout))
@@ -458,6 +479,8 @@ func (c *Hub) LogValue() slog.Value {
 		slog.Duration("enrollment_token_ttl", c.EnrollmentTokenTTL),
 		slog.Duration("agent_key_ttl", c.AgentKeyTTL),
 		slog.Duration("admin_key_ttl", c.AdminKeyTTL),
+		slog.Duration("state_retention", c.StateRetention),
+		slog.Duration("state_prune_interval", c.StatePruneInterval),
 		slog.Int("max_spokes", c.MaxSpokes),
 		slog.Duration("query_timeout", c.QueryTimeout),
 		slog.Duration("range_query_timeout", c.RangeQueryTimeout),

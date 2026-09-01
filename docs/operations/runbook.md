@@ -437,6 +437,32 @@ rather than discovering the limit during an enrollment.
 At roughly a kilobyte per credential this means several hundred records, which
 is far past any plausible fleet — so it almost always means accumulated cruft.
 
+**The hub prunes itself, so reaching this alert means something is unusual.**
+Every replica sweeps the state document on `--state-prune-interval` (6h by
+default), dropping expired credentials and revocations for certificates that
+have expired anyway, each kept `--state-retention` (30d) past the moment it
+stopped mattering. Check that it is actually running before you prune by hand:
+
+```bash
+# Should climb. If it is absent, no prune has ever removed anything.
+promfleet_hub_state_pruned_total
+kubectl -n $HUB_NS logs deploy/pmf-hub | grep -E "pruned state records|state prune did not run|pruning is disabled"
+```
+
+Three reasons the alert fires anyway, in order of likelihood:
+
+1. **Pruning is disabled** (`--state-prune-interval=0`). The startup log says
+   so explicitly.
+2. **The records are not prunable.** Live credentials, revoked-but-unexpired
+   ones, and anything minted with `--no-expiry` are all kept on purpose — a
+   revoked no-expiry key's record is the only thing refusing it. A fleet with
+   hundreds of live agent keys is a fleet that needs a bigger conversation
+   than a prune.
+3. **Genuine scale.** A hundred clusters rebuilt often enough leaves more
+   live enrollment records than the ceiling allows.
+
+For 2 and 3, the manual route below is still the tool.
+
 There is no `hub keys list` or `hub enroll list` CLI subcommand — the hub
 binary's only administrative subcommands are `enroll create` and `keys create`
 (`internal/hubcli`). List and prune through the admin REST API directly:

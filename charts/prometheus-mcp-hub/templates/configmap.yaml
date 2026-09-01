@@ -85,6 +85,8 @@ data:
   PMF_CA_ROTATION_POLL_INTERVAL: {{ .Values.config.caRotationPollInterval | quote }}
   PMF_AGENT_KEY_TTL: {{ .Values.config.agentKeyTTL | quote }}
   PMF_ADMIN_KEY_TTL: {{ .Values.config.adminKeyTTL | quote }}
+  PMF_STATE_RETENTION: {{ .Values.config.stateRetention | quote }}
+  PMF_STATE_PRUNE_INTERVAL: {{ .Values.config.statePruneInterval | quote }}
   PMF_MAX_SPOKES: {{ .Values.config.maxSpokes | int64 | quote }}
   PMF_QUERY_TIMEOUT: {{ .Values.config.queryTimeout | quote }}
   PMF_RANGE_QUERY_TIMEOUT: {{ .Values.config.rangeQueryTimeout | quote }}

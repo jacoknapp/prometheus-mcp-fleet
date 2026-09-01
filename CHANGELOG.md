@@ -12,6 +12,62 @@ lockstep.
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-09-01
+
+### Added
+
+- The hub prunes its own state document. Every replica sweeps on
+  `--state-prune-interval` (6h), dropping expired credentials and revocations
+  for certificates that have expired anyway, each retained
+  `--state-retention` (30d) past the moment it stopped mattering. A credential
+  with no expiry is never dropped, revoked or not: its record is the only
+  thing refusing it. The epoch is not bumped, because nothing removed can
+  change an answer. New counter `promfleet_hub_state_pruned_total{kind}`.
+
+### Fixed
+
+- Both charts declared `appVersion: 0.1.0`, and the image tag defaults to the
+  chart's appVersion — so a `helm install` of the 0.8.0 charts deployed the
+  0.1.0 images.
+
+## [0.8.0] - 2026-09-01
+
+### Added
+
+- **Automatic CA rotation.** A four-phase state machine
+  (steady → publishing → signing → steady) persisted in the CA Secret and
+  advanced by whichever replica wins a compare-and-swap on it. Retirement of
+  the outgoing root is gated on evidence — no live session may still chain to
+  it — behind a clock of `SpokeCertTTL + RenewGrace` padded by two poll
+  intervals. An unrecognised phase freezes the controller and widens trust to
+  everything present rather than guessing. See ADR-0015.
+- **Hub replica coverage for spokes.** The hub advertises its replica count;
+  spokes hold one tunnel per replica and run one probe dialer above that
+  count so a scale-up is noticed within about a minute. Surplus dialers retire
+  themselves after a scale-down. Several configured endpoints switch to
+  explicit mode: one tunnel each, no probe.
+- Agent keys may be minted with no expiry (`--no-expiry`, agent class only);
+  the default lifetime is 90 days. Admin key lifetime moves to its own
+  `--admin-key-ttl`.
+- Three MCP tools: `query_exemplars`, `target_metadata`, `alertmanagers`.
+- Alerts: `PrometheusMCPHubStateSecretLarge`, `PrometheusMCPHubRevocationStale`,
+  `PrometheusMCPHubPeerDiscoveryBroken`, `PrometheusMCPHubCARotationStalled`.
+
+### Fixed
+
+- The periodic facts refresh stored spoke-reported labels verbatim, so a
+  compromised cluster could relabel itself into any `matchLabels` scope.
+- The CA issuer tracker was keyed per cluster, so a renewed sibling's
+  handshake hid a live holdout on the outgoing root.
+- Key rotation was two writes; a failed revoke left a live credential whose
+  raw token was already unrecoverable. Now one compare-and-swap.
+- `fleet.Role` was documented as a capability tier and enforced nowhere.
+- MCP resource reads bypassed the per-key rate limiter entirely.
+- The bootstrap admin key took its lifetime from `--agent-key-ttl`.
+- A spoke would adopt another cluster's certificate from a shared identity
+  Secret and renew it forever while every handshake failed.
+- Spoke readiness and `tunnel_up` were last-writer-wins across dialers.
+
 ## [0.1.0] - 2026-08-29
 
 Initial release.

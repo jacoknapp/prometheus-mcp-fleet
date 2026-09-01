@@ -86,6 +86,13 @@ func TestMetricsAdapterRecordsEveryContract(t *testing.T) {
 	a.CACertExpiry(notAfter)
 	assertApprox(t, metricValue(t, r, "promfleet_hub_ca_cert_expiry_seconds"), time.Hour.Seconds())
 	a.StateBytes(700)
+	a.StatePruned(2, 3)
+	if got := metricValue(t, r, `promfleet_hub_state_pruned_total{kind="key"}`); got != 2 {
+		t.Fatalf("pruned keys = %v, want 2", got)
+	}
+	if got := metricValue(t, r, `promfleet_hub_state_pruned_total{kind="revoked_cert"}`); got != 3 {
+		t.Fatalf("pruned revocations = %v, want 3", got)
+	}
 	a.DiscoveredPeers(3)
 	if got := metricValue(t, r, "promfleet_hub_discovered_peers"); got != 3 {
 		t.Fatalf("discovered peers = %v, want 3", got)

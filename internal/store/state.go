@@ -463,6 +463,74 @@ func (s *State) ListRevokedCerts() []RevokedCert {
 	return out
 }
 
+// PruneResult counts what a prune removed.
+type PruneResult struct {
+	// Keys is how many credential records were dropped.
+	Keys int `json:"keys"`
+	// RevokedCerts is how many revocation entries were dropped.
+	RevokedCerts int `json:"revokedCerts"`
+}
+
+// Empty reports whether the prune found nothing to do, which is the ordinary
+// case and the one that must not provoke a write.
+func (p PruneResult) Empty() bool { return p.Keys == 0 && p.RevokedCerts == 0 }
+
+// Prune drops records that can no longer affect any decision, so that a
+// long-lived fleet does not grow its state document into the write ceiling.
+//
+// retain is how long a record is kept PAST the moment it stopped mattering.
+// It exists because the store cannot know the caller's clock-skew tolerance
+// (see [RevokedCert.NotAfter]) and because an operator investigating an
+// incident wants yesterday's records to still be there.
+//
+// What is dropped:
+//
+//   - a revocation entry whose certificate expired more than retain ago. The
+//     certificate is invalid on its own terms, so the entry protects nothing.
+//   - a credential whose expiry passed more than retain ago. It cannot
+//     authenticate, and its KID cannot be reissued: KIDs are random, and the
+//     mint path refuses a collision rather than overwriting.
+//
+// What is deliberately NOT dropped:
+//
+//   - a credential with NO expiry, revoked or not. For a revoked one the
+//     record is the only thing refusing it -- there is no expiry to fall back
+//     on -- so pruning it would hand a revoked immortal key back its access.
+//     This is the single most important rule here.
+//   - a revoked credential that has not yet expired, for the same reason: the
+//     revocation is what is doing the refusing.
+//   - a burned enrollment record that has not yet expired. It is what turns a
+//     replayed token into a 409 and a security event rather than a bare
+//     "unknown credential", and that distinction is how a leaked install
+//     secret announces itself.
+//
+// The epoch is deliberately NOT bumped. Every record removed here is one no
+// decision can depend on, so a replica still serving its larger cached view
+// behaves identically -- and bumping would make every replica re-read the
+// Secret for a change that cannot alter a single answer.
+func (s *State) Prune(now time.Time, retain time.Duration) (PruneResult, bool, error) {
+	if retain < 0 {
+		return PruneResult{}, false, fmt.Errorf("retain must not be negative: %w", ErrInvalid)
+	}
+	var res PruneResult
+	for serial, rc := range s.RevokedCerts {
+		if rc.NotAfter.IsZero() || !now.After(rc.NotAfter.Add(retain)) {
+			continue
+		}
+		delete(s.RevokedCerts, serial)
+		res.RevokedCerts++
+	}
+	for kid, rec := range s.Keys {
+		exp := rec.Key.ExpiresAt
+		if exp.IsZero() || !now.After(exp.Add(retain)) {
+			continue
+		}
+		delete(s.Keys, kid)
+		res.Keys++
+	}
+	return res, !res.Empty(), nil
+}
+
 // --- backend helpers -----------------------------------------------------
 
 // Clock returns now, or time.Now when now is nil. Backends use it to

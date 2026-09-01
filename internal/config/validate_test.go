@@ -74,6 +74,8 @@ func TestHubValidate(t *testing.T) {
 		{"renew grace negative", func(c *Hub) { c.RenewGrace = -time.Second }, "--renew-grace"},
 		{"agent key ttl", func(c *Hub) { c.AgentKeyTTL = 0 }, "--agent-key-ttl"},
 		{"max spokes negative", func(c *Hub) { c.MaxSpokes = -1 }, "--max-spokes"},
+		{"state retention negative", func(c *Hub) { c.StateRetention = -time.Second }, "--state-retention"},
+		{"state prune interval negative", func(c *Hub) { c.StatePruneInterval = -time.Second }, "--state-prune-interval"},
 		{"query timeout", func(c *Hub) { c.QueryTimeout = 0 }, "--query-timeout"},
 		{"range query timeout", func(c *Hub) { c.RangeQueryTimeout = 0 }, "--range-query-timeout"},
 		{"max response bytes", func(c *Hub) { c.MaxResponseBytes = 0 }, "--max-response-bytes"},

@@ -127,6 +127,14 @@ func (a *metricsAdapter) CACertExpiry(notAfter time.Time) {
 	a.m.CACertExpiry.Set(time.Until(notAfter).Seconds())
 }
 
+// StatePruned records one prune pass. Zero counts are still added so the
+// series exists from the first pass, which is what makes "has it ever run"
+// answerable.
+func (a *metricsAdapter) StatePruned(keys, revokedCerts int) {
+	a.m.StatePrunedTotal.WithLabelValues("key").Add(float64(keys))
+	a.m.StatePrunedTotal.WithLabelValues("revoked_cert").Add(float64(revokedCerts))
+}
+
 // DiscoveredPeers records what peer discovery resolved.
 func (a *metricsAdapter) DiscoveredPeers(n int) { a.m.DiscoveredPeers.Set(float64(n)) }
 

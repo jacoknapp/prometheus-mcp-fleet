@@ -167,6 +167,8 @@ func TestLoadHubDefaults(t *testing.T) {
 		EnrollmentTokenTTL:          15 * time.Minute,
 		AgentKeyTTL:                 2160 * time.Hour,
 		AdminKeyTTL:                 2160 * time.Hour,
+		StateRetention:              720 * time.Hour,
+		StatePruneInterval:          6 * time.Hour,
 		MaxSpokes:                   0,
 		QueryTimeout:                30 * time.Second,
 		RangeQueryTimeout:           120 * time.Second,
