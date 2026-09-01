@@ -89,7 +89,7 @@ widen them past what is set here.
 | `--max-response-bytes` | `32Mi` | Maximum accepted from one upstream response, enforced **during** the read and applied to the decompressed size. |
 | `--max-inflight-per-cluster` | `8` | Per-cluster in-flight limit. Over it returns a retryable "busy", not an unbounded queue. |
 | `--max-response-budget-bytes` | `256Mi` | Process-wide in-flight response byte budget. This is what stops 100 concurrent large results from OOM-killing the hub. |
-| `--max-spokes` | `1024` | Cap on concurrent spoke sessions per hub replica. A cluster holds one per spoke pod, so the fleet total is clusters x spoke replicas. |
+| `--max-spokes` | `0` | Optional cap on concurrent spoke sessions per hub replica. `0` means no limit. It counts sessions, not clusters — a cluster holds one per spoke pod. |
 | `--facts-poll-interval` | `60s` | How often cluster facts are refreshed. Unchanged facts cost about 40 bytes. |
 | `--enable-status-config` | `false` | Ungates `/api/v1/status/config`. **Leave this off** unless you have audited your scrape configurations — they routinely contain bearer tokens in plain text. |
 
