@@ -161,3 +161,40 @@ func TestPruneOnceSaysNothingWhenThereIsNothingToDo(t *testing.T) {
 		t.Errorf("an empty prune logged:\n%s", sink.String())
 	}
 }
+
+// TestJitterAround pins the spread that keeps replicas out of lockstep: every
+// value inside ±jitterPercent, both halves of the range actually used, and a
+// degenerate interval returned untouched rather than turned into a negative
+// sleep.
+func TestJitterAround(t *testing.T) {
+	t.Parallel()
+
+	const base = time.Hour
+	lo := base - base*jitterPercent/100
+	hi := base + base*jitterPercent/100
+
+	var sawBelow, sawAbove bool
+	for range 2000 {
+		got := jitterAround(base)
+		if got < lo || got > hi {
+			t.Fatalf("jitterAround(%s) = %s, outside [%s, %s]", base, got, lo, hi)
+		}
+		if got < base {
+			sawBelow = true
+		}
+		if got > base {
+			sawAbove = true
+		}
+	}
+	if !sawBelow || !sawAbove {
+		t.Errorf("jitter only moved one way (below=%v above=%v); replicas would stay clustered", sawBelow, sawAbove)
+	}
+
+	// Too small to spread. Returning d unchanged beats computing a negative
+	// sleep out of it.
+	for _, d := range []time.Duration{0, time.Nanosecond} {
+		if got := jitterAround(d); got != d {
+			t.Errorf("jitterAround(%s) = %s, want it returned unchanged", d, got)
+		}
+	}
+}

@@ -80,7 +80,7 @@ startup error naming the rule you are missing.
 | `--agent-key-ttl` | `2160h` (90d) | Default lifetime of a minted agent key, and the maximum a create request may ask for. Nothing rotates agent keys automatically, so expiry here is an outage on a timer; a key may also be minted with no expiry at all (`--no-expiry`, agent keys only). |
 | `--admin-key-ttl` | `2160h` (90d) | Default and maximum lifetime of a minted admin key, including the bootstrap key printed on first start. Separate from `--agent-key-ttl` on purpose: relaxing agent expiry must not silently relax the credential that mints credentials, and unlike an agent key an admin key can never be minted without an expiry. |
 | `--state-retention` | `720h` (30d) | How long an expired credential or a revocation for an already-expired certificate is kept before the hub prunes it. A forensics window, not a safety margin: nothing pruned can change an answer. |
-| `--state-prune-interval` | `6h` | How often each replica prunes the state document. `0` disables pruning entirely, which leaves the Secret growing toward its 700 KiB write ceiling with only `PrometheusMCPHubStateSecretLarge` to catch it. |
+| `--state-prune-interval` | `6h` | How often each replica prunes the state document, jittered ±20% so replicas started together do not wake in lockstep. Every replica runs its own pruner; no leader election is needed, because the sweep is a compare-and-swap and the losers find the work already done. `0` disables pruning entirely, which leaves the Secret growing toward its 700 KiB write ceiling with only `PrometheusMCPHubStateSecretLarge` to catch it. |
 | `--pepper-file` | `<data-dir>/pepper.key` | Out-of-database HMAC pepper. Generated on first start. |
 
 ### Limits

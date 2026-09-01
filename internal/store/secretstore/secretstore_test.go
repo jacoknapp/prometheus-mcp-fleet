@@ -751,3 +751,80 @@ func enrollmentKey(kid, clusterID string) *fleet.Key {
 		ExpiresAt:  tBase.Add(15 * time.Minute),
 	}
 }
+
+// TestPruneIsSafeWithSeveralReplicas is the HA case: every hub replica runs
+// its own pruner against one Secret, and on a rollout they all start within
+// seconds of each other, so their first passes collide.
+//
+// What must hold is that the collision is boring. One replica's write wins;
+// the losers retry, re-read, find the work already done and return without
+// writing at all. No error reaches the caller, no record is removed twice,
+// and the surviving records are exactly the ones a single pruner would have
+// left.
+func TestPruneIsSafeWithSeveralReplicas(t *testing.T) {
+	t.Parallel()
+
+	const replicas = 4
+	_, client := newFakeAPI(t)
+	_, seeder := newStore(t, secretstore.Options{Client: client})
+
+	// Two credentials long past their expiry, one still live.
+	for _, kid := range []string{"agent0001", "agent0002"} {
+		k := agentKey(kid)
+		k.ExpiresAt = tBase.Add(-90 * 24 * time.Hour)
+		if err := seeder.PutKey(t.Context(), k); err != nil {
+			t.Fatalf("seed %s: %v", kid, err)
+		}
+	}
+	if err := seeder.PutKey(t.Context(), agentKey("agent0003")); err != nil {
+		t.Fatalf("seed live key: %v", err)
+	}
+
+	// Every replica shares the one API, as they share the one Secret.
+	stores := make([]*secretstore.Store, 0, replicas)
+	for range replicas {
+		_, s := newStore(t, secretstore.Options{Client: client})
+		stores = append(stores, s)
+	}
+
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		removed int
+		errs    []error
+	)
+	start := make(chan struct{})
+	for _, s := range stores {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start // release them together, which is the rollout shape
+			res, err := s.Prune(context.Background(), 24*time.Hour)
+			mu.Lock()
+			defer mu.Unlock()
+			removed += res.Keys
+			if err != nil {
+				errs = append(errs, err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if len(errs) != 0 {
+		t.Fatalf("concurrent prunes reported %d errors, want none: %v", len(errs), errs)
+	}
+	// Exactly one replica does the removing. Anything else means two writers
+	// each believed they had pruned the same record.
+	if removed != 2 {
+		t.Errorf("replicas removed %d keys in total, want 2 (one winner, the rest no-ops)", removed)
+	}
+
+	keys, err := seeder.ListKeys(t.Context(), fleet.ClassAgent)
+	if err != nil {
+		t.Fatalf("ListKeys: %v", err)
+	}
+	if len(keys) != 1 || keys[0].KID != "agent0003" {
+		t.Errorf("surviving keys = %+v, want only the live one", keys)
+	}
+}

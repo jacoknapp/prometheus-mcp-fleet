@@ -439,9 +439,12 @@ is far past any plausible fleet — so it almost always means accumulated cruft.
 
 **The hub prunes itself, so reaching this alert means something is unusual.**
 Every replica sweeps the state document on `--state-prune-interval` (6h by
-default), dropping expired credentials and revocations for certificates that
-have expired anyway, each kept `--state-retention` (30d) past the moment it
-stopped mattering. Check that it is actually running before you prune by hand:
+default, jittered ±20% so replicas started together do not stay in lockstep),
+dropping expired credentials and revocations for certificates that have
+expired anyway, each kept `--state-retention` (30d) past the moment it
+stopped mattering. Running one pruner per replica is deliberate and needs no
+leader: the sweep is a compare-and-swap like every other write, so one
+replica wins and the rest re-read, find the work done and write nothing. Check that it is actually running before you prune by hand:
 
 ```bash
 # Should climb. If it is absent, no prune has ever removed anything.

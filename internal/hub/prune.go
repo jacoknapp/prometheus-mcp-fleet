@@ -6,6 +6,7 @@ package hub
 import (
 	"context"
 	"log/slog"
+	"math/rand/v2"
 	"time"
 )
 
@@ -39,17 +40,48 @@ func (h *hub) runStatePrune(ctx context.Context) {
 	}
 
 	// One immediate pass, so a hub adopted with an already-crowded Secret is
-	// helped at startup rather than one interval later.
+	// helped at startup rather than one interval later. Every replica does
+	// this at once on a rollout, and that is fine: one wins the
+	// compare-and-swap, the rest re-read, find the work done and write
+	// nothing. The cost is a handful of reads, once.
 	h.pruneOnce(ctx, retain)
-	t := time.NewTicker(interval)
-	defer t.Stop()
+
+	// Jittered rather than a fixed ticker. Replicas that started together --
+	// which is what a rollout produces -- would otherwise wake in lockstep
+	// forever, putting their whole contention burst on the same instant of
+	// every interval, and on the same instant as each other's retries. The
+	// prune is not urgent to the second, so spreading it costs nothing.
 	for {
-		select {
-		case <-ctx.Done():
+		if !sleepCtx(ctx, jitterAround(interval)) {
 			return
-		case <-t.C:
-			h.pruneOnce(ctx, retain)
 		}
+		h.pruneOnce(ctx, retain)
+	}
+}
+
+// jitterPercent is how far either side of the interval a prune may drift.
+const jitterPercent = 20
+
+// jitterAround returns d moved by up to ±jitterPercent, which is enough to
+// pull a fleet of replicas out of lockstep without letting any of them drift
+// far from the schedule an operator configured.
+func jitterAround(d time.Duration) time.Duration {
+	spread := int64(d) * jitterPercent / 100
+	if spread <= 0 {
+		return d
+	}
+	return d + time.Duration(rand.Int64N(2*spread)-spread)
+}
+
+// sleepCtx sleeps for d, reporting false if ctx ended first.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
 	}
 }
 
