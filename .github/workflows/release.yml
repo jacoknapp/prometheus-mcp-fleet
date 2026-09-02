@@ -574,17 +574,31 @@ jobs:
       # A chart version may only be published once. If it already exists we
       # refuse rather than overwrite: 100 clusters resolving the same chart
       # version to two different renders is an unfalsifiable support ticket.
+      #
+      # The one exception is a chart this same tag already published: v0.10.0
+      # pushed the hub chart and then failed on the spoke chart, and without
+      # this the only way forward was a new chart version under a new tag. A
+      # published chart whose appVersion equals this tag's version is that
+      # case, and the push step below reuses it rather than repackaging.
       - name: Refuse to overwrite an already-published chart version
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
         run: |
           set -euo pipefail
           fail=0
           for chart in charts/*/; do
             name="$(helm show chart "${chart}" | awk '$1=="name:"{print $2}')"
             ver="$(helm show chart "${chart}" | awk '$1=="version:"{print $2}')"
-            if helm show chart "oci://${CHART_REGISTRY}/${name}" --version "${ver}" >/dev/null 2>&1; then
-              echo "::error file=${chart}Chart.yaml::${name} ${ver} is already published. Chart versions are independent SemVer and immutable: bump Chart.yaml's 'version' and re-tag."
-              fail=1
+            published="$(helm show chart "oci://${CHART_REGISTRY}/${name}" --version "${ver}" 2>/dev/null | awk '$1=="appVersion:"{print $2}' || true)"
+            if [ -z "${published}" ]; then
+              continue
             fi
+            if [ "${published}" = "${VERSION}" ]; then
+              echo "${name} ${ver} was already published for ${VERSION}; it will be reused, not overwritten"
+              continue
+            fi
+            echo "::error file=${chart}Chart.yaml::${name} ${ver} is already published for appVersion ${published}. Chart versions are independent SemVer and immutable: bump Chart.yaml's 'version' and re-tag."
+            fail=1
           done
           exit "${fail}"
 
@@ -637,15 +651,38 @@ jobs:
             name="$(basename "${chart}")"
             ver="$(helm show chart "${chart}" | awk '$1=="version:"{print $2}')"
 
-            # --app-version writes appVersion without the leading `v`, which is
-            # the documented contract between the git tag and the chart.
-            helm package "${chart}" --app-version "${VERSION}" --destination dist-charts
+            ref="oci://${CHART_REGISTRY}/${name}"
+            published="$(helm show chart "${ref}" --version "${ver}" 2>/dev/null | awk '$1=="appVersion:"{print $2}' || true)"
+            if [ "${published}" = "${VERSION}" ]; then
+              # Left behind by an earlier attempt at this same tag (the step
+              # above vouched for it). `helm pull` reports the digest that
+              # `helm push` would have.
+              pull_out="$(helm pull "${ref}" --version "${ver}" --destination dist-charts 2>&1)" || {
+                echo "${pull_out}"
+                echo "::error::helm pull failed for the already-published ${name} ${ver}"
+                exit 1
+              }
+              echo "${pull_out}"
+              out="${pull_out}"
+            else
+              # --app-version writes appVersion without the leading `v`, which is
+              # the documented contract between the git tag and the chart.
+              helm package "${chart}" --app-version "${VERSION}" --destination dist-charts
 
-            push_out="$(helm push "dist-charts/${name}-${ver}.tgz" "oci://${CHART_REGISTRY}" 2>&1)"
-            echo "${push_out}"
-            digest="$(printf '%s\n' "${push_out}" | awk '/^Digest:/{print $2}')"
+              # Capture with `||`: under set -e a failing command substitution
+              # ends the step before the echo, and the v0.10.0 run failed on
+              # this push with nothing in the log but the exit code.
+              push_out="$(helm push "dist-charts/${name}-${ver}.tgz" "oci://${CHART_REGISTRY}" 2>&1)" || {
+                echo "${push_out}"
+                echo "::error::helm push failed for ${name} ${ver}"
+                exit 1
+              }
+              echo "${push_out}"
+              out="${push_out}"
+            fi
+            digest="$(printf '%s\n' "${out}" | awk '/^Digest:/{print $2}')"
             if [ -z "${digest}" ]; then
-              echo "::error::could not parse a digest out of 'helm push' for ${name}"
+              echo "::error::could not parse a digest out of helm's output for ${name}"
               exit 1
             fi
 

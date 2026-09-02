@@ -12,6 +12,20 @@ lockstep. The exception is called out where it happens: 0.10.0's `renew-v2`
 is a hard cut on the renewal proof alone, with existing tunnels unaffected
 and `--renew-grace` covering spokes that upgrade late.
 
+## [0.10.1] - 2026-09-02
+
+### Fixed
+
+- The v0.10.0 release published the hub chart and then failed pushing the
+  spoke chart with nothing in the log but the exit code: `helm push` ran
+  inside a command substitution under `set -e`, so the step ended before its
+  output was echoed. The push is now captured with `||` and the error printed.
+  A chart that an earlier attempt at the same tag already published is reused
+  (its digest read back with `helm pull`) rather than refused, so a release
+  can be re-cut from where it stopped instead of needing a new chart version.
+  Charts move to 0.5.1; `prometheus-mcp-spoke` 0.5.0 was never published and
+  `prometheus-mcp-hub` 0.5.0 remains valid for 0.10.0.
+
 ## [0.10.0] - 2026-09-01
 
 ### Changed
