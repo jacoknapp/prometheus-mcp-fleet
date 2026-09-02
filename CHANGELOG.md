@@ -12,7 +12,7 @@ lockstep. The exception is called out where it happens: 0.10.0's `renew-v2`
 is a hard cut on the renewal proof alone, with existing tunnels unaffected
 and `--renew-grace` covering spokes that upgrade late.
 
-## [0.10.2] - 2026-09-02
+## [0.10.3] - 2026-09-02
 
 ### Fixed
 
@@ -21,6 +21,8 @@ and `--renew-grace` covering spokes that upgrade late.
   between linking the key and linking the certificate. Replicas starting
   together then died with `ErrCAIncomplete` against a CA that was complete a
   millisecond later. The budget is now 5s.
+
+## [0.10.2] - 2026-09-02
 
 ### Changed
 
