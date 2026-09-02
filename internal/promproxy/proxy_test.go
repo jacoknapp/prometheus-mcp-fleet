@@ -675,7 +675,11 @@ func TestGlobalByteBudget(t *testing.T) {
 			return jsonResponse(200, []byte(`{}`)), nil
 		}
 
-		go func() { _, _ = f.proxy.Do(context.Background(), allowAll(), queryCall("prod-eu")) }()
+		first := make(chan struct{})
+		go func() {
+			defer close(first)
+			_, _ = f.proxy.Do(context.Background(), allowAll(), queryCall("prod-eu"))
+		}()
 		s.waitEntered(t)
 		if got := f.proxy.bytes.available(); got != 0 {
 			t.Fatalf("available = %d, want the whole budget reserved", got)
@@ -701,6 +705,15 @@ func TestGlobalByteBudget(t *testing.T) {
 			}
 		case <-time.After(3 * time.Second):
 			t.Fatal("the second call never obtained the freed budget")
+		}
+		// The second call returning does not mean the first has: Do releases
+		// the byte budget before the in-flight slot (the release defers run in
+		// that order), so the waiter can wake and finish while the first call
+		// is still between the two. Wait for it before reading the gauges.
+		select {
+		case <-first:
+		case <-time.After(3 * time.Second):
+			t.Fatal("the first call never returned")
 		}
 		f.budgetsAreClean(t, "prod-eu")
 	})
