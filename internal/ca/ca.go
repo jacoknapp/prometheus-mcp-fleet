@@ -112,15 +112,30 @@ func (c *CA) current() *caMaterial { return c.material.Load() }
 func (c *CA) now() time.Time { return c.opts.Clock() }
 
 // Timing of the creation-race retry. Generating a P-256 key and writing two
-// small files takes on the order of a millisecond, so a few hundred
-// milliseconds of patience is enough to let a racing process finish while
-// still failing fast on a genuinely half-present CA.
+// small files takes on the order of a millisecond, so the loser of a race is
+// normally through on its first or second poll.
+//
+// The budget is nevertheless five seconds, not the couple of hundred
+// milliseconds that arithmetic suggests. Eight goroutines racing these paths
+// on a loaded CI runner exhausted a 200ms budget and every loser reported
+// ErrCAIncomplete: the window between the winner linking the key and linking
+// the certificate is short in CPU terms and unbounded in wall-clock terms,
+// because the winner can be descheduled inside it. Waiting is nearly free --
+// two stats every 10ms -- and the thing being waited for is normal startup on
+// a fresh installation, so the cost of being impatient is a crash loop while
+// the cost of being patient is a slower error on a genuinely half-present CA,
+// which no amount of waiting will fix anyway.
 const (
-	initPollAttempts = 20
+	initPollAttempts = 500
 	initPollInterval = 10 * time.Millisecond
 )
 
-var loadOrCreateCreate = Create
+var (
+	loadOrCreateCreate = Create
+	// caSleep is the retry delay, indirected so the tests that drive the
+	// budget to exhaustion do not have to spend it.
+	caSleep = time.Sleep
+)
 
 // LoadOrCreate loads the CA at certPath and keyPath, creating a new one
 // atomically if neither file exists.
@@ -132,14 +147,14 @@ var loadOrCreateCreate = Create
 //
 // Concurrent callers racing to initialise the same paths are safe. Exactly one
 // wins the exclusive creation of the key file; the others observe the
-// intermediate states and retry briefly before loading what the winner wrote,
-// which is why a transient half-present state is re-checked rather than
-// reported immediately.
+// intermediate states and retry until the winner has written both files
+// before loading them, which is why a transient half-present state is
+// re-checked rather than reported immediately.
 func LoadOrCreate(certPath, keyPath string, opts Options) (*CA, error) {
 	var lastIncomplete error
 	for attempt := range initPollAttempts + 1 {
 		if attempt > 0 {
-			time.Sleep(initPollInterval)
+			caSleep(initPollInterval)
 		}
 		certExists, err := regularFileExists(certPath)
 		if err != nil {

@@ -1093,6 +1093,11 @@ func TestCAOperationalFailures(t *testing.T) {
 	})
 
 	t.Run("creation race never settles", func(t *testing.T) {
+		// The real delay is the budget itself; nothing here is waiting on
+		// another goroutine, so spending it would only slow the suite.
+		origSleep := caSleep
+		caSleep = func(time.Duration) {}
+		defer func() { caSleep = origSleep }()
 		loadOrCreateCreate = func(string, string, Options) (*CA, error) { return nil, ErrCAExists }
 		certPath, keyPath := paths(t)
 		got, err := LoadOrCreate(certPath, keyPath, Options{})
@@ -1108,6 +1113,9 @@ func TestCAOperationalFailures(t *testing.T) {
 	// one attempt short of that would report the race as never having
 	// settled instead.
 	t.Run("creation race settles on the last permitted attempt", func(t *testing.T) {
+		origSleep := caSleep
+		caSleep = func(time.Duration) {}
+		defer func() { caSleep = origSleep }()
 		certPath, keyPath := paths(t)
 		calls := 0
 		loadOrCreateCreate = func(cp, kp string, o Options) (*CA, error) {

@@ -14,6 +14,14 @@ and `--renew-grace` covering spokes that upgrade late.
 
 ## [0.10.2] - 2026-09-02
 
+### Fixed
+
+- The hub could fail to start on a cold cluster: `LoadOrCreate` gave a racing
+  caller 200ms to see both CA files appear, and the winner can be descheduled
+  between linking the key and linking the certificate. Replicas starting
+  together then died with `ErrCAIncomplete` against a CA that was complete a
+  millisecond later. The budget is now 5s.
+
 ### Changed
 
 - The charts now carry the application's version: `Chart.yaml`'s `version` and
