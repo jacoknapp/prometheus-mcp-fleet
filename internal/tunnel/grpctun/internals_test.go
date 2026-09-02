@@ -435,6 +435,30 @@ func (s *fakeClientStream) Recv() (*fleetv1.ProxyChunk, error) {
 	return r.chunk, r.err
 }
 
+// blockingClientStream is a stream whose Recv waits, like a spoke that has
+// stopped answering, until release is called -- the fake's stand-in for the
+// stream context being cancelled. entered is closed once Recv is waiting.
+type blockingClientStream struct {
+	grpc.ServerStreamingClient[fleetv1.ProxyChunk]
+	unblock chan struct{}
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (s *blockingClientStream) Recv() (*fleetv1.ProxyChunk, error) {
+	s.once.Do(func() { close(s.entered) })
+	<-s.unblock
+	return nil, status.Error(codes.Canceled, "context canceled")
+}
+
+func (s *blockingClientStream) release() {
+	select {
+	case <-s.unblock:
+	default:
+		close(s.unblock)
+	}
+}
+
 type fakeSpokeClient struct {
 	describeResp *fleetv1.DescribeResponse
 	describeErr  error
@@ -668,6 +692,51 @@ func TestBodyReaderProtocolAndTerminalPaths(t *testing.T) {
 		}
 		if err := b.Close(); err != nil || calls.Load() != 2 {
 			t.Errorf("second Close = %v, callbacks = %d", err, calls.Load())
+		}
+	})
+
+	// Read holds b.mu across Recv. A Close that took the lock first would
+	// wait behind a Read that is waiting on the spoke, for as long as the
+	// spoke stalled; the tunnel package promises the opposite, that closing
+	// the body is what aborts the upstream call.
+	t.Run("close unblocks a read waiting on the spoke", func(t *testing.T) {
+		stream := &blockingClientStream{unblock: make(chan struct{}), entered: make(chan struct{})}
+		var cleanups atomic.Int32
+		b := &bodyReader{
+			stream: stream, budget: 10,
+			// cleanup stands in for cancelling the stream context: it is
+			// what makes the pending Recv return.
+			cleanup: func() { cleanups.Add(1); stream.release() },
+			release: func() {},
+			mapErr:  func(err error) error { return err },
+		}
+		readErr := make(chan error, 1)
+		go func() {
+			_, err := b.Read(make([]byte, 1))
+			readErr <- err
+		}()
+		<-stream.entered
+
+		closed := make(chan struct{})
+		go func() {
+			_ = b.Close()
+			close(closed)
+		}()
+		select {
+		case <-closed:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Close waited behind a Read blocked on the spoke")
+		}
+		select {
+		case err := <-readErr:
+			if !errors.Is(err, ErrBodyClosed) {
+				t.Errorf("blocked Read returned %v after Close, want ErrBodyClosed", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("the blocked Read never returned after Close")
+		}
+		if cleanups.Load() != 1 {
+			t.Errorf("cleanup ran %d times, want once", cleanups.Load())
 		}
 	})
 

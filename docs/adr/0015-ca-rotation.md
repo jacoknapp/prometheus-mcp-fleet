@@ -203,7 +203,8 @@ A state machine, persisted in the CA Secret, one phase at a time:
 
 ```
 steady ──(signer in its last fifth, or an operator annotation)──▶ publishing
-publishing ──(one full spoke-certificate lifetime)──▶ signing
+publishing ──(one full spoke-certificate lifetime, or at once if the
+             outgoing signer has already expired)──▶ signing
 signing ──(a lifetime plus the renewal grace, AND no live session on the
             outgoing root anywhere in the fleet)──▶ steady
 ```
@@ -215,8 +216,13 @@ signing ──(a lifetime plus the renewal grace, AND no live session on the
   outgoing certificate is kept in `ca-previous.crt` and is still trusted. Its
   private key is **not** kept: a root that has stopped signing must not be able
   to start again, which also means a rotation run because a key leaked really
-  does dispose of that key.
-* back to **`steady`** — `ca-previous.crt` is dropped.
+  does dispose of that key. The promotion also records
+  `ca-rotation.retire-after`, the earliest the outgoing root may be dropped,
+  computed from the certificate lifetime and renewal grace in force at that
+  moment — so shortening either setting mid-rotation cannot open the gate on
+  certificates issued under the longer values.
+* back to **`steady`** — `ca-previous.crt` and `ca-rotation.retire-after` are
+  dropped.
 
 The set of trusted roots is `{old, new}` in both middle phases, so the
 promotion — the step that changes what signs — changes nothing about what

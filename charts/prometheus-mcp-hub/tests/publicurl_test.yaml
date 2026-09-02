@@ -1,0 +1,81 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# PMF_PUBLIC_URL is the one value the binary refuses to start without: it is the
+# "resource" of the RFC 9728 document the 401 challenge points at. Before this
+# guard a plain `helm install` rendered a ConfigMap with no PMF_PUBLIC_URL at
+# all, the pod came up, failed Validate and CrashLooped -- a minute after an
+# install that had looked perfectly fine.
+suite: hub public URL is always rendered, derived from the Ingress or refused
+templates:
+  - templates/configmap.yaml
+tests:
+  - it: refuses to render with no publicURL and no Ingress to derive one from
+    asserts:
+      - failedTemplate:
+          errorPattern: "config.publicURL is empty and there is no TLS Ingress host"
+
+  - it: refuses a publicURL that is not an absolute http or https URL
+    set:
+      config:
+        publicURL: mcp.example.com/mcp
+    asserts:
+      - failedTemplate:
+          errorPattern: "must be an absolute http or https URL"
+
+  - it: derives https://<ingress.host>/mcp from a TLS Ingress
+    set:
+      ingress:
+        enabled: true
+        host: mcp.example.com
+        tls:
+          enabled: true
+    asserts:
+      - equal:
+          path: data.PMF_PUBLIC_URL
+          value: https://mcp.example.com/mcp
+
+  - it: refuses to derive from an Ingress that does not terminate TLS
+    # The derived value would be http://, and nothing downstream would
+    # question it: the protected-resource document, the NOTES enrollment
+    # recipe and the spoke all accept a plaintext URL at face value.
+    set:
+      ingress:
+        enabled: true
+        host: mcp.example.com
+    asserts:
+      - failedTemplate:
+          errorPattern: "no TLS Ingress host to derive it from"
+
+  - it: an explicit http publicURL is the operator's own decision
+    set:
+      config:
+        publicURL: http://mcp.example.com/mcp
+      ingress:
+        enabled: true
+        host: mcp.example.com
+    asserts:
+      - equal:
+          path: data.PMF_PUBLIC_URL
+          value: http://mcp.example.com/mcp
+
+  - it: an explicit publicURL wins over the Ingress host
+    set:
+      config:
+        publicURL: https://fleet.example.net/mcp
+      ingress:
+        enabled: true
+        host: mcp.example.com
+    asserts:
+      - equal:
+          path: data.PMF_PUBLIC_URL
+          value: https://fleet.example.net/mcp
+
+  - it: renders the explicit publicURL with no Ingress at all
+    set:
+      config:
+        publicURL: https://fleet.example.net/mcp
+    asserts:
+      - equal:
+          path: data.PMF_PUBLIC_URL
+          value: https://fleet.example.net/mcp

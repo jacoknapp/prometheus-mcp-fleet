@@ -2146,3 +2146,45 @@ func TestRoleAllowsNilScope(t *testing.T) {
 		t.Error("roleAllows(nil) granted a non-operational tool to a scopeless principal")
 	}
 }
+
+// TestRawFormatRefusedUnderScopeLimits pins that format "json" cannot be used
+// to read past a scope's maxSeries or maxPoints: the raw payload bypasses the
+// encoder that applies them, so the format is refused rather than honoured
+// unbounded. Range queries additionally refuse under maxPoints alone; instant
+// queries have no point dimension and ignore it.
+func TestRawFormatRefusedUnderScopeLimits(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+
+	series := principal(fullScope())
+	series.Scope.Limits.MaxSeries = 3
+	points := principal(fullScope())
+	points.Scope.Limits.MaxPoints = 50
+
+	if _, terr := h.tools.query(ctx(t), series,
+		QueryIn{Cluster: okCluster, Query: "up", Format: "json"}); terr == nil || terr.Code != CodeInvalidArgument {
+		t.Fatalf("query json under maxSeries: terr = %v, want INVALID_ARGUMENT", terr)
+	}
+	if _, terr := h.tools.queryRange(ctx(t), series,
+		QueryRangeIn{Cluster: okCluster, Query: "up", Format: "json"}); terr == nil || terr.Code != CodeInvalidArgument {
+		t.Fatalf("query_range json under maxSeries: terr = %v, want INVALID_ARGUMENT", terr)
+	}
+	if _, terr := h.tools.queryRange(ctx(t), points,
+		QueryRangeIn{Cluster: okCluster, Query: "up", Format: "json"}); terr == nil || terr.Code != CodeInvalidArgument {
+		t.Fatalf("query_range json under maxPoints: terr = %v, want INVALID_ARGUMENT", terr)
+	}
+	// An instant query has no points to cap, so maxPoints alone leaves json
+	// available to it.
+	if _, terr := h.tools.query(ctx(t), points,
+		QueryIn{Cluster: okCluster, Query: "up", Format: "json"}); terr != nil {
+		t.Fatalf("query json under maxPoints only: %v", terr)
+	}
+	// The cap must not leak into the other formats.
+	out, terr := h.tools.query(ctx(t), series, QueryIn{Cluster: okCluster, Query: "up"})
+	if terr != nil {
+		t.Fatalf("query compact under maxSeries: %v", terr)
+	}
+	if len(out.Rows) > 3 {
+		t.Fatalf("compact returned %d rows past maxSeries 3", len(out.Rows))
+	}
+}

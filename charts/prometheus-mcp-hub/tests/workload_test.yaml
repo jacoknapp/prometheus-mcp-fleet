@@ -8,6 +8,9 @@ templates:
   - templates/serviceaccount.yaml
   - templates/rbac.yaml
   - templates/networkpolicy.yaml
+# PMF_PUBLIC_URL is required; the chart refuses to render without it.
+set:
+  config.publicURL: https://mcp.example.com/mcp
 tests:
   - it: renders no StatefulSet and no PersistentVolumeClaim anywhere
     asserts:
@@ -227,4 +230,4 @@ tests:
     asserts:
       - equal:
           path: spec.template.spec.containers[0].image
-          value: ghcr.io/jacoknapp/prometheus-mcp-fleet/hub:0.9.0
+          value: ghcr.io/jacoknapp/prometheus-mcp-fleet/hub:0.10.0

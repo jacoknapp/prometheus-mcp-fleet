@@ -655,7 +655,10 @@ func TestRenewLoopWaitsWhenThereIsNoIdentity(t *testing.T) {
 
 	f := newRenewFixture(t)
 	stop := f.run(t)
-	time.Sleep(20 * time.Millisecond)
+	// The no-identity path leaves no trace to wait on, so give the 2ms
+	// check interval a generous number of turns: under the full race suite on
+	// an oversubscribed box, 20ms was occasionally not even one.
+	time.Sleep(200 * time.Millisecond)
 	stop()
 
 	f.hub.mu.Lock()
@@ -1849,6 +1852,43 @@ func TestRunWarnsWhenTheFirstFactsRefreshFails(t *testing.T) {
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("run() = %v, want nil: a Prometheus that is down must not stop the spoke", err)
+	}
+}
+
+// TestRunBoundsTheFirstFactsRefresh. A Prometheus that accepts the connection
+// and then never answers must not hold start-up for one --prometheus-timeout
+// per source: the first refresh runs under the facts budget like every later
+// one, so the spoke gives up on it and moves on to dialling the hub.
+func TestRunBoundsTheFirstFactsRefresh(t *testing.T) {
+	t.Parallel()
+
+	release := make(chan struct{})
+	hung := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(func() { close(release); hung.Close() })
+
+	e, _ := newEnroller(t)
+	cfg := spokeConfig(t, e.apiURL, "ws://"+deadAddr(t)+"/tunnel", hung.URL)
+	// promclient refuses a budget under its 250ms hop margin, so the facts
+	// interval cannot be shortened arbitrarily.
+	cfg.FactsRefreshInterval = 600 * time.Millisecond
+	cfg.PrometheusTimeout = time.Hour
+
+	s, logs := newTestSpoke(t, newStubClock(), cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.run(ctx, obs.NewRegistry(s.build, "spoke")) }()
+
+	eventually(t, "the hung first refresh to be given up on", func() bool {
+		return logs.has("initial facts refresh incomplete")
+	})
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("run() = %v, want nil", err)
 	}
 }
 

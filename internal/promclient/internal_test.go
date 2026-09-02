@@ -200,7 +200,7 @@ func TestProbeInternalFailures(t *testing.T) {
 		t.Parallel()
 		c := mustInternalClient(t, Config{BaseURL: "http://prom.example"})
 		c.base = &url.URL{Scheme: "http", Host: "[::1"}
-		if err := c.probe(t.Context(), "/-/healthy"); err == nil || !strings.Contains(err.Error(), "/-/healthy") {
+		if err := c.probe(t.Context(), EndpointHealthy, "/-/healthy"); err == nil || !strings.Contains(err.Error(), "/-/healthy") {
 			t.Errorf("probe malformed URL = %v, want path-named construction error", err)
 		}
 	})
@@ -208,7 +208,7 @@ func TestProbeInternalFailures(t *testing.T) {
 	t.Run("bearer token read", func(t *testing.T) {
 		t.Parallel()
 		c := mustInternalClient(t, Config{BaseURL: "http://prom.example", BearerTokenFile: "/missing/token"})
-		if err := c.probe(t.Context(), "/-/healthy"); err == nil || !strings.Contains(err.Error(), "read bearer token") {
+		if err := c.probe(t.Context(), EndpointHealthy, "/-/healthy"); err == nil || !strings.Contains(err.Error(), "read bearer token") {
 			t.Errorf("probe missing bearer token = %v, want token read error", err)
 		}
 	})
@@ -476,3 +476,43 @@ type failingBody struct{ err error }
 
 func (b *failingBody) Read([]byte) (int, error) { return 0, b.err }
 func (*failingBody) Close() error               { return nil }
+
+// fakeNetError is a transport error that reports itself as a timeout without
+// the context having expired, which is what a ResponseHeaderTimeout or a dial
+// timeout looks like from the caller's side.
+type fakeNetError struct{ timeout bool }
+
+func (e fakeNetError) Error() string   { return "fake net error" }
+func (e fakeNetError) Timeout() bool   { return e.timeout }
+func (e fakeNetError) Temporary() bool { return false }
+
+// TestErrorCode pins the mapping from transport failures onto the closed code
+// set: a context that ended is a timeout whatever the transport said, a
+// net.Error that timed out on its own is a timeout, everything else is
+// CodeError.
+func TestErrorCode(t *testing.T) {
+	t.Parallel()
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	tests := []struct {
+		name string
+		ctx  context.Context
+		err  error
+		want string
+	}{
+		{"context ended", cancelled, errors.New("connection reset"), CodeTimeout},
+		{"transport timeout", context.Background(), fakeNetError{timeout: true}, CodeTimeout},
+		{"transport failure", context.Background(), fakeNetError{timeout: false}, CodeError},
+		{"plain error", context.Background(), errors.New("EOF"), CodeError},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := errorCode(tc.ctx, tc.err); got != tc.want {
+				t.Errorf("errorCode() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

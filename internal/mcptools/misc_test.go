@@ -771,3 +771,19 @@ func TestRedactURLQueries(t *testing.T) {
 		}
 	}
 }
+
+// TestInstantQueryHonoursPrincipalMaxSeries: the scope's series ceiling caps
+// an instant result the way it caps a range one.
+func TestInstantQueryHonoursPrincipalMaxSeries(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	p := principal(fullScope())
+	p.Scope.Limits.MaxSeries = 1
+	out, terr := h.tools.query(ctx(t), p, QueryIn{Cluster: okCluster, Query: "up", Limit: 100})
+	if terr != nil {
+		t.Fatalf("query: %v", terr)
+	}
+	if len(out.Rows) != 1 {
+		t.Errorf("rows = %d, want the principal's cap of 1", len(out.Rows))
+	}
+}

@@ -248,7 +248,12 @@ type bodyReader struct {
 	finished bool
 	term     error
 	trail    tunnel.Trailer
-	doneOnce sync.Once
+	// closing is raised by Close before it cancels the stream, so a Read
+	// that was blocked in Recv at the time reports ErrBodyClosed rather
+	// than the cancellation it was woken with.
+	closing     atomic.Bool
+	abortOnce   sync.Once
+	releaseOnce sync.Once
 }
 
 var _ io.ReadCloser = (*bodyReader)(nil)
@@ -280,6 +285,10 @@ func (b *bodyReader) Read(p []byte) (int, error) {
 func (b *bodyReader) pull() {
 	chunk, err := b.stream.Recv()
 	if err != nil {
+		if b.closing.Load() {
+			b.finish(ErrBodyClosed)
+			return
+		}
 		if errors.Is(err, io.EOF) {
 			b.finish(fmt.Errorf("%w: stream ended before the trailer", ErrProtocol))
 			return
@@ -355,16 +364,23 @@ func (b *bodyReader) finish(err error) {
 	if b.trail.BytesTotal == 0 && b.received > 0 {
 		b.trail.BytesTotal = b.received
 	}
-	b.doneOnce.Do(func() {
-		b.cleanup()
-		b.release()
-	})
+	b.abortOnce.Do(b.cleanup)
+	b.releaseOnce.Do(b.release)
 }
 
 // Close implements io.Closer. Closing before the body has been drained cancels
 // the upstream stream, which the spoke observes as a cancelled request context.
 // It is idempotent.
+//
+// The stream is cancelled BEFORE the lock is taken. Read holds b.mu across
+// Recv, so a Close that locked first would wait behind a Read that is itself
+// waiting on a spoke -- and a stalled spoke would then hold the closer for
+// as long as it stalled. Cancelling first wakes that Read, which finishes
+// with ErrBodyClosed because closing is already raised, and the lock is
+// then free.
 func (b *bodyReader) Close() error {
+	b.closing.Store(true)
+	b.abortOnce.Do(b.cleanup)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.pending = nil

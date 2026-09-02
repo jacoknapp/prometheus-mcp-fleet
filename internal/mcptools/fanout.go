@@ -255,7 +255,7 @@ func (t *Tools) fanoutQuery(
 		// it through resolveRange; instant mode had nothing, which made
 		// fanout_query the one tool where a principal's maxLookback did not
 		// apply -- times a hundred clusters.
-		if terr := t.checkLookback(p, at, "", map[string]any{
+		if terr := t.checkLookback(p, at, map[string]any{
 			"query": render.ClipRunes(in.Query, 512), "time": in.Time,
 		}); terr != nil {
 			return nil, terr
@@ -286,7 +286,21 @@ func (t *Tools) fanoutQuery(
 		step, down = t.commonStep(targets, start, end, userStep, maxPoints)
 		// One aligned start for every cluster, so index i means the same
 		// wall-clock instant in every series and the rows are comparable.
-		start = time.Unix(start.Unix()-start.Unix()%int64(step.Seconds()), 0).UTC()
+		//
+		// Aligned UP, never down. The step is the caller's to choose and
+		// unbounded above, so rounding start down by up to one step moved it
+		// an arbitrary distance behind the window resolveRange had just
+		// checked against the lookback limit: a scope confined to the last
+		// hour, asked for now-30m with step=720h, was served a sample from
+		// weeks ago -- and walking step by an hour at a time walked that
+		// sample across the whole retention. Rounding up stays inside the
+		// checked window; a start rounded past the end collapses to the end,
+		// which is one instant and the honest answer to a step wider than
+		// the window.
+		start = alignUp(start, step)
+		if start.After(end) {
+			start = end
+		}
 		out.Downsampled = &down
 		endpoint = promapi.EndpointQueryRange
 		form = url.Values{}
@@ -787,4 +801,14 @@ func (t *Tools) accountCoverage(
 			"%d timed out. Do not report a fleet-wide minimum, maximum or ranking as "+
 			"complete without saying which clusters are missing.",
 		cov.OK, cov.Requested, cov.Failed, cov.TimedOut)
+}
+
+// alignUp rounds t up to the next multiple of step since the Unix epoch.
+func alignUp(t time.Time, step time.Duration) time.Time {
+	sec := int64(step.Seconds())
+	rem := t.Unix() % sec
+	if rem == 0 {
+		return time.Unix(t.Unix(), 0).UTC()
+	}
+	return time.Unix(t.Unix()-rem+sec, 0).UTC()
 }

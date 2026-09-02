@@ -52,7 +52,10 @@ const DefaultAdminURL = "http://" + config.DefaultHubAdminAddr
 const requestTimeout = 30 * time.Second
 
 // ErrUsage is returned when arguments do not name a command.
-var ErrUsage = errors.New("usage: hub <enroll|keys> <create> [flags]")
+var ErrUsage = errors.New("usage: hub <command> [flags]\n" +
+	"  enroll create|list|revoke\n" +
+	"  keys   create|list|revoke|rotate\n" +
+	"  certs  list|revoke")
 
 // Doer is the subset of *http.Client the commands need, so tests can drive
 // them without a listener.
@@ -447,6 +450,7 @@ func keysList(ctx context.Context, args []string, getenv func(string) string, st
 	fs.SetOutput(stdout)
 	var (
 		class     = fs.String("class", "", `restrict to one class: "agent", "admin" or "enrollment"`)
+		asJSON    = fs.Bool("json", false, "print the admin API's JSON listing instead of the table, for scripts")
 		adminURL  = fs.String("admin-url", "", "admin API base URL; defaults to $PMF_ADMIN_URL or "+DefaultAdminURL)
 		tokenFile = fs.String("admin-token-file", "", "read the admin credential from a file instead of $PMF_ADMIN_TOKEN")
 	)
@@ -465,7 +469,22 @@ func keysList(ctx context.Context, args []string, getenv func(string) string, st
 	if err := get(ctx, client, url, adminToken(*tokenFile, getenv), &out); err != nil {
 		return err
 	}
+	if *asJSON {
+		// The table is for eyes; a script wants fields it can select on
+		// without guessing where a key name with spaces in it ends.
+		return printJSON(stdout, out)
+	}
 	return printKeys(stdout, out.Keys)
+}
+
+// printJSON writes v as indented JSON followed by a newline.
+//
+// The value is one the hub has just decoded, so re-encoding it cannot fail:
+// every field is a string, time, bool, number or pointer to one of those.
+func printJSON(stdout io.Writer, v any) error {
+	b, _ := json.MarshalIndent(v, "", "  ")
+	_, err := fmt.Fprintf(stdout, "%s\n", b)
+	return err
 }
 
 // keysRevoke withdraws one credential.

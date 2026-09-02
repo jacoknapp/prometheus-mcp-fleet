@@ -6,6 +6,7 @@ package mcptools
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -433,19 +434,21 @@ func TestFanoutRangeCommonStep(t *testing.T) {
 	}
 }
 
-// TestFanoutRangeStartFloorsToStepBoundary pins the exact floor-alignment
+// TestFanoutRangeStartAlignsUpToStepBoundary pins the exact alignment
 // arithmetic, distinct from TestFanoutRangeCommonStep's own alignment check:
 // that test's "now-10m"/"now" bounds are already second-aligned (testNow has
-// zero seconds), so start%step is already 0 there and an ARITHMETIC_BASE
-// mutation turning "start.Unix() - start.Unix()%step" into
-// "start.Unix() + start.Unix()%step" would be a no-op and go undetected. Here
-// the requested start (11:50:07) is deliberately 7 seconds off the 30s step
-// grid, so the two formulas floor to different seconds and only the correct
-// one lands on :50:00.
-func TestFanoutRangeStartFloorsToStepBoundary(t *testing.T) {
+// zero seconds), so start%step is already 0 there and any mutation of the
+// rounding would be a no-op and go undetected. Here the requested start
+// (11:50:07) is deliberately 7 seconds off the 30s grid, so rounding up,
+// rounding down and not rounding all land on different seconds and only
+// the correct one hits :50:30.
+//
+// Up, not down: the step is the caller's and unbounded, so a start rounded
+// down could land anywhere behind the window the lookback check approved.
+func TestFanoutRangeStartAlignsUpToStepBoundary(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
-	wantStart, err := time.Parse(time.RFC3339, "2026-08-29T11:50:00Z")
+	wantStart, err := time.Parse(time.RFC3339, "2026-08-29T11:50:30Z")
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -461,9 +464,60 @@ func TestFanoutRangeStartFloorsToStepBoundary(t *testing.T) {
 			"TestFanoutRangeCommonStep)", out.StepSeconds)
 	}
 	if out.Start != wantStart.Unix() {
-		t.Errorf("start = %d (%s), want %d (%s), the requested start floored down to "+
-			"the 30s grid, not up past it and not left unaligned",
+		t.Errorf("start = %d (%s), want %d (%s), the requested start rounded up to "+
+			"the 30s grid, not down behind it and not left unaligned",
 			out.Start, time.Unix(out.Start, 0).UTC(), wantStart.Unix(), wantStart)
+	}
+}
+
+// TestFanoutRangeStepCannotReachPastLookback is the bypass the alignment
+// direction exists to close. A principal confined to the last hour asks for
+// the last 30 minutes with a 720-hour step; rounding start down to that
+// step's grid used to send upstream a start weeks behind the limit, one
+// sample of which every cluster then returned. The start sent upstream must
+// stay inside the requested window, and a step wider than the window
+// collapses it to its end rather than reaching outside it.
+func TestFanoutRangeStepCannotReachPastLookback(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	tight := principal(fullScope())
+	tight.Scope.Limits.MaxLookback = fleet.Duration(time.Hour)
+	out, terr := h.tools.fanoutQuery(ctx(t), tight, FanoutQueryIn{
+		Query: "up", Clusters: connectedClusters, Mode: FanoutRange,
+		Start: "now-30m", End: "now", Step: "720h", MaxSeriesPerCluster: 5,
+	})
+	if terr != nil {
+		t.Fatalf("fanoutQuery: %v", terr)
+	}
+	sent := h.prom.lastForm(promapi.EndpointQueryRange)
+	secs, err := strconv.ParseFloat(sent["start"][0], 64)
+	if err != nil {
+		t.Fatalf("start sent upstream %q: %v", sent["start"][0], err)
+	}
+	startSent := time.Unix(int64(secs), 0).UTC()
+	if startSent.Before(testNow.Add(-30 * time.Minute)) {
+		t.Fatalf("start sent upstream = %s, behind the requested now-30m (%s): the step "+
+			"alignment reached outside the lookback-checked window",
+			startSent, testNow.Add(-30*time.Minute))
+	}
+	if startSent.After(testNow) {
+		t.Fatalf("start sent upstream = %s is after end %s", startSent, testNow)
+	}
+	if out.Start != startSent.Unix() {
+		t.Errorf("reported start %d != start sent upstream %d", out.Start, startSent.Unix())
+	}
+}
+
+// TestAlignUp pins the epoch arithmetic on both sides of a boundary.
+func TestAlignUp(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ in, want int64 }{
+		{0, 0}, {1, 30}, {29, 30}, {30, 30}, {31, 60},
+	} {
+		got := alignUp(time.Unix(tc.in, 0), 30*time.Second).Unix()
+		if got != tc.want {
+			t.Errorf("alignUp(%d, 30s) = %d, want %d", tc.in, got, tc.want)
+		}
 	}
 }
 
@@ -1097,4 +1151,117 @@ func syntheticVector(t *testing.T, n int) []byte {
 		t.Fatalf("marshal synthetic vector: %v", err)
 	}
 	return body
+}
+
+// TestFanoutInstantHonoursPrincipalLimits pins the principal's ceilings on the
+// instant path: maxLookback, which range mode already got through
+// resolveRange, and maxSeries, which caps each cluster's contribution.
+func TestFanoutInstantHonoursPrincipalLimits(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	tight := principal(fullScope())
+	tight.Scope.Limits.MaxLookback = fleet.Duration(time.Hour)
+	tight.Scope.Limits.MaxSeries = 1
+
+	_, terr := h.tools.fanoutQuery(ctx(t), tight, FanoutQueryIn{
+		Query: "up", Clusters: connectedClusters, Time: "now-2h",
+	})
+	if terr == nil || terr.Code != CodeRangeTooLarge {
+		t.Fatalf("terr = %v, want RANGE_TOO_LARGE from the principal's lookback", terr)
+	}
+	if len(h.prom.calls) != 0 {
+		t.Error("a refused lookback still contacted clusters")
+	}
+
+	out, terr := h.tools.fanoutQuery(ctx(t), tight, FanoutQueryIn{
+		Query: "up", Clusters: connectedClusters, MaxSeriesPerCluster: 5,
+	})
+	if terr != nil {
+		t.Fatalf("fanoutQuery: %v", terr)
+	}
+	if len(out.Rows) != 2 {
+		t.Errorf("rows = %d, want one per cluster under the principal's maxSeries of 1", len(out.Rows))
+	}
+	if out.Truncated == nil || out.Truncated.Reason != render.ReasonMaxSeries {
+		t.Errorf("truncation = %+v, want the series cap reported", out.Truncated)
+	}
+}
+
+// TestFanoutRangeHonoursPrincipalMaxPoints: the point budget widens the shared
+// step the way query_range's does.
+func TestFanoutRangeHonoursPrincipalMaxPoints(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.prom.set(string(promapi.EndpointQueryRange), fakeResponse{
+		body: syntheticMatrix(t, 1, 10, testNow.Add(-10*time.Minute), time.Minute),
+	})
+	tight := principal(fullScope())
+	tight.Scope.Limits.MaxPoints = 5
+	out, terr := h.tools.fanoutQuery(ctx(t), tight, FanoutQueryIn{
+		Mode: FanoutRange, Query: "up", Clusters: connectedClusters, Start: "now-10m", Step: "1s",
+	})
+	if terr != nil {
+		t.Fatalf("fanoutQuery: %v", terr)
+	}
+	step := h.prom.lastForm(promapi.EndpointQueryRange)["step"]
+	if len(step) != 1 || step[0] == "1s" {
+		t.Errorf("step sent upstream = %v, want the 1s request widened to fit 5 points", step)
+	}
+	if out.Downsampled == nil || out.Downsampled.AppliedStep == "1s" {
+		t.Errorf("downsampled = %+v, want the widening reported", out.Downsampled)
+	}
+}
+
+// TestFanoutResultTypes covers what the merge does with each result type an
+// instant expression can produce. A scalar is one unlabelled row per cluster;
+// a string has no merge; a matrix in instant mode is the agent's own mistake
+// and says so per cluster rather than as "every cluster returned garbage".
+func TestFanoutResultTypes(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		body     string
+		wantRows int
+		wantCode string
+	}{
+		{"scalar", `{"status":"success","data":{"resultType":"scalar","result":[1756468807,"42"]}}`, 2, ""},
+		{"scalar malformed", `{"status":"success","data":{"resultType":"scalar","result":["nope"]}}`, 0, CodeMalformedUpstream},
+		{"string", `{"status":"success","data":{"resultType":"string","result":[1756468807,"hello"]}}`, 0, CodeInvalidArgument},
+		{"matrix in instant mode", `{"status":"success","data":{"resultType":"matrix","result":[]}}`, 0, CodeInvalidArgument},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t)
+			h.prom.set(string(promapi.EndpointQuery), fakeResponse{body: []byte(tc.body)})
+			out, terr := h.tools.fanoutQuery(ctx(t), h.p, FanoutQueryIn{
+				Query: "x", Clusters: connectedClusters,
+			})
+			if tc.wantCode == "" {
+				if terr != nil {
+					t.Fatalf("fanoutQuery: %v", terr)
+				}
+				if len(out.Rows) != tc.wantRows {
+					t.Fatalf("rows = %v, want %d", out.Rows, tc.wantRows)
+				}
+				if labels, _ := out.Rows[0][2].(map[string]string); len(labels) != 0 {
+					t.Errorf("a scalar row carries labels: %v", out.Rows[0])
+				}
+				return
+			}
+			if terr == nil || terr.Code != CodeAllClustersFailed {
+				t.Fatalf("terr = %v, want ALL_CLUSTERS_FAILED", terr)
+			}
+			first, _ := terr.Input["firstFailure"].(map[string]any)
+			if first["code"] != tc.wantCode {
+				t.Errorf("first failure = %v, want code %s", first, tc.wantCode)
+			}
+			if terr.Retryable == nil || *terr.Retryable {
+				t.Error("a permanent per-cluster failure was reported as retryable")
+			}
+			if !strings.Contains(terr.Hint, "permanent") {
+				t.Errorf("hint = %q, want it to say the failures are permanent", terr.Hint)
+			}
+		})
+	}
 }

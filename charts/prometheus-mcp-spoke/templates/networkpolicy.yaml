@@ -128,9 +128,27 @@ spec:
     {{- if .Values.networkPolicy.egress.kubeAPI.enabled }}
     # The Kubernetes API server, for the identity Secret. Pointless unless
     # identity.backend is "secret", but harmless and one less thing to forget.
+    # Every port in the list is allowed, because the Service port (443) and
+    # the endpoint port the CNI actually sees after DNAT (often 6443) are not
+    # the same number.
+    {{- /* Normalised to int first: Helm hands YAML numbers over as float64 and `has` would never match. */}}
+    {{- $ports := list }}
+    {{- range .Values.networkPolicy.egress.kubeAPI.ports }}
+    {{- $ports = append $ports (int .) }}
+    {{- end }}
+    {{- with .Values.networkPolicy.egress.kubeAPI.port }}
+    {{- if not (has (int .) $ports) }}
+    {{- $ports = append $ports (int .) }}
+    {{- end }}
+    {{- end }}
+    {{- if not $ports }}
+    {{- fail "prometheus-mcp-spoke: networkPolicy.egress.kubeAPI.enabled is true but networkPolicy.egress.kubeAPI.ports is empty; the rule would allow nothing and the spoke could not reach its identity Secret." }}
+    {{- end }}
     - ports:
-        - port: {{ .Values.networkPolicy.egress.kubeAPI.port }}
+        {{- range $ports }}
+        - port: {{ int . }}
           protocol: TCP
+        {{- end }}
     {{- end }}
     {{- with .Values.networkPolicy.egress.extraRules }}
     {{- toYaml . | nindent 4 }}

@@ -340,7 +340,9 @@ One PromQL across many clusters.
 | `query`* | — | Validated once at the hub before dispatch |
 | `clusters` / `labelSelector` | — | **One is required** |
 | `mode` | `instant` | `instant` · `range` |
-| `start` / `end` | `now` / `now` | Range mode |
+| `time` | `now` | Instant mode. Relative (`now-15m`) or RFC 3339 |
+| `start` / `end` | `now-1h` / `now` | Range mode. Relative or RFC 3339 |
+| `step` | chosen by the hub | Range mode. Omit for one step common to every cluster; the applied step is reported in `downsampled` |
 | `maxClusters` | `25` | |
 | `maxSeriesPerCluster` | `5` | Lower than single-cluster on purpose |
 | `concurrency` | `8` | Max 32 |
@@ -367,15 +369,35 @@ Calling this with neither `clusters` nor `labelSelector` against a large fleet
 returns `NO_SELECTOR_TOO_BROAD`. An untargeted hundred-cluster range query
 should be hard to do by accident.
 
+**Result types.** In instant mode a vector merges one row per series; a scalar
+(`scalar(...)`, `time()`, a bare number) merges as one unlabelled row per
+cluster; a range-vector selector (`up[5m]`) is refused per cluster with
+`INVALID_ARGUMENT` pointing at mode `range`; a string-valued expression has no
+fleet-wide merge and is refused the same way. In range mode every cluster's
+matrix is merged, and the start is aligned **up** to the step boundary so the
+first sample never lands before the requested `start`.
+
+**When every cluster fails** the call returns `ALL_CLUSTERS_FAILED` instead of
+an empty success. Its `input.firstFailure` carries the first cluster's
+`cluster`, `code` and `message`, the message repeats them, and `retryable` is
+true only if at least one failure was (a timeout, an unreachable spoke). A
+permanent failure everywhere — usually the expression itself — comes with the
+hint to fix the arguments rather than retry.
+
 ## Errors
 
 Two kinds, and the distinction matters.
 
 **Protocol errors** (JSON-RPC `error`) mean the request never really happened:
-unknown tool, schema-invalid arguments, authentication failure, or a scope that
-forbids the tool (`FORBIDDEN`, JSON-RPC code -32003). Authentication and
-authorization failures are deliberately never a tool result — an agent that saw
-one as a tool error would try to "fix" it by editing its PromQL.
+unknown tool, authentication failure, or a scope that forbids the tool
+(`FORBIDDEN`, JSON-RPC code -32003). Authentication and authorization failures
+are deliberately never a tool result — an agent that saw one as a tool error
+would try to "fix" it by editing its PromQL.
+
+Arguments that fail the tool's input schema are **not** a protocol error. The
+MCP SDK answers them with an `isError: true` tool result whose text starts
+`validating "arguments":` and names the offending field, so the model can
+correct the call in one turn; the tool itself never runs.
 
 **Tool errors** (`isError: true`) are facts about the world, and are written so
 a model can self-correct in one turn:
@@ -398,11 +420,30 @@ a model can self-correct in one turn:
 | `RANGE_TOO_LARGE` | Includes a corrected argument object to copy | Use it |
 | `RESPONSE_TOO_LARGE` | Response exceeded the byte budget | Raise `step`, narrow the selector |
 | `HUB_BUSY` | A hub concurrency or memory budget is exhausted | Retryable; back off |
+| `RATE_LIMITED` | This key's own `rateRps` allowance is spent; the message says when to retry | Retryable; wait the stated interval |
 | `QUERY_TIMEOUT` | Upstream took too long | Narrow the range |
 | `TSDB_STATS_UNAVAILABLE` | Endpoint disabled upstream | Use `count by(__name__)` |
 | `NO_SELECTOR_TOO_BROAD` | Untargeted fan-out refused | Add `clusters` or `labelSelector` |
+| `NO_CLUSTERS_MATCHED` | The selector matched nothing this key can reach | Loosen the selector; `list_clusters` |
+| `ALL_CLUSTERS_FAILED` | Every selected cluster failed; `input.firstFailure` names the first | Retryable only if some failure was; otherwise fix the query |
+| `INVALID_ARGUMENT` | An argument the hub refused before any upstream call, e.g. a range-vector selector on `query`, format `json` under a scope cap | Follow the `hint` |
+| `INVALID_TIME` | A `time`, `start`, `end`, `step` or `timeout` that did not parse | Use `now-15m`, RFC 3339 or a Unix timestamp |
+| `BAD_MATCHER` | A malformed series selector | Fix the selector |
+| `BAD_REGEX` | A malformed RE2 pattern | Fix the pattern |
+| `PROMQL_EXEC` | Parsed, but Prometheus could not evaluate it | Read the message; usually the query, sometimes the data |
+| `UPSTREAM_ERROR` | The cluster's Prometheus, or the tunnel to it, failed some other way | Retryable |
+| `MALFORMED_UPSTREAM` | The reply was not the Prometheus API envelope | Check what `prometheus.url` points at; not retryable |
+| `CANCELED` | The caller abandoned the call before it finished | Nothing; it was you |
 
 (`FORBIDDEN` is a protocol error, not a row here — see above.)
+
+The key's rate limit is reported differently per channel, on purpose. A tool
+call over the allowance gets the `RATE_LIMITED` tool result above, because a
+model driving tools reads tool results and honours `retryable`. A resource
+read (`resources/read`) over the same allowance gets a JSON-RPC error with code
+-32005, because resource reads have no result body in which to carry a
+structured error, and clients treat a failed read as a failed read rather than
+as content. Both draw from the same per-key bucket.
 
 Every error carries `retryable: true|false`. Honour it — that flag alone
 prevents most retry-loop pathologies.

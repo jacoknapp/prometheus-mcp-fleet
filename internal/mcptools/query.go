@@ -80,6 +80,9 @@ func (t *Tools) query(
 	if terr != nil {
 		return nil, terr
 	}
+	if terr := refuseRawUnderLimits(format, p, false); terr != nil {
+		return nil, terr
+	}
 	if terr := validateExpr(in.Query, in.Cluster); terr != nil {
 		return nil, terr
 	}
@@ -91,7 +94,7 @@ func (t *Tools) query(
 	if at.IsZero() {
 		at = now
 	}
-	if terr := t.checkLookback(p, at, in.Cluster, map[string]any{
+	if terr := t.checkLookback(p, at, map[string]any{
 		"cluster": in.Cluster, "query": render.ClipRunes(in.Query, 512), "time": in.Time,
 	}); terr != nil {
 		return nil, terr
@@ -279,6 +282,9 @@ func (t *Tools) queryRange(
 	if terr != nil {
 		return nil, terr
 	}
+	if terr := refuseRawUnderLimits(format, p, true); terr != nil {
+		return nil, terr
+	}
 	if terr := validateExpr(in.Query, in.Cluster); terr != nil {
 		return nil, terr
 	}
@@ -459,9 +465,7 @@ func (t *Tools) resolveRange(
 
 // checkLookback refuses an instant query reaching further back than the hub or
 // the principal permits.
-func (t *Tools) checkLookback(
-	p *fleet.Principal, at time.Time, cluster string, echo map[string]any,
-) *ToolError {
+func (t *Tools) checkLookback(p *fleet.Principal, at time.Time, echo map[string]any) *ToolError {
 	limit := t.lookbackLimit(p)
 	age := t.now().Sub(at)
 	if age <= limit {
@@ -475,7 +479,6 @@ func (t *Tools) checkLookback(
 		WithInput(echo).
 		WithHint("Use the corrected arguments.")
 	e.Corrected = corrected
-	_ = cluster
 	return e
 }
 

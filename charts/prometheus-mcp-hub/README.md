@@ -1,7 +1,7 @@
 
 # prometheus-mcp-hub
 
-![Version: 0.4.0](https://img.shields.io/badge/Version-0.4.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.9.0](https://img.shields.io/badge/AppVersion-0.9.0-informational?style=flat-square)
+![Version: 0.5.0](https://img.shields.io/badge/Version-0.5.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.10.0](https://img.shields.io/badge/AppVersion-0.10.0-informational?style=flat-square)
 
 MCP server that gives AI agents Prometheus capability across a fleet of Kubernetes clusters, terminating WebSocket tunnels dialled out by prometheus-mcp-spoke through a standard Ingress.
 
@@ -22,11 +22,17 @@ helm install hub oci://ghcr.io/jacoknapp/prometheus-mcp-fleet/charts/prometheus-
   --namespace prometheus-mcp --create-namespace \
   --set ingress.enabled=true \
   --set ingress.className=nginx \
-  --set ingress.host=hub.example.com \
-  --set ingress.enabled=true \
   --set ingress.host=mcp.example.com \
-  --set config.publicURL=https://mcp.example.com
+  --set ingress.tls.enabled=true \
+  --set ingress.tls.secretName=mcp-tls
 ```
+
+`config.publicURL` (`PMF_PUBLIC_URL`, the canonical `https://<host>/mcp`) is
+derived from the Ingress host when it is left empty and the Ingress terminates
+TLS, as above. Set it yourself when the published hostname is not
+`ingress.host` or TLS ends somewhere the chart cannot see, and expect the
+render to be refused when there is neither: the binary will not start without
+one, and the chart will not invent a plaintext URL for it.
 
 ## There is no database and no PersistentVolumeClaim
 
@@ -325,9 +331,9 @@ Kubernetes: `>=1.28.0-0`
 | config.maxResponseBytes | int | `33554432` | `PMF_MAX_RESPONSE_BYTES`. Maximum bytes accepted from one upstream response. |
 | config.maxSpokes | int | `0` | `PMF_MAX_SPOKES`. Optional cap on concurrent spoke sessions on one hub replica. `0`, the default, means no limit. A cap here refuses spokes rather than shedding load: it is applied before the WebSocket upgrade, so an over-limit spoke gets a 503 and its cluster silently never joins, which looks like a missing cluster rather than a limit being hit. It also counts sessions and not clusters — a cluster running several spoke pods holds one per pod — so any number picked for a cluster count is wrong by that multiple. Set it only as a deliberate resource guard. |
 | config.pprofEnabled | bool | `false` | `PMF_PPROF_ENABLED`. Exposes `/debug/pprof` on the admin listener. |
-| config.publicURL | string | `""` | `PMF_PUBLIC_URL`. Canonical external MCP URL, used for the OAuth protected-resource-metadata document. Set this to whatever your Ingress publishes. |
-| config.queryTimeout | string | `"30s"` | `PMF_QUERY_TIMEOUT`. Instant and metadata query deadline. |
-| config.rangeQueryTimeout | string | `"120s"` | `PMF_RANGE_QUERY_TIMEOUT`. Range query deadline. |
+| config.publicURL | string | `""` | `PMF_PUBLIC_URL`. Canonical external MCP URL, `https://<host>/mcp`, published as the `resource` of the OAuth protected-resource-metadata document the 401 challenge points at. The binary refuses to start without one. Empty derives `https://<ingress.host>/mcp` when `ingress.enabled` and `ingress.tls.enabled` are both true; otherwise the chart refuses to render rather than ship a Deployment that CrashLoops on startup validation, or a plaintext URL that enrollment tokens would then be sent over. Set it explicitly when the published hostname differs from `ingress.host` (a load balancer or gateway in front), or when TLS really is terminated somewhere the chart cannot see. |
+| config.queryTimeout | string | `"30s"` | `PMF_QUERY_TIMEOUT`. Deadline for a call that states none (metadata and selector lookups). Instant queries default to 30s and range queries to 60s at the tool layer. |
+| config.rangeQueryTimeout | string | `"120s"` | `PMF_RANGE_QUERY_TIMEOUT`. Ceiling every per-call deadline is clamped to. The tool layer caps callers at 120s, so a larger value changes nothing; a smaller one tightens every tool. |
 | config.renewGrace | string | `"720h"` | `PMF_RENEW_GRACE`. How long after a spoke certificate expires the hub will still renew it, given proof the spoke still holds the private key. A spoke renews at half its certificate's life, so an expired certificate means the cluster was unreachable for half a lifetime; without this it is locked out permanently, because `/renew` refuses the expired certificate and its enrollment token was burned at install. Nothing else is relaxed: the chain must still verify, the certificate must not be revoked, and the possession proof must still pass. Set to `0` to require an unexpired certificate. |
 | config.shutdownDrainDelay | string | `"5s"` | `PMF_SHUTDOWN_DRAIN_DELAY`. Time `/readyz` reports 503 before work stops, so load balancers notice. |
 | config.shutdownGrace | string | `"30s"` | `PMF_SHUTDOWN_GRACE`. Graceful shutdown budget for in-flight work. |
@@ -421,7 +427,8 @@ Kubernetes: `>=1.28.0-0`
 | networkPolicy.egress.allowKubeAPI | bool | `true` | Allow egress to the Kubernetes API server. Required whenever `state.backend` is `secret`. |
 | networkPolicy.egress.enabled | bool | `true` | Restrict hub egress. On by default now that the hub talks to a known, small set: DNS, the Kubernetes API for its state Secret, and optionally an OTLP collector. |
 | networkPolicy.egress.extraRules | list | `[]` | Raw additional `egress` rules, appended verbatim. |
-| networkPolicy.egress.kubeAPIPort | int | `443` | Port of the Kubernetes API server for the egress rule. |
+| networkPolicy.egress.kubeAPIPort | string | `nil` | Deprecated, superseded by `kubeAPIPorts`. A single extra port to allow, appended to the list when set. |
+| networkPolicy.egress.kubeAPIPorts | list | `[443,6443]` | Ports of the Kubernetes API server for the egress rule. Both defaults matter: the pod dials `kubernetes.default.svc:443`, but most CNIs evaluate egress policy AFTER kube-proxy has DNATed that to the real API server endpoint, which kubeadm, k3s, RKE2 and most managed control planes serve on 6443. A rule for 443 alone then drops every state Secret read and the hub cannot start. Trim to the one your cluster uses if you know it. |
 | networkPolicy.enabled | bool | `true` | Render a NetworkPolicy. On by default: the hub terminates connections from outside the cluster and holds a CA. |
 | networkPolicy.labels | object | `{}` | Extra labels for the NetworkPolicy. |
 | networkPolicy.mcp.allowAll | bool | `false` | Allow ingress to the MCP port from any source. Use when your Ingress controller's identity cannot be expressed as a selector. Leave it false. This one rule is the hub's whole inbound story: SPOKE TUNNELS arrive here too, on the same port, from the same Ingress controller, so there is no separate tunnel rule to open. Restricting the port to the controller is defence in depth — the hub authenticates every spoke itself, inside the connection — but it is still right, and if you narrow it, narrow it to the CONTROLLER and never to the agents alone or you cut off every spoke in the fleet. |
@@ -449,7 +456,7 @@ Kubernetes: `>=1.28.0-0`
 | rbac.create | bool | `true` | Render the namespaced Role and RoleBinding that let the hub read and write its own state Secret. Nothing cluster-scoped is ever rendered by this chart. |
 | rbac.extraSecretNames | list | `[]` | Extra `resourceNames` appended to the name-restricted Secret rule. Use only if you point `PMF_STATE_SECRET_NAME` elsewhere through `extraEnv`. |
 | readinessProbe.enabled | bool | `true` | Enable the readiness probe. It targets `/readyz`, which does check dependencies. |
-| readinessProbe.failureThreshold | int | `3` | Failure threshold. |
+| readinessProbe.failureThreshold | int | `3` | Failure threshold. `/readyz` reflects a state-store probe that runs every 15 seconds, so one failed probe holds the replica not-ready for at least 15 seconds; at the default period that is two kubelet failures. Keep this at 2 or more, or a single API-server blip removes the replica from the Endpoints. |
 | readinessProbe.initialDelaySeconds | int | `0` | Initial delay. |
 | readinessProbe.periodSeconds | int | `10` | Probe period. |
 | readinessProbe.successThreshold | int | `1` | Success threshold. |

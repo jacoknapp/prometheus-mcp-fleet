@@ -4,6 +4,9 @@ suite: hub pod and container hardening
 templates:
   - templates/deployment.yaml
   - templates/configmap.yaml
+# PMF_PUBLIC_URL is required; the chart refuses to render without it.
+set:
+  config.publicURL: https://mcp.example.com/mcp
 tests:
   - it: keeps the whole securityContext through a render with unrelated overrides set
     template: templates/deployment.yaml

@@ -14,6 +14,9 @@ suite: hub cert-manager integration
 templates:
   - templates/certificate.yaml
   - templates/ingress.yaml
+# PMF_PUBLIC_URL is required; the chart refuses to render without it.
+set:
+  config.publicURL: https://mcp.example.com/mcp
 tests:
   - it: renders nothing when certManager is disabled
     template: templates/certificate.yaml

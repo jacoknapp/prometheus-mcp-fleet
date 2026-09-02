@@ -185,6 +185,34 @@ func (t *Tools) readFiringAlerts(
 	clusters := t.clusters.Visible(p)
 	out := &FleetAlertsOut{Envelope: untrusted()}
 
+	// The same bounds fanout_query lives under. A resource read carries no
+	// arguments, so nothing an agent does can narrow it: without a cluster
+	// cap, a deadline and a token ceiling, one URI read was the single
+	// largest, longest and least bounded operation the hub would perform,
+	// and the one an agent reaches for first when asked "what is broken".
+	// Deterministic order, so the clusters that fall past the cap are the
+	// same ones on every read.
+	slices.SortFunc(clusters, func(a, b fleet.Cluster) int { return strings.Compare(a.ID, b.ID) })
+	cov := Coverage{Requested: len(clusters)}
+	if len(clusters) > MaxClustersCeiling {
+		for _, c := range clusters[MaxClustersCeiling:] {
+			cov.Failed++
+			out.Failed = append(out.Failed, ClusterFailure{
+				Cluster: c.ID,
+				Code:    CodeInvalidArgument,
+				Message: fmt.Sprintf("not read: this resource reads at most %d clusters", MaxClustersCeiling),
+			})
+		}
+		clusters = clusters[:MaxClustersCeiling]
+	}
+
+	// One overall budget and a per-cluster sub-deadline of half of it, as
+	// fanout_query does: a single unresponsive spoke must not hold the whole
+	// read to the budget's end.
+	fctx, cancel := context.WithTimeout(ctx, DefaultFanoutDeadline)
+	defer cancel()
+	perCluster := DefaultFanoutDeadline / 2
+
 	type entry struct {
 		cluster string
 		res     *AlertsOut
@@ -199,7 +227,9 @@ func (t *Tools) readFiringAlerts(
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			res, terr := t.alerts(ctx, p, AlertsIn{
+			cctx, cancel := context.WithTimeout(fctx, perCluster)
+			defer cancel()
+			res, terr := t.alerts(cctx, p, AlertsIn{
 				Cluster:            c.ID,
 				State:              AlertFiring,
 				IncludeAnnotations: true,
@@ -210,7 +240,6 @@ func (t *Tools) readFiringAlerts(
 	}
 	wg.Wait()
 
-	cov := Coverage{Requested: len(clusters)}
 	for _, e := range entries {
 		if e.err != nil {
 			cov.Failed++
@@ -243,7 +272,19 @@ func (t *Tools) readFiringAlerts(
 	out.Total = len(out.Alerts)
 	kept, trunc := render.TruncateItems(out.Alerts, MaxFleetAlerts,
 		"Use the alerts tool on one cluster, filtered by severity, for the full picture.")
-	out.Alerts = kept
+	// Then the token ceiling, which annotations -- included here because an
+	// alert without its summary is a name -- can reach well before the row
+	// cap does.
+	fitted, hit := render.FitTokens(kept, t.tokenCeiling, func(s []FleetAlert) any {
+		return &FleetAlertsOut{Alerts: s}
+	})
+	if hit {
+		trunc = trunc.Escalate(len(fitted), render.ReasonTokenCeiling,
+			fmt.Sprintf("The hub caps a result at about %d estimated tokens. Use the alerts "+
+				"tool on one cluster, filtered by severity, for the full picture.", t.tokenCeiling))
+		trunc.Total = out.Total
+	}
+	out.Alerts = fitted
 	out.Truncated = trunc
 	if cov.Complete {
 		out.Preamble = fmt.Sprintf("Complete result: all %d clusters answered.", cov.OK)

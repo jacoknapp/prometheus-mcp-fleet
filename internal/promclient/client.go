@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -52,7 +53,8 @@ const (
 	// hub can turn into a proper TIMEOUT tool error.
 	HopMargin = 250 * time.Millisecond
 
-	// DefaultTimeout bounds one upstream call when Config.Timeout is zero.
+	// DefaultTimeout is the ceiling on one upstream call when Config.Timeout
+	// is zero. The context deadline is the usual bound; see Config.Timeout.
 	DefaultTimeout = 30 * time.Second
 
 	// DefaultMaxResponseBytes bounds one upstream response body when
@@ -80,7 +82,10 @@ type Config struct {
 	// "http://prometheus-operated.monitoring.svc:9090". A path prefix
 	// ("http://gateway/prom") and a query prefix are both preserved.
 	BaseURL string
-	// Timeout bounds one upstream call. Defaults to [DefaultTimeout].
+	// Timeout is the ceiling on one upstream call. Defaults to
+	// [DefaultTimeout]. The context deadline the hub forwards down the tunnel
+	// is the usual bound; this only matters when that deadline is absent or
+	// longer, so it should sit above the hub's largest per-call timeout.
 	Timeout time.Duration
 	// BearerTokenFile is read on every request, not once at startup, because
 	// Kubernetes rotates projected service account tokens in place and a
@@ -106,6 +111,9 @@ type Config struct {
 	// budgeting. Defaults to time.Now. A test that injects a clock which does
 	// not track wall time must not also set a context deadline.
 	Clock func() time.Time
+	// Metrics receives one record per upstream round trip. Defaults to
+	// [NopMetrics].
+	Metrics Metrics
 }
 
 // Client is the spoke's connection to one Prometheus-compatible server.
@@ -119,6 +127,7 @@ type Client struct {
 	userAgent         string
 	log               *slog.Logger
 	now               func() time.Time
+	metrics           Metrics
 }
 
 // New validates cfg and returns a ready client. It performs no I/O beyond
@@ -167,6 +176,10 @@ func New(cfg Config) (*Client, error) {
 		userAgent:         cmpOrDefault(cfg.UserAgent, DefaultUserAgent),
 		log:               cfg.Logger,
 		now:               cfg.Clock,
+		metrics:           cfg.Metrics,
+	}
+	if c.metrics == nil {
+		c.metrics = NopMetrics{}
 	}
 	if c.log == nil {
 		c.log = slog.New(slog.DiscardHandler)
@@ -325,14 +338,46 @@ func (c *Client) roundTrip(ctx context.Context, route promapi.Route, labelName s
 		return nil, 0, nil, err
 	}
 
-	start := c.now()
-	resp, err := c.httpc.Do(httpReq)
-	latency := c.now().Sub(start)
+	resp, latency, err := c.send(route.Endpoint, httpReq)
 	if err != nil {
 		cancel()
 		return nil, 0, nil, fmt.Errorf("%w: %s: %w", ErrUpstream, route.Endpoint, err)
 	}
 	return resp, latency, cancel, nil
+}
+
+// send is the one place a request leaves for Prometheus, so it is the one
+// place the request is counted and timed. Every path -- the tunnel's Do, the
+// JSON helpers and the readiness probe -- funnels through it; instrumenting
+// the callers instead is how the spoke's request metrics went unwritten for
+// nine releases while the chart alerted on them.
+func (c *Client) send(endpoint promapi.Endpoint, req *http.Request) (*http.Response, time.Duration, error) {
+	start := c.now()
+	resp, err := c.httpc.Do(req)
+	latency := c.now().Sub(start)
+	c.metrics.PromDuration(endpoint, latency)
+	if err != nil {
+		c.metrics.PromRequest(endpoint, errorCode(req.Context(), err))
+		return nil, latency, err
+	}
+	c.metrics.PromRequest(endpoint, strconv.Itoa(resp.StatusCode))
+	return resp, latency, nil
+}
+
+// errorCode maps a transport failure onto the closed set of non-status
+// codes. Anything that is not a deadline or cancellation is CodeError: the
+// distinction that matters to the alert is "Prometheus answered slowly or
+// not at all" versus "Prometheus was never reached", and both are visible
+// in the error text the hub receives.
+func errorCode(ctx context.Context, err error) string {
+	if ctx.Err() != nil {
+		return CodeTimeout
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return CodeTimeout
+	}
+	return CodeError
 }
 
 // resolve builds the absolute upstream URL by assigning fields on a copy of
@@ -405,19 +450,20 @@ func (c *Client) setAuth(req *http.Request) error {
 // Neither path is reachable from the tunnel: Ping is called by the spoke's
 // readiness probe and by the facts collector, never by the hub.
 func (c *Client) Ping(ctx context.Context) error {
-	healthErr := c.probe(ctx, "/-/healthy")
+	healthErr := c.probe(ctx, EndpointHealthy, "/-/healthy")
 	if healthErr == nil {
 		return nil
 	}
-	buildErr := c.probe(ctx, "/api/v1/status/buildinfo")
+	buildErr := c.probe(ctx, promapi.EndpointBuildInfo, "/api/v1/status/buildinfo")
 	if buildErr == nil {
 		return nil
 	}
 	return fmt.Errorf("%w: ping: %w", ErrUpstream, errors.Join(healthErr, buildErr))
 }
 
-// probe issues a bare GET and reports whether the status was 2xx.
-func (c *Client) probe(ctx context.Context, path string) error {
+// probe issues a bare GET and reports whether the status was 2xx. endpoint
+// is only the label the call is counted under.
+func (c *Client) probe(ctx context.Context, endpoint promapi.Endpoint, path string) error {
 	callCtx, cancel, err := c.upstreamContext(ctx)
 	if err != nil {
 		return err
@@ -432,7 +478,7 @@ func (c *Client) probe(ctx context.Context, path string) error {
 	if err := c.setAuth(req); err != nil {
 		return err
 	}
-	resp, err := c.httpc.Do(req)
+	resp, _, err := c.send(endpoint, req)
 	if err != nil {
 		return fmt.Errorf("%s: %w", path, err)
 	}

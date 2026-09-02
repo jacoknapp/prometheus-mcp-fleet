@@ -23,12 +23,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/coder/websocket"
 
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/certproof"
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel/grpctun"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel/tunneltest"
 )
@@ -553,6 +555,9 @@ func TestHTTPClient(t *testing.T) {
 	if tr.TLSHandshakeTimeout != 10*time.Second {
 		t.Errorf("TLSHandshakeTimeout = %s, want 10s", tr.TLSHandshakeTimeout)
 	}
+	if !tr.DisableKeepAlives {
+		t.Error("keep-alives are enabled; a refused upgrade would park its connection in a pool nothing drains")
+	}
 
 	t.Run("no bundle uses the system pool without error", func(t *testing.T) {
 		t.Parallel()
@@ -906,4 +911,153 @@ func (r *slowReader) Read(p []byte) (int, error) {
 	p[0] = r.b[r.i]
 	r.i++
 	return 1, nil
+}
+
+// TestDialFailedUpgradeLeavesNoConnectionBehind pins what a refused upgrade
+// costs: nothing that outlives the call. Dial builds a transport per attempt,
+// and a transport that pools connections keeps the one the 403 arrived on --
+// with its two goroutines -- idle forever, because no later request will ever
+// reach that transport. A spoke locked out by a bad credential retries on a
+// backoff for as long as it runs, and before this each retry left another
+// open socket on the hub's Ingress.
+func TestDialFailedUpgradeLeavesNoConnectionBehind(t *testing.T) {
+	t.Parallel()
+
+	ca := newTestCA(t)
+	cert := ca.issue(t, "prod")
+
+	var open atomic.Int32
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	ts.Config.ConnState = func(_ net.Conn, st http.ConnState) {
+		switch st {
+		case http.StateNew:
+			open.Add(1)
+		case http.StateClosed, http.StateHijacked:
+			open.Add(-1)
+		case http.StateActive, http.StateIdle:
+			// Still the same connection; only its ends are counted.
+		}
+	}
+	ts.Start()
+	defer ts.Close()
+
+	const attempts = 5
+	for range attempts {
+		// No HTTPClient: the transport under test is the one Dial builds.
+		err := Dial(context.Background(), ClientConfig{
+			URL: "ws" + strings.TrimPrefix(ts.URL, "http"), Certificate: cert,
+			ClusterID: "prod", Logger: quiet(),
+		}, &tunneltest.EchoHandler{})
+		var de *grpctun.DialError
+		if !errors.As(err, &de) || de.Reason != grpctun.ReasonUpgradeRejected {
+			t.Fatalf("Dial() = %v, want a rejected upgrade", err)
+		}
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for open.Load() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of %d refused-upgrade connections are still open on the server", open.Load(), attempts)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestDialDefaultTransportCompletesTheUpgrade pins the success path of the
+// transport Dial builds when no HTTPClient is supplied. It runs with
+// DisableKeepAlives so a failed upgrade frees its socket, and net/http only
+// injects "Connection: close" on requests that are not protocol switches, so
+// the upgrade itself must still go through — over plaintext and over TLS —
+// and the hijacked connection must survive the transport's idle reaping.
+func TestDialDefaultTransportCompletesTheUpgrade(t *testing.T) {
+	t.Parallel()
+
+	for _, tlsOn := range []bool{false, true} {
+		name := "ws"
+		if tlsOn {
+			name = "wss"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			ca := newTestCA(t)
+			srv, err := NewServer(ServerConfig{
+				Verify: ca.verify, Logger: quiet(), ServerID: "hub-x",
+				Keepalive: grpctun.KeepaliveParams{Time: time.Minute, Timeout: 30 * time.Second, PermitWithoutStream: true},
+			})
+			if err != nil {
+				t.Fatalf("NewServer: %v", err)
+			}
+			mux := http.NewServeMux()
+			mux.Handle(DefaultPath, srv.Handler())
+			var (
+				ts     *httptest.Server
+				bundle []byte
+			)
+			if tlsOn {
+				ts = httptest.NewTLSServer(mux)
+				bundle = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ts.Certificate().Raw})
+			} else {
+				ts = httptest.NewServer(mux)
+			}
+			t.Cleanup(ts.Close)
+
+			sessions := make(chan tunnel.Session, 1)
+			sctx, scancel := context.WithCancel(context.Background())
+			serveErr := make(chan error, 1)
+			go func() {
+				serveErr <- srv.Listener().Serve(sctx, tunnel.SessionHandlerFunc(
+					func(_ context.Context, s tunnel.Session) (func(), error) {
+						sessions <- s
+						return nil, nil
+					}))
+			}()
+			t.Cleanup(func() {
+				scancel()
+				shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer shutCancel()
+				_ = srv.Listener().Shutdown(shutCtx)
+				<-serveErr
+			})
+
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() {
+				// No HTTPClient: the transport under test is the one Dial builds.
+				done <- Dial(ctx, ClientConfig{
+					URL:         "ws" + strings.TrimPrefix(ts.URL, "http") + DefaultPath,
+					Certificate: ca.issue(t, "prod"), ClusterID: "prod",
+					Logger: quiet(), CABundle: bundle, Generation: 1,
+				}, &tunneltest.EchoHandler{})
+			}()
+
+			var s tunnel.Session
+			select {
+			case s = <-sessions:
+			case err := <-done:
+				cancel()
+				t.Fatalf("Dial returned before a session was established: %v", err)
+			case <-time.After(20 * time.Second):
+				cancel()
+				t.Fatal("no session within 20s")
+			}
+			do := func(when string) {
+				t.Helper()
+				resp, err := s.Do(ctx, &tunnel.Request{Method: "GET", Path: "/api/v1/query", MaxResponseBytes: 1 << 20})
+				if err != nil {
+					t.Fatalf("Do %s: %v", when, err)
+				}
+				_, _ = io.Copy(io.Discard, resp.Body)
+				_ = resp.Body.Close()
+			}
+			do("right after the upgrade")
+			// Outlive any plausible idle-reaping of the hijacked connection.
+			time.Sleep(1500 * time.Millisecond)
+			do("after sitting idle")
+			cancel()
+			<-done
+		})
+	}
 }

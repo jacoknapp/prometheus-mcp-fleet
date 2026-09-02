@@ -14,8 +14,7 @@
 # Helm stores release values in a Secret that anyone with namespace read can
 # render with `helm get values`. The e2e job therefore reads the bootstrap
 # admin token out of the hub's own log, mints an agent key and an enrollment
-# token through the admin API, and reads the CA bundle from `GET /pki/bundle`.
-# Nothing credential-shaped belongs in this file.
+# token through the admin API. Nothing credential-shaped belongs in this file.
 # ---------------------------------------------------------------------------
 image:
   # `make images REGISTRY=localhost/prometheus-mcp-fleet` produces this name.

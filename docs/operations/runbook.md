@@ -125,7 +125,11 @@ curl -s localhost:9090/metrics | grep promfleet_hub_spokes_connected
 ```
 
 `/readyz` returns JSON listing each not-ready component and why. Read it before
-guessing.
+guessing. The `store` component is re-probed every 15 seconds after startup:
+it reports `the state document cannot be read: ...` when the state Secret is
+unreadable (a schema from a newer build, a corrupt document, an API server
+that stopped answering), and readiness returns on its own once a read
+succeeds. Fix the document or the API server; nothing needs a restart.
 
 ## PrometheusMCPHubDown
 
@@ -207,7 +211,7 @@ kubectl -n prometheus-mcp logs deploy/pmf-spoke --tail=50
 | Log line | Cause | Fix |
 |---|---|---|
 | `dial tcp: i/o timeout` | Egress to the hub is blocked | Check the NetworkPolicy and the cluster's egress firewall |
-| `x509: certificate signed by unknown authority` | The spoke does not trust the hub's CA | Re-supply `hub.caBundle`; fetch it from `GET /pki/bundle` |
+| `x509: certificate signed by unknown authority` | The spoke does not trust the certificate the hub's **Ingress** presents | Public issuer: leave `hub.caBundle` empty (system roots). Private issuer: supply that issuer's CA as `hub.caBundle` / `hub.existingCASecret`. Never the hub's `/pki/bundle`, which signs spoke identities and cannot verify the Ingress |
 | `x509: certificate has expired` | The spoke's own certificate lapsed | Nothing, usually: `/renew` accepts an expired certificate within `--renew-grace` (default 30 days), and the spoke's own renewal loop keeps retrying it automatically. Past that grace period `/renew` refuses it and the cluster needs a fresh enrollment token |
 | `auth-rejected` | The hub refused the handshake — usually a revoked certificate | Check the hub's audit log for the serial |
 | `upgrade-rejected` / `404` | The Ingress is not routing `/tunnel` | Fix the Ingress path |
@@ -237,8 +241,8 @@ that could not finish before the signer expires.
 | Phase | Signs | Trusted | Leaves when |
 |---|---|---|---|
 | `steady` | the one root | that root | the signer enters its last fifth, or you force it |
-| `publishing` | the **old** root | old + new | one full `--spoke-cert-ttl` has passed, so every spoke has renewed onto the two-root bundle and every replica has seen the successor |
-| `signing` | the **new** root | old + new | one `--spoke-cert-ttl` **plus** `--renew-grace`, padded by two poll intervals (a replica that lost the promotion race keeps signing with the old root until its next poll), has passed **and** no replica has seen a live session on the outgoing root recently |
+| `publishing` | the **old** root | old + new | one full `--spoke-cert-ttl` has passed, so every spoke has renewed onto the two-root bundle and every replica has seen the successor; or immediately if the signing root has already expired, since past that point no spoke can renew onto the outgoing bundle and waiting protects nothing |
+| `signing` | the **new** root | old + new | one `--spoke-cert-ttl` **plus** `--renew-grace`, padded by two poll intervals (a replica that lost the promotion race keeps signing with the old root until its next poll), has passed since promotion, measured against the values in force **when the successor was promoted** (recorded in Secret key `ca-rotation.retire-after`) or the current values if those are longer, **and** no replica has seen a live session on the outgoing root recently |
 | `steady` | the new root | that root | — |
 | `unknown` | whatever the Secret says | **everything present** — signer, successor, outgoing | never on its own: this build cannot interpret the recorded phase (usually a rollback mid-rotation, or a hand edit) and freezes rather than guessing. Roll forward to a build that knows the phase, or fix the `phase` key by hand |
 
@@ -301,15 +305,19 @@ kubectl -n $HUB_NS annotate secret pmf-hub-ca \
 
 The next poll — within `config.caRotationPollInterval`, five minutes by default
 — mints the successor, enters `publishing`, and consumes the annotation,
-recording `promfleet.io/rotate-accepted` in its place. It is edge triggered:
+recording `promfleet.io/rotate-accepted` in its place. If the Secret still
+carries leftovers from an interrupted rotation, the first poll discards those
+and the next one starts the rotation; the annotation survives the tidy-up. It
+is edge triggered:
 re-annotating starts nothing while a rotation is already under way, and the
 annotation is cleared rather than left to fire again months later.
 
 **Forcing does not make the rotation faster.** The gates are unchanged, because
 the thing they are waiting for — the fleet renewing — has not got any quicker.
 If a key is genuinely compromised, the annotation starts the clock; revoking
-the certificates issued under it (`DELETE /admin/v1/keys/...`, and the
-revocation store for spoke serials) is the part that acts immediately.
+the credentials issued under it (`hub keys revoke --kid` for agent and admin
+keys, `hub certs revoke --serial` for spoke certificates) is the part that
+acts immediately.
 
 ### What you should not do
 
@@ -396,9 +404,13 @@ Read the `code` label first; it tells you which layer is at fault.
 
 | Code | Layer | Likely cause |
 |---|---|---|
+| `forbidden` | Hub | The agent key's scope does not cover that cluster or tool. The call never left the hub. A steady trickle is an agent probing its limits; a spike after a key rotation means the new key was minted too narrow |
+| `invalid` | Hub | A parameter or endpoint the proxy refused before forwarding: a bad `step`, a malformed label name, an endpoint that is gated off or does not exist. Never reaches Prometheus |
 | `busy` | Hub | The per-cluster in-flight limit is saturated. An agent is fanning out too hard, or `--max-inflight-per-cluster` is too low for your workload |
 | `too_large` | Hub | Results exceed the byte budget. Usually an unbounded range query; the agent should get a hint telling it to raise `step` |
+| `timeout` | Hub or tunnel | The call hit `--query-timeout` / `--range-query-timeout`, or the agent went away first. Steady on one cluster points at a slow Prometheus there or a saturated tunnel; fleet-wide points at the hub's deadlines being too short for the workload |
 | `unavailable` | Tunnel | That spoke is disconnected — see the tunnel alert. **Or it holds a tunnel to only SOME hub replicas**, which is indistinguishable from here: check [PrometheusMCPSpokePartialCoverage](#prometheusmcpspokepartialcoverage) before concluding the cluster is down |
+| `upstream` | Tunnel or spoke | The tunnel was up but the round trip failed for a reason other than a status code: the tunnel dropped mid-call, the spoke could not reach its Prometheus, or the reply could not be decoded. Check the spoke's logs and `describe_cluster` for that cluster |
 | `4xx` | Prometheus | Bad PromQL from the agent. Expected at some rate; a spike suggests a model looping |
 | `5xx` | Prometheus | The upstream is unhealthy or overloaded. **Check whether your agents caused it** |
 
@@ -760,19 +772,27 @@ redistribute them. Nothing about the fleet's connectivity is affected.
 
 ### Everything is on fire and you need agents cut off now
 
-Revoking every agent key is a single loop against the admin API (there is no
-`hub keys list` or `hub keys revoke` CLI subcommand — only `enroll create` and
-`keys create` exist), and it takes effect within one cache TTL (60 seconds by
-default) because the revocation epoch invalidates every cached entry:
+Revoking every agent key is one loop over `hub keys list` and
+`hub keys revoke`, and it takes effect within one cache TTL (60 seconds by
+default) because the revocation epoch invalidates every cached entry. Use
+`keys list --json` rather than parsing the table: key names may contain
+spaces, so a column count is not a safe way to find the status. Select on
+`revoked` (a key that has merely expired is harmless to revoke again); the
+admin token file is the one the chart mounts from `adminToken.existingSecret`:
 
 ```bash
-kubectl -n $HUB_NS port-forward deploy/pmf-hub 9090:9090 &
-curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
-  'localhost:9090/admin/v1/keys?class=agt' |
-  jq -r '.keys[].kid' |
-  xargs -n1 -I{} curl -s -X DELETE -H "Authorization: Bearer $ADMIN_TOKEN" \
-    "localhost:9090/admin/v1/keys/{}?reason=incident"
+kubectl -n $HUB_NS exec deploy/pmf-hub -- \
+  hub keys list --class agent --json --admin-token-file /var/run/pmf/admin-token |
+  jq -r '.keys[] | select(.revoked | not) | .kid' |
+  while read -r kid; do
+    kubectl -n $HUB_NS exec deploy/pmf-hub -- \
+      hub keys revoke --kid "$kid" --reason incident \
+        --admin-token-file /var/run/pmf/admin-token
+  done
 ```
+
+The same data is on the admin API (`GET /admin/v1/keys?class=agt`, `DELETE
+/admin/v1/keys/<kid>?reason=...`) if you would rather port-forward and `curl`.
 
 This revokes **agent keys** (MCP access), not spoke certificates. Revoking a
 spoke's certificate is checked at handshake only — it does not tear down a

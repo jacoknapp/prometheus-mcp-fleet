@@ -18,6 +18,11 @@ const (
 	// DefaultPrometheusURL is the in-cluster service the Prometheus Operator
 	// creates.
 	DefaultPrometheusURL = "http://prometheus-operated.monitoring.svc:9090"
+	// DefaultPrometheusTimeout is the ceiling on one upstream request. It
+	// sits above the hub's default --range-query-timeout (120s) plus the hop
+	// margin the spoke reserves, so a default spoke never cuts short a query
+	// a default hub allowed. See Spoke.PrometheusTimeout.
+	DefaultPrometheusTimeout = 130 * time.Second
 	// DefaultIdentitySecretName is the Secret the spoke writes its issued key
 	// and certificate to, so a restart does not need a fresh enrollment token.
 	DefaultIdentitySecretName = "prometheus-mcp-fleet-identity"
@@ -45,9 +50,10 @@ type Spoke struct {
 	HubEndpoints []string
 	// HubAPIURL is the https base URL of the hub's enrollment listener.
 	HubAPIURL string
-	// HubCAFile is the trust bundle used to verify the hub's server
-	// certificate, which behind an Ingress is the Ingress's certificate. When
-	// empty the bundle returned by enrollment and cached in DataDir is used.
+	// HubCAFile is the CA bundle used to verify the hub's server certificate,
+	// which behind an Ingress is the Ingress's certificate. When empty the
+	// system roots are used. The spoke-identity CA that enrollment returns
+	// is not a candidate: it signs spoke certificates, not the hub's.
 	HubCAFile string
 	// HubTLSInsecure disables verification of the hub's server certificate.
 	// It exists only for bootstrapping a lab and is refused by Validate
@@ -117,9 +123,17 @@ type Spoke struct {
 
 	// PrometheusURL is the local Prometheus-compatible server.
 	PrometheusURL string
-	// PrometheusTimeout bounds one upstream request. It is deliberately below
-	// the hub's query timeout so the spoke fails first and returns a useful
-	// error instead of the hub timing out blind.
+	// PrometheusTimeout is the ceiling on one upstream request. The bound
+	// that normally applies is the hub's: every proxied call carries the
+	// hub's per-call deadline down the tunnel, and the spoke spends that
+	// less a hop margin, so it fails first and returns a structured error
+	// instead of the hub timing out blind. This ceiling only matters when
+	// the hub's deadline is longer, or absent. It therefore defaults ABOVE
+	// the hub's longest allowed query (--range-query-timeout, 120s): at the
+	// old 25s default it silently overrode every deadline the hub granted
+	// past 25s, so an agent's timeout of 60s, or the hub's 120s range
+	// budget, was never honoured and the spoke's error said the query was
+	// slow when it was the spoke that gave up.
 	PrometheusTimeout time.Duration
 	// PrometheusBearerTokenFile authenticates to Prometheus when it is behind
 	// an authenticating proxy.
@@ -170,7 +184,7 @@ func LoadSpoke(args []string, getenv func(string) string) (*Spoke, error) {
 
 	l.list(&c.HubEndpoints, "hub-endpoints", nil, "comma-separated hub tunnel URLs, e.g. wss://hub.example.com/tunnel")
 	l.str(&c.HubAPIURL, "hub-api-url", "", "https base URL of the hub's enrollment listener")
-	l.str(&c.HubCAFile, "hub-ca-file", "", "trust bundle for the hub; empty uses the bundle cached in <data-dir>")
+	l.str(&c.HubCAFile, "hub-ca-file", "", "CA bundle verifying the hub's Ingress certificate; empty uses the system roots")
 	l.boolean(&c.HubTLSInsecure, "hub-tls-insecure", false, "skip verification of the hub certificate; requires --allow-insecure")
 	l.boolean(&c.AllowInsecure, "allow-insecure", false, "permit the insecure options; never set this in production")
 	l.str(&c.EnrollmentTokenFile, "enrollment-token-file", "", "file holding the single-use enrollment token")
@@ -190,7 +204,7 @@ func LoadSpoke(args []string, getenv func(string) string) (*Spoke, error) {
 	l.str(&c.DataDir, "data-dir", DefaultDataDir, "directory holding the client key, certificate and hub trust bundle")
 
 	l.str(&c.PrometheusURL, "prometheus-url", DefaultPrometheusURL, "URL of the local Prometheus-compatible server")
-	l.duration(&c.PrometheusTimeout, "prometheus-timeout", 25*time.Second, "timeout for one upstream Prometheus request")
+	l.duration(&c.PrometheusTimeout, "prometheus-timeout", DefaultPrometheusTimeout, "ceiling on one upstream Prometheus request; the hub's per-call deadline is the usual bound, so keep this above the hub's --range-query-timeout")
 	l.str(&c.PrometheusBearerTokenFile, "prometheus-bearer-token-file", "", "file holding a bearer token for Prometheus")
 	l.str(&c.PrometheusTLSCAFile, "prometheus-tls-ca-file", "", "trust bundle for an https Prometheus")
 	l.boolean(&c.PrometheusTLSSkipVerify, "prometheus-tls-skip-verify", false, "skip verification of the Prometheus certificate; requires --allow-insecure")

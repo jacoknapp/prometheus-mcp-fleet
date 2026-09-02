@@ -824,8 +824,11 @@ func TestPostResponseHandling(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "enrollment already redeemed") {
 			t.Fatalf("error = %v, want it to carry the envelope message", err)
 		}
-		if !strings.Contains(err.Error(), "409") {
-			t.Errorf("error = %v, want it to carry the HTTP status", err)
+		// Exact: the raw-body fallback would also contain the message (it is
+		// in the JSON), so only the bare "status: message" shape proves the
+		// envelope was decoded rather than dumped.
+		if got, want := err.Error(), "409 Conflict: enrollment already redeemed"; got != want {
+			t.Errorf("error = %q, want %q", got, want)
 		}
 	})
 
@@ -1028,6 +1031,19 @@ func TestReportOutput(t *testing.T) {
 		}
 	})
 
+	t.Run("a token without labels reports no labels line", func(t *testing.T) {
+		t.Parallel()
+		m := wantMinted()
+		m.Key.Enrollment.Labels = nil
+		var stdout bytes.Buffer
+		if err := report(&stdout, m, false); err != nil {
+			t.Fatalf("report: %v", err)
+		}
+		if strings.Contains(stdout.String(), "labels:") {
+			t.Errorf("report output = %q, an unlabelled token must not print an empty labels line", stdout.String())
+		}
+	})
+
 	t.Run("single-use token reports no reusable line", func(t *testing.T) {
 		t.Parallel()
 		m := wantMinted()
@@ -1209,6 +1225,39 @@ func TestKeysListRendersStatusAndTarget(t *testing.T) {
 	}
 }
 
+// TestKeysListJSONIsTheAPIListing pins --json: a script selecting on
+// .revokedAt must see the admin API's own fields, not a re-projection that
+// could drift from them.
+func TestKeysListJSONIsTheAPIListing(t *testing.T) {
+	t.Parallel()
+
+	want := hubapi.KeyListResponse{Keys: keyViews(), Count: 4}
+	doer, _ := capturingDoer(jsonResponse(http.StatusOK, want))
+	var stdout bytes.Buffer
+	if err := Run(context.Background(), []string{"keys", "list", "--json"},
+		env(map[string]string{"PMF_ADMIN_TOKEN": "pmf_adm_x"}), &stdout, doer); err != nil {
+		t.Fatalf("keys list --json: %v", err)
+	}
+	var got hubapi.KeyListResponse
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, stdout.String())
+	}
+	if got.Count != want.Count || len(got.Keys) != len(want.Keys) {
+		t.Fatalf("decoded %d keys (count %d), want %d (count %d)", len(got.Keys), got.Count, len(want.Keys), want.Count)
+	}
+	for i := range want.Keys {
+		if got.Keys[i].KID != want.Keys[i].KID || got.Keys[i].Revoked != want.Keys[i].Revoked {
+			t.Errorf("key %d = %+v, want %+v", i, got.Keys[i], want.Keys[i])
+		}
+	}
+	if strings.Contains(stdout.String(), "STATUS") {
+		t.Error("--json still printed the table header")
+	}
+	if !strings.HasSuffix(stdout.String(), "\n") {
+		t.Error("--json output does not end in a newline")
+	}
+}
+
 // TestKeysListFiltersByClass pins the query the filter builds, since a typo
 // there would silently list everything.
 func TestKeysListFiltersByClass(t *testing.T) {
@@ -1365,6 +1414,26 @@ func TestKeysRotate(t *testing.T) {
 		}
 		if !strings.Contains(stdout.String(), "pmf_agt_new") {
 			t.Errorf("the replacement token was not printed: %q", stdout.String())
+		}
+	})
+
+	t.Run("no-expiry alone is sent as such", func(t *testing.T) {
+		t.Parallel()
+		doer, cap := capturingDoer(jsonResponse(http.StatusCreated, hubapi.MintedKeyResponse{
+			Key: hubapi.KeyView{KID: "agent0009", Class: fleet.ClassAgent}, Token: "pmf_agt_new",
+		}))
+		var stdout bytes.Buffer
+		if err := Run(context.Background(),
+			[]string{"keys", "rotate", "--kid=agent0001", "--no-expiry"},
+			env(map[string]string{"PMF_ADMIN_TOKEN": "pmf_adm_x"}), &stdout, doer); err != nil {
+			t.Fatalf("keys rotate: %v", err)
+		}
+		var body rotateBody
+		if err := json.Unmarshal(cap.body, &body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		if !body.NoExpiry || body.TTL != 0 {
+			t.Errorf("body = %+v, want noExpiry with no ttl", body)
 		}
 	})
 

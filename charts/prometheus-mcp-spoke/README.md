@@ -1,7 +1,7 @@
 
 # prometheus-mcp-spoke
 
-![Version: 0.4.0](https://img.shields.io/badge/Version-0.4.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.9.0](https://img.shields.io/badge/AppVersion-0.9.0-informational?style=flat-square)
+![Version: 0.5.0](https://img.shields.io/badge/Version-0.5.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.10.0](https://img.shields.io/badge/AppVersion-0.10.0-informational?style=flat-square)
 
 Tiny outbound-only agent that dials the prometheus-mcp-hub over an authenticated WebSocket and proxies this cluster's Prometheus HTTP API. One namespaced Role over one Secret, or no RBAC at all in memory identity mode.
 
@@ -150,10 +150,13 @@ or `hub.existingCASecret` supplies the trust bundle for the **hub's server certi
 the one its Ingress terminates, on both `hub.endpoints` and `hub.apiUrl`. It is not
 client-certificate material and has nothing to do with this spoke's own identity, which
 comes from enrollment. If the hub's Ingress serves a publicly trusted certificate you do not
-need either value; they exist for a private CA. Supply it **out of band**: the hub is in a
-different cluster, so nothing here vouches for it on first enrollment. With neither set the
-spoke accepts the bundle the hub returns at enrollment and caches it — trust on first use,
-which is fine on a trusted path and not fine on the open internet.
+need either value; they exist for a private CA, and then the content is **that issuer's**
+CA certificate, supplied out of band because the hub is in a different cluster and nothing
+here vouches for it on first enrollment. With neither set the spoke verifies against the
+image's system roots. There is no trust-on-first-use and no fallback to the bundle the hub
+returns at enrollment: that bundle is the CA that signs spoke *identities*, it never signed
+the Ingress certificate, and pointing `hub.caBundle` at it fails every dial with
+`certificate signed by unknown authority`.
 
 `hub.tlsInsecure` and `prometheus.tls.skipVerify` each require `hub.allowInsecure` as well.
 Two independent settings mean an insecure spoke cannot be reached by a single typo.
@@ -226,7 +229,9 @@ its firewall.
    not close the connection while idle. The tunnel pings every 10 seconds, so any idle
    timeout above ~30 seconds is fine.
 5. **TLS.** `certificate signed by unknown authority` means the trust bundle for the hub's
-   **server** certificate is wrong: set `hub.caBundle` or `hub.existingCASecret`.
+   **server** certificate is wrong. A public issuer needs nothing (system roots); a private
+   issuer needs *its* CA in `hub.caBundle` or `hub.existingCASecret`. Never the hub's
+   `/pki/bundle`, which signs spoke identities and is itself a cause of this error.
    `certificate is valid for X, not Y` means the hub's Ingress certificate does not cover
    the host in your `hub.endpoints` — fixed on the hub's `ingress.host` /
    `certManager.serving.dnsNames`, not here.
@@ -366,7 +371,8 @@ Kubernetes: `>=1.28.0-0`
 | networkPolicy.egress.hub.enabled | bool | `true` | Allow egress to the hub. Without this the tunnel never establishes. |
 | networkPolicy.egress.hub.ports | list | `[]` | Ports the hub is reached on. Empty derives them from the `hub.endpoints` URLs, which is what you want: a `wss://` URL with no explicit port means 443, because the tunnel now arrives on the hub's ordinary HTTPS Ingress rather than a dedicated 8443 listener. Set this only when something between here and the hub — an egress gateway, a NAT — moves the port. |
 | networkPolicy.egress.kubeAPI.enabled | bool | `true` | Allow egress to the Kubernetes API server. Required whenever `identity.backend` is `secret`; pointless otherwise. |
-| networkPolicy.egress.kubeAPI.port | int | `443` | Port of the Kubernetes API server for the egress rule. |
+| networkPolicy.egress.kubeAPI.port | string | `nil` | Deprecated, superseded by `ports`. A single extra port to allow, appended to the list when set. |
+| networkPolicy.egress.kubeAPI.ports | list | `[443,6443]` | Ports of the Kubernetes API server for the egress rule. Both defaults matter: the pod dials `kubernetes.default.svc:443`, but most CNIs evaluate egress policy AFTER kube-proxy has DNATed that to the real API server endpoint, which kubeadm, k3s, RKE2 and most managed control planes serve on 6443. A rule for 443 alone then drops every identity Secret write and the spoke re-enrolls on every restart. Trim to the one your cluster uses if you know it. |
 | networkPolicy.egress.prometheus.enabled | bool | `true` | Allow egress to the local Prometheus, on the port parsed from `prometheus.url`. |
 | networkPolicy.egress.prometheus.namespaceSelector | object | `{"matchLabels":{"kubernetes.io/metadata.name":"monitoring"}}` | `namespaceSelector` for the namespace Prometheus runs in. |
 | networkPolicy.egress.prometheus.podSelector | object | `{}` | `podSelector` for the Prometheus pods. Empty selects every pod in the selected namespaces. |
@@ -394,7 +400,7 @@ Kubernetes: `>=1.28.0-0`
 | prometheus.bearerToken.mountPath | string | `"/etc/prometheus-mcp-fleet/prometheus-auth"` | Where the bearer token Secret is mounted. |
 | prometheus.bearerToken.secretKey | string | `"token"` | Key inside `prometheus.bearerToken.existingSecret`. |
 | prometheus.maxResponseBytes | int | `33554432` | `PMF_PROMETHEUS_MAX_RESPONSE_BYTES`. Maximum bytes accepted from one Prometheus response. |
-| prometheus.timeout | string | `"25s"` | `PMF_PROMETHEUS_TIMEOUT`. Deliberately below the hub's `queryTimeout` so the spoke fails first and returns a useful error instead of the hub timing out blind. |
+| prometheus.timeout | string | `"130s"` | `PMF_PROMETHEUS_TIMEOUT`. Ceiling on one upstream request. The hub's per-call deadline is the usual bound, so keep this above the hub's `rangeQueryTimeout`. |
 | prometheus.tls.existingSecret | string | `""` | Name of an existing Secret or ConfigMap holding the trust bundle for an https Prometheus. Empty leaves `PMF_PROMETHEUS_TLS_CA_FILE` unset. |
 | prometheus.tls.mountPath | string | `"/etc/prometheus-mcp-fleet/prometheus-ca"` | Where the Prometheus trust bundle is mounted. |
 | prometheus.tls.secretKey | string | `"ca.crt"` | Key inside `prometheus.tls.existingSecret` holding the PEM bundle. |

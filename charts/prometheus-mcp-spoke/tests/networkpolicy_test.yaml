@@ -172,6 +172,8 @@ tests:
             ports:
               - port: 443
                 protocol: TCP
+              - port: 6443
+                protocol: TCP
 
   - it: parses the Prometheus port out of the URL, including the https default
     set:

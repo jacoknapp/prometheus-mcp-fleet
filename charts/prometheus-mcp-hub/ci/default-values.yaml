@@ -5,3 +5,7 @@
 # diff in this file's render rather than silently.
 tunnel:
   path: /tunnel
+config:
+  # PMF_PUBLIC_URL is required by the binary and the chart refuses to render
+  # without one (or an Ingress host to derive it from).
+  publicURL: https://mcp.example.com/mcp

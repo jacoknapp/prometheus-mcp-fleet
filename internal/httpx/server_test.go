@@ -56,7 +56,7 @@ func TestNewServerDefaults(t *testing.T) {
 			cfg:                   ServerConfig{},
 			wantName:              "http",
 			wantReadHeaderTimeout: DefaultReadHeaderTimeout,
-			wantReadTimeout:       0,
+			wantReadTimeout:       DefaultReadTimeout,
 			wantWriteTimeout:      0, // SSE: an absolute write deadline would sever a stream.
 			wantIdleTimeout:       DefaultIdleTimeout,
 			wantGrace:             DefaultShutdownGrace,
@@ -77,6 +77,16 @@ func TestNewServerDefaults(t *testing.T) {
 			wantWriteTimeout:      3 * time.Second,
 			wantIdleTimeout:       4 * time.Second,
 			wantGrace:             5 * time.Second,
+		},
+		{
+			name:                  "a negative ReadTimeout disables it",
+			cfg:                   ServerConfig{ReadTimeout: -1},
+			wantName:              "http",
+			wantReadHeaderTimeout: DefaultReadHeaderTimeout,
+			wantReadTimeout:       0,
+			wantWriteTimeout:      0,
+			wantIdleTimeout:       DefaultIdleTimeout,
+			wantGrace:             DefaultShutdownGrace,
 		},
 	}
 
@@ -433,5 +443,77 @@ func TestServerTLS(t *testing.T) {
 	// HSTS is meaningful here and must be present, unlike over plaintext.
 	if got := resp.Header.Get("Strict-Transport-Security"); got != hstsValue {
 		t.Errorf("Strict-Transport-Security = %q, want %q", got, hstsValue)
+	}
+}
+
+// TestReadTimeoutSparesLongHandlers pins the net/http behaviour the default
+// ReadTimeout relies on: once the body has been read to EOF the server clears
+// the read deadline, so a handler that then runs well past ReadTimeout -- a
+// long tool call, a streaming response -- still completes. A body that
+// dribbles in slower than ReadTimeout is what the deadline is for, and it is
+// cut off.
+func TestReadTimeoutSparesLongHandlers(t *testing.T) {
+	t.Parallel()
+
+	const readTimeout = 300 * time.Millisecond
+	s := startTestServer(t, ServerConfig{
+		ReadTimeout: readTimeout,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if _, err := io.ReadAll(r.Body); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			// Outlive ReadTimeout by a wide margin before answering, and
+			// keep answering past it in the streaming shape.
+			w.WriteHeader(http.StatusOK)
+			flusher, _ := w.(http.Flusher)
+			for range 3 {
+				select {
+				case <-r.Context().Done():
+					return
+				case <-time.After(readTimeout):
+				}
+				_, _ = io.WriteString(w, "tick\n")
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
+		}),
+	})
+	url := "http://" + s.Addr() + "/slow"
+
+	resp, err := http.Post(url, "text/plain", strings.NewReader("prompt body")) //nolint:noctx // local test request
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("a handler that outlived ReadTimeout after reading its body was cut off: %v", err)
+	}
+	if got, want := string(body), "tick\ntick\ntick\n"; got != want {
+		t.Fatalf("body = %q, want %q", got, want)
+	}
+
+	// The same request with a body that never finishes arriving is refused
+	// once ReadTimeout elapses: the handler's ReadAll fails and the
+	// connection is closed rather than parked forever.
+	pr, pw := io.Pipe()
+	defer func() { _ = pw.Close() }()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, url, pr)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	req.ContentLength = 1 << 20
+	start := time.Now()
+	resp2, err := http.DefaultClient.Do(req)
+	if err == nil {
+		defer func() { _ = resp2.Body.Close() }()
+		if resp2.StatusCode != http.StatusBadRequest {
+			t.Fatalf("dribbling body: status %d, want 400 or a severed connection", resp2.StatusCode)
+		}
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("dribbling body took %v to be refused; ReadTimeout %v did not bite", elapsed, readTimeout)
 	}
 }

@@ -631,44 +631,30 @@ func TestCorruptDocumentIsReported(t *testing.T) {
 
 func TestCancelledContextDuringBackoff(t *testing.T) {
 	t.Parallel()
-	api, s := newStore(t, secretstore.Options{MaxAttempts: 5, Backoff: time.Hour})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	// Cancel from the store's own retry log line, which it writes after the
+	// update error has been classified as a conflict and before it sleeps.
+	//
+	// Every earlier trigger raced the HTTP round trip: cancelling from the
+	// write hook, or from a goroutine watching the fake API's conflict
+	// counter, sometimes landed while the 409 was still on the wire, so the
+	// store took the non-conflict error return instead of the backoff --
+	// and errors.Is matched context.Canceled either way. The test passed
+	// either way while the statement it exists to cover flipped between
+	// runs, and the package's 100% floor failed CI whenever the loser was
+	// the sleep. The log line cannot fire early: it is the conflict branch.
+	//
+	// The backoff is an hour, so if the cancellation were somehow missed
+	// the test would hang rather than pass by accident.
+	api, s := newStore(t, secretstore.Options{
+		MaxAttempts: 5, Backoff: time.Hour,
+		Logger: slog.New(cancelOnRetry{cancel: cancel}),
+	})
 	api.seed(secretstore.DefaultSecretName, map[string][]byte{
 		secretstore.DefaultKey: []byte(`{"schemaVersion":1,"epoch":1}`),
 	})
-	ctx, cancel := context.WithCancel(context.Background())
-
-	// Cancel from a separate goroutine once a conflict has actually been
-	// served, not from inside the write hook.
-	//
-	// beforeWrite runs while the update request is still in flight, so
-	// cancelling there raced the response: sometimes the store saw the 409 and
-	// was cancelled in the hour-long backoff, which is the path this test is
-	// named for, and sometimes the HTTP round trip itself was cancelled and
-	// the store took the non-conflict error return instead. errors.Is matched
-	// context.Canceled either way, so the test passed either way -- while
-	// which of the two statements got executed flipped between runs, and the
-	// package's 100% coverage floor failed CI whenever the loser was the
-	// non-conflict return. That one now has TestUpdateFailurePropagates.
-	//
-	// The backoff is an hour, so once a conflict is counted the store is
-	// parked in sleep() and cancelling is unambiguous.
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for {
-			if _, _, _, conflicts := api.counts(); conflicts > 0 {
-				cancel()
-				return
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(time.Millisecond):
-			}
-		}
-	}()
-	t.Cleanup(func() { cancel(); <-done })
-
 	api.beforeWrite = func() {
 		api.seed(secretstore.DefaultSecretName, map[string][]byte{
 			secretstore.DefaultKey: []byte(`{"schemaVersion":1,"epoch":1}`),
@@ -678,7 +664,26 @@ func TestCancelledContextDuringBackoff(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("PutKey error = %v, want context.Canceled rather than a full backoff", err)
 	}
+	if _, _, _, conflicts := api.counts(); conflicts == 0 {
+		t.Error("no conflict was served, so the backoff was never entered")
+	}
 }
+
+// cancelOnRetry is a slog.Handler that cancels a context when the store logs
+// that it is about to back off after a conflict.
+type cancelOnRetry struct{ cancel context.CancelFunc }
+
+func (cancelOnRetry) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h cancelOnRetry) Handle(_ context.Context, r slog.Record) error {
+	if strings.Contains(r.Message, "retrying") {
+		h.cancel()
+	}
+	return nil
+}
+
+func (h cancelOnRetry) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h cancelOnRetry) WithGroup(string) slog.Handler      { return h }
 
 // TestUpdateFailurePropagates covers the update error that is not a conflict.
 // It is a distinct statement from the conflict retry beside it, and leaving it

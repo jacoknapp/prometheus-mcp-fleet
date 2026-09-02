@@ -473,8 +473,10 @@ func (s *server) readCSR(w http.ResponseWriter, r *http.Request) ([]byte, bool) 
 // decodeCSRField bounds and decodes one base64 DER certificate signing request.
 //
 // It is shared by /enroll and /renew so that the two routes cannot disagree
-// about what a CSR field may contain. On /renew it runs only after the caller
-// has proved possession, so an unauthenticated peer never reaches the decoder.
+// about what a CSR field may contain. On /renew it runs after the nonce and
+// the chain have been checked but before the possession proof, because the
+// proof covers the decoded CSR; a peer that gets this far holds a
+// certificate this CA issued, and the field is bounded by MaxCSRBytes.
 func (s *server) decodeCSRField(w http.ResponseWriter, r *http.Request, csr string) ([]byte, bool) {
 	if csr == "" {
 		s.metrics.Enrollment(ResultInvalid)

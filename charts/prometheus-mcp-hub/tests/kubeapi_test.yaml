@@ -1,0 +1,101 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# The hub reaches its state Secret through the API server. The pod dials the
+# Service port (443) but most CNIs evaluate egress after kube-proxy's DNAT, so
+# the port they see is the endpoint's (usually 6443). Allowing only one of the
+# two silently strands the hub on half the clusters it is installed on.
+suite: hub NetworkPolicy opens every Kubernetes API port
+templates:
+  - templates/networkpolicy.yaml
+set:
+  config:
+    publicURL: https://mcp.example.com/mcp
+
+tests:
+  - it: allows both 443 and 6443 by default
+    asserts:
+      - contains:
+          path: spec.egress
+          content:
+            ports:
+              - port: 443
+                protocol: TCP
+              - port: 6443
+                protocol: TCP
+
+  - it: honours a trimmed list
+    set:
+      networkPolicy:
+        egress:
+          kubeAPIPorts: [6443]
+    asserts:
+      - contains:
+          path: spec.egress
+          content:
+            ports:
+              - port: 6443
+                protocol: TCP
+      - notContains:
+          path: spec.egress
+          content:
+            ports:
+              - port: 443
+                protocol: TCP
+
+  - it: still honours the deprecated single-port key without duplicating it
+    set:
+      networkPolicy:
+        egress:
+          kubeAPIPorts: [443]
+          kubeAPIPort: 6443
+    asserts:
+      - contains:
+          path: spec.egress
+          content:
+            ports:
+              - port: 443
+                protocol: TCP
+              - port: 6443
+                protocol: TCP
+
+  - it: appends the deprecated single-port key when it is new
+    set:
+      networkPolicy:
+        egress:
+          kubeAPIPorts: [443, 6443]
+          kubeAPIPort: 8443
+    asserts:
+      - contains:
+          path: spec.egress
+          content:
+            ports:
+              - port: 443
+                protocol: TCP
+              - port: 6443
+                protocol: TCP
+              - port: 8443
+                protocol: TCP
+
+  - it: refuses an empty port list rather than rendering a rule that allows nothing
+    set:
+      networkPolicy:
+        egress:
+          kubeAPIPorts: []
+    asserts:
+      - failedTemplate:
+          errorPattern: kubeAPIPorts is empty
+
+  - it: renders no API server rule when allowKubeAPI is off
+    set:
+      networkPolicy:
+        egress:
+          allowKubeAPI: false
+          kubeAPIPorts: []
+    asserts:
+      - notContains:
+          path: spec.egress
+          content:
+            ports:
+              - port: 6443
+                protocol: TCP

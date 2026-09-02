@@ -126,10 +126,19 @@ helm install pmf-spoke oci://ghcr.io/jacoknapp/charts/prometheus-mcp-spoke \
   --set cluster.labels[1].name=region --set cluster.labels[1].value=us-east-1 \
   --set hub.endpoints[0]=wss://pmf.example.com/tunnel \
   --set hub.apiUrl=https://pmf.example.com \
-  --set hub.existingCASecret=pmf-hub-ca \
   --set enrollment.existingSecret=pmf-enrollment \
   --set prometheus.url=http://prometheus-operated.monitoring.svc:9090
 ```
+
+Nothing above names a CA, and that is deliberate: `hub.caBundle` is the trust
+for the certificate the hub's **Ingress** presents, and an Ingress certificate
+from a public issuer verifies against the system roots the image already
+carries. Only when that certificate comes from a private issuer does the spoke
+need `hub.caBundle` / `hub.existingCASecret`, and then the content is the
+**issuer's** CA. The bundle the hub serves at `/pki/bundle` is a different
+thing entirely: the internal CA that signs spoke identities. It cannot verify
+the Ingress certificate, so pointing `hub.caBundle` at it breaks every dial,
+and the spoke receives it on its own at enrollment anyway.
 
 `fullnameOverride=pmf-spoke` keeps every object named `pmf-spoke` rather than
 the chart's default `<release>-<chart>` (here `pmf-spoke-prometheus-mcp-spoke`)
@@ -400,14 +409,19 @@ helm uninstall pmf-spoke -n prometheus-mcp
 kubectl delete secret pmf-spoke-identity -n prometheus-mcp
 
 # On the hub — revoke so the certificate cannot be used until it expires.
-# There is no `hub certs` subcommand (only `hub enroll create` and
-# `hub keys create` exist); revocation is a direct call against the admin API.
+# The serial is in the spoke's own log line at enrollment and in the hub's
+# enrollment record (`GET /admin/v1/enrollments`, field
+# `.keys[].enrollment.certSerial`, as in the reconciliation script below).
+# `hub certs list` shows what is already revoked.
 kubectl exec -n prometheus-mcp-hub deploy/pmf-hub -- \
-  curl -sS -X POST "http://127.0.0.1:9090/admin/v1/certs/<hex-serial>/revoke" \
-    -H "Authorization: Bearer $(cat /var/run/pmf/admin-token)" \
-    -H 'Content-Type: application/json' \
-    -d '{"reason":"cluster decommissioned"}'
+  hub certs revoke \
+    --admin-token-file /var/run/pmf/admin-token \
+    --serial <hex-serial> \
+    --reason "cluster decommissioned"
 ```
+
+The subcommand is a thin client for `POST /admin/v1/certs/<serial>/revoke`;
+the API is there if you would rather call it directly.
 
 Uninstalling alone is not enough if the cluster or its Secret may be
 compromised: the certificate stays valid for up to 14 days. There is no TLS
@@ -521,16 +535,17 @@ on it rather than auto-revoking — a stale inventory checkout or a rename can
 produce a false positive, and revocation is exactly the kind of action you
 don't want a cron job getting wrong unattended. There is no shipped alert for
 this reconciliation -- it has to be a script you own, run on a schedule -- but
-the pieces it needs are commands now: `hub certs list` for what the hub still
-trusts, and `hub certs revoke --serial` for what your inventory says should
-be gone.
+the pieces it needs are commands now: `hub enroll list` for which clusters
+have redeemed an enrollment (each one is an identity the hub issued),
+`hub certs list` for the certificates it has already revoked, and
+`hub certs revoke --serial` for what your inventory says should be gone.
 
 | Symptom | Cause | Fix |
 |---|---|---|
 | `this enrollment token has already been redeemed and cannot be redeemed again` (409) | The token was redeemed once already (only possible for a `--single-use` token, or a reusable one past `--max-redemptions`). **Treat this as a security event** — it means the install secret leaked, or an automation retried a burn | Investigate, then mint a fresh token |
 | `401` from `/enroll` | The token expired. They last 15 minutes | Mint a new one; consider a faster delivery path |
 | `cluster ID mismatch` | The `cluster.id` value does not match what the token was minted for | Reinstall with the right ID, or mint a token for this one |
-| `x509: certificate signed by unknown authority` on the tunnel | The spoke does not trust the hub's CA | Supply `hub.caBundle` / `hub.existingCASecret`; the bundle is at `GET /pki/bundle` on the hub |
+| `x509: certificate signed by unknown authority` on the tunnel | The spoke does not trust the certificate the hub's **Ingress** presents | A public issuer needs nothing: leave `hub.caBundle` empty so the system roots apply. A private issuer needs that issuer's CA in `hub.caBundle` / `hub.existingCASecret`. Never the hub's `/pki/bundle`: that CA signs spoke identities, not the Ingress certificate, and trusting it is itself a cause of this error |
 | `dial tcp: i/o timeout` to the tunnel | Egress from this cluster to the hub is blocked, or the NetworkPolicy does not permit it | This is a network problem in the spoke's cluster. Check egress rules and DNS |
 | Spoke connects, cluster shows `degraded` | The tunnel is up but the spoke cannot reach its local Prometheus | Check `prometheus.url`; the reason is in `describe_cluster` |
 | Spoke restarts and re-enrolls every time | `identity.backend: memory`, or the identity Secret is not persisting | Switch to the `secret` backend and grant the one-Secret Role |

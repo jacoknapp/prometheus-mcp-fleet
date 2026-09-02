@@ -231,10 +231,57 @@ have the two disagree.
 {{- end -}}
 
 {{/*
+PMF_PUBLIC_URL: the URL agents reach the MCP endpoint at. config.publicURL wins;
+with it empty and a TLS Ingress rendered, it is derived as https://<ingress.host>/mcp,
+because the Ingress IS what publishes the endpoint and asking for the same hostname
+twice invites the two to disagree. Empty when neither is set, which validate refuses:
+the binary requires it (it is the mandatory "resource" of the RFC 9728 document
+the 401 challenge points at) and without it the pod starts, fails Validate and
+CrashLoops a minute after an install that looked fine.
+
+Only a TLS Ingress is derived from. An Ingress with tls.enabled=false is the one
+shape where a derived value would quietly be http://, and everything downstream
+takes that at face value: the protected-resource document is advertised over
+plaintext, the NOTES enrollment recipe POSTs bearer enrollment tokens in the
+clear, and spokes accept an http apiUrl. Under 0.9 that install refused to start;
+it must not now "look fine". An operator who really terminates TLS elsewhere
+sets config.publicURL and says so.
+*/}}
+{{- define "prometheus-mcp-hub.publicURL" -}}
+{{- if .Values.config.publicURL -}}
+{{- .Values.config.publicURL -}}
+{{- else if and .Values.ingress.enabled .Values.ingress.host .Values.ingress.tls.enabled -}}
+{{- printf "https://%s/mcp" .Values.ingress.host -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Scheme and host of the public URL, with no path: what a spoke's hub.apiUrl must
+be. The enrollment listener lives at /enroll on the same host and a spoke appends
+that itself, so handing it the MCP URL (which ends in /mcp) makes it POST to
+/mcp/enroll and fail enrollment with a 404.
+*/}}
+{{- define "prometheus-mcp-hub.publicOrigin" -}}
+{{- $u := include "prometheus-mcp-hub.publicURL" . -}}
+{{- if $u -}}
+{{- $parsed := urlParse $u -}}
+{{- printf "%s://%s" $parsed.scheme $parsed.host -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Fail-fast validation. Every one of these is a misconfiguration that would
 otherwise install cleanly and be wrong in production.
 */}}
 {{- define "prometheus-mcp-hub.validate" -}}
+
+{{/* ---- the public URL, which the binary refuses to start without ---- */}}
+{{- if not (include "prometheus-mcp-hub.publicURL" .) -}}
+{{- fail "prometheus-mcp-hub: config.publicURL is empty and there is no TLS Ingress host to derive it from. Set config.publicURL to the URL agents reach the MCP endpoint at, for example https://mcp.example.com/mcp (PMF_PUBLIC_URL is required: it is the \"resource\" of the OAuth protected-resource document the 401 challenge points at). Enabling ingress with ingress.host and ingress.tls.enabled set derives it automatically; an Ingress without TLS is never derived from, because the result would be a plaintext URL that enrollment tokens are then sent over." -}}
+{{- end -}}
+{{- if not (regexMatch "^https?://[^/]+" (include "prometheus-mcp-hub.publicURL" .)) -}}
+{{- fail (printf "prometheus-mcp-hub: config.publicURL %q must be an absolute http or https URL, for example https://mcp.example.com/mcp." .Values.config.publicURL) -}}
+{{- end -}}
 
 {{/* ---- the admin port must never leave the cluster ---- */}}
 {{- if and .Values.service.admin.enabled (ne .Values.service.type "ClusterIP") -}}

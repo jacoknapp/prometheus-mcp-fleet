@@ -49,8 +49,8 @@ helm install pmf-hub oci://ghcr.io/jacoknapp/charts/prometheus-mcp-hub \
 is `<release>-<chart>` whenever the release name doesn't already contain the
 chart name (`prometheus-mcp-hub`), which would render the Deployment as
 `pmf-hub-prometheus-mcp-hub` instead of `pmf-hub` and break every
-`deploy/pmf-hub` command below, along with the CA Secret name the spoke
-install further down points at (`pmf-hub-ca`).
+`deploy/pmf-hub` command below, along with the name of the CA Secret the hub
+writes (`pmf-hub-ca`) that the backup step further down reads.
 
 On first boot the hub generates its own CA and HMAC pepper into a Secret it
 owns, using a Role scoped by `resourceNames` to exactly that object. There is no
@@ -110,20 +110,29 @@ finish before step 4, or the exec lands on a pod that predates the mount:
 kubectl -n prometheus-mcp-hub rollout status deploy/pmf-hub
 ```
 
-## 3. Export the CA bundle
+## 3. Decide how the spoke will trust the hub
 
-Each spoke is in a different cluster and different trust domain, so it needs the
-hub's CA out of band for its first connection.
+The spoke verifies the certificate the hub's **Ingress** presents on
+`wss://pmf.example.com/tunnel` and `https://pmf.example.com`. That is ordinary
+server-certificate trust, exactly like a browser's, and it has nothing to do
+with the hub's own CA:
 
-There is no `hub ca` subcommand — the bundle needs no credential, so a
-command would only be a longer way to type `curl`. It is served
-unauthenticated at
-`/pki/bundle` on the same public hostname as the MCP endpoint, so no `exec` is
-needed at all:
+- **Ingress certificate from a public issuer** (Let's Encrypt, a commercial CA):
+  nothing to do. The spoke's image ships the system roots and
+  `hub.caBundle` stays empty. This is the common case and the one the
+  install in step 5 assumes.
+- **Ingress certificate from a private issuer** (an internal PKI, a
+  cert-manager `ClusterIssuer` backed by your own root): supply **that
+  issuer's** CA certificate to the spoke as `hub.caBundle` or
+  `hub.existingCASecret`. It is public material, so a Secret is a convenience,
+  not a requirement.
 
-```bash
-curl -fsS https://pmf.example.com/pki/bundle > hub-ca.crt
-```
+Do **not** supply the bundle the hub serves at `/pki/bundle`. That is the
+internal CA the hub uses to sign **spoke identities**; it has never signed the
+Ingress certificate and cannot verify it, so a spoke told to trust it fails
+every dial with `x509: certificate signed by unknown authority`. The spoke
+receives that bundle on its own at enrollment; nothing in this quickstart needs
+to fetch it.
 
 ## 4. Mint an agent key
 
@@ -188,9 +197,6 @@ kubectl create namespace prometheus-mcp
 kubectl create secret generic pmf-enrollment -n prometheus-mcp \
   --from-literal=token='pmf_enr_9dK2mQ4pLz…'
 
-kubectl create secret generic pmf-hub-ca -n prometheus-mcp \
-  --from-file=ca.crt=hub-ca.crt
-
 helm install pmf-spoke oci://ghcr.io/jacoknapp/charts/prometheus-mcp-spoke \
   --namespace prometheus-mcp \
   --set fullnameOverride=pmf-spoke \
@@ -200,9 +206,18 @@ helm install pmf-spoke oci://ghcr.io/jacoknapp/charts/prometheus-mcp-spoke \
   --set cluster.labels[1].name=region --set cluster.labels[1].value=us-east-1 \
   --set hub.endpoints[0]=wss://pmf.example.com/tunnel \
   --set hub.apiUrl=https://pmf.example.com \
-  --set hub.existingCASecret=pmf-hub-ca \
   --set enrollment.existingSecret=pmf-enrollment \
   --set prometheus.url=http://prometheus-operated.monitoring.svc:9090
+```
+
+If the hub's Ingress certificate comes from a private issuer (step 3), put that
+issuer's CA in a Secret and add it to the install:
+
+```bash
+kubectl create secret generic pmf-hub-ingress-ca -n prometheus-mcp \
+  --from-file=ca.crt=ingress-issuer-ca.crt
+# ... and on the helm install above:
+#   --set hub.existingCASecret=pmf-hub-ingress-ca
 ```
 
 `fullnameOverride=pmf-spoke` is the same fix as for the hub above — without it

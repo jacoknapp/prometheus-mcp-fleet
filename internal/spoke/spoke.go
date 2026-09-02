@@ -270,6 +270,7 @@ func (s *spoke) run(ctx context.Context, registry prometheusRegistry) error {
 		MaxResponseBytes: s.cfg.PrometheusMaxResponseBytes,
 		UserAgent:        "prometheus-mcp-spoke/" + s.build.Version,
 		Logger:           s.logger,
+		Metrics:          promMetrics{m: s.metrics},
 	}); err != nil {
 		return fmt.Errorf("configure the Prometheus client: %w", err)
 	}
@@ -326,8 +327,14 @@ func (s *spoke) run(ctx context.Context, registry prometheusRegistry) error {
 
 	// The first facts refresh is best-effort: a spoke whose Prometheus is down
 	// must still connect and report that fact, because "cluster reachable,
-	// Prometheus down" is far more useful to an agent than silence.
-	if err := s.facts.Refresh(ctx); err != nil {
+	// Prometheus down" is far more useful to an agent than silence. It runs
+	// under the same budget as every later refresh: a Prometheus that accepts
+	// the connection and then hangs would otherwise hold the whole start-up
+	// for one full --prometheus-timeout per source before the first dial.
+	initialCtx, cancelInitial := context.WithTimeout(ctx, s.timing.facts)
+	err = s.facts.Refresh(initialCtx)
+	cancelInitial()
+	if err != nil {
 		s.logger.WarnContext(ctx, "initial facts refresh incomplete", "error", err)
 	}
 
@@ -913,6 +920,15 @@ func (s *spoke) dialLoop(ctx context.Context, endpoint string, cov *coverage, ac
 
 // dialOnce runs a single connection to exhaustion and returns why it ended.
 func (s *spoke) dialOnce(ctx context.Context, endpoint string, log *slog.Logger, cov *coverage) string {
+	// The signal is taken BEFORE the identity. A renewal publishes the new
+	// certificate and then fires the signal, so a dialer that read the
+	// identity first could see the old certificate, lose the race to the
+	// renewal, and then subscribe to the channel created AFTER the one it
+	// needed was closed -- and hold the tunnel open on the stale certificate
+	// until something else dropped it. Taken in this order, a renewal that
+	// lands in between either hands over the new identity or fires a signal
+	// this dialer is already holding.
+	sig := s.reconnectSignal()
 	id := s.currentIdentity()
 	if id == nil {
 		return "no-identity"
@@ -942,7 +958,7 @@ func (s *spoke) dialOnce(ctx context.Context, endpoint string, log *slog.Logger,
 	}()
 	go func() {
 		select {
-		case <-s.reconnectSignal():
+		case <-sig:
 			cancel()
 		case <-dialCtx.Done():
 		}

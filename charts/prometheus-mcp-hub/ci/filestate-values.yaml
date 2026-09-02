@@ -18,3 +18,4 @@ networkPolicy:
 config:
   logLevel: debug
   logFormat: text
+  publicURL: https://mcp.example.com/mcp

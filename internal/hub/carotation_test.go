@@ -440,6 +440,52 @@ func TestCARotationForcedDuringARotationDoesNotStartASecond(t *testing.T) {
 	f.sink.mustFind(t, "CA rotation state recorded")
 }
 
+// TestCARotationForcedAnnotationSurvivesTheStrayCleanup pins that the
+// annotation is consumed only by the write that acts on it. Steady state
+// tidies stray material BEFORE it considers whether a rotation is due, and
+// that tidy-up used to clear the annotation along with everything else --
+// so an operator who annotated a Secret that happened to carry leftovers
+// from an interrupted rotation got a rotate-accepted stamp and no rotation.
+func TestCARotationForcedAnnotationSurvivesTheStrayCleanup(t *testing.T) {
+	t.Parallel()
+
+	f := newRotationFixture(t, caLifetime)
+	strayCert, strayKey := f.mintRoot()
+	f.seed(func(data map[string][]byte) {
+		data[secretKeyCANextCert] = strayCert
+		data[secretKeyCANextKey] = strayKey
+	}, map[string]string{annotationRotateNow: "compromise"})
+
+	// First poll: the tidy-up. The annotation must come through it intact.
+	f.step()
+	if got := f.phase(); got != string(caPhaseSteady) {
+		t.Fatalf("phase after the tidy-up = %q, want steady", got)
+	}
+	if _, present := f.data()[secretKeyCANextCert]; present {
+		t.Fatal("the stray successor was not discarded")
+	}
+	ann := f.api.annotationsOf(f.cfg.CASecretName)
+	if ann[annotationRotateNow] != "compromise" {
+		t.Fatalf("rotate-now = %q after the tidy-up, want it left for the next poll to honour", ann[annotationRotateNow])
+	}
+	if _, stamped := ann[annotationRotateAccepted]; stamped {
+		t.Fatal("rotate-accepted was recorded by a write that started no rotation")
+	}
+
+	// Second poll: the rotation the operator asked for.
+	f.step()
+	if got := f.phase(); got != string(caPhasePublishing) {
+		t.Fatalf("phase = %q, want publishing: the forced rotation was swallowed", got)
+	}
+	ann = f.api.annotationsOf(f.cfg.CASecretName)
+	if _, still := ann[annotationRotateNow]; still {
+		t.Error("the annotation survived the rotation it started")
+	}
+	if ann[annotationRotateAccepted] == "" {
+		t.Error("no rotate-accepted annotation records that the trigger was picked up")
+	}
+}
+
 func TestCARotationSteadyTidiesStrayMaterial(t *testing.T) {
 	t.Parallel()
 
@@ -450,13 +496,15 @@ func TestCARotationSteadyTidiesStrayMaterial(t *testing.T) {
 		data[secretKeyCANextKey] = strayKey
 		data[secretKeyCAPrevCert] = strayCert
 		data[secretKeyRotationHoldout] = []byte("not a timestamp")
+		data[secretKeyRotationRetireAfter] = []byte("not a timestamp either")
 	}, nil)
 
 	f.step()
 
 	data := f.data()
 	for _, key := range []string{
-		secretKeyCANextCert, secretKeyCANextKey, secretKeyCAPrevCert, secretKeyRotationHoldout,
+		secretKeyCANextCert, secretKeyCANextKey, secretKeyCAPrevCert,
+		secretKeyRotationHoldout, secretKeyRotationRetireAfter,
 	} {
 		if _, present := data[key]; present {
 			t.Errorf("%s survived the steady-state tidy-up", key)
@@ -503,6 +551,7 @@ func TestCARotationPublishing(t *testing.T) {
 
 	tests := []struct {
 		name     string
+		caTTL    time.Duration
 		elapsed  time.Duration
 		omitNext bool
 		want     caPhase
@@ -510,12 +559,22 @@ func TestCARotationPublishing(t *testing.T) {
 		{name: "before a full certificate lifetime, nothing moves", elapsed: 3 * time.Hour, want: caPhasePublishing},
 		{name: "after a full certificate lifetime, the successor signs", elapsed: 4 * time.Hour, want: caPhaseSigning},
 		{name: "a missing successor falls back to steady", elapsed: 8 * time.Hour, omitNext: true, want: caPhaseSteady},
+		// The signer lapses one hour in. Past that instant no spoke can renew
+		// onto the outgoing bundle, so the remaining three hours of the
+		// lifetime gate would protect nothing and cost every renewal that
+		// fell due in them. One tick before expiry the gate still holds.
+		{name: "a signer one tick from expiry still waits", caTTL: time.Hour, elapsed: time.Hour - time.Nanosecond, want: caPhasePublishing},
+		{name: "an expired signer is replaced without waiting out the lifetime", caTTL: time.Hour, elapsed: time.Hour, want: caPhaseSigning},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			f := newRotationFixture(t, caLifetime)
+			caTTL := caLifetime
+			if tc.caTTL != 0 {
+				caTTL = tc.caTTL
+			}
+			f := newRotationFixture(t, caTTL)
 			nextCert, nextKey := f.mintRoot()
 			f.seed(func(data map[string][]byte) {
 				data[secretKeyRotationPhase] = []byte(caPhasePublishing)
@@ -552,6 +611,13 @@ func TestCARotationPublishing(t *testing.T) {
 			}
 			if _, present := data[secretKeyCAKey]; !present {
 				t.Error("the signing key is missing after promotion")
+			}
+			// The retirement horizon is fixed at promotion from the config
+			// in force, so a later change to the lifetime or grace cannot
+			// open the gate on certificates issued under the old values.
+			wantRetire := f.clock.Now().Add(f.rotator.retirementHold()).UTC().Format(time.RFC3339)
+			if got := string(data[secretKeyRotationRetireAfter]); got != wantRetire {
+				t.Errorf("%s = %q, want %q", secretKeyRotationRetireAfter, got, wantRetire)
 			}
 			// The trust bundle is the same SET across the promotion, which is
 			// why no spoke can be disconnected by it.
@@ -646,6 +712,67 @@ func TestCARotationRetirementPadIsInclusive(t *testing.T) {
 	if got := f.phase(); got != string(caPhaseSteady) {
 		t.Fatalf("phase = %q exactly at the padded hold, want %q", got, caPhaseSteady)
 	}
+}
+
+// TestCARotationRetirementHonoursThePersistedHorizon pins the gate as the
+// LATER of the persisted and the live horizon. The persisted one is what
+// makes shortening --spoke-cert-ttl or --renew-grace mid-rotation safe: the
+// certificates in the field were issued under the old values, and the
+// replica that promoted the successor wrote down when they would all be
+// past renewal. The live one still applies when it is the later, because a
+// lengthened config can only be conservative and an older build's rotation
+// persisted nothing.
+func TestCARotationRetirementHonoursThePersistedHorizon(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a persisted horizon later than the live config holds the root", func(t *testing.T) {
+		t.Parallel()
+		f, _ := signingFixture(t, 0)
+		live := f.rotator.retirementHold()
+		// Stands in for a promotion made under a 4h-longer lifetime that
+		// was since shortened: the operator's config now says the root may
+		// go, the record made at promotion says not yet.
+		persisted := rotationBase.Add(live + 4*time.Hour)
+		f.seed(func(data map[string][]byte) {
+			data[secretKeyRotationRetireAfter] = []byte(persisted.UTC().Format(time.RFC3339))
+		}, nil)
+
+		f.clock.Advance(live)
+		f.step()
+		if got := f.phase(); got != string(caPhaseSigning) {
+			t.Fatalf("phase = %q at the live horizon, want it still signing until the persisted one", got)
+		}
+
+		f.clock.Advance(4*time.Hour - time.Nanosecond)
+		f.step()
+		if got := f.phase(); got != string(caPhaseSigning) {
+			t.Fatalf("phase = %q one tick before the persisted horizon, want it still signing", got)
+		}
+
+		f.clock.Advance(time.Nanosecond)
+		f.step()
+		if got := f.phase(); got != string(caPhaseSteady) {
+			t.Fatalf("phase = %q at the persisted horizon, want steady", got)
+		}
+		if _, present := f.data()[secretKeyRotationRetireAfter]; present {
+			t.Error("the horizon outlived the rotation it belonged to; steady state would tidy it as stray")
+		}
+	})
+
+	t.Run("a persisted horizon earlier than the live config does not shorten it", func(t *testing.T) {
+		t.Parallel()
+		f, _ := signingFixture(t, 0)
+		live := f.rotator.retirementHold()
+		f.seed(func(data map[string][]byte) {
+			data[secretKeyRotationRetireAfter] = []byte(rotationBase.Add(time.Hour).UTC().Format(time.RFC3339))
+		}, nil)
+
+		f.clock.Advance(live - time.Nanosecond)
+		f.step()
+		if got := f.phase(); got != string(caPhaseSigning) {
+			t.Fatalf("phase = %q before the live horizon, want it still signing", got)
+		}
+	})
 }
 
 func TestCARotationSigningWaitsOutTheClock(t *testing.T) {

@@ -50,6 +50,16 @@ const (
 	// still admitted by the outgoing root. It is how a per-replica observation
 	// becomes a fleet-wide veto on retiring that root.
 	secretKeyRotationHoldout = "ca-rotation.last-holdout"
+	// secretKeyRotationRetireAfter is the earliest instant the outgoing root
+	// may be retired, fixed by the replica that promoted the successor from
+	// the certificate lifetime and renewal grace IN FORCE AT THAT MOMENT. The
+	// clock gate in planSigning is otherwise recomputed from live config on
+	// every poll, and shortening --spoke-cert-ttl or --renew-grace
+	// mid-rotation would open it early -- while certificates issued under
+	// the longer old values are still renewable. Persisting the horizon
+	// turns that from a documented hazard into a non-event. RFC 3339 in UTC.
+	// #nosec G101 -- a key NAME inside the Secret, as above.
+	secretKeyRotationRetireAfter = "ca-rotation.retire-after"
 )
 
 // Annotations on the CA Secret.
@@ -137,7 +147,12 @@ type caRotationState struct {
 	// as lastHoldout being non-zero: a hand-edited value that does not parse
 	// still has to be tidied away.
 	hasHoldout bool
-	force      string
+	// retireAfter is the persisted retirement horizon, zero when absent or
+	// unreadable -- a rotation promoted by an older build has none, and the
+	// live-config gate alone applies to it, as it always did.
+	retireAfter    time.Time
+	hasRetireAfter bool
+	force          string
 }
 
 // readCARotation interprets a CA Secret.
@@ -168,6 +183,11 @@ func readCARotation(sec *kube.Secret) caRotationState {
 	st.hasHoldout = len(holdout) > 0
 	if t, err := time.Parse(time.RFC3339, string(holdout)); err == nil {
 		st.lastHoldout = t
+	}
+	retireAfter := sec.Data[secretKeyRotationRetireAfter]
+	st.hasRetireAfter = len(retireAfter) > 0
+	if t, err := time.Parse(time.RFC3339, string(retireAfter)); err == nil {
+		st.retireAfter = t
 	}
 	return st
 }
@@ -371,6 +391,14 @@ type caRotationPlan struct {
 	keepSince bool
 	set       map[string][]byte
 	del       []string
+	// consumeForce clears the rotate-now annotation in this same write. Only
+	// the plan that ACTS on the annotation -- starting the rotation it asks
+	// for, or declining because one is already running -- may set it. A
+	// steady-state write made for another reason, such as discarding stray
+	// material, leaves the annotation for the next poll to honour; consuming
+	// it there would silently swallow an operator's order to rotate a key
+	// they no longer trust.
+	consumeForce bool
 }
 
 // advance evaluates the gates and, if one has opened, performs the transition.
@@ -393,10 +421,11 @@ func (r *caRotator) advance(ctx context.Context, sec *kube.Secret, st caRotation
 	for _, key := range plan.del {
 		delete(sec.Data, key)
 	}
-	if st.force != "" {
+	if plan.consumeForce {
 		// Edge triggered: the annotation is consumed in the same write that
 		// records what it caused, so it cannot fire twice. The map is
-		// necessarily non-nil here -- st.force came out of it.
+		// necessarily non-nil here -- a plan only consumes a force that
+		// readCARotation found in it.
 		delete(sec.Annotations, annotationRotateNow)
 		sec.Annotations[annotationRotateAccepted] = now.UTC().Format(time.RFC3339)
 	}
@@ -451,7 +480,7 @@ func (r *caRotator) plan(st caRotationState) (*caRotationPlan, error) {
 		// current rotation finished, months later, for a reason nobody
 		// remembers.
 		return &caRotationPlan{
-			to: st.phase, keepSince: true,
+			to: st.phase, keepSince: true, consumeForce: true,
 			reason: "a CA rotation is already in progress, so " + annotationRotateNow +
 				" is consumed without starting a second one",
 		}, nil
@@ -488,7 +517,7 @@ func (r *caRotator) planSteady(st caRotationState) (*caRotationPlan, error) {
 		return nil, fmt.Errorf("mint the successor root: %w", err)
 	}
 	return &caRotationPlan{
-		to: caPhasePublishing, reason: reason,
+		to: caPhasePublishing, reason: reason, consumeForce: st.force != "",
 		set: map[string][]byte{secretKeyCANextCert: certPEM, secretKeyCANextKey: keyPEM},
 	}, nil
 }
@@ -497,10 +526,11 @@ func (r *caRotator) planSteady(st caRotationState) (*caRotationPlan, error) {
 func strayRotationKeys(st caRotationState) []string {
 	var stray []string
 	for key, present := range map[string]bool{
-		secretKeyCANextCert:      len(st.nextCertPEM) > 0,
-		secretKeyCANextKey:       len(st.nextKeyPEM) > 0,
-		secretKeyCAPrevCert:      len(st.prevCertPEM) > 0,
-		secretKeyRotationHoldout: st.hasHoldout,
+		secretKeyCANextCert:          len(st.nextCertPEM) > 0,
+		secretKeyCANextKey:           len(st.nextKeyPEM) > 0,
+		secretKeyCAPrevCert:          len(st.prevCertPEM) > 0,
+		secretKeyRotationHoldout:     st.hasHoldout,
+		secretKeyRotationRetireAfter: st.hasRetireAfter,
 	} {
 		if present {
 			stray = append(stray, key)
@@ -546,31 +576,76 @@ func (r *caRotator) rotationDue(st caRotationState) (string, bool) {
 // break a multi-replica hub: every replica polls this Secret, so a lifetime is
 // many thousand poll intervals, and no replica can still be ignorant of the
 // successor when another starts signing with it.
+//
+// The one thing that opens the gate early is the signer itself expiring.
+// Waiting is for spokes to renew onto the two-root bundle, and past the
+// signer's notAfter no spoke can renew at all -- every certificate it would
+// issue chains to an expired root -- so the rest of the wait protects nothing
+// and costs every cluster whose renewal falls due inside it. This is the
+// runway-floor case in rotationDue having lost anyway: a rotation forced or
+// begun too late to finish. Promoting is the only move that gets issuance
+// back.
 func (r *caRotator) planPublishing(st caRotationState) *caRotationPlan {
 	if len(st.nextCertPEM) == 0 || len(st.nextKeyPEM) == 0 {
 		return &caRotationPlan{
 			to:     caPhaseSteady,
 			reason: "no successor root is stored, so there is nothing to publish",
-			del:    []string{secretKeyCANextCert, secretKeyCANextKey, secretKeyRotationHoldout},
+			del:    rotationScratchKeys,
 		}
 	}
 	if plan := r.repairSince(st); plan != nil {
 		return plan
 	}
-	if r.now().Sub(st.since) < r.cfg.SpokeCertTTL {
-		return nil
+	now := r.now()
+	reason := fmt.Sprintf("the successor root has been published for %s, a full spoke certificate lifetime",
+		r.cfg.SpokeCertTTL)
+	if now.Sub(st.since) < r.cfg.SpokeCertTTL {
+		if now.Before(r.authority.NotAfter()) {
+			return nil
+		}
+		reason = "the signing root has expired, so nothing can renew onto the outgoing bundle; " +
+			"promoting the successor restores issuance"
 	}
+	// The retirement horizon is fixed here, from the lifetime and grace this
+	// promotion was made under, and read back by planSigning. See
+	// secretKeyRotationRetireAfter for why it is stored rather than
+	// recomputed.
+	retireAfter := now.Add(r.retirementHold())
 	return &caRotationPlan{
-		to: caPhaseSigning,
-		reason: fmt.Sprintf("the successor root has been published for %s, a full spoke certificate lifetime",
-			r.cfg.SpokeCertTTL),
+		to:     caPhaseSigning,
+		reason: reason,
 		set: map[string][]byte{
-			secretKeyCACert:     st.nextCertPEM,
-			secretKeyCAKey:      st.nextKeyPEM,
-			secretKeyCAPrevCert: st.certPEM,
+			secretKeyCACert:              st.nextCertPEM,
+			secretKeyCAKey:               st.nextKeyPEM,
+			secretKeyCAPrevCert:          st.certPEM,
+			secretKeyRotationRetireAfter: []byte(retireAfter.UTC().Format(time.RFC3339)),
 		},
 		del: []string{secretKeyCANextCert, secretKeyCANextKey, secretKeyRotationHoldout},
 	}
+}
+
+// rotationScratchKeys is every rotation key a return to steady state clears.
+// One list rather than one per transition, because the transitions that
+// merely tidy up -- a missing successor, a missing outgoing root -- must
+// clear exactly the same set, and a key left behind by one of them would be
+// mistaken for stray material on the very next poll.
+var rotationScratchKeys = []string{
+	secretKeyCANextCert, secretKeyCANextKey, secretKeyRotationHoldout, secretKeyRotationRetireAfter,
+}
+
+// retirementHold is how long after promotion the outgoing root must stay
+// trusted, from the config in force now: a full certificate lifetime plus
+// the renewal grace, padded by two poll intervals.
+//
+// By the time it has elapsed, every certificate the outgoing root ever issued
+// is past its own expiry AND the window in which a spoke that was switched
+// off could still have renewed it. The padding is for the replicas that LOST
+// the promotion: each keeps signing with the old root until its next poll
+// adopts the new signer, and a certificate issued in that lag is legitimately
+// renewable until lag + TTL + grace after the promotion. Two intervals rather
+// than one because the poll is jittered and a read can straddle a boundary.
+func (r *caRotator) retirementHold() time.Duration {
+	return r.cfg.SpokeCertTTL + r.cfg.RenewGrace + 2*r.cfg.CARotationPollInterval
 }
 
 // planSigning decides whether the outgoing root may be dropped.
@@ -587,7 +662,7 @@ func (r *caRotator) planSigning(st caRotationState) *caRotationPlan {
 		return &caRotationPlan{
 			to:     caPhaseSteady,
 			reason: "the outgoing root is no longer stored, so the rotation is already complete",
-			del:    []string{secretKeyCANextCert, secretKeyCANextKey, secretKeyRotationHoldout},
+			del:    rotationScratchKeys,
 		}
 	}
 	if plan := r.repairSince(st); plan != nil {
@@ -598,22 +673,26 @@ func (r *caRotator) planSigning(st caRotationState) *caRotationPlan {
 	// THIS clock gate is the load-bearing protection, and the holdout count
 	// below is the second belt. By the time the gate opens, every certificate
 	// the outgoing root ever issued is past its own expiry AND the renewal
-	// grace, so retiring the root strands nothing that could still come back.
-	// The holdout veto is advisory on top of that: it is per-replica evidence
-	// with a startup quiet window, and a replica restart racing the
-	// retirement can leave a short gap where a live holdout goes unreported.
-	// That gap is only dangerous if this arithmetic is broken -- which is why
-	// shortening --spoke-cert-ttl or --renew-grace MID-ROTATION is the one
-	// operation this design does not defend against.
-	// Padded by two poll intervals: the phase timestamp is written by the
-	// replica that WON the promotion, but a replica that lost keeps signing
-	// with the OLD root until its next poll adopts the new signer. A
-	// certificate it issues in that lag is legitimately renewable until
-	// lag + TTL + grace after the timestamp, and retiring the root on the
-	// unpadded clock would strand exactly that spoke if it was offline when
-	// the gate opened. Two intervals rather than one because the poll is
-	// jittered and a read can straddle a boundary.
-	if hold := r.cfg.SpokeCertTTL + r.cfg.RenewGrace + 2*r.cfg.CARotationPollInterval; now.Sub(st.since) < hold {
+	// grace (see retirementHold), so retiring the root strands nothing that
+	// could still come back. The holdout veto is advisory on top of that: it
+	// is per-replica evidence with a startup quiet window, and a replica
+	// restart racing the retirement can leave a short gap where a live
+	// holdout goes unreported. That gap is only dangerous if this arithmetic
+	// is broken.
+	//
+	// The gate is the LATER of two horizons: the one the promoting replica
+	// persisted from the config it promoted under, and the one the live
+	// config gives from the phase start. The persisted one is what makes
+	// shortening --spoke-cert-ttl or --renew-grace mid-rotation safe -- the
+	// certificates in the field were issued under the old values and the old
+	// values are what bound their renewal. The live one still counts because
+	// LENGTHENING mid-rotation can only ever be conservative, and because a
+	// rotation promoted by an older build persisted nothing.
+	gate := st.since.Add(r.retirementHold())
+	if st.retireAfter.After(gate) {
+		gate = st.retireAfter
+	}
+	if now.Before(gate) {
 		// Nothing is decided here yet, and nothing is written either. Every
 		// spoke is on the outgoing root at the start of this phase, so
 		// recording sightings before the clock is anywhere near open would be
@@ -646,7 +725,7 @@ func (r *caRotator) planSigning(st caRotationState) *caRotationPlan {
 	return &caRotationPlan{
 		to:     caPhaseSteady,
 		reason: "no replica has seen a session on the outgoing root, and every certificate it issued has passed expiry and the renewal grace",
-		del:    []string{secretKeyCAPrevCert, secretKeyRotationHoldout},
+		del:    []string{secretKeyCAPrevCert, secretKeyRotationHoldout, secretKeyRotationRetireAfter},
 	}
 }
 

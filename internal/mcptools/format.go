@@ -6,6 +6,7 @@ package mcptools
 import (
 	"fmt"
 
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/fleet"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/render"
 )
 
@@ -38,4 +39,25 @@ func parseFormat(s string, allowJSON bool) (render.Format, *ToolError) {
 			WithHint("Use compact or table.")
 	}
 	return f, nil
+}
+
+// refuseRawUnderLimits rejects format "json" for a principal whose scope caps
+// what a query result may contain. The raw payload bypasses the encoder that
+// applies maxSeries and maxPoints, so passing it through would hand the
+// caller everything the cap was meant to withhold. points is true for the
+// range tools, whose result has a point dimension the cap can apply to.
+func refuseRawUnderLimits(format render.Format, p *fleet.Principal, points bool) *ToolError {
+	if format != render.FormatJSON {
+		return nil
+	}
+	l := p.Scope.Limits
+	capped := l.MaxSeries > 0 || (points && l.MaxPoints > 0)
+	if !capped {
+		return nil
+	}
+	return newError(CodeInvalidArgument,
+		"format \"json\" is not available to this key: its scope caps the result size "+
+			"and the raw Prometheus payload cannot be capped without re-encoding it", false).
+		WithInput(map[string]any{"format": "json"}).
+		WithHint("Use compact or table; both honour the cap and report what was withheld in truncated.")
 }

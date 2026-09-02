@@ -134,7 +134,13 @@ is about what refusing it at the limiter would have cost. The limiter bounds
 work against a *key*, which is what brute force is; it is not a request-rate
 control and no Ingress-level one is assumed. Forwarded-for headers are
 ignored (the hub cannot know which proxy to trust), so the address is always
-the TCP peer's.
+the TCP peer's. What remains: someone who knows a KID and shares the source
+address with its owner -- behind the same Ingress, that is anyone who can
+reach it -- can hold that one key in backoff with eleven failures every five
+minutes, and its owner's cache misses answer `429` until they stop. That is
+the residue of the old fleet-wide lockout, confined to a key whose KID
+leaked; treat a KID as the semi-public half of the credential it is, and
+revoke rather than wait it out.
 
 Why not Argon2id: [ADR-0007](adr/0007-hmac-pepper-not-argon2.md).
 

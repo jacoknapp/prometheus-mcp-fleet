@@ -96,15 +96,44 @@ replicaCount={{ .Values.replicaCount }}. Read this before relying on it:
 {{- end }}
 
 Next steps
-  1. Mint an agent key from a pod that can reach the admin listener:
-       kubectl -n {{ include "prometheus-mcp-hub.namespace" . }} port-forward svc/{{ include "prometheus-mcp-hub.fullname" . }} {{ int .Values.ports.admin }}:{{ int .Values.service.admin.port }}
-       curl -X POST localhost:{{ int .Values.ports.admin }}/admin/v1/keys -d '{"class":"agent"}'
-  2. Mint a single-use enrollment token per cluster:
-       curl -X POST localhost:{{ int .Values.ports.admin }}/admin/v1/enrollments -d '{"clusterId":"<cluster>"}'
+{{- $ns := include "prometheus-mcp-hub.namespace" . }}
+{{- $deploy := include "prometheus-mcp-hub.fullname" . }}
+{{- $adminURL := "" }}
+{{- if ne (int .Values.ports.admin) 9090 }}
+{{- $adminURL = printf " --admin-url http://127.0.0.1:%d" (int .Values.ports.admin) }}
+{{- end }}
+{{- $tokenFlag := "" }}
+{{- if .Values.adminToken.existingSecret }}
+{{- $tokenFlag = printf " --admin-token-file %s/%s" (trimSuffix "/" .Values.adminToken.mountPath) .Values.adminToken.key }}
+{{- end }}
+  Every admin call needs an admin bearer token. The hub printed one ONCE on first
+  start; capture it before it scrolls away:
+       kubectl -n {{ $ns }} logs deploy/{{ $deploy }} | grep pmf_adm_
+{{- if not .Values.adminToken.existingSecret }}
+  Put it in a Secret and mount it, so the commands below can read it from a file
+  instead of carrying it in the node's process table:
+       kubectl -n {{ $ns }} create secret generic pmf-admin --from-literal=admin-token='pmf_adm_...'
+       helm upgrade {{ .Release.Name }} <chart> -n {{ $ns }} --reuse-values --set adminToken.existingSecret=pmf-admin
+  Until then, append --admin-token-file <file> to each command below (or set
+  PMF_ADMIN_TOKEN in the exec's environment).
+{{- end }}
+  1. Mint an agent key:
+       kubectl -n {{ $ns }} exec deploy/{{ $deploy }} -- \
+         hub keys create --class agent --name <bot-name> --clusters '*' --tools '*'{{ $tokenFlag }}{{ $adminURL }}
+  2. Mint an enrollment token per cluster:
+       kubectl -n {{ $ns }} exec deploy/{{ $deploy }} -- \
+         hub enroll create --cluster <cluster-id>{{ $tokenFlag }}{{ $adminURL }}
      then install prometheus-mcp-spoke in that cluster with
+       cluster.id=<cluster-id>
        enrollment.token=<the pmf_enr_ token>   (or enrollment.existingSecret)
        hub.endpoints[0]={{ if .Values.ingress.enabled }}wss://{{ .Values.ingress.host }}{{ .Values.tunnel.path }}{{ else }}wss://<external hub host>{{ .Values.tunnel.path }}{{ end }}
-       hub.apiUrl={{ if .Values.config.publicURL }}{{ .Values.config.publicURL }}{{ else }}<external MCP URL>{{ end }}
+       hub.apiUrl={{ with (include "prometheus-mcp-hub.publicOrigin" .) }}{{ . }}{{ else }}https://<external hub host>{{ end }}
+     hub.apiUrl is scheme and host ONLY: the spoke appends /enroll itself, so the
+     MCP URL ({{ include "prometheus-mcp-hub.publicURL" . }}) would make it POST to /mcp/enroll and fail.
+     Leave hub.caBundle empty when the Ingress serves a publicly trusted certificate.
+     For a private issuer, hub.caBundle is THAT issuer's CA (the one that signed the
+     Ingress certificate), never this hub's /pki/bundle, which signs spoke identities
+     and vouches for no server.
   3. Watch spokes attach:
        kubectl -n {{ include "prometheus-mcp-hub.namespace" . }} logs deploy/{{ include "prometheus-mcp-hub.fullname" . }} -f
 

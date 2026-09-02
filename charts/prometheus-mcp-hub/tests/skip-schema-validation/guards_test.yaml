@@ -13,6 +13,9 @@
 #   helm unittest --skip-schema-validation \
 #     -f 'tests/skip-schema-validation/*_test.yaml' charts/prometheus-mcp-hub
 suite: hub template guards behind the schema
+# PMF_PUBLIC_URL is required; the chart refuses to render without it.
+set:
+  config.publicURL: https://mcp.example.com/mcp
 tests:
   # tunnel.path is a mount point on the MCP listener, not a listener of its own.
   # "/" would swallow every MCP request; the binary's checkPath refuses it too.

@@ -338,8 +338,8 @@ func LoadHub(args []string, getenv func(string) string) (*Hub, error) {
 		"how often each replica prunes the state document; zero disables pruning")
 	l.integer(&c.MaxSpokes, "max-spokes", 0, "optional cap on concurrent spoke sessions on this replica; 0 means no limit")
 
-	l.duration(&c.QueryTimeout, "query-timeout", 30*time.Second, "timeout for instant and metadata queries")
-	l.duration(&c.RangeQueryTimeout, "range-query-timeout", 120*time.Second, "timeout for range queries")
+	l.duration(&c.QueryTimeout, "query-timeout", 30*time.Second, "deadline for a call that states none, which is the metadata and selector lookups; instant queries default to 30s and range queries to 60s at the tool layer")
+	l.duration(&c.RangeQueryTimeout, "range-query-timeout", 120*time.Second, "ceiling every per-call deadline is clamped to; the tool layer already caps callers at 120s, so a larger value changes nothing and a smaller one tightens every tool")
 	l.bytesize(&c.MaxResponseBytes, "max-response-bytes", 33554432, "maximum bytes accepted from one upstream response")
 	l.integer(&c.MaxInflightPerCluster, "max-inflight-per-cluster", 8, "per-cluster in-flight request limit")
 	l.bytesize(&c.MaxResponseBudgetBytes, "max-response-budget-bytes", 268435456, "process-wide in-flight response byte budget")

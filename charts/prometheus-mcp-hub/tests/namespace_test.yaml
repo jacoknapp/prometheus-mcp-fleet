@@ -1,0 +1,32 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# namespaceOverride moves every object; the peer-discovery domain the hub
+# resolves must move with the headless Service or every replica counts zero
+# peers and HA silently degrades to one tunnel per spoke.
+suite: hub namespaceOverride is honoured by every object and by peer discovery
+set:
+  config.publicURL: https://mcp.example.com/mcp
+  namespaceOverride: fleet-system
+tests:
+  - it: renders every namespaced object into the override
+    templates:
+      - templates/configmap.yaml
+      - templates/deployment.yaml
+      - templates/service.yaml
+      - templates/service-headless.yaml
+      - templates/serviceaccount.yaml
+      - templates/rbac.yaml
+      - templates/networkpolicy.yaml
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: fleet-system
+
+  - it: points PMF_PEER_DISCOVERY_DOMAIN at the headless Service in the override namespace
+    templates:
+      - templates/configmap.yaml
+    asserts:
+      - equal:
+          path: data.PMF_PEER_DISCOVERY_DOMAIN
+          value: RELEASE-NAME-prometheus-mcp-hub-peers.fleet-system.svc

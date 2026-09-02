@@ -10,6 +10,8 @@ set:
   metrics:
     prometheusRule:
       enabled: true
+  # PMF_PUBLIC_URL is required; the chart refuses to render without it.
+  config.publicURL: https://mcp.example.com/mcp
 tests:
   - it: alerts on the registered promfleet_hub_* series
     asserts:

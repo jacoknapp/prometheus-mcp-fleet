@@ -315,6 +315,15 @@ func (cfg ClientConfig) httpClient() (*http.Client, error) {
 			ForceAttemptHTTP2:   false,
 			TLSHandshakeTimeout: 10 * time.Second,
 			Proxy:               http.ProxyFromEnvironment,
+			// This transport makes exactly one request and is then dropped.
+			// A successful upgrade hijacks the connection out of it; a
+			// refused one (403 from a revoked certificate, 502 from an
+			// Ingress with no backend) would otherwise be parked in its idle
+			// pool -- socket and two goroutines -- for a transport nothing
+			// will ever use again, once per retry for as long as the spoke
+			// keeps trying. The upgrade itself is unaffected: net/http does
+			// not add Connection: close to a protocol-switch request.
+			DisableKeepAlives: true,
 		},
 	}, nil
 }

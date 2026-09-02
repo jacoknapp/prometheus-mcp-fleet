@@ -11,3 +11,7 @@ podSecurityContext:
   fsGroup: null
   seccompProfile:
     type: RuntimeDefault
+config:
+  # PMF_PUBLIC_URL is required by the binary and the chart refuses to render
+  # without one (or an Ingress host to derive it from).
+  publicURL: https://mcp.example.com/mcp

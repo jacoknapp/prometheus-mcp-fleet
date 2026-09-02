@@ -26,3 +26,7 @@ tracing:
   enabled: true
   endpoint: otel-collector.observability.svc:4317
   sampleRatio: "0.10"
+config:
+  # PMF_PUBLIC_URL is required by the binary and the chart refuses to render
+  # without one (or an Ingress host to derive it from).
+  publicURL: https://mcp.example.com/mcp

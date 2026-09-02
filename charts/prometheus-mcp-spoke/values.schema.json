@@ -305,7 +305,7 @@
           "pattern": "^https?://.+"
         },
         "timeout": {
-          "description": "PMF_PROMETHEUS_TIMEOUT. Deliberately below the hub's query timeout so the spoke fails first with a useful error.",
+          "description": "PMF_PROMETHEUS_TIMEOUT. Ceiling on one upstream request. The hub's per-call deadline is the usual bound, so keep this above the hub's rangeQueryTimeout.",
           "type": "string"
         },
         "maxResponseBytes": {
@@ -772,9 +772,18 @@
                   "description": "Allow egress to the API server. Required with identity.backend=secret.",
                   "type": "boolean"
                 },
+                "ports": {
+                  "description": "Ports of the Kubernetes API server: the Service port and the endpoint port the CNI sees after DNAT.",
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 65535
+                  }
+                },
                 "port": {
-                  "description": "Port of the Kubernetes API server.",
-                  "type": "integer",
+                  "description": "Deprecated, superseded by ports. A single extra port appended to the list when set.",
+                  "type": ["integer", "null"],
                   "minimum": 1,
                   "maximum": 65535
                 }

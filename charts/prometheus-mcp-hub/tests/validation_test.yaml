@@ -3,6 +3,9 @@
 #
 # Every case here would otherwise install cleanly and be wrong in production.
 suite: hub misconfiguration fails at render time, not at 03:00
+# PMF_PUBLIC_URL is required; the chart refuses to render without it.
+set:
+  config.publicURL: https://mcp.example.com/mcp
 tests:
   - it: refuses an Ingress with no host
     set:

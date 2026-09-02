@@ -8,9 +8,156 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 While the project is pre-1.0, minor releases may contain breaking changes. The
 hub↔spoke wire protocol carries an explicit version and the hub supports the
 previous spoke minor from the outset, because 100 clusters never upgrade in
-lockstep.
+lockstep. The exception is called out where it happens: 0.10.0's `renew-v2`
+is a hard cut on the renewal proof alone, with existing tunnels unaffected
+and `--renew-grace` covering spokes that upgrade late.
 
-## [Unreleased]
+## [0.10.0] - 2026-09-01
+
+### Changed
+
+- **Renewal proofs cover the certificate signing request (`renew-v2`).**
+  The signed transcript a spoke presents to `/renew` now binds
+  `sha256(CSR)` alongside the nonce, protocol version and cluster ID. Before,
+  the signature proved possession of the old key but said nothing about
+  *which* CSR was being signed, so anything on the path between the spoke and
+  the hub that could read the request — the Ingress terminates TLS and sees
+  `/renew` in plaintext — could swap in a CSR over its own key and be issued
+  that spoke's identity. `docs/security.md` had listed a compromised Ingress
+  as a threat the design contained; it did not.
+
+  This is a hard cut with no compatibility flag: a v0.9 spoke renewing
+  against a v0.10 hub, or the reverse, is refused with `forbidden` (security
+  event `renewal.unproven`) until both sides match. Existing tunnels are unaffected — the transcript is
+  only checked at renewal — and `--renew-grace` (30 days) is what recovers a
+  spoke that was upgraded late: it renews on its expired certificate the
+  moment it comes back. Upgrade the hub first, then the spokes, inside one
+  certificate lifetime.
+
+- **Authentication backoff is per (source address, KID), not per address.**
+  Behind an Ingress every agent shares the Ingress pod's address, so the
+  old per-address bucket let one client retrying a revoked key put the whole
+  fleet into `429` on its next cache miss — and let anyone outside, holding
+  no credential, keep it there. A bad key's penalty is now confined to that
+  key. Forwarded-for headers stay ignored.
+
+### Fixed
+
+- `make mutate` failed on every run since 0.9.0: `internal/hubcli` shipped
+  without an entry in `hack/mutation-baseline.txt`. The package now has one
+  (94, measured 97.35) and three tests that kill the survivors that were not
+  equivalent: the error envelope is reported as `status: message` rather than
+  dumped, a token without labels prints no empty `labels:` line, and
+  `keys rotate --no-expiry` alone is sent as such.
+- Range tools (`query_range`, `exemplars`, `metadata`), `fanout` in both
+  modes, and the instant `query` ignored the principal's scope limits: a key
+  scoped to `maxLookback: 1h` could read a year, and `maxSeries` /
+  `maxPoints` were never applied to instant queries or the fan-out. Every
+  path now takes the tighter of the scope and the hub default. Two ways
+  around the check found in review are closed too: the fan-out's range start
+  is now aligned *up* to the step boundary, so a large `step` can no longer
+  pull the first sample before the lookback-checked window; and
+  `format: "json"` on `query` / `query_range` is refused for a key whose
+  scope caps `maxSeries` or `maxPoints`, because the raw payload bypasses
+  the encoder that applies them.
+- The spoke's first facts collection at start-up had no deadline of its own,
+  so a Prometheus that accepted the connection and then hung held the whole
+  start-up — and with the 130-second upstream ceiling, for over two minutes
+  per source — before the first dial to the hub. It now runs under the same
+  budget as every later refresh.
+- Every HTTP listener now sets a 60-second `ReadTimeout` (`httpx`), closing
+  the body-shaped slowloris the header timeout left open: a client that
+  sends a complete request head and then dribbles the body. Long tool calls,
+  SSE streams and the tunnel upgrade are unaffected, because net/http clears
+  the read deadline once the body has been read to EOF and on hijack — a
+  behaviour the package comment had described backwards.
+- `hub keys list --json` prints the admin API's own listing for scripts. The
+  runbook's emergency revoke-everything loop parsed the table with `awk` on
+  column number, which skipped any key whose name contains a space; it now
+  selects on `.revoked` from the JSON.
+- `fanout` against a query that returns a scalar (`count(up)`, `time()`)
+  reported `ALL_CLUSTERS_FAILED` as retryable. Scalars are rendered as a
+  one-sample series; a matrix in instant mode and a string are per-cluster
+  `INVALID_ARGUMENT`; and when every cluster failed permanently the error is
+  no longer marked retryable.
+- The state prune could delete the enrollment record that is the authority
+  for a cluster's operator-pinned labels, silently turning a pinned
+  `tier=pci` into a spoke-asserted one at the next reconnect. The newest
+  non-revoked enrollment record per cluster is now never pruned.
+- The prune could also drop a certificate revocation inside the renew grace
+  window — the only thing refusing that certificate at `/renew` — with a
+  short `--state-retention`. Records are now held for
+  `expiry + --renew-grace + --state-retention`.
+- `POST /admin/v1/certs/{serial}/revoke` accepted a `notAfter` in the past
+  and answered 204 for a revocation the tunnel would ignore as moot. It is
+  now refused with `invalid_request`; omit the field to cover the longest
+  possible lifetime.
+- The `fleet://alerts/firing` resource fanned out to every cluster with no
+  cluster cap, no deadline and no token ceiling. It is now bounded the way
+  the `fanout` tool is: clusters are capped, the fan-out carries the default
+  deadline, and the rendering is fitted with a truncation note.
+- The spoke's Prometheus metrics `prom_requests_total{endpoint,code}` and
+  `prom_duration_seconds{endpoint}` were declared but never written, so the
+  `PrometheusMCPSpokePromErrorRatioHigh` alert could not fire. Every upstream
+  call now records them; `code` is the HTTP status or `timeout` / `error`,
+  `endpoint` is the allow-list name (a new `healthy` value covers the
+  readiness probe).
+- The spoke's `--prometheus-timeout` (25 s) silently overrode any longer
+  deadline the hub forwarded down the tunnel, so a range query granted 120 s
+  died at 25 s. The default is now 130 s and the flag is documented as the
+  ceiling it is; the hub's per-call deadline is the usual bound. The hub's
+  `--range-query-timeout` help now says what it does: the ceiling any call
+  may raise its timeout to, not a range-only setting.
+- A refused WebSocket upgrade (a 403 from the Ingress, say) left the spoke's
+  dial transport holding an idle keep-alive connection and two goroutines per
+  attempt, for the life of the process. The dial transport is now one-shot.
+- A spoke that renewed its certificate between reading its identity and
+  arming the reconnect signal missed the renewal until the next reconnect.
+- Closing a tunnelled request body while another goroutine was blocked
+  reading it could not unblock the read. Close now cancels the stream first.
+- A `promfleet.io/rotate-now` annotation applied while the state Secret still
+  held leftovers from an interrupted rotation was consumed by the tidy-up
+  and the rotation never started. The annotation now survives the tidy-up.
+- A CA rotation in the `publishing` phase waited the full spoke certificate
+  lifetime even after the outgoing root had expired, during which nothing
+  could be issued. The successor is promoted as soon as the signer expires.
+- The `signing` phase's retirement gate was computed from the live
+  `--spoke-cert-ttl` and `--renew-grace`, so shortening either mid-rotation
+  could drop the outgoing root while certificates issued under the longer
+  values were still live. The horizon is now recorded at promotion
+  (`ca-rotation.retire-after`) and the gate takes the later of the two.
+- Store health was evaluated once at startup. A replica whose state Secret
+  became unreadable (a schema written by a newer build, a corrupt document,
+  an unreachable API server) stayed ready while failing every cache miss.
+  The store is now re-probed every 15 s and readiness follows it.
+- `hub` with no recognised subcommand printed a usage line that still named
+  only `enroll create` and `keys create`.
+- Helm: the hub chart with a plain `helm install` rendered no
+  `PMF_PUBLIC_URL`, which the hub refuses at startup; the URL is now derived
+  from `ingress.host`, and the template fails with a clear message when
+  neither that nor `config.publicURL` is set. `service-headless` and the peer
+  ConfigMap used `.Release.Namespace` and broke `namespaceOverride`. The
+  NetworkPolicy allowed the API server on port 443 only; `kubeAPIPorts`
+  (hub) and `kubeAPI.ports` (spoke) default to `[443, 6443]`, with the old
+  scalar keys still honoured. The hub NOTES printed `hub.apiUrl` with the
+  `/mcp` path and a `curl` with no credential.
+- Docs: the quickstart, troubleshooting guide, runbook and enrollment guide
+  told operators to mount `/pki/bundle` (the spoke-identity CA) as the CA the
+  spoke should trust the hub's Ingress with, which fails TLS against any real
+  Ingress certificate; `--hub-ca-file` claimed a fallback to the enrollment
+  bundle that does not exist, and `spoke --help` said the same. All
+  corrected. The runbook's response-code
+  table, the admin CLI recipes, `mcp-tools.md`'s error shapes and the
+  `fanout` parameter table were brought in line with the code; the error
+  table now lists every code a tool can return, and the fan-out section
+  documents how each result type merges and what `ALL_CLUSTERS_FAILED`
+  carries. `--query-timeout` / `--range-query-timeout` are described as the
+  code implements them: the first is the deadline for calls that state none,
+  the second the ceiling every per-call deadline is clamped to, which the
+  tool layer already caps at 120 seconds. The enrollment guide's
+  reconciliation paragraph no longer claims `hub certs list` shows what the
+  hub trusts (it lists revocations), and ADR-0015's diagram shows the early
+  promotion when the outgoing signer has already expired.
 
 ## [0.9.0] - 2026-09-01
 

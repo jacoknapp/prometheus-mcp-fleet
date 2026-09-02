@@ -21,7 +21,12 @@ kubectl -n prometheus-mcp logs deploy/pmf-spoke --tail=100
 ```
 
 `/readyz` returns JSON listing each not-ready component with a reason. Read it
-before guessing — it is right more often than intuition.
+before guessing — it is right more often than intuition. One component to know
+about: the hub re-probes `store` every 15 seconds, so a state Secret that
+becomes unreadable after startup (a schema from a newer build, a corrupt
+document, an API server that stopped answering) shows up as `the state
+document cannot be read: ...` and takes the replica out of the Service until a
+read succeeds again. Readiness comes back on its own; no restart is needed.
 
 ## The agent cannot connect
 
@@ -179,7 +184,12 @@ taints, node capacity — not a storage one.
 ## Certificates
 
 **`x509: certificate signed by unknown authority`** — the spoke does not trust
-the hub's CA. Fetch it from `GET /pki/bundle` and supply it as `hub.caBundle`.
+the certificate the hub's **Ingress** presents. With a publicly issued Ingress
+certificate the fix is to leave `hub.caBundle` empty so the system roots apply;
+with a private issuer, supply that issuer's CA as `hub.caBundle` /
+`hub.existingCASecret`. Do not supply the hub's `/pki/bundle`: that is the CA
+for spoke identities, it never signed the Ingress certificate, and a spoke told
+to trust it produces exactly this error.
 
 **`remote error: tls: bad certificate`** — the hub rejected the spoke. Usually
 revoked; check the hub's audit log for the serial.

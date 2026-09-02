@@ -3,6 +3,9 @@
 suite: hub RBAC is namespaced and name-restricted
 templates:
   - templates/rbac.yaml
+# PMF_PUBLIC_URL is required; the chart refuses to render without it.
+set:
+  config.publicURL: https://mcp.example.com/mcp
 tests:
   - it: restricts get and update by resourceNames to the state and CA Secrets only
     documentIndex: 0

@@ -33,6 +33,13 @@ const (
 	// Slowloris hole, where a handful of connections dribbling one byte at a
 	// time exhaust the listener.
 	DefaultReadHeaderTimeout = 10 * time.Second
+	// DefaultReadTimeout bounds how long a client may take to deliver the
+	// whole request, body included, counted from its first byte. It closes
+	// the body-shaped Slowloris that ReadHeaderTimeout leaves open: a client
+	// that sends a complete head and then dribbles the body one byte at a
+	// time. Every body this product accepts is small (see [MaxBody] and the
+	// per-route caps), so a minute is generous.
+	DefaultReadTimeout = 60 * time.Second
 	// DefaultIdleTimeout bounds how long a keep-alive connection may sit idle.
 	DefaultIdleTimeout = 120 * time.Second
 	// DefaultShutdownGrace bounds how long [Server.Shutdown] waits for
@@ -59,18 +66,19 @@ type ServerConfig struct {
 	// ReadHeaderTimeout bounds the request head. Zero means
 	// [DefaultReadHeaderTimeout].
 	ReadHeaderTimeout time.Duration
-	// ReadTimeout bounds the whole request including the body. Zero means no
-	// limit, which is intentional: a large remote-write-shaped upload or a
-	// slow client on a long POST must not be cut off by a clock. Body size is
-	// bounded by [MaxBody] instead, which is the right control for it.
+	// ReadTimeout bounds the whole request including the body, counted from
+	// the first byte of the request line. Zero means [DefaultReadTimeout];
+	// a negative value disables it.
 	//
-	// It is also unsafe on any listener that streams: over HTTP/1.1 the
-	// server keeps a background read on the connection while a handler
-	// runs, and when that read hits the deadline it cancels the request
-	// context -- so a 30-second ReadTimeout would abort every tool call or
-	// event stream that outlived it, not just slow uploads. The MCP listener
-	// serves 120-second tool calls and open-ended SSE, and the tunnel
-	// upgrade hijacks the same listener's connections.
+	// It is safe on a listener that streams or hijacks, which is not
+	// obvious: net/http clears the read deadline the moment the body has
+	// been read to EOF (or at once for a body-less request) and starts its
+	// background read with no deadline, so a handler that runs for minutes
+	// after consuming its body -- a 120-second tool call, an open-ended SSE
+	// stream -- is never cut off by it. Hijack clears the deadline too, so
+	// the tunnel upgrade on the same listener is unaffected. What it does
+	// bound is delivery of the body itself, which is exactly the hole
+	// ReadHeaderTimeout leaves.
 	ReadTimeout time.Duration
 	// WriteTimeout bounds the whole response. Zero means no limit -- see
 	// [NewServer] for why that is the default here.
@@ -112,8 +120,8 @@ type Server struct {
 
 // NewServer builds a server from cfg. It binds nothing; call [Server.Start].
 //
-// Defaults for zero fields: ReadHeaderTimeout 10s, IdleTimeout 120s,
-// ShutdownGrace 30s.
+// Defaults for zero fields: ReadHeaderTimeout 10s, ReadTimeout 60s,
+// IdleTimeout 120s, ShutdownGrace 30s.
 //
 // WriteTimeout deliberately defaults to 0, meaning no limit. The MCP endpoint
 // answers over Streamable HTTP and streams Server-Sent Events, and a tool call
@@ -137,6 +145,13 @@ func NewServer(cfg ServerConfig) *Server {
 	readHeaderTimeout := cfg.ReadHeaderTimeout
 	if readHeaderTimeout <= 0 {
 		readHeaderTimeout = DefaultReadHeaderTimeout
+	}
+	readTimeout := cfg.ReadTimeout
+	switch {
+	case readTimeout == 0:
+		readTimeout = DefaultReadTimeout
+	case readTimeout < 0:
+		readTimeout = 0
 	}
 	idleTimeout := cfg.IdleTimeout
 	if idleTimeout <= 0 {
@@ -163,7 +178,7 @@ func NewServer(cfg ServerConfig) *Server {
 			Handler:           handler,
 			TLSConfig:         cfg.TLS,
 			ReadHeaderTimeout: readHeaderTimeout,
-			ReadTimeout:       cfg.ReadTimeout,
+			ReadTimeout:       readTimeout,
 			WriteTimeout:      cfg.WriteTimeout,
 			IdleTimeout:       idleTimeout,
 			// Route the server's own connection-level errors into structured

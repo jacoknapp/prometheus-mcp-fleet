@@ -31,11 +31,17 @@ helm install hub oci://ghcr.io/jacoknapp/prometheus-mcp-fleet/charts/prometheus-
   --namespace prometheus-mcp --create-namespace \
   --set ingress.enabled=true \
   --set ingress.className=nginx \
-  --set ingress.host=hub.example.com \
-  --set ingress.enabled=true \
   --set ingress.host=mcp.example.com \
-  --set config.publicURL=https://mcp.example.com
+  --set ingress.tls.enabled=true \
+  --set ingress.tls.secretName=mcp-tls
 ```
+
+`config.publicURL` (`PMF_PUBLIC_URL`, the canonical `https://<host>/mcp`) is
+derived from the Ingress host when it is left empty and the Ingress terminates
+TLS, as above. Set it yourself when the published hostname is not
+`ingress.host` or TLS ends somewhere the chart cannot see, and expect the
+render to be refused when there is neither: the binary will not start without
+one, and the chart will not invent a plaintext URL for it.
 
 ## There is no database and no PersistentVolumeClaim
 

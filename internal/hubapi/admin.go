@@ -471,7 +471,7 @@ func (s *server) handleRevokeCert(w http.ResponseWriter, r *http.Request) {
 	// safe.
 	if notAfter.Before(now) {
 		s.fail(w, r, CodeInvalidRequest,
-			"notAfter is in the past; omit it to cover the longest possible certificate lifetime, or supply the certificate's real expiry")
+			"notAfter is in the past; omit it to cover the longest possible certificate lifetime")
 		return
 	}
 	if err := s.store.RevokeCert(r.Context(), RevokedCert{

@@ -159,10 +159,13 @@ or `hub.existingCASecret` supplies the trust bundle for the **hub's server certi
 the one its Ingress terminates, on both `hub.endpoints` and `hub.apiUrl`. It is not
 client-certificate material and has nothing to do with this spoke's own identity, which
 comes from enrollment. If the hub's Ingress serves a publicly trusted certificate you do not
-need either value; they exist for a private CA. Supply it **out of band**: the hub is in a
-different cluster, so nothing here vouches for it on first enrollment. With neither set the
-spoke accepts the bundle the hub returns at enrollment and caches it — trust on first use,
-which is fine on a trusted path and not fine on the open internet.
+need either value; they exist for a private CA, and then the content is **that issuer's**
+CA certificate, supplied out of band because the hub is in a different cluster and nothing
+here vouches for it on first enrollment. With neither set the spoke verifies against the
+image's system roots. There is no trust-on-first-use and no fallback to the bundle the hub
+returns at enrollment: that bundle is the CA that signs spoke *identities*, it never signed
+the Ingress certificate, and pointing `hub.caBundle` at it fails every dial with
+`certificate signed by unknown authority`.
 
 `hub.tlsInsecure` and `prometheus.tls.skipVerify` each require `hub.allowInsecure` as well.
 Two independent settings mean an insecure spoke cannot be reached by a single typo.
@@ -236,7 +239,9 @@ its firewall.
    not close the connection while idle. The tunnel pings every 10 seconds, so any idle
    timeout above ~30 seconds is fine.
 5. **TLS.** `certificate signed by unknown authority` means the trust bundle for the hub's
-   **server** certificate is wrong: set `hub.caBundle` or `hub.existingCASecret`.
+   **server** certificate is wrong. A public issuer needs nothing (system roots); a private
+   issuer needs *its* CA in `hub.caBundle` or `hub.existingCASecret`. Never the hub's
+   `/pki/bundle`, which signs spoke identities and is itself a cause of this error.
    `certificate is valid for X, not Y` means the hub's Ingress certificate does not cover
    the host in your `hub.endpoints` — fixed on the hub's `ingress.host` /
    `certManager.serving.dnsNames`, not here.

@@ -211,7 +211,7 @@ func TestLoadSpokeDefaults(t *testing.T) {
 		IdentityBackend:            IdentityBackendAuto,
 		IdentitySecretName:         DefaultIdentitySecretName,
 		PrometheusURL:              DefaultPrometheusURL,
-		PrometheusTimeout:          25 * time.Second,
+		PrometheusTimeout:          130 * time.Second,
 		PrometheusMaxResponseBytes: 33554432,
 		FactsRefreshInterval:       10 * time.Minute,
 		ReconnectMinBackoff:        500 * time.Millisecond,

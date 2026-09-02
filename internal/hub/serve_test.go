@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -24,6 +25,7 @@ import (
 
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/ca"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/config"
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/store"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel/tunneltest"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel/wstun"
@@ -116,6 +118,72 @@ func TestWatchCertExpiryRefusesReadinessBeforeTheCALapses(t *testing.T) {
 		t.Fatalf("readiness blocker = %q, want it to name the expiry", blockers["ca"])
 	}
 	sink.mustFind(t, "component not ready")
+}
+
+// --- watchStoreHealth -------------------------------------------------
+
+// TestWatchStoreHealthFollowsTheStore pins the loop's whole contract: a
+// store that stops decoding takes readiness away, one that recovers gives it
+// back without a restart, and a probe cut short by shutdown changes nothing.
+// The failure is an ErrSchemaTooNew, the case a rolling upgrade produces:
+// the newer replica writes a document this build cannot read, and until
+// this loop existed the old replica kept telling the Service it was ready
+// while every cache miss it served was refused.
+func TestWatchStoreHealthFollowsTheStore(t *testing.T) {
+	t.Parallel()
+
+	h, sink := newTestHub(t, newHubConfig(t))
+	faulty := &faultyStore{Store: h.store}
+	h.store = faulty
+	if ready, blockers := h.health.Ready(); !ready {
+		t.Fatalf("not ready before the first probe: %v", blockers)
+	}
+
+	faulty.failEpoch(fmt.Errorf("decode state: %w", store.ErrSchemaTooNew))
+	h.probeStore(context.Background())
+	ready, blockers := h.health.Ready()
+	if ready {
+		t.Fatal("the hub reported ready with a state document it cannot read")
+	}
+	if !strings.Contains(blockers["store"], store.ErrSchemaTooNew.Error()) {
+		t.Fatalf("readiness blocker = %q, want it to carry the store's error", blockers["store"])
+	}
+	sink.mustFind(t, "component not ready")
+
+	// Shutdown mid-probe is not a store failure. The store is already
+	// marked unready here, so what this pins is that the probe does not
+	// REWRITE the reason with a context error -- nor, on a healthy store,
+	// take readiness away on the way out.
+	faulty.failEpoch(nil)
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	faulty.failEpoch(context.Canceled)
+	h.probeStore(cancelled)
+	if _, after := h.health.Ready(); after["store"] != blockers["store"] {
+		t.Fatalf("a cancelled probe rewrote the blocker: %q -> %q", blockers["store"], after["store"])
+	}
+
+	// The document is fixed: readiness returns on the next probe, with no
+	// restart.
+	faulty.failEpoch(nil)
+	h.probeStore(context.Background())
+	if ready, blockers := h.health.Ready(); !ready {
+		t.Fatalf("readiness did not return once the store recovered: %v", blockers)
+	}
+	sink.mustFind(t, "readiness check passed")
+
+	// The loop itself: it probes on entry, not one interval later, and it
+	// stops with the context.
+	faulty.failEpoch(store.ErrCorrupt)
+	ctx, stop := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); h.watchStoreHealth(ctx) }()
+	eventually(t, 5*time.Second, "the loop's first probe to take readiness away", func() bool {
+		ready, _ := h.health.Ready()
+		return !ready
+	})
+	stop()
+	<-done
 }
 
 // --- drain ------------------------------------------------------------

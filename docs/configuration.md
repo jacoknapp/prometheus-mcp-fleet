@@ -91,8 +91,8 @@ widen them past what is set here.
 
 | Flag / `PMF_` variable | Default | Description |
 |---|---|---|
-| `--query-timeout` | `30s` | Instant and metadata queries. |
-| `--range-query-timeout` | `120s` | Range queries. |
+| `--query-timeout` | `30s` | Deadline for a call that states none: the metadata and selector lookups. Instant queries default to 30s and range queries to 60s at the tool layer, and a caller may raise either to 120s. |
+| `--range-query-timeout` | `120s` | Ceiling every per-call deadline is clamped to. The tool layer already caps callers at 120s, so a larger value changes nothing; a smaller one tightens every tool. |
 | `--max-response-bytes` | `32Mi` | Maximum accepted from one upstream response, enforced **during** the read and applied to the decompressed size. |
 | `--max-inflight-per-cluster` | `8` | Per-cluster in-flight limit. Over it returns a retryable "busy", not an unbounded queue. |
 | `--max-response-budget-bytes` | `256Mi` | Process-wide budget for response bytes actively IN TRANSFER. It is reserved before the upstream call and released the moment it returns, so it does not cover the decoded and rendered copies a tool call still holds afterwards — set the pod memory limit to several times this, not equal to it. |
@@ -126,7 +126,7 @@ widen them past what is set here.
 |---|---|---|
 | `--hub-endpoints` | **required** | Comma-separated hub tunnel URLs, e.g. `wss://pmf.example.com/tunnel`. List one per hub replica; the spoke holds a tunnel to each. |
 | `--hub-api-url` | **required** | HTTPS base URL of the hub's enrollment listener. |
-| `--hub-ca-file` | — | Trust bundle for the hub. Empty uses the bundle cached in `--data-dir` from enrollment. |
+| `--hub-ca-file` | — | CA bundle used to verify the hub's **server** certificate, i.e. the one its Ingress presents. Empty means the system roots, which is right for a publicly issued certificate. There is no fallback to the bundle enrollment returns: that CA signs spoke identities and could never verify the Ingress. |
 | `--hub-tls-insecure` | `false` | Skips verification of the hub certificate. Requires `--allow-insecure` as a second, deliberate opt-in. |
 | `--allow-insecure` | `false` | Permits the insecure options. Never set this in production. |
 | `--reconnect-min-backoff` | `500ms` | Initial reconnect delay. |
@@ -162,7 +162,7 @@ weaker posture; choose it deliberately.
 | Flag / `PMF_` variable | Default | Description |
 |---|---|---|
 | `--prometheus-url` | `http://prometheus-operated.monitoring.svc:9090` | The local Prometheus-compatible server. A path prefix such as `http://gateway/prom` is preserved. |
-| `--prometheus-timeout` | `25s` | One upstream request. The spoke subtracts a 250 ms hop margin so it can return a structured error rather than a truncated stream. |
+| `--prometheus-timeout` | `130s` | Ceiling on one upstream request. The hub's per-call deadline, forwarded down the tunnel, is the usual bound; the spoke spends it less a 250 ms hop margin so it can return a structured error rather than a truncated stream. Keep this above the hub's `--range-query-timeout`. |
 | `--prometheus-bearer-token-file` | — | Re-read on every request, because Kubernetes rotates projected tokens in place. |
 | `--prometheus-tls-ca-file` | — | Trust bundle for an HTTPS Prometheus. |
 | `--prometheus-tls-skip-verify` | `false` | Requires `--allow-insecure`. |
@@ -194,7 +194,7 @@ from a workstation with no extra flags.
 | Command | Does |
 |---|---|
 | `hub keys create` | Mint an agent or admin key. `--class`, `--name`, `--clusters`, `--tools`, `--ttl`, `--no-expiry`, `--quiet` |
-| `hub keys list` | List credentials with a STATUS column. `--class agent\|admin\|enrollment` |
+| `hub keys list` | List credentials with a STATUS column. `--class agent\|admin\|enrollment`; `--json` for the raw API listing |
 | `hub keys revoke` | Withdraw one key. `--kid`, `--reason`, and `--purge` to destroy the record rather than revoke it |
 | `hub keys rotate` | Mint a replacement with the same identity and scope and revoke the original, as one store mutation. `--kid`, `--ttl`, `--no-expiry`, `--reason` |
 | `hub enroll create` | Mint an enrollment token bound to one cluster. `--cluster`, `--labels`, `--ttl`, `--single-use`, `--max-redemptions` |
@@ -220,7 +220,9 @@ checks a dependency**. A dead Prometheus must not restart the pod.
 
 `/readyz` — able to serve. The body is JSON listing what is blocking.
 
-The hub is **not ready** when: the credential store is unopened or unwritable,
+The hub is **not ready** when: the credential store is unopened, unwritable or
+unreadable (the `store` component is re-probed every 15 seconds and reports
+`the state document cannot be read: ...` until a read succeeds again),
 the CA key cannot be loaded, the CA certificate expires within 24 hours, the
 pepper is unreadable, the tunnel listener is not bound, or a drain has started.
 Spoke count is deliberately *not* an input — a hub with zero spokes is

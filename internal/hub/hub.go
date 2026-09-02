@@ -254,6 +254,7 @@ func (h *hub) run(ctx context.Context) error {
 	group.Go(func() error { return h.serveTunnel(gctx, listener) })
 	group.Go(func() error { h.registry.Run(gctx); return nil })
 	group.Go(func() error { h.watchCertExpiry(gctx); return nil })
+	group.Go(func() error { h.watchStoreHealth(gctx); return nil })
 	group.Go(func() error { h.runStatePrune(gctx); return nil })
 
 	<-gctx.Done()
@@ -555,6 +556,71 @@ func (h *hub) watchCertExpiry(ctx context.Context) {
 		case <-ticker.C:
 		}
 	}
+}
+
+// Store health probing.
+const (
+	// storeProbeInterval is how often readiness re-checks that the state
+	// document can still be read. Shorter than a kubelet readiness period
+	// would be pointless; longer would leave a replica taking traffic it
+	// cannot authenticate for that much longer.
+	storeProbeInterval = 15 * time.Second
+	// storeProbeTimeout bounds one probe. A read that takes this long is a
+	// failure in its own right: the verifier gives every request the same
+	// read and would be timing out too.
+	storeProbeTimeout = 5 * time.Second
+)
+
+// watchStoreHealth keeps the "store" readiness component honest after
+// startup, which openStore alone does not: it marks the store ready once, at
+// open, and nothing ever revisited that.
+//
+// What can change underneath is the document, not the process. A newer build
+// rolling out writes a schema this one refuses ([store.ErrSchemaTooNew]); a
+// hand edit or a bad restore leaves one it cannot decode
+// ([store.ErrCorrupt]); the API server can stop answering. In every case the
+// verifier fails every cache miss -- it reads the revocation epoch on each
+// request -- so the replica is already refusing work while still telling the
+// Service it is ready to take it. Flipping readiness moves that traffic to a
+// replica that can serve it, and flips back on its own once the read
+// succeeds again, so an operator fixing the document does not also have to
+// restart anything.
+//
+// The probe is the epoch read, because it is the cheapest read that decodes
+// the whole document and it is the one the verifier depends on.
+func (h *hub) watchStoreHealth(ctx context.Context) {
+	ticker := time.NewTicker(storeProbeInterval)
+	defer ticker.Stop()
+
+	for {
+		h.probeStore(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// probeStore runs one readiness read against the store and records the
+// result. Nothing is logged here: obs.Health logs the transitions, and a
+// probe that keeps failing the same way would otherwise say so four times a
+// minute.
+func (h *hub) probeStore(ctx context.Context) {
+	probeCtx, cancel := context.WithTimeout(ctx, storeProbeTimeout)
+	defer cancel()
+	if _, err := h.store.Epoch(probeCtx); err != nil {
+		if ctx.Err() != nil {
+			// Shutdown, not a store failure: the read was cut off by the
+			// process leaving. Draining already reports not-ready, and a
+			// "component not ready" warning about the store here would send
+			// an operator looking for a problem that does not exist.
+			return
+		}
+		h.health.Set("store", false, "the state document cannot be read: "+err.Error())
+		return
+	}
+	h.health.Set("store", true, "")
 }
 
 // drain implements the shutdown ordering described in the package comment.

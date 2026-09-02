@@ -83,10 +83,11 @@ func TestRunStatePruneHoldsRevocationsThroughRenewGrace(t *testing.T) {
 
 	// Expired ten days ago: inside the grace, still renewable, must stay.
 	// Expired forty days ago: past the grace, nothing can present it, goes.
-	for serial, ago := range map[string]time.Duration{"0a": 10, "0b": 40} {
+	const day = 24 * time.Hour
+	for serial, ago := range map[string]time.Duration{"0a": 10 * day, "0b": 40 * day} {
 		if err := h.store.RevokeCert(context.Background(), store.RevokedCert{
-			Serial: serial, RevokedAt: now.Add(-50 * 24 * time.Hour),
-			NotAfter: now.Add(-ago * 24 * time.Hour), Reason: "stolen",
+			Serial: serial, RevokedAt: now.Add(-50 * day),
+			NotAfter: now.Add(-ago), Reason: "stolen",
 		}); err != nil {
 			t.Fatalf("RevokeCert(%s): %v", serial, err)
 		}

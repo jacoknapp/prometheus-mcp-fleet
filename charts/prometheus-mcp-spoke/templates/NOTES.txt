@@ -60,10 +60,11 @@ WARNING - no enrollment token was supplied.
 {{- if and (not .Values.hub.caBundle) (not .Values.hub.existingCASecret) }}
 
 NOTE - no hub trust bundle was supplied (hub.caBundle / hub.existingCASecret are empty).
-  The hub is in another cluster and another trust domain, so nothing here vouches for
-  it. The spoke will accept the bundle the hub returns at enrollment and cache it --
-  trust on first use. That is fine on a trusted path and not fine on the open internet.
-  Supply the bundle out of band for a properly authenticated first enrollment.
+  The spoke verifies the hub's Ingress certificate against the image's system roots,
+  which is correct when that certificate comes from a public issuer. If it comes from
+  a private issuer, supply THAT issuer's CA out of band as hub.caBundle or
+  hub.existingCASecret. There is no fallback to the bundle the hub returns at
+  enrollment: that CA signs spoke identities, not the Ingress certificate.
 {{- end }}
 
 {{- if .Values.hub.allowInsecure }}
@@ -104,8 +105,9 @@ If the spoke cannot reach the hub
      must not close the connection while idle -- the tunnel pings every 10s, so any
      idle timeout above ~30s is fine. It needs a path to {{ join ", " .Values.hub.endpoints }}.
   5. TLS. "certificate signed by unknown authority" means the trust bundle for the HUB'S
-     SERVER certificate is wrong: set hub.caBundle or hub.existingCASecret, or use a hub
-     Ingress certificate your trust store already accepts. "certificate is valid for X,
+     SERVER certificate is wrong: a private issuer needs its CA in hub.caBundle or
+     hub.existingCASecret (never the hub's /pki/bundle, which signs spoke identities);
+     a public issuer needs nothing. "certificate is valid for X,
      not Y" means the hub's Ingress certificate does not cover the host in your
      hub.endpoints -- fixed on the hub's ingress.host / certManager.serving.dnsNames,
      not here.

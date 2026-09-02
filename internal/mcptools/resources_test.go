@@ -4,10 +4,12 @@
 package mcptools
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 
@@ -15,6 +17,7 @@ import (
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/mcpsurface"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/promapi"
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/promproxy"
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/render"
 )
 
 // resourceRequest builds the request a resource handler sees.
@@ -209,6 +212,119 @@ func TestResourceFiringAlertsClusterTieBreak(t *testing.T) {
 	if len(clusters) != 2 || clusters[0] != "eu-west-prod-1" || clusters[1] != "us-east-prod-2" {
 		t.Errorf("clusters = %v, want the identical-rank pair tie-broken by cluster name", clusters)
 	}
+}
+
+// TestResourceFiringAlertsIsBounded pins the bounds fanout_query lives under
+// onto the resource, which carries no arguments an agent could narrow: at
+// most MaxClustersCeiling clusters are read and the rest are named as not
+// read; a slow cluster is cut at the deadline instead of holding the read;
+// and the token ceiling wins over the row cap.
+func TestResourceFiringAlertsIsBounded(t *testing.T) {
+	t.Parallel()
+
+	t.Run("cluster cap", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t)
+		// A fleet one past the ceiling, in the order the cap is applied.
+		// Every extra cluster answers, so the cap alone explains the miss.
+		for i := range MaxClustersCeiling + 1 - len(h.clusters.entries) {
+			id := fmt.Sprintf("zz-cluster-%03d", i)
+			h.clusters.entries = append(h.clusters.entries, fleet.Cluster{ID: id, State: fleet.StateConnected})
+			h.prom.set(id+"/"+string(promapi.EndpointAlerts),
+				fakeResponse{body: []byte(`{"status":"success","data":{"alerts":[]}}`)})
+		}
+		got, err := h.tools.readFiringAlerts(ctx(t), resourceRequest(ResourceFiringAlerts, h.p))
+		if err != nil {
+			t.Fatalf("readFiringAlerts: %v", err)
+		}
+		var out FleetAlertsOut
+		if err := json.Unmarshal([]byte(got.Text), &out); err != nil {
+			t.Fatalf("resource body: %v", err)
+		}
+		if out.Coverage.Requested != MaxClustersCeiling+1 {
+			t.Fatalf("requested = %d, want the whole fleet counted", out.Coverage.Requested)
+		}
+		var notRead []string
+		for _, f := range out.Failed {
+			if strings.HasPrefix(f.Message, "not read:") {
+				notRead = append(notRead, f.Cluster)
+			}
+		}
+		// Sorted by ID, the last cluster is the one past the cap.
+		if diff := cmp.Diff([]string{fmt.Sprintf("zz-cluster-%03d", MaxClustersCeiling-len(testClusters()))}, notRead); diff != "" {
+			t.Errorf("clusters not read (-want +got):\n%s", diff)
+		}
+		if out.Coverage.Complete {
+			t.Error("a capped read claims to be complete")
+		}
+		for _, c := range h.prom.calls {
+			if c.ClusterID == notRead[0] {
+				t.Error("the cluster past the cap was still queried")
+			}
+		}
+	})
+
+	t.Run("deadline", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t)
+		h.prom.set("us-east-prod-2/"+string(promapi.EndpointAlerts), fakeResponse{delay: 2 * time.Second})
+		// The resource's own budget is derived from the caller's context, so
+		// a short one here stands in for the sixty-second default without
+		// waiting for it.
+		c, cancel := context.WithTimeout(ctx(t), 300*time.Millisecond)
+		defer cancel()
+		started := time.Now()
+		got, err := h.tools.readFiringAlerts(c, resourceRequest(ResourceFiringAlerts, h.p))
+		if err != nil {
+			t.Fatalf("readFiringAlerts: %v", err)
+		}
+		if took := time.Since(started); took > time.Second {
+			t.Fatalf("the read took %s: one slow cluster held the whole resource", took)
+		}
+		var out FleetAlertsOut
+		if err := json.Unmarshal([]byte(got.Text), &out); err != nil {
+			t.Fatalf("resource body: %v", err)
+		}
+		var slow *ClusterFailure
+		for i := range out.Failed {
+			if out.Failed[i].Cluster == "us-east-prod-2" {
+				slow = &out.Failed[i]
+			}
+		}
+		if slow == nil || (slow.Code != CodeQueryTimeout && slow.Code != CodeCanceled) {
+			t.Fatalf("slow cluster failure = %+v, want a timeout", slow)
+		}
+		if out.Coverage.OK == 0 {
+			t.Error("the cluster that did answer was discarded along with the slow one")
+		}
+	})
+
+	t.Run("token ceiling", func(t *testing.T) {
+		t.Parallel()
+		const ceiling = 120
+		h := newHarness(t, func(o *Options) { o.TokenCeiling = ceiling })
+		got, err := h.tools.readFiringAlerts(ctx(t), resourceRequest(ResourceFiringAlerts, h.p))
+		if err != nil {
+			t.Fatalf("readFiringAlerts: %v", err)
+		}
+		var out FleetAlertsOut
+		if err := json.Unmarshal([]byte(got.Text), &out); err != nil {
+			t.Fatalf("resource body: %v", err)
+		}
+		if out.Truncated == nil || out.Truncated.Reason != render.ReasonTokenCeiling {
+			t.Fatalf("truncation = %+v, want reason %q", out.Truncated, render.ReasonTokenCeiling)
+		}
+		if out.Truncated.Total != out.Total || out.Truncated.Returned != len(out.Alerts) {
+			t.Errorf("truncation = %+v, want total %d and returned %d",
+				out.Truncated, out.Total, len(out.Alerts))
+		}
+		if len(out.Alerts) >= out.Total {
+			t.Errorf("returned %d of %d: nothing was cut", len(out.Alerts), out.Total)
+		}
+		if !strings.Contains(out.Truncated.Hint, "alerts tool") {
+			t.Errorf("hint does not name the way to the full picture: %q", out.Truncated.Hint)
+		}
+	})
 }
 
 // TestResourceCheatsheet covers the static document.

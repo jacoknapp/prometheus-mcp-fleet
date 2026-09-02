@@ -456,11 +456,11 @@
           "minimum": 0
         },
         "queryTimeout": {
-          "description": "PMF_QUERY_TIMEOUT.",
+          "description": "PMF_QUERY_TIMEOUT. Deadline for a call that states none (metadata and selector lookups).",
           "type": "string"
         },
         "rangeQueryTimeout": {
-          "description": "PMF_RANGE_QUERY_TIMEOUT.",
+          "description": "PMF_RANGE_QUERY_TIMEOUT. Ceiling every per-call deadline is clamped to; the tool layer caps callers at 120s.",
           "type": "string"
         },
         "maxResponseBytes": {
@@ -499,7 +499,7 @@
           "type": "boolean"
         },
         "publicURL": {
-          "description": "PMF_PUBLIC_URL. Canonical external MCP URL for the OAuth PRM document.",
+          "description": "PMF_PUBLIC_URL. Canonical external MCP URL (https://<host>/mcp) for the OAuth PRM document. Empty derives it from ingress.host; with no Ingress either the chart refuses to render.",
           "type": "string"
         },
         "caRotationEnabled": {
@@ -886,9 +886,18 @@
               "description": "Allow egress to the Kubernetes API. Required with state.backend=secret.",
               "type": "boolean"
             },
+            "kubeAPIPorts": {
+              "description": "Ports of the Kubernetes API server: the Service port and the endpoint port the CNI sees after DNAT.",
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 65535
+              }
+            },
             "kubeAPIPort": {
-              "description": "Port of the Kubernetes API server.",
-              "type": "integer",
+              "description": "Deprecated, superseded by kubeAPIPorts. A single extra port appended to the list when set.",
+              "type": ["integer", "null"],
               "minimum": 1,
               "maximum": 65535
             },

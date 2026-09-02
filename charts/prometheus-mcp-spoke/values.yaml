@@ -174,8 +174,8 @@ enrollment:
 prometheus:
   # -- `PMF_PROMETHEUS_URL`. REQUIRED. The local, IN-CLUSTER Prometheus-compatible server this spoke proxies. Thanos Query, Mimir and Cortex all work: the spoke never parses the response body.
   url: http://prometheus-operated.monitoring.svc:9090
-  # -- `PMF_PROMETHEUS_TIMEOUT`. Deliberately below the hub's `queryTimeout` so the spoke fails first and returns a useful error instead of the hub timing out blind.
-  timeout: 25s
+  # -- `PMF_PROMETHEUS_TIMEOUT`. Ceiling on one upstream request. The hub's per-call deadline is the usual bound, so keep this above the hub's `rangeQueryTimeout`.
+  timeout: 130s
   # -- `PMF_PROMETHEUS_MAX_RESPONSE_BYTES`. Maximum bytes accepted from one Prometheus response.
   maxResponseBytes: 33554432
   bearerToken:
@@ -350,8 +350,17 @@ networkPolicy:
     kubeAPI:
       # -- Allow egress to the Kubernetes API server. Required whenever `identity.backend` is `secret`; pointless otherwise.
       enabled: true
-      # -- Port of the Kubernetes API server for the egress rule.
-      port: 443
+      # -- Ports of the Kubernetes API server for the egress rule. Both defaults matter: the pod
+      # dials `kubernetes.default.svc:443`, but most CNIs evaluate egress policy AFTER kube-proxy
+      # has DNATed that to the real API server endpoint, which kubeadm, k3s, RKE2 and most managed
+      # control planes serve on 6443. A rule for 443 alone then drops every identity Secret
+      # write and the spoke re-enrolls on every restart. Trim to the one your cluster uses if
+      # you know it.
+      ports:
+        - 443
+        - 6443
+      # -- Deprecated, superseded by `ports`. A single extra port to allow, appended to the list when set.
+      port: null
     # -- Raw additional `egress` rules, appended verbatim.
     extraRules: []
 

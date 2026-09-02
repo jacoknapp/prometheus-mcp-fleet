@@ -5,6 +5,9 @@
 # pprof. It must never leave the cluster. These are the assertions that keep it
 # that way.
 suite: the admin port never leaves the cluster
+# PMF_PUBLIC_URL is required; the chart refuses to render without it.
+set:
+  config.publicURL: https://mcp.example.com/mcp
 tests:
   - it: routes only the mcp Service port through the Ingress
     template: templates/ingress.yaml
