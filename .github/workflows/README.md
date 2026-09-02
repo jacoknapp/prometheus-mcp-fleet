@@ -14,7 +14,7 @@ not negotiable:
    needing more declares exactly what it needs and nothing else.
 3. **`step-security/harden-runner` is the first step of every job** —
    `egress-policy: audit` on CI, `block` with an explicit allow-list on anything
-   that can publish, sign or promote.
+   that can publish or sign.
 4. **Nothing privileged runs on a fork pull request.** There is no
    `pull_request_target` anywhere in this repository, and there is no reason to
    add one: a fork PR gets `contents: read` and no secrets, which is why the
@@ -29,9 +29,8 @@ not negotiable:
 | [`ci.yml`](ci.yml) | `pull_request`, `push: main` | `golangci-lint` v2 + `gofmt` + `go vet`; `go test -race -covermode=atomic` with the coverage percentage in the step summary and a hard floor; cross-compile matrix (linux/darwin × amd64/arm64); `govulncheck`; `buf lint`/`format`/`breaking` vs `main`; `tidy-check`; `generate-check`; `arch` (layering + dependency budget, `test/arch`) | none | none |
 | [`chart.yml`](chart.yml) | `pull_request` touching `charts/**`, `push: main` | `helm lint --strict` over every `ci/` values file; `helm unittest` incl. `__snapshot__`; `kubeconform` against k8s 1.28 / 1.31 / 1.34; `ct lint --check-version-increment`; `helm-docs` verify-only. There is deliberately no `ct install`: the `ci/` files are render fixtures naming an unpublished image and operator-supplied Secrets, so it could never pass — a live install is `e2e.yml` | none | none |
 | [`e2e.yml`](e2e.yml) | `pull_request`, nightly `03:17 UTC`, `workflow_dispatch` | kind cluster, real `kube-prometheus-stack`, both images built and side-loaded, hub then spoke installed from the real charts, spoke enrolment asserted from the hub's own metrics, then `go test -tags e2e ./test/e2e/...` drives a real MCP `query` tool call and asserts `up == 1`. Uploads `kubectl cluster-info dump` and every pod log on failure | none | none |
-| [`release.yml`](release.yml) | `push: tags v*` | GoReleaser (binaries, archives, checksums, SBOMs, source archive, GitHub Release); multi-arch hub and spoke images to GHCR, **Trivy-gated before push**, SLSA-provenance- and SBOM-attested, cosign-signed; both charts packaged with the release `appVersion` and the published image digests, pushed as OCI and cosign-signed | `contents: write` (release only), `packages: write`, `id-token: write`, `attestations: write` | `GITHUB_TOKEN` only |
+| [`release.yml`](release.yml) | `push: tags v*` | GoReleaser (binaries, archives, checksums, SBOMs, source archive, GitHub Release); multi-arch hub and spoke images to GHCR, **Trivy-gated before push**, SLSA-provenance- and SBOM-attested, cosign-signed; both charts packaged with the release `appVersion` and the published image digests, pushed as OCI and cosign-signed. Images are tagged `X.Y.Z`, `X.Y` and `latest` (the last two only for a non-prerelease); there is no `stable` tag and no promotion step | `contents: write` (release only), `packages: write`, `id-token: write`, `attestations: write` | `GITHUB_TOKEN` only |
 | [`weekly-rebuild.yml`](weekly-rebuild.yml) | `schedule: 0 6 * * 1`, `workflow_dispatch` | Rebuilds the latest release tag from unchanged source onto freshly pulled base images, publishes `X.Y.Z-build.N`, re-attests and re-signs, runs Trivy and Grype, and opens or updates one tracking issue when a new unfixable HIGH/CRITICAL appears | `packages: write`, `id-token: write`, `attestations: write`, `issues: write` | `GITHUB_TOKEN` only |
-| [`promote.yml`](promote.yml) | `workflow_dispatch` | **The fleet-wide kill switch.** Verifies a digest's cosign signature, its SLSA provenance and its soak age in an unprivileged job, then — behind the protected `production` environment and a human approval — moves the `stable` OCI tag to it | `packages: write`, `attestations: read`; job gated on environment `production` | `GITHUB_TOKEN` only |
 | [`codeql.yml`](codeql.yml) | `pull_request`, `push: main`, weekly Tue `04:41 UTC` | CodeQL for Go with `security-extended` | `security-events: write`, `actions: read` | none |
 | [`scorecard.yml`](scorecard.yml) | `push: main`, weekly Wed `05:23 UTC`, `workflow_dispatch` | OpenSSF Scorecard, SARIF uploaded to code scanning and published to the OpenSSF API | `security-events: write`, `id-token: write`, `actions: read`, `checks/issues/pull-requests: read` | none |
 | [`stale.yml`](stale.yml) | daily `01:07 UTC`, `workflow_dispatch` | Conservative stale policy: issues 90d to stale / 30d to close, PRs 45d to stale and never auto-closed, generous exempt labels | `issues: write`, `pull-requests: write` | none |
@@ -61,21 +60,18 @@ charts or the Dockerfile, and nightly.
 
 These are not in code and CI cannot create them:
 
-1. **Environment `production`** — Settings → Environments → New environment.
-   Add at least one required reviewer, and restrict deployment branches to
-   `main`. `promote.yml` will not work without it, which is the point.
-2. **Dependabot security updates** — Settings → Code security → enable.
+1. **Dependabot security updates** — Settings → Code security → enable.
    `.github/dependabot.yml` disables Dependabot *version* updates for `gomod`
    and `docker` (Renovate owns those) but security updates are a separate
    switch and must be on.
-3. **Private vulnerability reporting** — Settings → Code security → enable.
+2. **Private vulnerability reporting** — Settings → Code security → enable.
    `SECURITY.md` sends reporters there.
-4. **Branch protection on `main`** — require the two checks above, require a
+3. **Branch protection on `main`** — require the two checks above, require a
    Code Owner review, and require linear history.
-5. **Actions permissions** — Settings → Actions → General → "Allow enterprise,
+4. **Actions permissions** — Settings → Actions → General → "Allow enterprise,
    and select non-enterprise, actions and reusable workflows", listing the
    action owners used here. Also set the default workflow token to read-only.
-6. **GHCR package visibility** — the first push creates the packages as private.
+5. **GHCR package visibility** — the first push creates the packages as private.
    Make `prometheus-mcp-fleet/hub`, `prometheus-mcp-fleet/spoke` and both chart
    packages public, and link them to this repository so `GITHUB_TOKEN` retains
    write access.
@@ -170,7 +166,9 @@ for component in hub spoke; do
 done
 ```
 
-Do **not** add `:latest` and do **not** add `:stable`.
+For a non-prerelease add `-t "$REGISTRY/$component:latest"` as well; for a
+prerelease drop the `${VERSION%.*}` tag too, so it is reachable only by its
+full tag. There is no `:stable`.
 
 Capture the digests and sign them:
 
@@ -188,9 +186,9 @@ done
 SLSA provenance from `actions/attest-build-provenance` is a CI-only artifact —
 it attests *that GitHub Actions built it*, which by definition a laptop cannot.
 A manual release will therefore have a cosign signature and an SBOM attestation
-but no GitHub provenance. **Say this explicitly in the release notes**, because
-`promote.yml` verifies provenance and will refuse to promote such a digest.
-Promoting a hand-built image requires a deliberate, documented exception.
+but no GitHub provenance. **Say this explicitly in the release notes**: an
+operator who verifies provenance before deploying, as the README tells them to,
+will reject the digest otherwise, and they should know that is expected.
 
 ### 4. Charts
 
@@ -223,29 +221,12 @@ done
 git checkout -- charts/   # the digest pin is a packaging step, not a commit
 ```
 
-### 5. Do not move `stable`
+### 5. Nothing to promote
 
-A release publishes; it does not promote. `stable` is what ~100 production
-clusters follow, and it moves only through `promote.yml` behind the `production`
-environment. If you have just hand-built a release because Actions is down, you
-almost certainly should **not** be promoting it at the same time — the whole
-value of the split is that publishing is routine and promoting is not.
-
-If you genuinely must promote by hand, verify first, exactly as the workflow
-does, and then:
-
-```bash
-cosign verify "$REGISTRY/hub@$digest" \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  --certificate-identity-regexp '^https://github\.com/jacoknapp/prometheus-mcp-fleet/\.github/workflows/.+@refs/tags/v.+$'
-
-gh attestation verify "oci://$REGISTRY/hub@$digest" --repo jacoknapp/prometheus-mcp-fleet
-
-crane digest "$REGISTRY/hub:stable"   # write this down — it is your rollback
-crane tag "$REGISTRY/hub@$digest" stable
-```
-
-Roll back by running `crane tag` again with the digest you wrote down.
+`latest` is the newest non-prerelease and nothing more; step 2 already tagged
+it. A release moves it, the weekly rebuild does not, and there is no `stable`
+tag behind it. A consumer who wants a vetted digest pins one — the charts pin
+the release's image digests for exactly that reason.
 
 ---
 

@@ -322,12 +322,13 @@ Full threat model: [docs/security.md](docs/security.md). Reporting:
 ## Operating a fleet
 
 - **Updating is yours to drive.** The charts do not ship an in-cluster updater.
-  Images are rebuilt weekly against fresh bases and republished, signed and with
-  SLSA provenance, and `stable` moves only through a human-approved promotion —
-  but nothing in the cluster acts on that by itself. Point your existing
-  delivery mechanism at the digest you want. An unattended rollout across a
-  hundred production clusters is a fleet-wide outage delivery mechanism, and the
-  hub is the single point of failure for every agent.
+  A release publishes `X.Y.Z`, `X.Y` and `latest`; the weekly CVE rebuild
+  publishes `X.Y.Z-build.N` and moves nothing. There is no `stable` tag and no
+  promotion step — every image is signed with SLSA provenance, and nothing in
+  the cluster acts on any of it by itself. Point your existing delivery
+  mechanism at the digest you want. An unattended rollout across a hundred
+  production clusters is a fleet-wide outage delivery mechanism, and the hub is
+  the single point of failure for every agent.
 - **The hub defaults to three replicas behind a single Ingress hostname.**
   Credentials live in a shared Secret, so every replica sees the same keys —
   but a *tunnel* pins a spoke to the replica that accepted it, and there is

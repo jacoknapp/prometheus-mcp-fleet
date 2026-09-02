@@ -11,14 +11,14 @@
 # `X.Y.Z` and the only delta a consumer sees is the base layer. That is what
 # makes "we only patched the OS" a checkable claim rather than a promise.
 #
-# It publishes. It does NOT promote: `stable` moves only through `promote.yml`,
-# behind the protected `production` environment. A rebuild that quietly reached
-# 100 clusters would be exactly the fleet-wide outage delivery mechanism this
-# design exists to prevent.
+# It publishes a new tag and moves nothing: `latest` and `X.Y` stay on the
+# release they were cut from. A rebuild that quietly reached 100 clusters would
+# be exactly the fleet-wide outage delivery mechanism this design exists to
+# prevent; an operator takes a `-build.N` digest on purpose or not at all.
 #
 # Vulnerability handling:
 #   * A HIGH/CRITICAL finding that HAS an upstream fix means the rebuild did not
-#     achieve its purpose -> the job fails, loudly, and nothing is promoted.
+#     achieve its purpose -> the job fails, loudly, and nothing is published.
 #   * A HIGH/CRITICAL finding with NO upstream fix cannot be rebuilt away ->
 #     the image still publishes, and a tracking issue is opened or updated so
 #     the exposure is visible instead of silently absorbed into a green tick.
@@ -161,7 +161,7 @@ jobs:
             echo "| SOURCE_DATE_EPOCH | \`${epoch}\` (unchanged from the original release) |"
             echo "| publishing as | \`${build_tag}\` |"
             echo
-            echo "\`stable\` is **not** moved by this workflow."
+            echo "\`latest\` and the release's own tags are **not** moved by this workflow; only \`${build_tag}\` is published."
           } >> "${GITHUB_STEP_SUMMARY}"
 
   # ---------------------------------------------------------------------------

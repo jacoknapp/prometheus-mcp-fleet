@@ -10,14 +10,14 @@
 #      pushed, then SLSA-provenance-attested, SBOM-attested and cosign-signed
 #   3. both Helm charts packaged and pushed as OCI artifacts, then cosign-signed
 #
+# Image tags: the immutable `X.Y.Z`, plus `X.Y` and `latest` for a
+# non-prerelease. `latest` is the newest release and nothing else: the weekly
+# CVE rebuild publishes `X.Y.Z-build.N` and leaves it alone. There is no
+# `stable` tag and no promotion step -- a release is the whole story, and a
+# consumer who wants a vetted digest pins one, which is why the charts pin the
+# release's image digests rather than any tag.
+#
 # What it deliberately does NOT do:
-#   * It does not move the `stable` OCI tag. `stable` is what ~100 production
-#     clusters follow, and it moves only through `promote.yml`, which is gated
-#     on a protected GitHub Environment with human approval. That separation is
-#     the fleet-wide kill switch: stop approving promotions and the fleet
-#     freezes on the last vetted digest.
-#   * It does not publish a `latest` tag, for the same reason: an unpinnable
-#     moving tag is not a supported input to anything we ship.
 #   * It does not commit anything back to `main`. No job here has write access
 #     to the default branch.
 #
@@ -333,8 +333,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # No `latest`, no `stable`. Only the immutable version tag plus the
-      # conventional major.minor convenience tag.
+      # The immutable version tag, plus `major.minor` and `latest` for a
+      # non-prerelease. A prerelease is reachable only by its full tag.
       - name: Derive image tags and OCI labels
         id: docker_meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
@@ -344,6 +344,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}},enable=${{ needs.meta.outputs.prerelease == 'false' }}
+            type=raw,value=latest,enable=${{ needs.meta.outputs.prerelease == 'false' }}
           labels: |
             org.opencontainers.image.title=prometheus-mcp-fleet-${{ matrix.component }}
             org.opencontainers.image.description=MCP ${{ matrix.component }} for fleet-wide Prometheus access
@@ -511,8 +512,8 @@ jobs:
       contents: read
       packages: write
       id-token: write
-      # Charts get SLSA provenance too, so `promote.yml` can verify an image
-      # and a chart with exactly the same two commands.
+      # Charts get SLSA provenance too, so an operator verifies an image and a
+      # chart with exactly the same two commands.
       attestations: write
     steps:
       - name: Harden the runner
@@ -761,10 +762,12 @@ jobs:
           retention-days: 30
 
   # ---------------------------------------------------------------------------
-  # Explicitly assert what this workflow did not do.
+  # One status that is red if any part of the release is. The GitHub Release,
+  # the images and the charts are separate jobs; this is the single check a
+  # human, or a branch rule, looks at.
   # ---------------------------------------------------------------------------
-  stable-not-moved:
-    name: stable tag untouched
+  released:
+    name: every release job succeeded
     needs: [meta, binaries, images, charts]
     if: always()
     runs-on: ubuntu-24.04
@@ -797,17 +800,19 @@ jobs:
             fi
           done
 
-      - name: Record that stable was not promoted
+      - name: Record what was published
         env:
           VERSION: ${{ needs.meta.outputs.version }}
+          PRERELEASE: ${{ needs.meta.outputs.prerelease }}
         run: |
           {
-            echo "## \`stable\` was NOT moved"
+            echo "## Published \`${VERSION}\`"
             echo
-            echo "\`${VERSION}\` is published but not promoted. ~100 production"
-            echo "clusters follow the \`stable\` tag and it moves only through the"
-            echo "\`promote\` workflow, which requires approval on the \`production\`"
-            echo "GitHub Environment."
+            if [ "${PRERELEASE}" = "true" ]; then
+              echo "Prerelease: the images carry only the \`${VERSION}\` tag; \`latest\` did not move."
+            else
+              echo "The images carry \`${VERSION}\`, \`${VERSION%.*}\` and \`latest\`; the charts are \`${VERSION}\`."
+            fi
             echo
-            echo "To promote, run **Actions -> promote** with the digests printed above."
+            echo "Pin the digests printed above. The tags are for humans."
           } >> "${GITHUB_STEP_SUMMARY}"

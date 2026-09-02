@@ -230,4 +230,4 @@ tests:
     asserts:
       - equal:
           path: spec.template.spec.containers[0].image
-          value: ghcr.io/jacoknapp/prometheus-mcp-fleet/hub:0.10.3
+          value: ghcr.io/jacoknapp/prometheus-mcp-fleet/hub:0.10.4

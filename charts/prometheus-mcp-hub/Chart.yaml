@@ -2,8 +2,8 @@ apiVersion: v2
 name: prometheus-mcp-hub
 description: MCP server that gives AI agents Prometheus capability across a fleet of Kubernetes clusters, terminating WebSocket tunnels dialled out by prometheus-mcp-spoke through a standard Ingress.
 type: application
-version: 0.10.3
-appVersion: "0.10.3"
+version: 0.10.4
+appVersion: "0.10.4"
 kubeVersion: ">=1.28.0-0"
 keywords:
   - mcp

@@ -220,11 +220,13 @@ release:
       --certificate-identity-regexp '^https://github.com/jacoknapp/prometheus-mcp-fleet/\.github/workflows/.+@refs/tags/v.+$'
     ```
 
-    **This release does not move the `stable` tag.** `stable` moves only through
-    the environment-protected `promote` workflow, which is the fleet-wide kill
-    switch.
+    {{- if .Prerelease }}
+    Prerelease: the images carry only the `{{ .Version }}` tag. `latest` did not move.
+    {{- else }}
+    The images are tagged `{{ .Version }}`, `{{ .Major }}.{{ .Minor }}` and
+    `latest`; the charts are `{{ .Version }}`. Pin a digest — the tags are for
+    humans, and `latest` moves with every release.
+    {{- end }}
 
-# The `stable` OCI tag is never touched by a release. Announcing that here as
-# well as in the workflow is deliberate belt-and-braces documentation.
 metadata:
   mod_timestamp: "{{ .CommitTimestamp }}"

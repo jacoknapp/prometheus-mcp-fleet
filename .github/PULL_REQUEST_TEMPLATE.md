@@ -93,7 +93,7 @@ built from the same commit is not a fleet product. -->
 
 ### Release impact
 
-- [ ] This does not move the `stable` tag. (Nothing in a PR should. `stable`
-      moves only through the environment-protected `promote` workflow.)
+- [ ] This does not publish or retag anything. (Nothing in a PR should; only a
+      `v*` tag publishes, and `latest` moves only with a release.)
 - [ ] Commit messages follow Conventional Commits; a breaking change is marked
       `!` and explained in the body.

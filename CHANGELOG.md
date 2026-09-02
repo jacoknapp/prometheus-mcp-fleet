@@ -12,6 +12,23 @@ lockstep. The exception is called out where it happens: 0.10.0's `renew-v2`
 is a hard cut on the renewal proof alone, with existing tunnels unaffected
 and `--renew-grace` covering spokes that upgrade late.
 
+## [0.10.4] - 2026-09-02
+
+### Changed
+
+- A non-prerelease now publishes the `latest` image tag alongside `X.Y.Z` and
+  `X.Y`. `latest` is the newest release and nothing more: the weekly CVE
+  rebuild still publishes `X.Y.Z-build.N` and moves nothing.
+
+### Removed
+
+- The `stable` channel and the `promote` workflow. `stable` was never
+  published — no promotion was ever run and the `production` environment it
+  depended on was never created — so the release pipeline, the release notes,
+  the workflows README, CONTRIBUTING, the pull request template and ADR-0011
+  no longer claim it exists. A consumer who wants a vetted digest pins one,
+  which the charts already do for the images.
+
 ## [0.10.3] - 2026-09-02
 
 ### Fixed

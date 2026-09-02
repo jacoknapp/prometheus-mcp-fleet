@@ -13,9 +13,18 @@
 > a fleet-wide outage delivery mechanism, and the hub is the single point of
 > failure for every agent. Shipping it opt-in and off was one answer to that;
 > not shipping it is a simpler one. Images are still rebuilt weekly, signed and
-> published with provenance, and `stable` still moves only through a
-> human-approved promotion — what is gone is the thing that acted on that
+> published with provenance — what is gone is the thing that acted on that
 > automatically, inside the cluster.
+>
+> **2026-09-02:** the promotion half went the same way. `stable` was never
+> published — no promotion was ever run, and the `production` environment it
+> was gated on was never created — so the `promote` workflow, the environment
+> and every claim that `stable` "moves only through a human-approved
+> promotion" have been removed. A release now publishes `X.Y.Z`, `X.Y` and
+> `latest`; the weekly rebuild publishes `X.Y.Z-build.N` and moves nothing.
+> The kill switch below is therefore also gone. What remains of the decision
+> is the part that needed no machinery: digests are pinned by the charts,
+> every artifact is verifiable, and nothing in a cluster updates itself.
 >
 > Anything below describes machinery that no longer exists.
 

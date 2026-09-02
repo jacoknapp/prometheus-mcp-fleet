@@ -10,7 +10,7 @@
 
 *                       @jacoknapp
 
-# Supply chain. A change here can publish or promote an artifact to ~100
+# Supply chain. A change here can publish an artifact to ~100
 # production clusters, so it is called out explicitly.
 /.github/                @jacoknapp
 /.github/workflows/      @jacoknapp

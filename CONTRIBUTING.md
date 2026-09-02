@@ -155,5 +155,6 @@ Maintainers only. Pushing a `vX.Y.Z` tag triggers `release.yml` — GoReleaser
 builds the binaries, archives, checksums and SBOMs, publishes signed hub and
 spoke images, and packages both charts, and its GitHub Release notes are
 grouped from the Conventional Commit history since the last tag (`feat:`,
-`fix:`, breaking `!`, and so on). Publishing does **not** promote — moving the
-`stable` tag is a separate, human-approved workflow, and it is the fleet-wide
+`fix:`, breaking `!`, and so on). A non-prerelease also moves the `X.Y` and
+`latest` image tags. That is the whole release: there is no `stable` tag and
+no promotion step, and consumers who want a vetted digest pin one.
