@@ -2,8 +2,8 @@ apiVersion: v2
 name: prometheus-mcp-spoke
 description: Tiny outbound-only agent that dials the prometheus-mcp-hub over an authenticated WebSocket and proxies this cluster's Prometheus HTTP API. One namespaced Role over one Secret, or no RBAC at all in memory identity mode.
 type: application
-version: 0.6.0
-appVersion: "0.10.1"
+version: 0.10.2
+appVersion: "0.10.2"
 kubeVersion: ">=1.28.0-0"
 keywords:
   - mcp

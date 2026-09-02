@@ -194,8 +194,11 @@ Promoting a hand-built image requires a deliberate, documented exception.
 
 ### 4. Charts
 
-Chart versions are immutable once published. If `helm show chart` finds the
-version already in the registry, bump `Chart.yaml`'s `version` and start again.
+Chart versions are the application's version — chart 0.10.2 is what `v0.10.2`
+publishes — and they are immutable once published. If `helm show chart` finds
+the version already in the registry and it was published for this same
+version, it is this release's own earlier attempt and can be reused; anything
+else means cutting the next version.
 
 ```bash
 for chart in charts/prometheus-mcp-hub charts/prometheus-mcp-spoke; do

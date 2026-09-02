@@ -87,6 +87,32 @@ jobs:
           done
           exit "${missing}"
 
+      # The chart version and the application version move together: a chart
+      # is published only by the `v*` tag whose version it carries, and
+      # release.yml refuses to publish a chart whose version is not the tag's.
+      # Catching the drift here means it is a red pull request rather than a
+      # release that dies halfway through, which is how v0.10.0 ended.
+      - name: Chart version must equal appVersion, in both charts
+        run: |
+          set -euo pipefail
+          bad=0
+          first=""
+          for c in ${CHARTS}; do
+            ver="$(awk '$1=="version:"{print $2; exit}' "${c}/Chart.yaml")"
+            app="$(awk '$1=="appVersion:"{gsub(/"/,"",$2); print $2; exit}' "${c}/Chart.yaml")"
+            if [ "${ver}" != "${app}" ]; then
+              echo "::error file=${c}/Chart.yaml::version ${ver} != appVersion ${app}. The charts version in lockstep with the application."
+              bad=1
+            fi
+            if [ -z "${first}" ]; then
+              first="${ver}"
+            elif [ "${ver}" != "${first}" ]; then
+              echo "::error file=${c}/Chart.yaml::version ${ver} != ${first} in the other chart. Both charts carry the same version."
+              bad=1
+            fi
+          done
+          exit "${bad}"
+
       - name: Set up Helm
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:

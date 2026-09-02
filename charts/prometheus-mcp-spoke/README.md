@@ -1,7 +1,7 @@
 
 # prometheus-mcp-spoke
 
-![Version: 0.6.0](https://img.shields.io/badge/Version-0.6.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.10.1](https://img.shields.io/badge/AppVersion-0.10.1-informational?style=flat-square)
+![Version: 0.10.2](https://img.shields.io/badge/Version-0.10.2-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.10.2](https://img.shields.io/badge/AppVersion-0.10.2-informational?style=flat-square)
 
 Tiny outbound-only agent that dials the prometheus-mcp-hub over an authenticated WebSocket and proxies this cluster's Prometheus HTTP API. One namespaced Role over one Secret, or no RBAC at all in memory identity mode.
 

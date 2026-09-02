@@ -571,6 +571,26 @@ jobs:
           printf '%s' "${GHCR_TOKEN}" \
             | cosign login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
 
+      # The charts version in lockstep with the application: chart 0.10.2 is
+      # what `v0.10.2` publishes, and nothing else ever publishes it. Two
+      # numbering schemes for one artifact set meant every support question
+      # started with "which chart version has the fix", and the answer lived
+      # only in the release notes.
+      - name: Chart versions must equal the release version
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          bad=0
+          for chart in charts/*/; do
+            ver="$(helm show chart "${chart}" | awk '$1=="version:"{print $2}')"
+            if [ "${ver}" != "${VERSION}" ]; then
+              echo "::error file=${chart}Chart.yaml::version ${ver} is not the release version ${VERSION}. The charts version in lockstep with the application."
+              bad=1
+            fi
+          done
+          exit "${bad}"
+
       # A chart version may only be published once. If it already exists we
       # refuse rather than overwrite: 100 clusters resolving the same chart
       # version to two different renders is an unfalsifiable support ticket.
@@ -580,6 +600,8 @@ jobs:
       # this the only way forward was a new chart version under a new tag. A
       # published chart whose appVersion equals this tag's version is that
       # case, and the push step below reuses it rather than repackaging.
+      # Under lockstep versioning that is now the only way a chart version can
+      # already exist at all.
       - name: Refuse to overwrite an already-published chart version
         env:
           VERSION: ${{ needs.meta.outputs.version }}
@@ -597,7 +619,7 @@ jobs:
               echo "${name} ${ver} was already published for ${VERSION}; it will be reused, not overwritten"
               continue
             fi
-            echo "::error file=${chart}Chart.yaml::${name} ${ver} is already published for appVersion ${published}. Chart versions are independent SemVer and immutable: bump Chart.yaml's 'version' and re-tag."
+            echo "::error file=${chart}Chart.yaml::${name} ${ver} is already published for appVersion ${published}. Published chart versions are immutable: cut the next version and re-tag."
             fail=1
           done
           exit "${fail}"

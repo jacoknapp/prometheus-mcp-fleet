@@ -12,6 +12,19 @@ lockstep. The exception is called out where it happens: 0.10.0's `renew-v2`
 is a hard cut on the renewal proof alone, with existing tunnels unaffected
 and `--renew-grace` covering spokes that upgrade late.
 
+## [0.10.2] - 2026-09-02
+
+### Changed
+
+- The charts now carry the application's version: `Chart.yaml`'s `version` and
+  `appVersion` are both `0.10.2`, in both charts, and move only when a release
+  is cut. Two numbering schemes for one artifact set meant "which chart has
+  the fix" was answerable only from the release notes. `chart.yml` fails a
+  pull request where the two fields disagree or the charts disagree with each
+  other, and `release.yml` refuses to publish a chart whose version is not the
+  tag being released. Chart versions 0.5.x are superseded; 0.6.0 was never
+  published.
+
 ## [0.10.1] - 2026-09-02
 
 ### Fixed

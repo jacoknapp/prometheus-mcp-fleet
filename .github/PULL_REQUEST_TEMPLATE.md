@@ -58,9 +58,10 @@ built from the same commit is not a fleet product. -->
 ### Charts
 
 - [ ] No chart change.
-- [ ] Or: `Chart.yaml` `version` is bumped (independent SemVer — `ct lint
-      --check-version-increment` enforces this, and a chart version is
-      immutable once published).
+- [ ] Or: the chart change rides the next release. `Chart.yaml`'s `version`
+      and `appVersion` are the application's own version, in both charts, and
+      are bumped only when cutting a release — CI fails if they disagree, and
+      a published chart version is immutable.
 - [ ] `values.yaml` keys are documented with `# --` comments and
       `values.schema.json` is updated; typos must fail `helm install`, not
       silently default.

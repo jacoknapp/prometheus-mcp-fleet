@@ -131,9 +131,13 @@ from these, so a lazy message becomes a bad release note.
 Keep pull requests focused. A refactor bundled with a behaviour change makes
 both harder to review and impossible to revert cleanly.
 
-The pull request template's checklist is real. In particular, a chart change
-needs a chart version bump — `ct lint --check-version-increment` will fail
-otherwise.
+The pull request template's checklist is real. Note what it says about chart
+versions: the charts do not carry a version of their own. `Chart.yaml`'s
+`version` and `appVersion` are both the application's version, identical in
+both charts, and they move only when a release is cut. A chart change does
+not bump them; it ships with the next release. CI fails if the two fields
+disagree, and `release.yml` refuses to publish a chart whose version is not
+the tag being released.
 
 ## Review
 
