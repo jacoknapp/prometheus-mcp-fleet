@@ -17,8 +17,7 @@ not negotiable:
    that can publish or sign.
 4. **Nothing privileged runs on a fork pull request.** There is no
    `pull_request_target` anywhere in this repository, and there is no reason to
-   add one: a fork PR gets `contents: read` and no secrets, which is why the
-   e2e job mints its own credentials with `openssl rand` instead of reading any.
+   add one: a fork PR gets `contents: read` and no secrets.
 
 ---
 
@@ -27,8 +26,7 @@ not negotiable:
 | Workflow | Trigger | What it does | Permissions above the default | Secrets |
 |---|---|---|---|---|
 | [`ci.yml`](ci.yml) | `pull_request`, `push: main` | `golangci-lint` v2 + `gofmt` + `go vet`; `go test -race -covermode=atomic` with the coverage percentage in the step summary and a hard floor; cross-compile matrix (linux/darwin × amd64/arm64); `govulncheck`; `buf lint`/`format`/`breaking` vs `main`; `tidy-check`; `generate-check`; `arch` (layering + dependency budget, `test/arch`) | none | none |
-| [`chart.yml`](chart.yml) | `pull_request` touching `charts/**`, `push: main` | `helm lint --strict` over every `ci/` values file; `helm unittest` incl. `__snapshot__`; `kubeconform` against k8s 1.28 / 1.31 / 1.34; `ct lint --check-version-increment`; `helm-docs` verify-only. There is deliberately no `ct install`: the `ci/` files are render fixtures naming an unpublished image and operator-supplied Secrets, so it could never pass — a live install is `e2e.yml` | none | none |
-| [`e2e.yml`](e2e.yml) | `pull_request`, nightly `03:17 UTC`, `workflow_dispatch` | kind cluster, real `kube-prometheus-stack`, both images built and side-loaded, hub then spoke installed from the real charts, spoke enrolment asserted from the hub's own metrics, then `go test -tags e2e ./test/e2e/...` drives a real MCP `query` tool call and asserts `up == 1`. Uploads `kubectl cluster-info dump` and every pod log on failure | none | none |
+| [`chart.yml`](chart.yml) | `pull_request` touching `charts/**`, `push: main` | `helm lint --strict` over every `ci/` values file; `helm unittest` incl. `__snapshot__`; `kubeconform` against k8s 1.28 / 1.31 / 1.34; `ct lint --check-version-increment`; `helm-docs` verify-only. There is deliberately no `ct install`: the `ci/` files are render fixtures naming an unpublished image and operator-supplied Secrets, so it could never pass. There is no live-install job in CI at all; `make e2e` runs one by hand | none | none |
 | [`release.yml`](release.yml) | `push: tags v*` | GoReleaser (binaries, archives, checksums, SBOMs, source archive, GitHub Release); multi-arch hub and spoke images to GHCR, **Trivy-gated before push**, SLSA-provenance- and SBOM-attested, cosign-signed; both charts packaged with the release `appVersion` and the published image digests, pushed as OCI and cosign-signed. Images are tagged `X.Y.Z`, `X.Y` and `latest` (the last two only for a non-prerelease); there is no `stable` tag and no promotion step | `contents: write` (release only), `packages: write`, `id-token: write`, `attestations: write` | `GITHUB_TOKEN` only |
 | [`weekly-rebuild.yml`](weekly-rebuild.yml) | `schedule: 0 6 * * 1`, `workflow_dispatch` | Rebuilds the latest release tag from unchanged source onto freshly pulled base images, publishes `X.Y.Z-build.N`, re-attests and re-signs, runs Trivy and Grype, and opens or updates one tracking issue when a new unfixable HIGH/CRITICAL appears | `packages: write`, `id-token: write`, `attestations: write`, `issues: write` | `GITHUB_TOKEN` only |
 | [`codeql.yml`](codeql.yml) | `pull_request`, `push: main`, weekly Tue `04:41 UTC` | CodeQL for Go with `security-extended` | `security-events: write`, `actions: read` | none |
@@ -50,9 +48,9 @@ adding a job later does not mean editing the protection rule:
 - `ci-required` (from `ci.yml`)
 - `chart-required` (from `chart.yml`)
 
-`e2e` is deliberately *not* required on every PR — it is slow and it depends on
-upstream chart repositories being reachable. It runs on PRs that touch code,
-charts or the Dockerfile, and nightly.
+There is no end-to-end job. `test/e2e` still exists and `make e2e` still runs
+it against a real kind cluster, but it is run by hand, not by any workflow, so
+nothing in CI installs the charts into a live cluster.
 
 ---
 
@@ -264,7 +262,6 @@ a check you will learn to ignore.
 | `chart / unittest` | `make helm-unittest` |
 | `chart / helm-docs` | `make helm-docs` |
 | `chart / ct` | `ct lint --config .github/ct.yaml --all` |
-| `e2e` | `make e2e` (needs kind and docker) |
 | `release / images` | `make images` |
 
 `make check` is the pull-request gate in one command.

@@ -14,6 +14,12 @@ and `--renew-grace` covering spokes that upgrade late.
 
 ## [Unreleased]
 
+### Removed
+
+- The `e2e` workflow. Nothing in CI now installs the charts into a live
+  cluster: `test/e2e`, `.github/e2e` and `make e2e` are unchanged and still
+  run the suite against a real kind cluster, but only when someone runs them.
+
 ### Fixed
 
 - The nightly e2e run failed in its preflight step, before it built anything:
