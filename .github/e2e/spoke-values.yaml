@@ -25,9 +25,16 @@ image:
 
 cluster:
   id: e2e-kind
+  # Required since the lifecycle stage became mandatory: a cluster with no
+  # `sdlc` label is one no scoped credential reaches and no fanout query
+  # targets, so the chart refuses to render without it.
+  sdlc: dev
   displayName: "kind e2e cluster"
+  # A list of {name, value}, not a map: entries stay ordered and the chart
+  # refuses duplicate keys instead of letting one silently win.
   labels:
-    env: ci
+    - name: env
+      value: ci
 
 hub:
   # Cross-namespace: the hub runs in pmf-hub, the spoke in pmf-spoke, which is

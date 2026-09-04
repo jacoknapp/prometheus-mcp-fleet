@@ -12,6 +12,16 @@ lockstep. The exception is called out where it happens: 0.10.0's `renew-v2`
 is a hard cut on the renewal proof alone, with existing tunnels unaffected
 and `--renew-grace` covering spokes that upgrade late.
 
+## [Unreleased]
+
+### Fixed
+
+- The nightly e2e run failed in its preflight step, before it built anything:
+  `cluster.sdlc` became required and `cluster.labels` became a list of
+  `{name, value}`, and `.github/e2e/spoke-values.yaml` still carried neither
+  the lifecycle stage nor the new label shape. The chart rejected the e2e
+  values every night from 2026-09-01 on.
+
 ## [0.10.4] - 2026-09-02
 
 ### Changed
