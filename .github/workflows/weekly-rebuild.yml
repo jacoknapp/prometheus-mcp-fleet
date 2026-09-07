@@ -288,20 +288,38 @@ jobs:
         env:
           SOURCE_DATE_EPOCH: ${{ needs.plan.outputs.source_date_epoch }}
 
-      # Full report, unfixable included, for the tracking issue.
+      # Full report, unfixable included, for the tracking issue. Run Trivy from
+      # its pinned GHCR image for the same reason release.yml does: trivy-action
+      # delegates installation to setup-trivy, whose install script downloads
+      # the binary from get.trivy.dev. That endpoint is intentionally absent
+      # from this publishing job's egress allowlist, while GHCR is already
+      # authenticated and required for the build and vulnerability databases.
       - name: Trivy report (everything)
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: ${{ env.IMAGE }}:rebuild-scan
-          format: json
-          output: trivy-${{ matrix.component }}.json
-          severity: HIGH,CRITICAL
-          ignore-unfixed: false
-          exit-code: "0"
-          scanners: vuln
         env:
-          TRIVY_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-db:2
-          TRIVY_JAVA_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-java-db:1
+          TRIVY_IMAGE: >-
+            ghcr.io/aquasecurity/trivy:0.70.0@sha256:be1190afcb28352bfddc4ddeb71470835d16462af68d310f9f4bca710961a41e
+          SCAN_REF: ${{ env.IMAGE }}:rebuild-scan
+          REPORT: trivy-${{ matrix.component }}.json
+          # Trivy pulls its database from GHCR; the token lifts the anonymous
+          # pull rate limit. Referenced under `set -u`, so it must be defined.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${HOME}/.cache/trivy:/root/.cache/trivy" \
+            -v "${PWD}:/workspace" \
+            -w /workspace \
+            -e TRIVY_DB_REPOSITORY=ghcr.io/aquasecurity/trivy-db:2 \
+            -e TRIVY_JAVA_DB_REPOSITORY=ghcr.io/aquasecurity/trivy-java-db:1 \
+            -e GITHUB_TOKEN="${GITHUB_TOKEN}" \
+            "${TRIVY_IMAGE}" image \
+            --format json \
+            --output "${REPORT}" \
+            --severity HIGH,CRITICAL \
+            --scanners vuln \
+            --exit-code 0 \
+            "${SCAN_REF}"
 
       - name: Grype report (second opinion)
         id: grype
