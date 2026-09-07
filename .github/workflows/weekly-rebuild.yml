@@ -195,6 +195,7 @@ jobs:
             gcr.io:443
             ghcr.io:443
             github.com:443
+            grype.anchore.io:443
             *.githubusercontent.com:443
             mirror.gcr.io:443
             objects.githubusercontent.com:443
