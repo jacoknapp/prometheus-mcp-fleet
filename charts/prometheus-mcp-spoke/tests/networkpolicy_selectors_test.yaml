@@ -1,0 +1,185 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Missing namespace selectors must keep pod selectors effective. Empty peers
+# must never render a null from/to field, which permits every source/destination.
+suite: spoke NetworkPolicy selector isolation
+templates:
+  - templates/networkpolicy.yaml
+set:
+  cluster.id: test-cluster
+  cluster.sdlc: test
+  hub.endpoints:
+    - wss://hub.example.com/tunnel
+  hub.apiUrl: https://hub.example.com
+tests:
+  - it: ingress keeps pod-only selectors within this namespace
+    set:
+      networkPolicy.ingress.namespaceSelector: null
+      networkPolicy.ingress.podSelector:
+        matchLabels:
+          app: prometheus
+    asserts:
+      - equal:
+          path: spec.ingress[0].from
+          value:
+            - podSelector:
+                matchLabels:
+                  app: prometheus
+            - podSelector:
+                matchLabels:
+                  app.kubernetes.io/instance: RELEASE-NAME
+                  app.kubernetes.io/component: spoke-test
+  - it: ingress preserves an empty pod selector in this namespace
+    set:
+      networkPolicy.ingress.namespaceSelector: null
+      networkPolicy.ingress.podSelector: {}
+    asserts:
+      - equal:
+          path: spec.ingress[0].from
+          value:
+            - podSelector: {}
+            - podSelector:
+                matchLabels:
+                  app.kubernetes.io/instance: RELEASE-NAME
+                  app.kubernetes.io/component: spoke-test
+  - it: ingress selects pods in all namespaces when the namespace selector is empty
+    set:
+      networkPolicy.ingress.namespaceSelector:
+        matchLabels: null
+      networkPolicy.ingress.podSelector:
+        matchLabels:
+          app: prometheus
+    asserts:
+      - equal:
+          path: spec.ingress[0].from
+          value:
+            - namespaceSelector: {}
+              podSelector:
+                matchLabels:
+                  app: prometheus
+            - podSelector:
+                matchLabels:
+                  app.kubernetes.io/instance: RELEASE-NAME
+                  app.kubernetes.io/component: spoke-test
+  - it: ingress combines namespace and pod selectors in one peer
+    set:
+      networkPolicy.ingress.namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: custom
+      networkPolicy.ingress.podSelector:
+        matchLabels:
+          app: prometheus
+    asserts:
+      - equal:
+          path: spec.ingress[0].from
+          value:
+            - namespaceSelector:
+                matchLabels:
+                  kubernetes.io/metadata.name: custom
+              podSelector:
+                matchLabels:
+                  app: prometheus
+            - podSelector:
+                matchLabels:
+                  app.kubernetes.io/instance: RELEASE-NAME
+                  app.kubernetes.io/component: spoke-test
+  - it: ingress denies ordinary traffic when both selectors are removed
+    set:
+      networkPolicy.ingress.namespaceSelector: null
+      networkPolicy.ingress.podSelector: null
+    asserts:
+      - equal:
+          path: spec.ingress[0].from
+          value:
+            - podSelector:
+                matchLabels:
+                  app.kubernetes.io/instance: RELEASE-NAME
+                  app.kubernetes.io/component: spoke-test
+  - it: ingress keeps explicit extra peers when selectors are removed
+    set:
+      networkPolicy.ingress.namespaceSelector: null
+      networkPolicy.ingress.podSelector: null
+      networkPolicy.ingress.extraFrom:
+        - ipBlock:
+            cidr: 192.0.2.0/24
+    asserts:
+      - equal:
+          path: spec.ingress[0].from
+          value:
+            - ipBlock:
+                cidr: 192.0.2.0/24
+            - podSelector:
+                matchLabels:
+                  app.kubernetes.io/instance: RELEASE-NAME
+                  app.kubernetes.io/component: spoke-test
+  - it: egress.prometheus keeps pod-only selectors within this namespace
+    set:
+      networkPolicy.egress.prometheus.namespaceSelector: null
+      networkPolicy.egress.prometheus.podSelector:
+        matchLabels:
+          app: prometheus
+    asserts:
+      - equal:
+          path: spec.egress[2].to
+          value:
+            - podSelector:
+                matchLabels:
+                  app: prometheus
+  - it: egress.prometheus preserves an empty pod selector in this namespace
+    set:
+      networkPolicy.egress.prometheus.namespaceSelector: null
+      networkPolicy.egress.prometheus.podSelector: {}
+    asserts:
+      - equal:
+          path: spec.egress[2].to
+          value:
+            - podSelector: {}
+  - it: egress.prometheus selects pods in all namespaces when the namespace selector is empty
+    set:
+      networkPolicy.egress.prometheus.namespaceSelector:
+        matchLabels: null
+      networkPolicy.egress.prometheus.podSelector:
+        matchLabels:
+          app: prometheus
+    asserts:
+      - equal:
+          path: spec.egress[2].to
+          value:
+            - namespaceSelector: {}
+              podSelector:
+                matchLabels:
+                  app: prometheus
+  - it: egress.prometheus combines namespace and pod selectors in one peer
+    set:
+      networkPolicy.egress.prometheus.namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: custom
+      networkPolicy.egress.prometheus.podSelector:
+        matchLabels:
+          app: prometheus
+    asserts:
+      - equal:
+          path: spec.egress[2].to
+          value:
+            - namespaceSelector:
+                matchLabels:
+                  kubernetes.io/metadata.name: custom
+              podSelector:
+                matchLabels:
+                  app: prometheus
+  - it: egress.prometheus denies ordinary traffic when both selectors are removed
+    set:
+      networkPolicy.egress.prometheus.namespaceSelector: null
+      networkPolicy.egress.prometheus.podSelector: null
+    asserts:
+      - lengthEqual:
+          path: spec.egress
+          count: 3
+      - equal:
+          path: spec.egress[2].ports
+          value:
+            - port: 443
+              protocol: TCP
+            - port: 6443
+              protocol: TCP

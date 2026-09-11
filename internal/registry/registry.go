@@ -48,7 +48,9 @@ type Options struct {
 	Logger *slog.Logger
 	// AuthoritativeLabels returns labels an OPERATOR set for a cluster, which
 	// override anything the spoke reports about itself. Nil means the spoke's
-	// own labels stand alone.
+	// own labels stand alone. Lookup errors reject new sessions and retain the
+	// last verified labels on refresh; failures never trust spoke labels alone.
+	// Implementations must honor ctx, which bounds admission or the facts poll.
 	//
 	// This is a trust boundary, not a convenience. Agent key scopes select
 	// clusters by label, so a self-reported label is a cluster asking to be
@@ -56,15 +58,16 @@ type Options struct {
 	// relabel itself `env: prod` and appear to every key scoped at production.
 	// Labels attached to the enrollment token were chosen by the operator who
 	// minted it, so they are the ones that decide reachability.
-	AuthoritativeLabels func(clusterID string) map[string]string
+	AuthoritativeLabels func(ctx context.Context, clusterID string) (map[string]string, error)
 	// Metrics receives connection and certificate gauges. Nil uses
 	// [NopMetrics].
 	Metrics Metrics
 	// FactsPollInterval is how often each live session is re-Described.
 	// Defaults to [DefaultFactsPollInterval]; must not be negative.
 	FactsPollInterval time.Duration
-	// FactsPollTimeout bounds a single Describe. Defaults to
-	// [DefaultFactsPollTimeout]; must not be negative.
+	// FactsPollTimeout bounds Describe and authoritative-label lookup together,
+	// on admission and refresh. Defaults to [DefaultFactsPollTimeout]; must not
+	// be negative.
 	FactsPollTimeout time.Duration
 	// DisconnectGrace is how long a disconnected cluster keeps its entry so
 	// that an agent is told "last seen 30s ago" rather than "unknown". Zero
@@ -124,6 +127,9 @@ type slot struct {
 	// onto its certificate identity. [Registry.mergedLocked] combines every
 	// live slot's facts into the entry's public [fleet.Cluster].
 	facts fleet.Cluster
+	// spokeLabels retains the unmerged labels so operator edits and deletions
+	// can be applied even when the spoke reports an unchanged fingerprint.
+	spokeLabels map[string]string
 }
 
 // Registry is the hub's in-memory view of the fleet. Create one with [New].
@@ -135,7 +141,7 @@ type Registry struct {
 	pollInterval        time.Duration
 	pollTimeout         time.Duration
 	grace               time.Duration
-	authoritativeLabels func(string) map[string]string
+	authoritativeLabels func(context.Context, string) (map[string]string, error)
 	sweepInterval       time.Duration
 
 	mu      sync.RWMutex
@@ -234,9 +240,9 @@ func New(opts Options) (*Registry, error) {
 // slot is a sibling pod: it is simply added to the pool alongside whatever is
 // already there, never displacing it.
 //
-// ctx is used only for the admission Describe. The facts poller runs on a
-// context derived from it with [context.WithoutCancel], so the poller's
-// lifetime is the session's — not that of whatever scope the transport chose
+// ctx bounds admission, including Describe and authoritative-label lookup.
+// The facts poller uses [context.WithoutCancel], so its lifetime is the
+// session's — not that of whatever scope the transport chose
 // to hand OnSession — and it stops on the session's Done channel, on release,
 // or on [Registry.Close].
 func (r *Registry) OnSession(ctx context.Context, s tunnel.Session) (func(), error) {
@@ -257,8 +263,8 @@ func (r *Registry) OnSession(ctx context.Context, s tunnel.Session) (func(), err
 	}
 
 	dctx, cancel := context.WithTimeout(ctx, r.pollTimeout)
+	defer cancel()
 	facts, err := s.Describe(dctx, "")
-	cancel()
 	if err != nil {
 		return nil, fmt.Errorf("%w: describe %s: %w", ErrRejectedSession, id, err)
 	}
@@ -270,7 +276,10 @@ func (r *Registry) OnSession(ctx context.Context, s tunnel.Session) (func(), err
 	}
 
 	key := r.slotKey(ident)
-	cluster := r.clusterFrom(id, ident, facts.Cluster)
+	cluster, err := r.clusterFrom(dctx, id, ident, facts.Cluster)
+	if err != nil {
+		return nil, fmt.Errorf("%w: authoritative labels for %s: %w", ErrRejectedSession, id, err)
+	}
 
 	pctx, pcancel := context.WithCancel(context.WithoutCancel(ctx))
 	sl := &slot{
@@ -280,6 +289,7 @@ func (r *Registry) OnSession(ctx context.Context, s tunnel.Session) (func(), err
 		certSerial:  ident.CertSerial,
 		cancel:      pcancel,
 		facts:       cluster,
+		spokeLabels: maps.Clone(facts.Cluster.Labels),
 	}
 
 	r.mu.Lock()
@@ -363,17 +373,21 @@ func (r *Registry) slotKey(ident tunnel.Identity) string {
 // clusterFrom folds a Describe payload onto the certificate identity. The
 // certificate always wins: a spoke that reports a different ID is logged,
 // counted and overwritten, never trusted.
-func (r *Registry) clusterFrom(id string, ident tunnel.Identity, reported fleet.Cluster) fleet.Cluster {
+func (r *Registry) clusterFrom(ctx context.Context, id string, ident tunnel.Identity, reported fleet.Cluster) (fleet.Cluster, error) {
 	r.noteReportedID(id, reported.ID, ident.CertSerial)
 	c := copyCluster(reported)
 	c.ID = id
 	c.CertNotAfter = ident.CertNotAfter
-	c.Labels = r.mergeLabels(id, c.Labels)
+	labels, err := r.mergeLabels(ctx, id, c.Labels)
+	if err != nil {
+		return fleet.Cluster{}, err
+	}
+	c.Labels = labels
 	now := r.now()
 	c.LastSeen = now
 	c.ConnectedSince = now
 	c.State = connectedState(c)
-	return c
+	return c, nil
 }
 
 // noteReportedID logs and counts a self-reported cluster ID that disagrees with
@@ -428,22 +442,23 @@ func (r *Registry) pollFacts(ctx context.Context, id, key string, sl *slot, s tu
 
 		cctx, cancel := context.WithTimeout(ctx, r.pollTimeout)
 		facts, err := s.Describe(cctx, fp)
-		cancel()
 		if err != nil {
+			cancel()
 			// Liveness belongs to the transport's keepalive, not to us: a
 			// single failed Describe must not evict a cluster that is still
 			// answering queries.
 			r.log.WarnContext(ctx, "registry: facts poll failed", "cluster", id, "error", err)
 			continue
 		}
-		r.applyFacts(id, key, sl, facts)
+		r.applyFacts(cctx, id, key, sl, facts)
+		cancel()
 	}
 }
 
 // applyFacts merges a Describe reply into sl, if sl is still the slot
 // registered under key for cluster id — i.e. it has not been displaced by a
 // newer generation of the same pod.
-func (r *Registry) applyFacts(id, key string, sl *slot, facts tunnel.Facts) {
+func (r *Registry) applyFacts(ctx context.Context, id, key string, sl *slot, facts tunnel.Facts) {
 	if facts.Changed {
 		r.noteReportedID(id, facts.Cluster.ID, sl.certSerial)
 	}
@@ -454,12 +469,19 @@ func (r *Registry) applyFacts(id, key string, sl *slot, facts tunnel.Facts) {
 	// Describe and have this path store it verbatim. Computed BEFORE the lock:
 	// the authoritative-labels callback may consult the credential store, and
 	// a store stall must slow this one refresh, not every registry reader.
-	var merged map[string]string
+	var reported map[string]string
 	if facts.Changed {
-		// Cloned first, as the admission path does: with no authoritative
-		// labels configured, mergeLabels returns its argument, and the
-		// registry must never retain a map the tunnel layer still owns.
-		merged = r.mergeLabels(id, maps.Clone(facts.Cluster.Labels))
+		reported = maps.Clone(facts.Cluster.Labels)
+	} else {
+		r.mu.RLock()
+		reported = maps.Clone(sl.spokeLabels)
+		r.mu.RUnlock()
+	}
+	// The operator's labels can change independently of the spoke fingerprint.
+	merged, err := r.mergeLabels(ctx, id, reported)
+	if err != nil {
+		r.log.WarnContext(ctx, "registry: authoritative label refresh failed", "cluster", id, "error", err)
+		return
 	}
 	r.mu.Lock()
 	e, ok := r.entries[id]
@@ -469,6 +491,7 @@ func (r *Registry) applyFacts(id, key string, sl *slot, facts tunnel.Facts) {
 	}
 	sl.facts.LastSeen = now
 	if !facts.Changed {
+		sl.facts.Labels = merged
 		r.mu.Unlock()
 		return
 	}
@@ -482,10 +505,11 @@ func (r *Registry) applyFacts(id, key string, sl *slot, facts tunnel.Facts) {
 	c.LastSeen = now
 	c.State = connectedState(c)
 	sl.facts = c
+	sl.spokeLabels = reported
 	sl.fingerprint = facts.Fingerprint
 	r.mu.Unlock()
 
-	r.log.Debug("registry: facts refreshed",
+	r.log.DebugContext(ctx, "registry: facts refreshed",
 		"cluster", id, "fingerprint", facts.Fingerprint, "state", string(c.State))
 }
 
@@ -683,9 +707,9 @@ func (r *Registry) closeSession(s tunnel.Session, id, reason string) {
 	}
 }
 
-// Session returns one live tunnel for a cluster, round-robin across its pool
-// of pods so load spreads over every one it is running rather than always
-// landing on the same pod.
+// Session returns one live tunnel for a cluster, round-robin across pods that
+// report a reachable Prometheus. If none do, it falls back to the live pool so
+// degraded clusters remain queryable while their cached facts recover.
 //
 // The error is deliberately layered. It always satisfies
 // errors.Is(err, [tunnel.ErrNotConnected]), so a caller that only wants to
@@ -719,19 +743,30 @@ func (r *Registry) Session(clusterID string) (tunnel.Session, error) {
 // pickLocked returns one live session from e's pool, round-robin across
 // slots. Callers must hold at least the read lock.
 //
-// A slot whose session has already ended but has not yet been released — the
-// transport calls the release function asynchronously from its own teardown,
-// so there is a window where a dead session is still in the pool — is skipped
-// rather than returned: round-robin visits every other slot first, so one
-// dead sibling never starves a healthy one, and only an entirely dead pool
-// yields nil, same as an empty one.
+// Closed sessions are excluded even before their transport releases them.
+// Among the remaining slots, prefer those that can reach Prometheus: a live
+// tunnel alone does not make a pod with a failed upstream useful for queries.
+// Falling back only when every live slot is degraded preserves diagnostics
+// and lets recovered upstreams answer before the next facts refresh.
 func (r *Registry) pickLocked(e *entry) tunnel.Session {
-	if len(e.slots) == 0 {
-		return nil
-	}
 	keys := make([]string, 0, len(e.slots))
-	for k := range e.slots {
+	healthy := make([]string, 0, len(e.slots))
+	for k, sl := range e.slots {
+		select {
+		case <-sl.session.Done():
+			continue
+		default:
+		}
 		keys = append(keys, k)
+		if sl.facts.Prometheus.Reachable {
+			healthy = append(healthy, k)
+		}
+	}
+	if len(healthy) > 0 {
+		keys = healthy
+	}
+	if len(keys) == 0 {
+		return nil
 	}
 	// Sorting gives round-robin a stable visiting order; map iteration order
 	// would make "round-robin" meaningless from one call to the next.
@@ -742,16 +777,7 @@ func (r *Registry) pickLocked(e *entry) tunnel.Session {
 	// value is only ever used modulo the slot count, so masking costs
 	// nothing and removes the overflow.
 	start := int((e.rr.Add(1) - 1) & math.MaxInt32)
-	for i := range keys {
-		s := e.slots[keys[(start+i)%len(keys)]].session
-		select {
-		case <-s.Done():
-			continue
-		default:
-			return s
-		}
-	}
-	return nil
+	return e.slots[keys[start%len(keys)]].session
 }
 
 // Cluster returns the merged public view of one cluster. The second result is
@@ -1035,13 +1061,16 @@ func copyCluster(c fleet.Cluster) fleet.Cluster {
 // request to be selected by any agent key scoped to them, and the spoke is the
 // party a compromise would control. Labels set on the enrollment token were
 // chosen by whoever decided this cluster should exist.
-func (r *Registry) mergeLabels(clusterID string, reported map[string]string) map[string]string {
+func (r *Registry) mergeLabels(ctx context.Context, clusterID string, reported map[string]string) (map[string]string, error) {
 	if r.authoritativeLabels == nil {
-		return reported
+		return reported, nil
 	}
-	owned := r.authoritativeLabels(clusterID)
+	owned, err := r.authoritativeLabels(ctx, clusterID)
+	if err != nil {
+		return nil, err
+	}
 	if len(owned) == 0 {
-		return reported
+		return reported, nil
 	}
 	merged := make(map[string]string, len(reported)+len(owned))
 	for k, v := range reported {
@@ -1050,5 +1079,5 @@ func (r *Registry) mergeLabels(clusterID string, reported map[string]string) map
 	for k, v := range owned {
 		merged[k] = v
 	}
-	return merged
+	return merged, nil
 }

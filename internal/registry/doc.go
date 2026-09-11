@@ -76,8 +76,11 @@
 //
 // Each live session gets one goroutine that polls [tunnel.Session.Describe] on
 // [Options.FactsPollInterval], passing the fingerprint the registry already
-// holds so an unchanged spoke replies with Changed=false and only refreshes
-// LastSeen.
+// holds so an unchanged spoke replies with Changed=false. A successful poll
+// refreshes LastSeen and rechecks operator labels even when spoke facts have
+// not changed; a failed label lookup preserves the last verified state.
+// Describe and label lookup share the poll timeout and release/shutdown
+// cancellation, so a stalled store read does not delay registry shutdown.
 //
 // Goroutine-per-session is chosen over a shared ticker with a worker pool
 // deliberately. The fleet is bounded at a few hundred spokes by

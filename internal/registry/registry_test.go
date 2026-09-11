@@ -1016,7 +1016,7 @@ func TestFactsPolling(t *testing.T) {
 
 		attach(t, r, newFakeSession("prod-eu", 200))
 
-		r.applyFacts("prod-eu", key, stale, tunnel.Facts{
+		r.applyFacts(t.Context(), "prod-eu", key, stale, tunnel.Facts{
 			Fingerprint: "zombie",
 			Changed:     true,
 			Cluster:     fleet.Cluster{DisplayName: "resurrected"},
@@ -1452,6 +1452,44 @@ func TestSiblingPods(t *testing.T) {
 			if got := counts[tunnel.Session(p)]; got != rounds {
 				t.Errorf("pod got %d of %d calls, want an even %d-way split", got, rounds*len(pods), rounds)
 			}
+		}
+	})
+
+	t.Run("healthy siblings receive all queries in an even rotation", func(t *testing.T) {
+		t.Parallel()
+		r := mustNew(t, Options{FactsPollInterval: time.Hour})
+		a := newFakeSessionInstance("prod-eu", 100, "pod-a")
+		broken := newFakeSessionInstance("prod-eu", 100, "pod-b")
+		c := newFakeSessionInstance("prod-eu", 100, "pod-c")
+		broken.facts.Cluster.Prometheus = fleet.PrometheusInfo{
+			Reachable: false, UnreachableReason: "dial tcp: refused",
+		}
+		for _, s := range []*fakeSession{a, broken, c} {
+			attach(t, r, s)
+		}
+		counts := map[tunnel.Session]int{}
+		for range 12 {
+			s, err := r.Session("prod-eu")
+			if err != nil {
+				t.Fatalf("Session: %v", err)
+			}
+			counts[s]++
+		}
+		if counts[broken] != 0 || counts[a] != 6 || counts[c] != 6 {
+			t.Fatalf("selection counts: healthy a=%d, degraded b=%d, healthy c=%d; want 6, 0, 6",
+				counts[a], counts[broken], counts[c])
+		}
+		// The remaining degraded tunnel must still be usable if both healthy
+		// siblings disconnect, even before their release callbacks run.
+		_ = a.Close("gone")
+		_ = c.Close("gone")
+		s, err := r.Session("prod-eu")
+		if err != nil || s != broken {
+			t.Fatalf("Session with only a degraded live sibling = %v, %v; want its tunnel", s, err)
+		}
+		_ = broken.Close("gone")
+		if _, err := r.Session("prod-eu"); !errors.Is(err, tunnel.ErrNotConnected) {
+			t.Fatalf("Session with every tunnel closed = %v; want not connected", err)
 		}
 	})
 

@@ -14,7 +14,7 @@ metadata:
   name: {{ include "prometheus-mcp-spoke.fullname" . }}-test-tunnel
   namespace: {{ include "prometheus-mcp-spoke.namespace" . }}
   labels:
-    {{- include "prometheus-mcp-spoke.componentLabels" (list . "spoke-test") | nindent 4 }}
+    {{- include "prometheus-mcp-spoke.testLabels" . | nindent 4 }}
   annotations:
     helm.sh/hook: test
     helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded

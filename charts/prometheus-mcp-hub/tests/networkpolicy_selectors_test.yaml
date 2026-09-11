@@ -1,0 +1,217 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Missing namespace selectors must keep pod selectors effective. Empty peers
+# must never render a null from/to field, which permits every source/destination.
+suite: hub NetworkPolicy selector isolation
+templates:
+  - templates/networkpolicy.yaml
+set:
+  config.publicURL: https://mcp.example.com/mcp
+tests:
+  - it: mcp keeps pod-only selectors within this namespace
+    set:
+      networkPolicy.mcp.namespaceSelector: null
+      networkPolicy.mcp.podSelector:
+        matchLabels:
+          app: prometheus
+    asserts:
+      - equal:
+          path: spec.ingress[0].from
+          value:
+            - podSelector:
+                matchLabels:
+                  app: prometheus
+            - podSelector:
+                matchLabels:
+                  app.kubernetes.io/instance: RELEASE-NAME
+                  app.kubernetes.io/component: hub-test
+  - it: mcp preserves an empty pod selector in this namespace
+    set:
+      networkPolicy.mcp.namespaceSelector: null
+      networkPolicy.mcp.podSelector: {}
+    asserts:
+      - equal:
+          path: spec.ingress[0].from
+          value:
+            - podSelector: {}
+            - podSelector:
+                matchLabels:
+                  app.kubernetes.io/instance: RELEASE-NAME
+                  app.kubernetes.io/component: hub-test
+  - it: mcp selects pods in all namespaces when the namespace selector is empty
+    set:
+      networkPolicy.mcp.namespaceSelector:
+        matchLabels: null
+      networkPolicy.mcp.podSelector:
+        matchLabels:
+          app: prometheus
+    asserts:
+      - equal:
+          path: spec.ingress[0].from
+          value:
+            - namespaceSelector: {}
+              podSelector:
+                matchLabels:
+                  app: prometheus
+            - podSelector:
+                matchLabels:
+                  app.kubernetes.io/instance: RELEASE-NAME
+                  app.kubernetes.io/component: hub-test
+  - it: mcp combines namespace and pod selectors in one peer
+    set:
+      networkPolicy.mcp.namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: custom
+      networkPolicy.mcp.podSelector:
+        matchLabels:
+          app: prometheus
+    asserts:
+      - equal:
+          path: spec.ingress[0].from
+          value:
+            - namespaceSelector:
+                matchLabels:
+                  kubernetes.io/metadata.name: custom
+              podSelector:
+                matchLabels:
+                  app: prometheus
+            - podSelector:
+                matchLabels:
+                  app.kubernetes.io/instance: RELEASE-NAME
+                  app.kubernetes.io/component: hub-test
+  - it: mcp denies ordinary traffic when both selectors are removed
+    set:
+      networkPolicy.mcp.namespaceSelector: null
+      networkPolicy.mcp.podSelector: null
+    asserts:
+      - equal:
+          path: spec.ingress[0].from
+          value:
+            - podSelector:
+                matchLabels:
+                  app.kubernetes.io/instance: RELEASE-NAME
+                  app.kubernetes.io/component: hub-test
+  - it: mcp keeps explicit extra peers when selectors are removed
+    set:
+      networkPolicy.mcp.namespaceSelector: null
+      networkPolicy.mcp.podSelector: null
+      networkPolicy.mcp.extraFrom:
+        - ipBlock:
+            cidr: 192.0.2.0/24
+    asserts:
+      - equal:
+          path: spec.ingress[0].from
+          value:
+            - ipBlock:
+                cidr: 192.0.2.0/24
+            - podSelector:
+                matchLabels:
+                  app.kubernetes.io/instance: RELEASE-NAME
+                  app.kubernetes.io/component: hub-test
+  - it: admin keeps pod-only selectors within this namespace
+    set:
+      networkPolicy.admin.namespaceSelector: null
+      networkPolicy.admin.podSelector:
+        matchLabels:
+          app: prometheus
+    asserts:
+      - equal:
+          path: spec.ingress[1].from
+          value:
+            - podSelector:
+                matchLabels:
+                  app: prometheus
+            - podSelector:
+                matchLabels:
+                  app.kubernetes.io/instance: RELEASE-NAME
+                  app.kubernetes.io/component: hub-test
+  - it: admin preserves an empty pod selector in this namespace
+    set:
+      networkPolicy.admin.namespaceSelector: null
+      networkPolicy.admin.podSelector: {}
+    asserts:
+      - equal:
+          path: spec.ingress[1].from
+          value:
+            - podSelector: {}
+            - podSelector:
+                matchLabels:
+                  app.kubernetes.io/instance: RELEASE-NAME
+                  app.kubernetes.io/component: hub-test
+  - it: admin selects pods in all namespaces when the namespace selector is empty
+    set:
+      networkPolicy.admin.namespaceSelector:
+        matchLabels: null
+      networkPolicy.admin.podSelector:
+        matchLabels:
+          app: prometheus
+    asserts:
+      - equal:
+          path: spec.ingress[1].from
+          value:
+            - namespaceSelector: {}
+              podSelector:
+                matchLabels:
+                  app: prometheus
+            - podSelector:
+                matchLabels:
+                  app.kubernetes.io/instance: RELEASE-NAME
+                  app.kubernetes.io/component: hub-test
+  - it: admin combines namespace and pod selectors in one peer
+    set:
+      networkPolicy.admin.namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: custom
+      networkPolicy.admin.podSelector:
+        matchLabels:
+          app: prometheus
+    asserts:
+      - equal:
+          path: spec.ingress[1].from
+          value:
+            - namespaceSelector:
+                matchLabels:
+                  kubernetes.io/metadata.name: custom
+              podSelector:
+                matchLabels:
+                  app: prometheus
+            - podSelector:
+                matchLabels:
+                  app.kubernetes.io/instance: RELEASE-NAME
+                  app.kubernetes.io/component: hub-test
+  - it: admin denies ordinary traffic when both selectors are removed
+    set:
+      networkPolicy.admin.namespaceSelector: null
+      networkPolicy.admin.podSelector: null
+    asserts:
+      - equal:
+          path: spec.ingress[1].from
+          value:
+            - podSelector:
+                matchLabels:
+                  app.kubernetes.io/instance: RELEASE-NAME
+                  app.kubernetes.io/component: hub-test
+  - it: admin keeps explicit extra peers when selectors are removed
+    set:
+      networkPolicy.admin.namespaceSelector: null
+      networkPolicy.admin.podSelector: null
+      networkPolicy.admin.extraFrom:
+        - ipBlock:
+            cidr: 192.0.2.0/24
+    asserts:
+      - equal:
+          path: spec.ingress[1].from
+          value:
+            - ipBlock:
+                cidr: 192.0.2.0/24
+            - podSelector:
+                matchLabels:
+                  app.kubernetes.io/instance: RELEASE-NAME
+                  app.kubernetes.io/component: hub-test
+  - it: allowAll explicitly opens MCP ingress
+    set:
+      networkPolicy.mcp.allowAll: true
+    asserts:
+      - notExists:
+          path: spec.ingress[0].from

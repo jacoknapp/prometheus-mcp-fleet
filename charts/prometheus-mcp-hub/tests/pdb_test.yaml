@@ -36,11 +36,10 @@ tests:
           count: 1
       - isKind:
           of: PodDisruptionBudget
-      # The chart default is maxUnavailable, not minAvailable: a percentage
-      # stays correct when replicaCount changes, where a count does not.
+      # A percentage rounds up; a count permits only one simultaneous eviction.
       - equal:
           path: spec.maxUnavailable
-          value: 50%
+          value: 1
       - notExists:
           path: spec.minAvailable
       # A pod that is not Ready must not consume the budget, or a node with a
@@ -86,3 +85,9 @@ tests:
           value: 1
       - notExists:
           path: spec.minAvailable
+
+  - it: allows only one eviction at the default three replicas
+    asserts:
+      - equal:
+          path: spec.maxUnavailable
+          value: 1

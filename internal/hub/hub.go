@@ -664,23 +664,25 @@ func (h *hub) shutdown(srv *httpx.Server, name string) {
 // A miss returns nil, which leaves the spoke's own labels in place: a cluster
 // enrolled before labels were recorded, or by a token since deleted, is
 // described by what it reports and simply gains no operator-set selectors.
+// A failed lookup returns an error: unavailability must never let a spoke
+// replace operator labels and enter a different agent key scope.
 // enrollmentLabelTimeout bounds the store read behind a label lookup.
 const enrollmentLabelTimeout = 5 * time.Second
 
-func (h *hub) enrollmentLabels(clusterID string) map[string]string {
+func (h *hub) enrollmentLabels(ctx context.Context, clusterID string) (map[string]string, error) {
 	if h.store == nil || clusterID == "" {
-		return nil
+		return nil, nil
 	}
 	// Bounded: this runs on session attach and on every facts refresh, not per
 	// request, and the store is a read-through cache over one Secret.
-	ctx, cancel := context.WithTimeout(context.Background(), enrollmentLabelTimeout)
+	ctx, cancel := context.WithTimeout(ctx, enrollmentLabelTimeout)
 	defer cancel()
 
 	keys, err := h.store.ListKeys(ctx, fleet.ClassEnrollment)
 	if err != nil {
-		h.logger.WarnContext(ctx, "could not read enrollment labels; using the spoke's own",
+		h.logger.WarnContext(ctx, "could not read enrollment labels; retaining existing authorization",
 			"cluster", clusterID, "error", err)
-		return nil
+		return nil, fmt.Errorf("read enrollment labels: %w", err)
 	}
 	var newest *fleet.Key
 	for _, k := range keys {
@@ -703,9 +705,9 @@ func (h *hub) enrollmentLabels(clusterID string) map[string]string {
 		}
 	}
 	if newest == nil {
-		return nil
+		return nil, nil
 	}
-	return newest.Enrollment.Labels
+	return newest.Enrollment.Labels, nil
 }
 
 // hubapi deliberately does not import registry, so this is where a signature

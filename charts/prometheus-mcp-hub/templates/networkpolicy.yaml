@@ -33,39 +33,29 @@ spec:
     # this one rule is the whole inbound story and there is no tunnel port to
     # open. If you narrow it, narrow it to the Ingress controller, never to the
     # agents alone, or every spoke in the fleet is cut off.
+    {{- $sources := deepCopy .Values.networkPolicy.mcp }}
+    {{- $_ := set $sources "extraFrom" (append ($sources.extraFrom | default list) (fromYaml (include "prometheus-mcp-hub.testPeer" .))) }}
+    {{- $peers := include "prometheus-mcp-hub.networkPeers" $sources }}
+    {{- if or $peers .Values.networkPolicy.mcp.allowAll }}
     - ports:
         - port: mcp
           protocol: TCP
       {{- if not .Values.networkPolicy.mcp.allowAll }}
       from:
-        {{- with .Values.networkPolicy.mcp.namespaceSelector }}
-        - namespaceSelector:
-            {{- toYaml . | nindent 12 }}
-          {{- with $.Values.networkPolicy.mcp.podSelector }}
-          podSelector:
-            {{- toYaml . | nindent 12 }}
-          {{- end }}
-        {{- end }}
-        {{- with .Values.networkPolicy.mcp.extraFrom }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
+        {{- $peers | nindent 8 }}
       {{- end }}
-    # Admin/metrics: scrapers only. This port is never published outside.
+    {{- end }}
+    # Admin/metrics: scrapers and this release's Helm test pod.
+    {{- $sources := deepCopy .Values.networkPolicy.admin }}
+    {{- $_ := set $sources "extraFrom" (append ($sources.extraFrom | default list) (fromYaml (include "prometheus-mcp-hub.testPeer" .))) }}
+    {{- $peers := include "prometheus-mcp-hub.networkPeers" $sources }}
+    {{- if $peers }}
     - ports:
         - port: admin
           protocol: TCP
       from:
-        {{- with .Values.networkPolicy.admin.namespaceSelector }}
-        - namespaceSelector:
-            {{- toYaml . | nindent 12 }}
-          {{- with $.Values.networkPolicy.admin.podSelector }}
-          podSelector:
-            {{- toYaml . | nindent 12 }}
-          {{- end }}
-        {{- end }}
-        {{- with .Values.networkPolicy.admin.extraFrom }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
+        {{- $peers | nindent 8 }}
+    {{- end }}
   {{- if .Values.networkPolicy.egress.enabled }}
   egress:
     {{- if .Values.networkPolicy.egress.allowDNS }}

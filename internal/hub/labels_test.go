@@ -92,26 +92,30 @@ func TestEnrollmentLabelsAreTheOperatorsIntent(t *testing.T) {
 			t.Parallel()
 
 			h, _ := newKeyHub(t, &labelStub{keys: tc.keys})
-			if diff := cmp.Diff(tc.want, h.enrollmentLabels(tc.cluster)); diff != "" {
+			got, err := h.enrollmentLabels(t.Context(), tc.cluster)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if diff := cmp.Diff(tc.want, got); diff != "" {
 				t.Errorf("enrollmentLabels() mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}
 }
 
-// TestEnrollmentLabelsFailOpenOnStoreError keeps a cluster visible when the
-// store cannot be read. Returning nothing leaves the spoke's own labels in
-// place, which is a degraded view rather than a cluster that disappears from
-// every scoped key at once because of a transient API-server error.
-func TestEnrollmentLabelsFailOpenOnStoreError(t *testing.T) {
+// TestEnrollmentLabelsFailClosedOnStoreError ensures store unavailability cannot
+// remove operator label overrides and expose a cluster to a different key scope.
+func TestEnrollmentLabelsFailClosedOnStoreError(t *testing.T) {
 	t.Parallel()
 
-	h, sink := newKeyHub(t, &labelStub{err: errors.New("apiserver unavailable")})
-	if got := h.enrollmentLabels("prod-eu-1"); got != nil {
-		t.Errorf("enrollmentLabels() = %v, want nil when the store fails", got)
+	storeErr := errors.New("apiserver unavailable")
+	h, sink := newKeyHub(t, &labelStub{err: storeErr})
+	got, err := h.enrollmentLabels(t.Context(), "prod-eu-1")
+	if got != nil || !errors.Is(err, storeErr) {
+		t.Errorf("enrollmentLabels() = %v, %v, want nil and store error", got, err)
 	}
-	if sink.find("could not read enrollment labels; using the spoke's own") == nil {
-		t.Error("the store failure was not logged; the labels would silently differ")
+	if sink.find("could not read enrollment labels; retaining existing authorization") == nil {
+		t.Error("the failed authorization lookup was not logged")
 	}
 }
 
@@ -121,8 +125,8 @@ func TestEnrollmentLabelsWithoutAStore(t *testing.T) {
 	t.Parallel()
 
 	h := &hub{}
-	if got := h.enrollmentLabels("prod-eu-1"); got != nil {
-		t.Errorf("enrollmentLabels() = %v, want nil with no store", got)
+	if got, err := h.enrollmentLabels(t.Context(), "prod-eu-1"); got != nil || err != nil {
+		t.Errorf("enrollmentLabels() = %v, %v, want nil, nil with no store", got, err)
 	}
 }
 
@@ -135,4 +139,50 @@ type labelStub struct {
 
 func (s *labelStub) ListKeys(context.Context, fleet.KeyClass) ([]*fleet.Key, error) {
 	return s.keys, s.err
+}
+
+func TestEnrollmentLabelsHonorsCallerCancellation(t *testing.T) {
+	t.Parallel()
+	started := make(chan context.Context, 1)
+	h, _ := newKeyHub(t, &blockingLabelStore{started: started})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.enrollmentLabels(ctx, "prod-eu-1")
+		done <- err
+	}()
+	select {
+	case lookup := <-started:
+		deadline, ok := lookup.Deadline()
+		if !ok || time.Until(deadline) > enrollmentLabelTimeout {
+			t.Error("store lookup lost its timeout bound")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("lookup did not reach store")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("lookup error = %v, want cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("store read continued after caller cancellation")
+	}
+}
+
+type blockingLabelStore struct {
+	store.Store
+	started chan context.Context
+}
+
+func (s *blockingLabelStore) ListKeys(ctx context.Context, _ fleet.KeyClass) ([]*fleet.Key, error) {
+	s.started <- ctx
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(3 * time.Second):
+		return nil, errors.New("store read did not cancel")
+	}
 }

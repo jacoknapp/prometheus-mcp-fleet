@@ -103,11 +103,11 @@ presents no tunnel server certificate and asks for none at the TLS layer — the
 a plain proxy and verifies nothing on its own. A spoke's
 `hub.endpoints` entry is therefore a URL: `wss://hub.example.com/tunnel`.
 
-The Ingress **must** route `tunnel.path`. `ingress.path: /` (the default) covers it. If
-you narrow `ingress.path` to something that does not — `/mcp`, say — the chart renders a
-**second path entry** for `tunnel.path` on that host automatically, and `NOTES.txt` says
-it did. This is not politeness: a hub whose Ingress misses `/tunnel` serves MCP perfectly,
-passes every probe and accepts zero spokes.
+The Ingress must route MCP, `tunnel.path`, enrollment, renewal, PKI and OAuth
+metadata. `ingress.path: /` (the default) covers every public endpoint. If you
+narrow it to `/mcp`, the chart adds the missing routes on each host automatically.
+Without the enrollment and renewal routes, a hub can pass its probes and serve
+MCP while new spokes cannot enroll and existing credentials cannot renew.
 
 ### Idle timeouts
 
@@ -366,9 +366,9 @@ Kubernetes: `>=1.28.0-0`
 | ingress.annotations | object | `{}` | Annotations for the Ingress. IDLE TIMEOUTS: an Ingress controller closes an idle upgraded connection, and the tunnel is a long-lived WebSocket. nginx defaults to 60s while the tunnel's HTTP/2 keepalive pings run every 10s, so the defaults are fine — but a controller tuned BELOW ~30s disconnects every spoke in the fleet, repeatedly, and the hub still looks healthy. Raise it there:   nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"   nginx.ingress.kubernetes.io/proxy-send-timeout: "3600" (HAProxy: `haproxy.org/timeout-tunnel`. Traefik: the entrypoint's respondingTimeouts.) |
 | ingress.className | string | `""` | `spec.ingressClassName`. |
 | ingress.enabled | bool | `false` | Render a standard `networking.k8s.io/v1` Ingress for the MCP port. This carries EVERYTHING: the agent-facing MCP endpoint and the spoke tunnel WebSocket at `tunnel.path` share the one listener, so one rule and one certificate publish the whole product. There is no second Service, no LoadBalancer and no `ssl-passthrough` to arrange. The controller only has to proxy `Connection: Upgrade`, which every Ingress controller does natively. |
-| ingress.extraHosts | list | `[]` | Additional hosts, each an object with `host`, and optionally `path` and `pathType`. Each one gets the same tunnel-path treatment as `ingress.host`. |
+| ingress.extraHosts | list | `[]` | Additional hosts, each an object with `host`, and optionally `path` and `pathType`. Each one gets the same required public routes as `ingress.host`. |
 | ingress.host | string | `""` | Hostname. Required when `ingress.enabled` is true. |
-| ingress.path | string | `"/"` | Path exposed. `/` publishes both the MCP endpoint and the tunnel at `tunnel.path`. A narrower path that does not cover `tunnel.path` gets a SECOND path entry rendered for the tunnel automatically — an Ingress that does not route `tunnel.path` accepts zero spokes while looking perfectly healthy. |
+| ingress.path | string | `"/"` | Path exposed. `/` publishes every public endpoint. Narrower paths automatically get additional rules for MCP, the tunnel, enrollment, renewal, PKI and OAuth metadata. |
 | ingress.pathType | string | `"Prefix"` | `pathType`. |
 | ingress.servicePortName | string | `"mcp"` | Name of the Service port to route to. Must be `mcp`; the chart refuses to route the admin port through an Ingress. |
 | ingress.tls.enabled | bool | `false` | Terminate TLS at the Ingress. Spokes dial `wss://`, so in practice this is on. |
@@ -421,7 +421,7 @@ Kubernetes: `>=1.28.0-0`
 | nameOverride | string | `""` | Override the chart name used in resource names. |
 | namespaceOverride | string | `""` | Render every object into this namespace instead of `.Release.Namespace`. |
 | networkPolicy.admin.extraFrom | list | `[]` | Additional raw `ingress.from` entries for the admin port. |
-| networkPolicy.admin.namespaceSelector | object | `{"matchLabels":{"kubernetes.io/metadata.name":"monitoring"}}` | `namespaceSelector` for the only namespace allowed to reach the admin/metrics port. |
+| networkPolicy.admin.namespaceSelector | object | `{"matchLabels":{"kubernetes.io/metadata.name":"monitoring"}}` | `namespaceSelector` for the only namespace allowed to reach the admin/metrics port. Set to `null` to restrict `podSelector` to the release namespace; set `matchLabels: null` to select all namespaces. |
 | networkPolicy.admin.podSelector | object | `{}` | `podSelector` for scrapers allowed to reach the admin/metrics port. |
 | networkPolicy.egress.allowDNS | bool | `true` | Allow DNS egress to `kube-system`. |
 | networkPolicy.egress.allowKubeAPI | bool | `true` | Allow egress to the Kubernetes API server. Required whenever `state.backend` is `secret`. |
@@ -433,14 +433,14 @@ Kubernetes: `>=1.28.0-0`
 | networkPolicy.labels | object | `{}` | Extra labels for the NetworkPolicy. |
 | networkPolicy.mcp.allowAll | bool | `false` | Allow ingress to the MCP port from any source. Use when your Ingress controller's identity cannot be expressed as a selector. Leave it false. This one rule is the hub's whole inbound story: SPOKE TUNNELS arrive here too, on the same port, from the same Ingress controller, so there is no separate tunnel rule to open. Restricting the port to the controller is defence in depth — the hub authenticates every spoke itself, inside the connection — but it is still right, and if you narrow it, narrow it to the CONTROLLER and never to the agents alone or you cut off every spoke in the fleet. |
 | networkPolicy.mcp.extraFrom | list | `[]` | Additional raw `ingress.from` entries for the MCP port. |
-| networkPolicy.mcp.namespaceSelector | object | `{"matchLabels":{"kubernetes.io/metadata.name":"ingress-nginx"}}` | `namespaceSelector` for clients allowed to reach the MCP port. |
+| networkPolicy.mcp.namespaceSelector | object | `{"matchLabels":{"kubernetes.io/metadata.name":"ingress-nginx"}}` | `namespaceSelector` for clients allowed to reach the MCP port. Set to `null` to restrict `podSelector` to the release namespace; set `matchLabels: null` to select all namespaces. |
 | networkPolicy.mcp.podSelector | object | `{}` | `podSelector` for clients allowed to reach the MCP port. Empty selects every pod in the selected namespaces. |
 | nodeSelector | object | `{}` | `spec.template.spec.nodeSelector`. |
 | peerDiscovery.domain | string | `""` | `PMF_PEER_DISCOVERY_DOMAIN`. Empty derives `<fullname>-peers.<namespace>.svc` from the headless Service above. Set it only to point at a Service this chart does not render. |
 | peerDiscovery.enabled | bool | `true` | Render the headless Service the hub resolves to count its replicas. Leave on for `replicaCount > 1`; harmless at 1. |
 | podAnnotations | object | `{}` | Annotations for the hub pods. |
 | podDisruptionBudget.enabled | bool | `true` | Render a PodDisruptionBudget. It is force-disabled whenever `replicaCount < 2`: a budget on a single-replica workload blocks every node drain forever. |
-| podDisruptionBudget.maxUnavailable | string | `"50%"` | `spec.maxUnavailable`. `50%` keeps at least half the replicas serving during a voluntary disruption: at 3 replicas one node may drain at a time. A percentage rather than a count so it stays correct if you change `replicaCount`. |
+| podDisruptionBudget.maxUnavailable | int | `1` | `spec.maxUnavailable`. The default permits one voluntary eviction at a time. A percentage rounds up in Kubernetes: `50%` would permit two evictions at the default three replicas. |
 | podDisruptionBudget.minAvailable | string | `""` | `spec.minAvailable`. Mutually exclusive with `maxUnavailable`, which is set below and wins. |
 | podDisruptionBudget.unhealthyPodEvictionPolicy | string | `"AlwaysAllow"` | `spec.unhealthyPodEvictionPolicy` (Kubernetes >= 1.27). `AlwaysAllow` means a pod that is not Ready — crashlooping, stuck pulling, wedged — does NOT consume the budget and can always be evicted. The default, `IfHealthyBudget`, does the opposite: broken pods are protected, so a node with a crashlooping hub on it cannot be drained until someone fixes the pod. That is the wrong way round for a workload whose whole point is to be replaceable. |
 | podLabels | object | `{}` | Extra labels for the hub pods. |

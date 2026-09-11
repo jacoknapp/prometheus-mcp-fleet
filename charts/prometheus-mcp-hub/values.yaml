@@ -326,17 +326,14 @@ ingress:
   annotations: {}
   # -- Hostname. Required when `ingress.enabled` is true.
   host: ""
-  # -- Path exposed. `/` publishes both the MCP endpoint and the tunnel at `tunnel.path`.
-  # A narrower path that does not cover `tunnel.path` gets a SECOND path entry rendered for
-  # the tunnel automatically — an Ingress that does not route `tunnel.path` accepts zero
-  # spokes while looking perfectly healthy.
+  # -- Path exposed. `/` publishes every public endpoint. Narrower paths automatically get additional rules for MCP, the tunnel, enrollment, renewal, PKI and OAuth metadata.
   path: /
   # -- `pathType`.
   pathType: Prefix
   # -- Name of the Service port to route to. Must be `mcp`; the chart refuses to route the admin port through an Ingress.
   servicePortName: mcp
   # -- Additional hosts, each an object with `host`, and optionally `path` and `pathType`.
-  # Each one gets the same tunnel-path treatment as `ingress.host`.
+  # Each one gets the same required public routes as `ingress.host`.
   extraHosts: []
   tls:
     # -- Terminate TLS at the Ingress. Spokes dial `wss://`, so in practice this is on.
@@ -395,8 +392,8 @@ podDisruptionBudget:
   enabled: true
   # -- `spec.minAvailable`. Mutually exclusive with `maxUnavailable`, which is set below and wins.
   minAvailable: ""
-  # -- `spec.maxUnavailable`. `50%` keeps at least half the replicas serving during a voluntary disruption: at 3 replicas one node may drain at a time. A percentage rather than a count so it stays correct if you change `replicaCount`.
-  maxUnavailable: 50%
+  # -- `spec.maxUnavailable`. The default permits one voluntary eviction at a time. A percentage rounds up in Kubernetes: `50%` would permit two evictions at the default three replicas.
+  maxUnavailable: 1
   # -- `spec.unhealthyPodEvictionPolicy` (Kubernetes >= 1.27). `AlwaysAllow` means a pod that is not Ready — crashlooping, stuck pulling, wedged — does NOT consume the budget and can always be evicted. The default, `IfHealthyBudget`, does the opposite: broken pods are protected, so a node with a crashlooping hub on it cannot be drained until someone fixes the pod. That is the wrong way round for a workload whose whole point is to be replaceable.
   unhealthyPodEvictionPolicy: AlwaysAllow
 
@@ -415,7 +412,7 @@ networkPolicy:
     # you narrow it, narrow it to the CONTROLLER and never to the agents alone or you cut off
     # every spoke in the fleet.
     allowAll: false
-    # -- `namespaceSelector` for clients allowed to reach the MCP port.
+    # -- `namespaceSelector` for clients allowed to reach the MCP port. Set to `null` to restrict `podSelector` to the release namespace; set `matchLabels: null` to select all namespaces.
     namespaceSelector:
       matchLabels:
         kubernetes.io/metadata.name: ingress-nginx
@@ -424,7 +421,7 @@ networkPolicy:
     # -- Additional raw `ingress.from` entries for the MCP port.
     extraFrom: []
   admin:
-    # -- `namespaceSelector` for the only namespace allowed to reach the admin/metrics port.
+    # -- `namespaceSelector` for the only namespace allowed to reach the admin/metrics port. Set to `null` to restrict `podSelector` to the release namespace; set `matchLabels: null` to select all namespaces.
     namespaceSelector:
       matchLabels:
         kubernetes.io/metadata.name: monitoring

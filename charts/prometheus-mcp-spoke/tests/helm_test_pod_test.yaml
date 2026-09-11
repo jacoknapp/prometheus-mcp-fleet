@@ -1,0 +1,51 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Helm test pods must reach their workload without becoming Service endpoints
+# or inheriting the workload NetworkPolicy egress restrictions.
+suite: spoke Helm test pod can probe without joining the workload
+templates:
+  - templates/tests/test-tunnel.yaml
+  - templates/networkpolicy.yaml
+set:
+  cluster.id: test-cluster
+  cluster.sdlc: test
+  hub.endpoints:
+    - wss://hub.example.com/tunnel
+  hub.apiUrl: https://hub.example.com
+tests:
+  - it: omits the workload name label with default labels
+    template: templates/tests/test-tunnel.yaml
+    set: {}
+    asserts:
+      - notExists:
+          path: metadata.labels["app.kubernetes.io/name"]
+      - equal:
+          path: metadata.labels["app.kubernetes.io/component"]
+          value: spoke-test
+      - equal:
+          path: metadata.labels["app.kubernetes.io/instance"]
+          value: RELEASE-NAME
+  - it: omits the workload name label with a maximum-length nameOverride
+    template: templates/tests/test-tunnel.yaml
+    set:
+      nameOverride: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    asserts:
+      - notExists:
+          path: metadata.labels["app.kubernetes.io/name"]
+      - equal:
+          path: metadata.labels["app.kubernetes.io/component"]
+          value: spoke-test
+      - equal:
+          path: metadata.labels["app.kubernetes.io/instance"]
+          value: RELEASE-NAME
+  - it: allows the test pod through ingress rule 0
+    template: templates/networkpolicy.yaml
+    asserts:
+      - contains:
+          path: spec.ingress[0].from
+          content:
+            podSelector:
+              matchLabels:
+                app.kubernetes.io/instance: RELEASE-NAME
+                app.kubernetes.io/component: spoke-test

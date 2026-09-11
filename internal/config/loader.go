@@ -486,7 +486,7 @@ func checkPair(certFlag, certPath, keyFlag, keyPath string) error {
 // redactedUserinfo replaces the credential portion of a logged URL.
 const redactedUserinfo = "redacted"
 
-// redactURL strips userinfo from a URL so a password embedded in it cannot
+// redactURL strips userinfo, queries and fragments so credentials in a URL cannot
 // reach a log line. A string that does not parse is replaced wholesale, since
 // we then cannot tell where the credential ends. The replacement is a bare
 // word rather than "[REDACTED]" because url.URL.String percent-escapes
@@ -502,5 +502,7 @@ func redactURL(raw string) string {
 	if u.User != nil {
 		u.User = url.User(redactedUserinfo)
 	}
+	u.RawQuery, u.Fragment, u.RawFragment = "", "", ""
+	u.ForceQuery = false
 	return u.String()
 }

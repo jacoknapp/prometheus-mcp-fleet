@@ -1,0 +1,24 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+suite: spoke PodDisruptionBudget limits simultaneous evictions
+templates:
+  - templates/pdb.yaml
+set:
+  cluster.id: test-cluster
+  cluster.sdlc: test
+  hub.endpoints: [wss://hub.example.com/tunnel]
+  hub.apiUrl: https://hub.example.com
+tests:
+  - it: omits the budget for a single replica
+    set:
+      replicaCount: 1
+    asserts:
+      - hasDocuments:
+          count: 0
+  - it: permits one eviction with three replicas
+    set:
+      replicaCount: 3
+    asserts:
+      - equal:
+          path: spec.maxUnavailable
+          value: 1

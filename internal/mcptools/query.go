@@ -6,6 +6,7 @@ package mcptools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"slices"
@@ -518,6 +519,13 @@ func invalidTime(field, value, cluster string, err error) *ToolError {
 
 // malformed builds the error for a payload this hub could not read.
 func malformed(cluster string, err error) *ToolError {
+	if errors.Is(err, render.ErrNativeHistogram) {
+		return newError(CodeInvalidArgument,
+			fmt.Sprintf("cluster %q returned native histograms, which compact output cannot represent", cluster),
+			false).WithInput(map[string]any{"cluster": cluster}).
+			WithHint("Use histogram_sum(...) or histogram_count(...) to return float samples, " +
+				"or call query/query_range with format \"json\" if your scope allows raw output.")
+	}
 	return newError(CodeMalformedUpstream,
 		fmt.Sprintf("cluster %q returned a payload this hub could not read: %v", cluster, err),
 		false).WithInput(map[string]any{"cluster": cluster})

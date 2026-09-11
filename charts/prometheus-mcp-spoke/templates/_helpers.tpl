@@ -450,3 +450,36 @@ derived from the cgroup limit and never from node allocatable.
 {{- $bytes := include "prometheus-mcp-spoke.memoryBytes" (dig "limits" "memory" "" .Values.resources) | float64 -}}
 {{- mulf $bytes .Values.goRuntime.memLimitRatio | floor | int64 -}}
 {{- end -}}
+
+{{/* NetworkPolicy peers preserve Kubernetes selector semantics: an omitted
+namespace selector with a pod selector means this namespace; an explicit empty
+namespace selector means every namespace. Never turn missing selectors into an
+empty from/to field, which would allow every source/destination. */}}
+{{- define "prometheus-mcp-spoke.networkPeers" -}}
+{{- $peers := list -}}
+{{- $peer := dict -}}
+{{- if hasKey . "namespaceSelector" -}}
+{{- $_ := set $peer "namespaceSelector" .namespaceSelector -}}
+{{- end -}}
+{{- if and (hasKey . "podSelector") (or .podSelector (not (hasKey . "namespaceSelector"))) -}}
+{{- $_ := set $peer "podSelector" .podSelector -}}
+{{- end -}}
+{{- if $peer -}}{{- $peers = append $peers $peer -}}{{- end -}}
+{{- range .extraFrom -}}{{- $peers = append $peers . -}}{{- end -}}
+{{- if $peers -}}{{- toYaml $peers -}}{{- end -}}
+{{- end -}}
+
+{{/* Test pods must not match workload Services, PDBs or egress policies. */}}
+{{- define "prometheus-mcp-spoke.testLabels" -}}
+{{- $labels := fromYaml (include "prometheus-mcp-spoke.componentLabels" (list . "spoke-test")) -}}
+{{- $_ := unset $labels "app.kubernetes.io/name" -}}
+{{- toYaml $labels -}}
+{{- end -}}
+
+{{/* Permit only this release's Helm test pod to probe the workload. */}}
+{{- define "prometheus-mcp-spoke.testPeer" -}}
+podSelector:
+  matchLabels:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: spoke-test
+{{- end -}}

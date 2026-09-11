@@ -32,9 +32,6 @@ const (
 	DefaultGlobalResponseBudget = 256 << 20
 	// DefaultMaxInflightPerCluster caps simultaneous calls to one cluster.
 	DefaultMaxInflightPerCluster = 8
-	// DefaultFanoutConcurrency is used when [Proxy.Fanout] is given a
-	// non-positive concurrency.
-	DefaultFanoutConcurrency = 8
 )
 
 // errBudgetTooLarge reports a reservation larger than the whole global budget.

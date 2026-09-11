@@ -52,22 +52,17 @@ spec:
     {{- end }}
   {{- if .Values.networkPolicy.ingress.enabled }}
   ingress:
-    # Scrapers only. This is the only thing that ever connects IN to a spoke.
+    # Scrapers and this release's Helm test pod.
+    {{- $sources := deepCopy .Values.networkPolicy.ingress }}
+    {{- $_ := set $sources "extraFrom" (append ($sources.extraFrom | default list) (fromYaml (include "prometheus-mcp-spoke.testPeer" .))) }}
+    {{- $peers := include "prometheus-mcp-spoke.networkPeers" $sources }}
+    {{- if $peers }}
     - ports:
         - port: admin
           protocol: TCP
       from:
-        {{- with .Values.networkPolicy.ingress.namespaceSelector }}
-        - namespaceSelector:
-            {{- toYaml . | nindent 12 }}
-          {{- with $.Values.networkPolicy.ingress.podSelector }}
-          podSelector:
-            {{- toYaml . | nindent 12 }}
-          {{- end }}
-        {{- end }}
-        {{- with .Values.networkPolicy.ingress.extraFrom }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
+        {{- $peers | nindent 8 }}
+    {{- end }}
   {{- end }}
   {{- if .Values.networkPolicy.egress.enabled }}
   egress:
@@ -110,17 +105,10 @@ spec:
         {{- end }}
     {{- end }}
     {{- end }}
-    {{- if .Values.networkPolicy.egress.prometheus.enabled }}
-    # The local Prometheus, on the port parsed from prometheus.url.
+    {{- $promPeers := include "prometheus-mcp-spoke.networkPeers" .Values.networkPolicy.egress.prometheus }}
+    {{- if and .Values.networkPolicy.egress.prometheus.enabled $promPeers }}
     - to:
-        {{- with .Values.networkPolicy.egress.prometheus.namespaceSelector }}
-        - namespaceSelector:
-            {{- toYaml . | nindent 12 }}
-          {{- with $.Values.networkPolicy.egress.prometheus.podSelector }}
-          podSelector:
-            {{- toYaml . | nindent 12 }}
-          {{- end }}
-        {{- end }}
+        {{- $promPeers | nindent 8 }}
       ports:
         - port: {{ int (include "prometheus-mcp-spoke.prometheusPort" .) }}
           protocol: TCP

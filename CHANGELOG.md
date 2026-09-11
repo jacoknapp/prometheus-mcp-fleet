@@ -16,12 +16,33 @@ and `--renew-grace` covering spokes that upgrade late.
 
 ### Removed
 
+- Unused internal proxy fanout API; fleet scheduling remains in `mcptools`.
 - The `e2e` workflow. Nothing in CI now installs the charts into a live
   cluster: `test/e2e`, `.github/e2e` and `make e2e` are unchanged and still
   run the suite against a real kind cluster, but only when someone runs them.
 
 ### Fixed
 
+- Enrollment-label lookup failures now reject new spoke attachments and retain
+  previously verified labels on existing sessions. Operator label changes are
+  refreshed even when the spoke's facts fingerprint has not changed. Reads now
+  honor admission cancellation and facts-poll deadlines, release and shutdown.
+- URL credentials are redacted from configuration logs and Prometheus transport
+  errors without changing the credentials sent upstream.
+- Queries prefer spoke replicas that report a reachable Prometheus over live
+  tunnels whose upstream is known to be unavailable.
+- Fleet queries compact each cluster's contribution before retaining it for the
+  final merge, avoiding retention of every full decoded response at fleet scale.
+- Native histogram samples now produce an explicit unsupported-output error in
+  compact queries instead of becoming zero values or missing samples. Raw JSON
+  remains available where the key's scope permits it.
+- Range step selection counts the inclusive starting sample, keeping the result
+  within `maxPoints` at exact step boundaries.
+- Restricted hub ingress paths also route enrollment, renewal and public
+  discovery endpoints. NetworkPolicy peer selectors preserve pod-only and empty
+  namespace selectors, and empty peer lists deny traffic.
+- The default hub disruption budget permits one unavailable replica. Helm test
+  pods no longer match workload Services, disruption budgets or NetworkPolicies.
 - The nightly e2e run failed in its preflight step, before it built anything:
   `cluster.sdlc` became required and `cluster.labels` became a list of
   `{name, value}`, and `.github/e2e/spoke-values.yaml` still carried neither

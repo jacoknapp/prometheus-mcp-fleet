@@ -352,6 +352,11 @@ either pin the deciding label on the enrollment token (`hub enroll create
 --labels tier=pci`, which no spoke can override) or use an explicit `allow`
 list; `matchLabels` on an unpinned label is a convenience, not a boundary.
 
+If the enrollment-label store cannot be read, the hub rejects new spoke
+attachments and preserves the last verified labels on existing sessions.
+Every successful facts poll rechecks operator labels, even when the spoke's
+fingerprint is unchanged, so operator edits do not depend on a spoke update.
+
 **Rate limits are per hub replica.** The token bucket lives in each replica's
 memory -- there is deliberately no shared state store to coordinate one -- so
 with N replicas behind one hostname a key's effective ceiling is N x `rateRps`

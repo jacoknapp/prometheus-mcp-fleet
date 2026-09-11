@@ -112,11 +112,11 @@ presents no tunnel server certificate and asks for none at the TLS layer — the
 a plain proxy and verifies nothing on its own. A spoke's
 `hub.endpoints` entry is therefore a URL: `wss://hub.example.com/tunnel`.
 
-The Ingress **must** route `tunnel.path`. `ingress.path: /` (the default) covers it. If
-you narrow `ingress.path` to something that does not — `/mcp`, say — the chart renders a
-**second path entry** for `tunnel.path` on that host automatically, and `NOTES.txt` says
-it did. This is not politeness: a hub whose Ingress misses `/tunnel` serves MCP perfectly,
-passes every probe and accepts zero spokes.
+The Ingress must route MCP, `tunnel.path`, enrollment, renewal, PKI and OAuth
+metadata. `ingress.path: /` (the default) covers every public endpoint. If you
+narrow it to `/mcp`, the chart adds the missing routes on each host automatically.
+Without the enrollment and renewal routes, a hub can pass its probes and serve
+MCP while new spokes cannot enroll and existing credentials cannot renew.
 
 ### Idle timeouts
 

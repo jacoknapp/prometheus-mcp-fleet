@@ -172,12 +172,19 @@ var FanoutColumns = []string{ClusterLabel, "__name__", "labels", "value"}
 
 // fanoutResult is one cluster's contribution.
 type fanoutResult struct {
-	cluster  string
-	vector   render.Vector
-	matrix   render.Matrix
-	warnings []string
-	err      *ToolError
-	timedOut bool
+	cluster     string
+	instant     render.InstantResult
+	rangeResult render.RangeResult
+	err         *ToolError
+	timedOut    bool
+}
+
+// fanoutEncoding bounds each worker's retained contribution. Raw decoded samples
+// live only within queryOne, so fleet size cannot multiply untrimmed responses.
+type fanoutEncoding struct {
+	maxSeries  int
+	start, end time.Time
+	step       time.Duration
 }
 
 // fanoutQuery runs one expression across many clusters and merges the answers.
@@ -316,12 +323,12 @@ func (t *Tools) fanoutQuery(
 	defer cancel()
 	perCluster := max(deadline/2, time.Second)
 
-	results := t.dispatch(fctx, p, targets, endpoint, form, concurrency, perCluster)
-
 	maxSeries := clampInt(in.MaxSeriesPerCluster, 5, 1, 50)
 	if l := p.Scope.Limits; l.MaxSeries > 0 {
 		maxSeries = min(maxSeries, l.MaxSeries)
 	}
+	encoding := fanoutEncoding{maxSeries: maxSeries, start: start, end: end, step: step}
+	results := t.dispatch(fctx, p, targets, endpoint, form, concurrency, perCluster, encoding)
 	if mode == FanoutInstant {
 		t.mergeInstant(out, results, maxSeries)
 	} else {
@@ -495,6 +502,7 @@ func (t *Tools) commonStep(
 func (t *Tools) dispatch(
 	ctx context.Context, p *fleet.Principal, targets []fleet.Cluster,
 	endpoint promapi.Endpoint, form url.Values, concurrency int, perCluster time.Duration,
+	encoding fanoutEncoding,
 ) []fanoutResult {
 	results := make([]fanoutResult, len(targets))
 	type job struct {
@@ -510,7 +518,7 @@ func (t *Tools) dispatch(
 			defer wg.Done()
 			for j := range jobs {
 				results[j.index] = t.queryOne(
-					ctx, p, j.cluster, endpoint, form, perCluster,
+					ctx, p, j.cluster, endpoint, form, perCluster, encoding,
 				)
 			}
 		}()
@@ -539,6 +547,7 @@ func (t *Tools) dispatch(
 func (t *Tools) queryOne(
 	ctx context.Context, p *fleet.Principal, c fleet.Cluster,
 	endpoint promapi.Endpoint, form url.Values, perCluster time.Duration,
+	encoding fanoutEncoding,
 ) fanoutResult {
 	cctx, cancel := context.WithTimeout(ctx, perCluster)
 	defer cancel()
@@ -560,7 +569,9 @@ func (t *Tools) queryOne(
 	if derr != nil {
 		return fanoutResult{cluster: c.ID, err: malformed(c.ID, derr)}
 	}
-	res := fanoutResult{cluster: c.ID, warnings: append(env.Warnings, env.Infos...)}
+	res := fanoutResult{cluster: c.ID}
+	var vector render.Vector
+	var matrix render.Matrix
 	switch data.ResultType {
 	case "matrix":
 		if endpoint == promapi.EndpointQuery {
@@ -576,7 +587,7 @@ func (t *Tools) queryOne(
 		if err != nil {
 			return fanoutResult{cluster: c.ID, err: malformed(c.ID, err)}
 		}
-		res.matrix = m
+		matrix = m
 	case "scalar":
 		// A scalar is a one-sample vector with no labels, and that is how it
 		// merges: one row per cluster. Before this branch a scalar expression
@@ -586,7 +597,7 @@ func (t *Tools) queryOne(
 		if err != nil {
 			return fanoutResult{cluster: c.ID, err: malformed(c.ID, err)}
 		}
-		res.vector = render.Vector{{Metric: map[string]string{}, Value: pt}}
+		vector = render.Vector{{Metric: map[string]string{}, Value: pt}}
 	case "string":
 		return fanoutResult{cluster: c.ID, err: newError(CodeInvalidArgument,
 			"that expression returns a string, which has no fleet-wide merge", false).
@@ -596,7 +607,18 @@ func (t *Tools) queryOne(
 		if err != nil {
 			return fanoutResult{cluster: c.ID, err: malformed(c.ID, err)}
 		}
-		res.vector = v
+		vector = v
+	}
+	warnings := slices.Concat(env.Warnings, env.Infos)
+	if endpoint == promapi.EndpointQueryRange {
+		res.rangeResult = *render.EncodeRange(render.RangeInput{
+			Matrix: matrix, Start: encoding.start, End: encoding.end,
+			Step: encoding.step, Warnings: warnings,
+		}, render.Options{MaxSeries: encoding.maxSeries, TokenCeiling: -1})
+	} else {
+		res.instant = *render.EncodeInstant(render.InstantInput{
+			Vector: vector, ResultType: "vector", Warnings: warnings,
+		}, render.Options{MaxItems: encoding.maxSeries, TokenCeiling: -1})
 	}
 	return res
 }
@@ -610,9 +632,7 @@ func (t *Tools) mergeInstant(out *FanoutQueryOut, results []fanoutResult, maxSer
 		if r.err != nil {
 			continue
 		}
-		enc := render.EncodeInstant(render.InstantInput{
-			Vector: r.vector, ResultType: "vector", Warnings: r.warnings,
-		}, render.Options{MaxItems: maxSeries, TokenCeiling: -1})
+		enc := r.instant
 		total += enc.Total
 		// enc.Rows are always the {name, labels, value} 3-tuples EncodeInstant's
 		// own vector branch builds (see instantTable in query.go for the same
@@ -639,7 +659,7 @@ func (t *Tools) mergeInstant(out *FanoutQueryOut, results []fanoutResult, maxSer
 		out.Truncated = (&render.Truncation{}).Escalate(len(fitted), render.ReasonTokenCeiling,
 			fmt.Sprintf("The hub caps a result at about %d estimated tokens regardless of "+
 				"limit. Aggregate the expression, or lower maxClusters.", t.tokenCeiling))
-		out.Truncated.Total = len(rows)
+		out.Truncated.Total = total
 	} else if total > len(rows) {
 		out.Truncated = &render.Truncation{
 			Returned:  len(rows),
@@ -674,9 +694,7 @@ func (t *Tools) mergeRange(
 		if r.err != nil {
 			continue
 		}
-		enc := render.EncodeRange(render.RangeInput{
-			Matrix: r.matrix, Start: start, End: end, Step: step, Warnings: r.warnings,
-		}, render.Options{MaxSeries: maxSeries, TokenCeiling: -1})
+		enc := r.rangeResult
 		total += enc.SeriesTotal
 		for _, s := range enc.Series {
 			labels, warn := injectCluster(s.Labels, r.cluster, enc.SharedLabels)
@@ -701,7 +719,7 @@ func (t *Tools) mergeRange(
 		out.Truncated = (&render.Truncation{}).Escalate(len(fitted), render.ReasonTokenCeiling,
 			fmt.Sprintf("The hub caps a result at about %d estimated tokens regardless of "+
 				"limit. Shorten the range, aggregate, or lower maxClusters.", t.tokenCeiling))
-		out.Truncated.Total = len(series)
+		out.Truncated.Total = total
 	} else if total > len(series) {
 		out.Truncated = &render.Truncation{
 			Returned:  len(series),

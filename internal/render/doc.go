@@ -34,7 +34,7 @@
 //
 // # Importers and concurrency
 //
-// Layer L3, alongside internal/mcptools, which is its only intended importer.
+// Layer L2, imported by internal/mcptools to encode agent-facing results.
 // It performs no I/O, holds no mutable global state, and every exported
 // function is safe for concurrent use.
 package render

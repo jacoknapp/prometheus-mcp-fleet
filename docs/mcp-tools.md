@@ -137,10 +137,11 @@ Range PromQL with automatic step selection.
 | `timeout` | `60s` | |
 | `format` | `compact` | |
 
-**Let the step be chosen for you.** The hub computes
-`step = max(yourStep, ceil((end-start)/maxPoints))`, snapped up to a sensible
-ladder and never below the cluster's scrape interval. It always reports what it
-did:
+**Let the step be chosen for you.** The hub chooses a step strictly greater
+than `(end-start)/maxPoints`, because Prometheus includes the sample at the
+start of the range. It never lowers your requested step, snaps up to a sensible
+ladder, and never goes below the cluster's scrape interval. It always reports
+what it did:
 
 ```json
 "downsampled": {"requestedStep": "15s", "appliedStep": "3m", "reason": "max_points"}
@@ -151,6 +152,13 @@ did:
 
 Read that before reasoning about a spike — averaged data hides them. If you need
 raw resolution, shorten the range rather than raising `maxPoints`.
+
+Native histogram samples cannot be represented by the compact float columns.
+`query`, `query_range`, and `fanout_query` reject them explicitly rather than
+returning invented zeroes or missing samples. Use a float-valued expression such
+as `histogram_sum(...)` or `histogram_count(...)`; `query` and `query_range` also
+preserve native histograms with `format: "json"` when the key's scope permits
+raw output.
 
 For scale: a six-hour range over 84 series is roughly 4.1 MB of native
 Prometheus JSON, on the order of a million tokens, which fits in no context

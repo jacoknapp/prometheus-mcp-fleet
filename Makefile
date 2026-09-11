@@ -79,12 +79,15 @@ proto-breaking: ## Fail if the wire contract broke against origin/main.
 ##@ Quality
 
 .PHONY: fmt
+# Include new sources and ignore deleted paths while reviewing a working tree.
+GO_SOURCES := $(filter-out internal/gen/%,$(wildcard $(shell git ls-files --cached --others --exclude-standard '*.go')))
+
 fmt: ## Format all Go source.
-	gofmt -w $$(git ls-files '*.go' | grep -v '^internal/gen/')
+	gofmt -w $(GO_SOURCES)
 
 .PHONY: fmt-check
 fmt-check: ## Fail if any Go source is unformatted.
-	@out=$$(gofmt -l $$(git ls-files '*.go' | grep -v '^internal/gen/')); \
+	@out=$$(gofmt -l $(GO_SOURCES)); \
 	if [ -n "$$out" ]; then echo "unformatted files:"; echo "$$out"; exit 1; fi
 
 .PHONY: vet

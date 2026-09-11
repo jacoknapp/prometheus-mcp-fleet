@@ -31,7 +31,7 @@ func TestSelectStep(t *testing.T) {
 		{
 			name:     "one hour at the default budget snaps to the ladder",
 			req:      StepRequest{Start: start, End: start.Add(time.Hour)},
-			wantStep: 30 * time.Second, wantReason: StepReasonMaxPoints, wantReq: "auto",
+			wantStep: time.Minute, wantReason: StepReasonMaxPoints, wantReq: "auto",
 		},
 		{
 			name: "a requested ladder step is honoured",
@@ -115,8 +115,7 @@ func TestSelectStep(t *testing.T) {
 				if budget <= 0 {
 					budget = DefaultMaxPoints
 				}
-				if got := int(span/step) + 1; got > budget+1 &&
-					tc.wantReason != StepReasonRequested {
+				if got := int(span/step) + 1; got > budget {
 					t.Errorf("%d points against a budget of %d", got, budget)
 				}
 			}

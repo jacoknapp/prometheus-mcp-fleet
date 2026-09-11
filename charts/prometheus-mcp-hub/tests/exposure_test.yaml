@@ -150,7 +150,7 @@ tests:
           path: spec.rules[0].http.paths[0].path
           value: /
 
-  - it: renders a second path entry when ingress.path would exclude the tunnel
+  - it: renders every public route when ingress.path is /mcp
     template: templates/ingress.yaml
     set:
       ingress:
@@ -165,7 +165,7 @@ tests:
     asserts:
       - lengthEqual:
           path: spec.rules[0].http.paths
-          count: 2
+          count: 6
       - equal:
           path: spec.rules[0].http.paths[1].path
           value: /tunnel
@@ -177,10 +177,91 @@ tests:
           value: 8080
       - lengthEqual:
           path: spec.rules[1].http.paths
-          count: 2
+          count: 6
       - equal:
           path: spec.rules[1].http.paths[1].path
           value: /tunnel
+
+      - contains:
+          path: spec.rules[0].http.paths
+          content:
+            path: /enroll
+            pathType: Prefix
+            backend:
+              service:
+                name: RELEASE-NAME-prometheus-mcp-hub
+                port:
+                  number: 8080
+      - contains:
+          path: spec.rules[0].http.paths
+          content:
+            path: /renew
+            pathType: Prefix
+            backend:
+              service:
+                name: RELEASE-NAME-prometheus-mcp-hub
+                port:
+                  number: 8080
+      - contains:
+          path: spec.rules[0].http.paths
+          content:
+            path: /pki
+            pathType: Prefix
+            backend:
+              service:
+                name: RELEASE-NAME-prometheus-mcp-hub
+                port:
+                  number: 8080
+      - contains:
+          path: spec.rules[0].http.paths
+          content:
+            path: /.well-known/oauth-protected-resource/mcp
+            pathType: Prefix
+            backend:
+              service:
+                name: RELEASE-NAME-prometheus-mcp-hub
+                port:
+                  number: 8080
+      - contains:
+          path: spec.rules[1].http.paths
+          content:
+            path: /enroll
+            pathType: Prefix
+            backend:
+              service:
+                name: RELEASE-NAME-prometheus-mcp-hub
+                port:
+                  number: 8080
+      - contains:
+          path: spec.rules[1].http.paths
+          content:
+            path: /renew
+            pathType: Prefix
+            backend:
+              service:
+                name: RELEASE-NAME-prometheus-mcp-hub
+                port:
+                  number: 8080
+      - contains:
+          path: spec.rules[1].http.paths
+          content:
+            path: /pki
+            pathType: Prefix
+            backend:
+              service:
+                name: RELEASE-NAME-prometheus-mcp-hub
+                port:
+                  number: 8080
+      - contains:
+          path: spec.rules[1].http.paths
+          content:
+            path: /.well-known/oauth-protected-resource/mcp
+            pathType: Prefix
+            backend:
+              service:
+                name: RELEASE-NAME-prometheus-mcp-hub
+                port:
+                  number: 8080
 
   - it: honours a custom tunnel.path in the Ingress rule it renders
     template: templates/ingress.yaml
@@ -208,7 +289,7 @@ tests:
     asserts:
       - lengthEqual:
           path: spec.rules[0].http.paths
-          count: 1
+          count: 6
 
   - it: keeps the admin port on a ClusterIP Service so a ServiceMonitor can reach it
     template: templates/service.yaml
@@ -219,3 +300,63 @@ tests:
       - equal:
           path: spec.ports[1].name
           value: admin
+
+  - it: preserves child routes when ingress.path is Exact /renew
+    template: templates/ingress.yaml
+    set:
+      ingress:
+        enabled: true
+        host: mcp.example.com
+        path: /renew
+        pathType: Exact
+    asserts:
+      - contains:
+          path: spec.rules[0].http.paths
+          content:
+            path: /renew
+            pathType: Prefix
+            backend:
+              service:
+                name: RELEASE-NAME-prometheus-mcp-hub
+                port:
+                  number: 8080
+
+  - it: preserves child routes when ingress.path is Exact /pki
+    template: templates/ingress.yaml
+    set:
+      ingress:
+        enabled: true
+        host: mcp.example.com
+        path: /pki
+        pathType: Exact
+    asserts:
+      - contains:
+          path: spec.rules[0].http.paths
+          content:
+            path: /pki
+            pathType: Prefix
+            backend:
+              service:
+                name: RELEASE-NAME-prometheus-mcp-hub
+                port:
+                  number: 8080
+
+  - it: preserves child routes when ingress.path is Exact /mcp
+    template: templates/ingress.yaml
+    set:
+      ingress:
+        enabled: true
+        host: mcp.example.com
+        path: /mcp
+        pathType: Exact
+    asserts:
+      - contains:
+          path: spec.rules[0].http.paths
+          content:
+            path: /mcp
+            pathType: Prefix
+            backend:
+              service:
+                name: RELEASE-NAME-prometheus-mcp-hub
+                port:
+                  number: 8080

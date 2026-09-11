@@ -16,6 +16,10 @@ import (
 // PromQL parse message is a well-formed response this package decodes happily.
 var ErrMalformedUpstream = errors.New("render: malformed Prometheus response")
 
+// ErrNativeHistogram reports samples the float-only compact encoders cannot
+// represent. Refusing them prevents invented zero values and silent data loss.
+var ErrNativeHistogram = errors.New("render: native histogram samples require format json or a float-valued expression such as histogram_sum(...) or histogram_count(...)")
+
 // APIResponse is the Prometheus HTTP API envelope. Data is left raw because
 // its shape depends on the endpoint and, for format "json", the hub passes it
 // through without ever parsing it.
@@ -125,6 +129,8 @@ type SeriesStream struct {
 	Metric map[string]string `json:"metric"`
 	// Values are the samples, ordered by timestamp.
 	Values []Point `json:"values"`
+	// Histograms detects native histogram samples, which compact output cannot represent.
+	Histograms []json.RawMessage `json:"histograms,omitempty"`
 }
 
 // Matrix is the result of a range query.
@@ -139,6 +145,11 @@ func DecodeMatrix(result json.RawMessage) (Matrix, error) {
 	if err := json.Unmarshal(result, &m); err != nil {
 		return nil, fmt.Errorf("%w: matrix: %w", ErrMalformedUpstream, err)
 	}
+	for _, s := range m {
+		if len(s.Histograms) > 0 {
+			return nil, ErrNativeHistogram
+		}
+	}
 	return m, nil
 }
 
@@ -148,6 +159,8 @@ type VectorSample struct {
 	Metric map[string]string `json:"metric"`
 	// Value is the single sample.
 	Value Point `json:"value"`
+	// Histogram detects a native histogram instead of a float sample.
+	Histogram []json.RawMessage `json:"histogram,omitempty"`
 }
 
 // Vector is the result of an instant query.
@@ -161,6 +174,11 @@ func DecodeVector(result json.RawMessage) (Vector, error) {
 	var v Vector
 	if err := json.Unmarshal(result, &v); err != nil {
 		return nil, fmt.Errorf("%w: vector: %w", ErrMalformedUpstream, err)
+	}
+	for _, s := range v {
+		if len(s.Histogram) > 0 {
+			return nil, ErrNativeHistogram
+		}
 	}
 	return v, nil
 }

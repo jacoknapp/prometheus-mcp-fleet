@@ -159,27 +159,19 @@ produces for this chart.
 {{- if and .Values.podDisruptionBudget.enabled (ge (int .Values.replicaCount) 2) -}}true{{- end -}}
 {{- end -}}
 
-{{/*
-Does an Ingress path route the tunnel WebSocket as well?
-
-This is not cosmetic. The tunnel shares the MCP listener, so an Ingress whose
-rule does not cover tunnel.path produces a hub that passes every probe, serves
-MCP perfectly and accepts ZERO spokes. templates/ingress.yaml renders a second
-path entry for the tunnel wherever this returns empty.
-
-Call as (list . $path $pathType). Returns "true" or "".
-*/}}
-{{- define "prometheus-mcp-hub.pathCoversTunnel" -}}
-{{- $root := index . 0 -}}
-{{- $path := index . 1 | toString -}}
-{{- $pathType := index . 2 | toString -}}
-{{- $tunnel := $root.Values.tunnel.path -}}
-{{- if eq $path $tunnel -}}
+{{/* Whether a configured Ingress path covers a required public route.
+Call as (list $path $pathType $target $subtree). Prefix matches whole path
+segments; an Exact path cannot cover route groups such as /renew/challenge. */}}
+{{- define "prometheus-mcp-hub.pathCoversPublicRoute" -}}
+{{- $path := index . 0 | toString -}}
+{{- $pathType := index . 1 | toString -}}
+{{- $target := index . 2 | toString -}}
+{{- $subtree := index . 3 -}}
+{{- if and (eq $path $target) (not $subtree) -}}
 true
 {{- else if eq $pathType "Prefix" -}}
-{{/* Prefix matches on whole path segments: "/" covers everything, "/mcp" does not cover "/tunnel". */}}
 {{- $base := trimSuffix "/" $path -}}
-{{- if or (eq $base "") (hasPrefix (printf "%s/" $base) $tunnel) -}}
+{{- if or (eq $base "") (eq $base $target) (hasPrefix (printf "%s/" $base) $target) -}}
 true
 {{- end -}}
 {{- end -}}
@@ -437,4 +429,37 @@ derived from the cgroup limit and never from node allocatable.
 {{- define "prometheus-mcp-hub.goMemLimit" -}}
 {{- $bytes := include "prometheus-mcp-hub.memoryBytes" (dig "limits" "memory" "" .Values.resources) | float64 -}}
 {{- mulf $bytes .Values.goRuntime.memLimitRatio | floor | int64 -}}
+{{- end -}}
+
+{{/* NetworkPolicy peers preserve Kubernetes selector semantics: an omitted
+namespace selector with a pod selector means this namespace; an explicit empty
+namespace selector means every namespace. Never turn missing selectors into an
+empty from/to field, which would allow every source/destination. */}}
+{{- define "prometheus-mcp-hub.networkPeers" -}}
+{{- $peers := list -}}
+{{- $peer := dict -}}
+{{- if hasKey . "namespaceSelector" -}}
+{{- $_ := set $peer "namespaceSelector" .namespaceSelector -}}
+{{- end -}}
+{{- if and (hasKey . "podSelector") (or .podSelector (not (hasKey . "namespaceSelector"))) -}}
+{{- $_ := set $peer "podSelector" .podSelector -}}
+{{- end -}}
+{{- if $peer -}}{{- $peers = append $peers $peer -}}{{- end -}}
+{{- range .extraFrom -}}{{- $peers = append $peers . -}}{{- end -}}
+{{- if $peers -}}{{- toYaml $peers -}}{{- end -}}
+{{- end -}}
+
+{{/* Test pods must not match workload Services, PDBs or egress policies. */}}
+{{- define "prometheus-mcp-hub.testLabels" -}}
+{{- $labels := fromYaml (include "prometheus-mcp-hub.componentLabels" (list . "hub-test")) -}}
+{{- $_ := unset $labels "app.kubernetes.io/name" -}}
+{{- toYaml $labels -}}
+{{- end -}}
+
+{{/* Permit only this release's Helm test pod to probe the workload. */}}
+{{- define "prometheus-mcp-hub.testPeer" -}}
+podSelector:
+  matchLabels:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: hub-test
 {{- end -}}

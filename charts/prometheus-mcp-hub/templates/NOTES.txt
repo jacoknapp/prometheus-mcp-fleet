@@ -44,10 +44,10 @@ WARNING - ingress.enabled=false, so nothing outside this cluster can reach this 
   LoadBalancer and no passthrough annotation to arrange - but with no Ingress at all
   there is also no path for a spoke to dial in on. Set ingress.enabled=true with
   ingress.host, or publish {{ include "prometheus-mcp-hub.fullname" . }}:{{ int .Values.service.mcpPort }} some other way.
-{{- else if not (include "prometheus-mcp-hub.pathCoversTunnel" (list . .Values.ingress.path .Values.ingress.pathType)) }}
+{{- else if not (include "prometheus-mcp-hub.pathCoversPublicRoute" (list .Values.ingress.path .Values.ingress.pathType .Values.tunnel.path false)) }}
 
 NOTE - ingress.path ({{ .Values.ingress.path }}, {{ .Values.ingress.pathType }}) does not cover tunnel.path ({{ .Values.tunnel.path }}),
-  so a SECOND Ingress path entry was rendered for the tunnel. Nothing to do; this
+  so an additional Ingress path entry was rendered for the tunnel. Nothing to do; this
   note exists because an Ingress that silently misses {{ .Values.tunnel.path }} gives you a hub
   that passes every probe and accepts zero spokes.
 {{- end }}

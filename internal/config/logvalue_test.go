@@ -46,12 +46,12 @@ func TestSpokeLogValueRedactsURLCredentials(t *testing.T) {
 	t.Parallel()
 
 	c := validSpoke(t)
-	c.PrometheusURL = "https://scraper:p4ssw0rd@prom.svc:9090"
+	c.PrometheusURL = "https://scraper:p4ssw0rd@prom.svc:9090?api_key=query-secret#fragment-secret"
 	c.HubAPIURL = "https://spoke:t0ken@hub.example.com"
 	c.ClusterLabels = map[string]string{"env": "prod"}
 
 	line := logLine(t, "spoke", c)
-	for _, secret := range []string{"p4ssw0rd", "t0ken"} {
+	for _, secret := range []string{"p4ssw0rd", "t0ken", "query-secret", "fragment-secret"} {
 		if strings.Contains(line, secret) {
 			t.Errorf("log line leaks %q:\n%s", secret, line)
 		}
@@ -84,6 +84,8 @@ func TestRedactURL(t *testing.T) {
 		{"no credentials", "https://hub.example.com/x", "https://hub.example.com/x"},
 		{"password", "https://u:p@h/x", "https://redacted@h/x"},
 		{"user only", "https://u@h/x", "https://redacted@h/x"},
+		{"query and fragment", "https://h/x?api_key=secret#secret", "https://h/x"},
+		{"empty query", "https://h/x?", "https://h/x"},
 		{"host port only", "collector:4317", "collector:4317"},
 		{"unparseable", "https://%zz", "[unparseable-url]"},
 	}

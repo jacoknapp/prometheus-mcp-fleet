@@ -13,7 +13,7 @@ metadata:
   name: {{ include "prometheus-mcp-hub.fullname" . }}-test-connection
   namespace: {{ include "prometheus-mcp-hub.namespace" . }}
   labels:
-    {{- include "prometheus-mcp-hub.componentLabels" (list . "hub-test") | nindent 4 }}
+    {{- include "prometheus-mcp-hub.testLabels" . | nindent 4 }}
   annotations:
     helm.sh/hook: test
     helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded

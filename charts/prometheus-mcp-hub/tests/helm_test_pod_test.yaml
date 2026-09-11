@@ -1,0 +1,57 @@
+# Copyright The prometheus-mcp-fleet Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Helm test pods must reach their workload without becoming Service endpoints
+# or inheriting the workload NetworkPolicy egress restrictions.
+suite: hub Helm test pod can probe without joining the workload
+templates:
+  - templates/tests/test-connection.yaml
+  - templates/networkpolicy.yaml
+set:
+  config.publicURL: https://mcp.example.com/mcp
+tests:
+  - it: omits the workload name label with default labels
+    template: templates/tests/test-connection.yaml
+    set: {}
+    asserts:
+      - notExists:
+          path: metadata.labels["app.kubernetes.io/name"]
+      - equal:
+          path: metadata.labels["app.kubernetes.io/component"]
+          value: hub-test
+      - equal:
+          path: metadata.labels["app.kubernetes.io/instance"]
+          value: RELEASE-NAME
+  - it: omits the workload name label with a maximum-length nameOverride
+    template: templates/tests/test-connection.yaml
+    set:
+      nameOverride: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    asserts:
+      - notExists:
+          path: metadata.labels["app.kubernetes.io/name"]
+      - equal:
+          path: metadata.labels["app.kubernetes.io/component"]
+          value: hub-test
+      - equal:
+          path: metadata.labels["app.kubernetes.io/instance"]
+          value: RELEASE-NAME
+  - it: allows the test pod through ingress rule 0
+    template: templates/networkpolicy.yaml
+    asserts:
+      - contains:
+          path: spec.ingress[0].from
+          content:
+            podSelector:
+              matchLabels:
+                app.kubernetes.io/instance: RELEASE-NAME
+                app.kubernetes.io/component: hub-test
+  - it: allows the test pod through ingress rule 1
+    template: templates/networkpolicy.yaml
+    asserts:
+      - contains:
+          path: spec.ingress[1].from
+          content:
+            podSelector:
+              matchLabels:
+                app.kubernetes.io/instance: RELEASE-NAME
+                app.kubernetes.io/component: hub-test

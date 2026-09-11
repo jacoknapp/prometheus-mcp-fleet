@@ -297,8 +297,8 @@ podDisruptionBudget:
   enabled: true
   # -- `spec.minAvailable`. Mutually exclusive with `maxUnavailable`, which is set below and wins.
   minAvailable: ""
-  # -- `spec.maxUnavailable`. A percentage rather than a count so it stays correct if you change `replicaCount`.
-  maxUnavailable: 50%
+  # -- `spec.maxUnavailable`. The default permits one voluntary eviction at a time. A percentage rounds up in Kubernetes: `50%` would permit two evictions at three replicas.
+  maxUnavailable: 1
   # -- `spec.unhealthyPodEvictionPolicy` (Kubernetes >= 1.27). `AlwaysAllow` means a pod that is not Ready does not consume the budget, so a node carrying a crashlooping spoke can still be drained.
   unhealthyPodEvictionPolicy: AlwaysAllow
 
@@ -310,7 +310,7 @@ networkPolicy:
   ingress:
     # -- Allow ingress to the metrics port. The spoke accepts nothing else — the tunnel is outbound.
     enabled: true
-    # -- `namespaceSelector` for the only namespace allowed to scrape the metrics port.
+    # -- `namespaceSelector` for the only namespace allowed to scrape the metrics port. Set to `null` to restrict `podSelector` to the release namespace; set `matchLabels: null` to select all namespaces.
     namespaceSelector:
       matchLabels:
         kubernetes.io/metadata.name: monitoring
@@ -341,7 +341,7 @@ networkPolicy:
     prometheus:
       # -- Allow egress to the local Prometheus, on the port parsed from `prometheus.url`.
       enabled: true
-      # -- `namespaceSelector` for the namespace Prometheus runs in.
+      # -- `namespaceSelector` for the namespace Prometheus runs in. Set to `null` to restrict `podSelector` to the release namespace; set `matchLabels: null` to select all namespaces.
       namespaceSelector:
         matchLabels:
           kubernetes.io/metadata.name: monitoring

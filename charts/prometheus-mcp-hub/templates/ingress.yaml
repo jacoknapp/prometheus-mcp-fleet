@@ -7,10 +7,9 @@ the agent-facing MCP endpoint and the spoke tunnel WebSocket at tunnel.path
 (ADR-0014). There is no Gateway API HTTPRoute and no OpenShift Route here, and
 there is no longer a tunnel Service: the tunnel is ordinary HTTP.
 
-The tunnel entry is rendered EXPLICITLY whenever the host's own path would not
-already route it. An Ingress that misses tunnel.path yields a hub that passes
-every probe, serves MCP correctly and accepts zero spokes -- the most expensive
-kind of healthy.
+Required public routes are rendered explicitly whenever the host's configured
+path would not cover them. Enrollment, renewal, PKI and OAuth metadata share
+this listener with MCP and the tunnel and must remain reachable too.
 
 Idle timeouts are the one operational hazard: a controller closes idle upgraded
 connections. The tunnel's HTTP/2 keepalive pings run every 10s, well inside
@@ -51,28 +50,9 @@ spec:
       {{- end }}
   {{- end }}
   rules:
-    - host: {{ .Values.ingress.host | quote }}
-      http:
-        paths:
-          - path: {{ .Values.ingress.path }}
-            pathType: {{ .Values.ingress.pathType }}
-            backend:
-              service:
-                name: {{ $fullName }}
-                port:
-                  number: {{ $port }}
-          {{- if not (include "prometheus-mcp-hub.pathCoversTunnel" (list . .Values.ingress.path .Values.ingress.pathType)) }}
-          # ingress.path does not cover tunnel.path, so the spoke tunnel gets
-          # its own rule. Without this no spoke can ever connect.
-          - path: {{ .Values.tunnel.path }}
-            pathType: Prefix
-            backend:
-              service:
-                name: {{ $fullName }}
-                port:
-                  number: {{ $port }}
-          {{- end }}
-    {{- range .Values.ingress.extraHosts }}
+    {{- $hosts := prepend .Values.ingress.extraHosts (dict "host" .Values.ingress.host "path" .Values.ingress.path "pathType" .Values.ingress.pathType) }}
+    {{- $routes := list "/mcp" .Values.tunnel.path "/enroll" "/renew" "/pki" "/.well-known/oauth-protected-resource/mcp" | uniq }}
+    {{- range $hosts }}
     {{- $path := .path | default "/" }}
     {{- $pathType := .pathType | default "Prefix" }}
     - host: {{ .host | quote }}
@@ -85,14 +65,16 @@ spec:
                 name: {{ $fullName }}
                 port:
                   number: {{ $port }}
-          {{- if not (include "prometheus-mcp-hub.pathCoversTunnel" (list $ $path $pathType)) }}
-          - path: {{ $.Values.tunnel.path }}
+          {{- range $routes }}
+          {{- if not (include "prometheus-mcp-hub.pathCoversPublicRoute" (list $path $pathType . (has . (list "/mcp" "/renew" "/pki")))) }}
+          - path: {{ . }}
             pathType: Prefix
             backend:
               service:
                 name: {{ $fullName }}
                 port:
                   number: {{ $port }}
+          {{- end }}
           {{- end }}
     {{- end }}
 {{- end }}

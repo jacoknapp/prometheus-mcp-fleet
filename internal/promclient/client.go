@@ -358,7 +358,18 @@ func (c *Client) send(endpoint promapi.Endpoint, req *http.Request) (*http.Respo
 	c.metrics.PromDuration(endpoint, latency)
 	if err != nil {
 		c.metrics.PromRequest(endpoint, errorCode(req.Context(), err))
-		return nil, latency, err
+		// Client.Do wraps transport failures in a URL error. Its URL includes
+		// query credentials, which would otherwise reach logs, published facts
+		// and MCP errors. Use the request's parsed URL to keep host/path context
+		// while removing credentials; retain the underlying transport error.
+		// net/http guarantees *url.Error for every Client.Do failure.
+		urlErr := *err.(*url.Error) //nolint:errcheck,errorlint // Client.Do documents that every returned error is *url.Error.
+		safeURL := *req.URL
+		safeURL.User = nil
+		safeURL.RawQuery, safeURL.Fragment, safeURL.RawFragment = "", "", ""
+		safeURL.ForceQuery = false
+		urlErr.URL = safeURL.String()
+		return nil, latency, &urlErr
 	}
 	c.metrics.PromRequest(endpoint, strconv.Itoa(resp.StatusCode))
 	return resp, latency, nil

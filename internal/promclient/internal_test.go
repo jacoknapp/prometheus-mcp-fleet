@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/jacoknapp/prometheus-mcp-fleet/internal/promapi"
+	"github.com/jacoknapp/prometheus-mcp-fleet/internal/tunnel"
 )
 
 func TestLimitedBodyRepeatsTerminalErrors(t *testing.T) {
@@ -512,6 +513,64 @@ func TestErrorCode(t *testing.T) {
 			t.Parallel()
 			if got := errorCode(tc.ctx, tc.err); got != tc.want {
 				t.Errorf("errorCode() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// Transport errors flow through facts, readiness logs and MCP errors; none may
+// expose credentials from the configured upstream URL or caller's query.
+func TestTransportErrorsRedactURLCredentials(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		call func(*Client) error
+	}{
+		{"tunnel", func(c *Client) error {
+			_, err := c.Do(t.Context(), &tunnel.Request{
+				Method: http.MethodPost, Path: "/api/v1/query",
+				Form: []byte("query=private-metric"),
+			})
+			return err
+		}},
+		{"json helper", func(c *Client) error {
+			_, err := c.InstantQuery(t.Context(), "private-metric")
+			return err
+		}},
+		{"readiness", func(c *Client) error { return c.Ping(t.Context()) }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			const baseURL = "https://private-user:private-password@prom.example/prom?token=private-token#private-fragment"
+			c := mustInternalClient(t, Config{BaseURL: baseURL})
+			transportErr := fakeNetError{timeout: true}
+			c.httpc.Transport = roundTripper(func(req *http.Request) (*http.Response, error) {
+				// Redaction must never strip the credentials from the real request.
+				if got := req.URL.Query().Get("token"); got != "private-token" {
+					t.Errorf("upstream token = %q", got)
+				}
+				return nil, transportErr
+			})
+			err := tc.call(c)
+			if !errors.Is(err, ErrUpstream) || !errors.Is(err, transportErr) {
+				t.Fatalf("call error = %v, want upstream error preserving its cause", err)
+			}
+			for _, secret := range []string{"private-user", "private-password", "private-token", "private-fragment", "private-metric"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Errorf("error leaks %q: %v", secret, err)
+				}
+			}
+			var urlErr *url.Error
+			if !errors.As(err, &urlErr) || !urlErr.Timeout() {
+				t.Fatalf("error = %v, want URL error retaining timeout classification", err)
+			}
+			if !strings.HasPrefix(urlErr.URL, "https://prom.example/prom/") {
+				t.Errorf("safe URL = %q, want original host/path context", urlErr.URL)
+			}
+			if got := c.BaseURL(); got != strings.Split(baseURL, "#")[0] {
+				t.Errorf("base URL mutated by error redaction: %q", got)
 			}
 		})
 	}

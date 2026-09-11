@@ -35,8 +35,8 @@ The default output encoding is **columnar and lossy in stated ways**.
 * Values are JSON numbers, not strings. Gaps are `null`.
 * Labels shared by every series are factored out into `sharedLabels`; only the
   differing labels stay per-series.
-* **Step is selected automatically**: `step = max(userStep, ceil((end-start)/maxPoints))`,
-  snapped up to a human-sensible ladder, never below the cluster's reported scrape
+* **Step is selected automatically**: greater than `(end-start)/maxPoints` and
+  at least `userStep`, snapped up to a human-sensible ladder, never below the cluster's reported scrape
   interval. Every response reports
   `downsampled: {requestedStep, appliedStep, reason}` — an agent reasoning about
   a latency spike must know it is looking at averaged data.

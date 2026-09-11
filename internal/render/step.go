@@ -72,7 +72,8 @@ type StepRequest struct {
 
 // SelectStep chooses the step for a range query and reports what it did.
 //
-// The rule is step = max(userStep, ceil((end-start)/maxPoints)), snapped up to
+// The rule is step > (end-start)/maxPoints, since both endpoints are inclusive,
+// and step >= userStep, snapped up to
 // [StepLadder] and then floored at the cluster's scrape interval. The floor is
 // applied last: asking for points closer together than the data was collected
 // buys nothing but tokens, and Prometheus will happily interpolate them.
@@ -101,7 +102,9 @@ func SelectStep(r StepRequest) (time.Duration, Downsampled) {
 
 	// Point budget.
 	if span > 0 {
-		needed := time.Duration(math.Ceil(float64(span) / float64(maxPoints)))
+		// floor(span/step)+1 samples fit only when step > span/maxPoints.
+		// Integer division plus one nanosecond also handles a one-point budget.
+		needed := span/time.Duration(maxPoints) + time.Nanosecond
 		if needed > step {
 			step = needed
 			reason = StepReasonMaxPoints

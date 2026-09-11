@@ -77,7 +77,7 @@ peerDiscovery:
   enabled: true      # renders the headless Service the hub resolves
 podDisruptionBudget:
   enabled: true
-  maxUnavailable: 50%
+  maxUnavailable: 1
   # A pod that is not Ready does NOT consume the budget. Without this a node
   # carrying a crashlooping hub cannot be drained until somebody fixes the pod,
   # which is backwards for a workload whose whole point is replaceability.

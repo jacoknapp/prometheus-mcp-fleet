@@ -374,18 +374,18 @@ Kubernetes: `>=1.28.0-0`
 | networkPolicy.egress.kubeAPI.port | string | `nil` | Deprecated, superseded by `ports`. A single extra port to allow, appended to the list when set. |
 | networkPolicy.egress.kubeAPI.ports | list | `[443,6443]` | Ports of the Kubernetes API server for the egress rule. Both defaults matter: the pod dials `kubernetes.default.svc:443`, but most CNIs evaluate egress policy AFTER kube-proxy has DNATed that to the real API server endpoint, which kubeadm, k3s, RKE2 and most managed control planes serve on 6443. A rule for 443 alone then drops every identity Secret write and the spoke re-enrolls on every restart. Trim to the one your cluster uses if you know it. |
 | networkPolicy.egress.prometheus.enabled | bool | `true` | Allow egress to the local Prometheus, on the port parsed from `prometheus.url`. |
-| networkPolicy.egress.prometheus.namespaceSelector | object | `{"matchLabels":{"kubernetes.io/metadata.name":"monitoring"}}` | `namespaceSelector` for the namespace Prometheus runs in. |
+| networkPolicy.egress.prometheus.namespaceSelector | object | `{"matchLabels":{"kubernetes.io/metadata.name":"monitoring"}}` | `namespaceSelector` for the namespace Prometheus runs in. Set to `null` to restrict `podSelector` to the release namespace; set `matchLabels: null` to select all namespaces. |
 | networkPolicy.egress.prometheus.podSelector | object | `{}` | `podSelector` for the Prometheus pods. Empty selects every pod in the selected namespaces. |
 | networkPolicy.enabled | bool | `true` | Render a NetworkPolicy. On by default: the spoke's egress set is small, known and worth pinning down, because this pod holds a credential that can read the whole cluster's metrics. |
 | networkPolicy.ingress.enabled | bool | `true` | Allow ingress to the metrics port. The spoke accepts nothing else — the tunnel is outbound. |
 | networkPolicy.ingress.extraFrom | list | `[]` | Additional raw `ingress.from` entries for the metrics port. |
-| networkPolicy.ingress.namespaceSelector | object | `{"matchLabels":{"kubernetes.io/metadata.name":"monitoring"}}` | `namespaceSelector` for the only namespace allowed to scrape the metrics port. |
+| networkPolicy.ingress.namespaceSelector | object | `{"matchLabels":{"kubernetes.io/metadata.name":"monitoring"}}` | `namespaceSelector` for the only namespace allowed to scrape the metrics port. Set to `null` to restrict `podSelector` to the release namespace; set `matchLabels: null` to select all namespaces. |
 | networkPolicy.ingress.podSelector | object | `{}` | `podSelector` for scrapers allowed to reach the metrics port. Empty selects every pod in the selected namespaces. |
 | networkPolicy.labels | object | `{}` | Extra labels for the NetworkPolicy. |
 | nodeSelector | object | `{}` | `spec.template.spec.nodeSelector`. |
 | podAnnotations | object | `{}` | Annotations for the spoke pods. |
 | podDisruptionBudget.enabled | bool | `true` | Render a PodDisruptionBudget. Force-disabled below `replicaCount: 2`, where a budget can never be satisfied and would block every node drain forever. |
-| podDisruptionBudget.maxUnavailable | string | `"50%"` | `spec.maxUnavailable`. A percentage rather than a count so it stays correct if you change `replicaCount`. |
+| podDisruptionBudget.maxUnavailable | int | `1` | `spec.maxUnavailable`. The default permits one voluntary eviction at a time. A percentage rounds up in Kubernetes: `50%` would permit two evictions at three replicas. |
 | podDisruptionBudget.minAvailable | string | `""` | `spec.minAvailable`. Mutually exclusive with `maxUnavailable`, which is set below and wins. |
 | podDisruptionBudget.unhealthyPodEvictionPolicy | string | `"AlwaysAllow"` | `spec.unhealthyPodEvictionPolicy` (Kubernetes >= 1.27). `AlwaysAllow` means a pod that is not Ready does not consume the budget, so a node carrying a crashlooping spoke can still be drained. |
 | podLabels | object | `{}` | Extra labels for the spoke pods. |

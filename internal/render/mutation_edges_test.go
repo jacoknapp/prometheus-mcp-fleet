@@ -257,11 +257,11 @@ func TestSelectStepReasonAtTheBoundaries(t *testing.T) {
 
 	t.Run("a requested step equal to the point budget stays requested", func(t *testing.T) {
 		t.Parallel()
-		// 30 minutes over the default 120-point budget needs exactly 15s,
+		// 119 intervals over the default 120-point budget permit exactly 15s,
 		// which is also what the caller asked for and is already on the
 		// ladder. Nothing overrode the request, so nothing may claim to have.
 		step, d := SelectStep(StepRequest{
-			Start: start, End: start.Add(30 * time.Minute), UserStep: 15 * time.Second,
+			Start: start, End: start.Add(119 * 15 * time.Second), UserStep: 15 * time.Second,
 		})
 		if step != 15*time.Second {
 			t.Errorf("step = %s, want 15s", step)
@@ -275,7 +275,7 @@ func TestSelectStepReasonAtTheBoundaries(t *testing.T) {
 	t.Run("a scrape interval equal to the step is not a floor that fired", func(t *testing.T) {
 		t.Parallel()
 		step, d := SelectStep(StepRequest{
-			Start: start, End: start.Add(30 * time.Minute),
+			Start: start, End: start.Add(119 * 15 * time.Second),
 			UserStep: 15 * time.Second, ScrapeInterval: 15 * time.Second,
 		})
 		if step != 15*time.Second {
@@ -290,7 +290,7 @@ func TestSelectStepReasonAtTheBoundaries(t *testing.T) {
 	t.Run("a scrape interval above the step does raise it", func(t *testing.T) {
 		t.Parallel()
 		step, d := SelectStep(StepRequest{
-			Start: start, End: start.Add(30 * time.Minute),
+			Start: start, End: start.Add(119 * 15 * time.Second),
 			UserStep: 15 * time.Second, ScrapeInterval: 30 * time.Second,
 		})
 		if step != 30*time.Second {

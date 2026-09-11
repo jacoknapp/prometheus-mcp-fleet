@@ -52,13 +52,8 @@
 //
 // # Fan-out
 //
-// [Proxy.Fanout] runs the same call across many clusters at a bounded
-// concurrency and returns one [FanoutResult] per cluster, in the input order.
-// Failure is per cluster: a forbidden, unknown, disconnected or busy cluster
-// occupies its own slot and costs the caller nothing else. The concurrency
-// bound is not politeness — every in-flight call reserves its worst-case size
-// against the hub-wide byte budget, so an unbounded fan-out would exhaust that
-// budget and start refusing unrelated callers.
+// internal/mcptools owns fleet scheduling and result merging. Each worker
+// calls [Proxy.Do], so per-call authorization and budgets also cover fan-out.
 //
 // # Allowed importers
 //
