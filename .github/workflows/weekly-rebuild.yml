@@ -345,12 +345,20 @@ jobs:
           report="trivy-${COMPONENT}.json"
           test -s "${report}"
 
-          fixable="$(jq -r '
-            [ .Results[]?.Vulnerabilities[]?
+          # Split by where the fix has to happen. A finding in the compiled Go
+          # binary (Go stdlib or a module) cannot be rebuilt away: this
+          # workflow recompiles the release tag's unchanged source with the
+          # same toolchain on purpose. Only a new release fixes it. Anything
+          # else lives in the base layer, which is what a rebuild refreshes.
+          # shellcheck disable=SC2016 # $go is a jq variable, not a shell one
+          fixable_q='
+            [ .Results[]? | select((.Type == "gobinary") == $go) | .Vulnerabilities[]?
               | select(.Severity == "HIGH" or .Severity == "CRITICAL")
               | select((.FixedVersion // "") != "")
               | "\(.VulnerabilityID) \(.PkgName) \(.InstalledVersion) -> \(.FixedVersion)" ]
-            | unique | .[]' "${report}")"
+            | unique | .[]'
+          fixable_go="$(jq -r --argjson go true "${fixable_q}" "${report}")"
+          fixable="$(jq -r --argjson go false "${fixable_q}" "${report}")"
 
           unfixable="$(jq -r '
             [ .Results[]?.Vulnerabilities[]?
@@ -375,11 +383,18 @@ jobs:
             fi
           } >> "${GITHUB_STEP_SUMMARY}"
 
+          failed=0
+          if [ -n "${fixable_go}" ]; then
+            echo "::error::${COMPONENT}: the compiled binary carries fixable HIGH/CRITICAL vulnerabilities in Go or a Go module. A rebuild cannot fix these; bump the Go toolchain or module on main and cut a release."
+            printf '%s\n' "${fixable_go}"
+            failed=1
+          fi
           if [ -n "${fixable}" ]; then
             echo "::error::${COMPONENT}: a fresh base image still carries fixable HIGH/CRITICAL vulnerabilities. The rebuild did not achieve its purpose; bump the base image digest in the Dockerfile."
             printf '%s\n' "${fixable}"
-            exit 1
+            failed=1
           fi
+          exit "${failed}"
 
       - name: Rebuild and push multi-arch image
         id: build

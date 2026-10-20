@@ -12,7 +12,25 @@ lockstep. The exception is called out where it happens: 0.10.0's `renew-v2`
 is a hard cut on the renewal proof alone, with existing tunnels unaffected
 and `--renew-grace` covering spokes that upgrade late.
 
-## [Unreleased]
+## [0.10.5] - 2026-10-20
+
+### Security
+
+- Built with Go 1.27.3 and `golang.org/x/net` 0.60.0. 0.10.4's binaries were
+  compiled with Go 1.27.0 and x/net 0.58.0, which carry fixable HIGH findings
+  (CVE-2026-78667, CVE-2026-78669, CVE-2026-97031). The weekly CVE rebuild
+  cannot fix a finding in the compiled binary -- it recompiles the release's
+  source unchanged, on purpose -- so it failed on 2026-10-12 and 2026-10-19
+  until this release. `go.mod` now declares Go 1.26, which x/net requires;
+  among other defaults that makes ECDSA signing ignore a caller-supplied
+  random source.
+
+### Changed
+
+- The weekly rebuild now says which kind of fix a fixable finding needs: a
+  finding in the Go binary asks for a toolchain or module bump and a release,
+  one in the base layer for a new base image digest. Both used to report as a
+  stale base image.
 
 ### Removed
 

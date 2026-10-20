@@ -1561,14 +1561,21 @@ func TestRenewCAIssuanceFailureIsInternal(t *testing.T) {
 	}
 }
 
-// TestPKICRLSignFailureIsInternal proves a CRL that fails to sign -- again,
-// the CA losing its entropy source -- is reported as an internal error on
-// the unauthenticated /pki/crl route.
+// TestPKICRLSignFailureIsInternal proves a CRL the CA refuses to build -- here
+// a corrupt revocation record whose serial is not hex -- is reported as an
+// internal error on the unauthenticated /pki/crl route.
 //
-// Deliberately not parallel: see [withFailingRand].
+// It used to starve the CA of entropy instead, but since go.mod declares Go
+// 1.26 crypto/ecdsa ignores a caller's rand.Reader (GODEBUG
+// cryptocustomrand=0), so CRL signing no longer fails that way.
 func TestPKICRLSignFailureIsInternal(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, nil)
-	withFailingRand(t)
+	if err := h.store.RevokeCert(t.Context(), RevokedCert{
+		Serial: "not-hex", RevokedAt: testNow, NotAfter: testNow.Add(24 * time.Hour), Reason: "corrupt",
+	}); err != nil {
+		t.Fatalf("RevokeCert: %v", err)
+	}
 
 	resp := h.do(h.public, http.MethodGet, "/pki/crl", "", nil)
 	if resp.StatusCode != http.StatusInternalServerError {
