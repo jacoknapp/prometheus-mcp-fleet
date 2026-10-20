@@ -29,7 +29,7 @@ env:
   # not used here.
   GO_VERSION: "1.27.x"
   # renovate: datasource=github-releases depName=golangci/golangci-lint
-  GOLANGCI_LINT_VERSION: "v2.13.2"
+  GOLANGCI_LINT_VERSION: "v2.15.0"
   # Repo-wide statement coverage floor, in percent. Enforced by the `test` job.
   # TODO(coverage): raise to 80 once internal/{registry,promproxy,mcptools} land,
   # then to the per-package 90% gate the build spec calls for.

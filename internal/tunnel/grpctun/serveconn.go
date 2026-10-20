@@ -87,17 +87,23 @@ func ServeConn(ctx context.Context, conn net.Conn, cfg DialerConfig, h tunnel.Ha
 
 	var (
 		cancelled bool
+		// Serve's own error only ever reports the one-shot listener waking
+		// up; the real cause is nc.DeathReason() or ctx.Err() below, so it is
+		// logged at debug and nothing else.
+		serveDone error
 	)
 	select {
-	case <-serveErr:
+	case serveDone = <-serveErr:
 	case <-ctx.Done():
 		cancelled = true
 		// Stop, not GracefulStop: the hub has already been told to go away by
 		// the caller's shutdown sequence, and a spoke that lingers keeps the
 		// hub routing queries at a process that is exiting.
 		srv.Stop()
-		<-serveErr
+		serveDone = <-serveErr
 	}
+	log.DebugContext(ctx, "spoke tunnel grpc server returned",
+		slog.String("endpoint", cfg.Endpoint), slog.Any("error", serveDone))
 	_ = lis.Close()
 	srv.Stop()
 	_ = nc.Close()
