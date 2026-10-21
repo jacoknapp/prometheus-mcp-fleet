@@ -447,6 +447,16 @@ func TestAuthenticateOverAPipe(t *testing.T) {
 		}
 	})
 
+	// The handshake subtest above can fail before it reaches validInstanceID
+	// on a loaded runner and still see ErrHandshakeFailed, so the length
+	// check is asserted directly as well.
+	t.Run("an instance id one byte over the bound is refused", func(t *testing.T) {
+		t.Parallel()
+		if err := validInstanceID(strings.Repeat("x", maxInstanceIDLen+1)); err == nil {
+			t.Fatal("validInstanceID one byte over the bound = nil, want it refused")
+		}
+	})
+
 	t.Run("verifier that reports no serial still yields an auditable identity", func(t *testing.T) {
 		t.Parallel()
 
